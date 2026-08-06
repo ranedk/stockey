@@ -1,16 +1,18 @@
 # LLM / Agent Integration Notes
 
+Stockey is a pure data platform (`CLAUDE.md`) — it has no research/analyst
+agent surface of its own. Any agent that needs to reason over price/reference
+data for signals, scoring, or trading decisions belongs against systrader's
+local `systrade` mirror, not against stockey directly (`DATA_CONTRACT.md`'s
+load rule: the cloud DB stockey writes to is small, never point heavy reads
+at it).
+
 ## Recommended split
 
 If you expose this repo to agent workflows, keep it as separate tool-owning agents instead of one general agent with full access:
 
 - `downloader`: runs crawler and downloader modules only
 - `storage-ops`: runs `scripts/sql_query_runner.py`, `scripts/redis_query_runner.py`, `scripts/s3_query_runner.py`
-- `ml-research`: read-only SQL plus notebook or training code
-- `investment-analyst`: read-only SQL plus fundamental tables
-- `technical-analyst`: read-only SQL plus price, volume, and market structure tables
-- `macro-geopolitical`: read-only SQL plus macro tables and external news tools
-- `sentiment`: news ingestion and sentiment pipelines
 
 ## Tool contract
 
@@ -72,7 +74,3 @@ Before adding more agents, finish these pieces:
 - standardize table names and unique keys
 - document per-table date semantics
 - prefer numeric SQL types at ingest time instead of repairing them later
-
-## Advisory system roadmap
-
-The current advisory roadmap is tracked in [`todo.md`](../todo.md). Use that file for active priorities and bottlenecks before exposing new advisory tools to agents.

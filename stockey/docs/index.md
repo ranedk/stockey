@@ -9,9 +9,9 @@ python builder.py
 source .xstockey/bin/activate
 ```
 
-`builder.py` is now safe to import and only runs when executed directly.
-
-`builder.py` also creates `logs/cron` and installs `go-crond` if it is missing. It resolves the binary in this order:
+`builder.py` is safe to import and only runs when executed directly. It also
+creates `logs/cron` and installs `go-crond` if missing, resolving the binary
+in this order:
 
 1. use `GO_CROND_INSTALL_DIR` if that env var is set
 2. otherwise install into the repo root as `./go-crond`
@@ -34,6 +34,15 @@ GRANT USAGE ON SCHEMA public TO stockey;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 ```
 
+TimescaleDB is still in active use on the cloud DB — several KEEP tables,
+including the primary adjusted price series, are hypertables. See
+`DATA_CONTRACT.md` for the `hypertable_size()` note (plain
+`pg_total_relation_size()` dramatically undercounts hypertables).
+
+For provisioning a fresh remote Postgres/Redis server from scratch (ZeroTier
+networking, UFW, moving data directories to an external volume), see
+`docs/db_setup.md`.
+
 ## Redis backup
 
 ```sh
@@ -55,304 +64,75 @@ Expected prefixes:
 
 ## Data loaders
 
-Symbol-specific loaders default to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt). Daily derivation jobs can instead use [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt). You can override either flow per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
+Symbol-specific loaders default to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt).
+Daily derivation jobs can instead use [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt).
+Override either per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
 
-## Orchestration scripts
+The full daily pipeline is `./complete_data.sh` — see `README.md` for the
+cron list and `docs/scripts.md` for the exact `data.download_runner` step
+registries. Individual source commands, for debugging one collector:
 
-The repo now has these top-level operator entrypoints:
-
-1. Download-only refresh:
-
-```sh
-./all_downloaders.sh
-```
-
-2. Parse-only refresh:
-
-```sh
-./all_parsers.sh
-```
-
-3. Download plus parse:
-
-```sh
-./complete_data.sh
-```
-
-4. Optional model prep and training:
-
-```sh
-./all_ml.sh
-```
-
-Optional experimental forecast feature run:
-
-```sh
-python builder.py
-python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
-python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
-python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model-name naive_momentum_v1
-```
-
-5. Advisory and portfolio generation:
-
-```sh
-./all_advisory.sh
-```
-
-6. Continuous market watchers:
-
-```sh
-./all_watchers.sh --loop
-```
-
-## Advisory Flow Summary
-
-1. `complete_data.sh` downloads and parses Dhan, Sharpely, macro, NSE, announcements, and news data.
-2. Screener.in production screeners and ad hoc research queries create symbol universes.
-3. Snapshot builders create macro, regime, fundamental, technical, intraday, exchange-event, and market-context rows.
-4. Rule and technical engines score setups into `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
-5. Watchers refresh active watchlist and open-position symbols with OHLCV, news, and announcements.
-6. The router reevaluates only symbols whose watched evidence changed.
-7. LLM/Codex usage stays bounded to extraction, summaries, playbook notes, and manual-review context.
-8. Event policy, adversarial review, regime, risk, and lifecycle layers convert evidence into entry, hold, add, partial-exit, or full-exit intent.
-9. Action consolidation produces one final action per symbol in `advisory_action_recommendations`.
-10. Execution planning converts only complete, validated action contracts into broker-order plans.
-11. Operator snapshots, FastAPI, and Nuxt expose recommendations, traces, health, errors, fallbacks, and fix hints.
-12. Research jobs evaluate TimesFM forecasts, event-policy outcomes, technical thresholds, and optional event-model training without changing live policy automatically.
-
-Primary operator commands:
-
-```sh
-./complete_data.sh
-./all_advisory.sh
-./all_watchers.sh --loop
-./all_frontend.sh
-./all_research_evidence.sh
-python -m advisory.recommendation_diagnostics --format text
-python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format text
-python -m advisory.signal_quality_family_report --horizons 5 10 20 --format text
-python -m advisory.llm_provenance_audit --lookback-days 30 --limit-per-table 100 --format text
-python -m advisory.action_evidence_provenance --dry-run --limit 250 --format text
-python -m advisory.causal_event_provenance --dry-run --limit 250 --format text
-```
-
-`./all_research_evidence.sh` is the lighter daily evidence-refresh path. `./all_ml.sh` is available for research/event-model training, but it is not part of the default production decision path.
-
-Scheduled operator flow:
-
-- run `python builder.py` to render `config/stockey.generated.crontab`, then run it with `./go-crond config/stockey.generated.crontab --allow-unprivileged`
-- let `complete_data.sh` handle the once-daily broad refresh
-- let `all_watchers.sh` run every `10` minutes during market hours
-- let investor hypothesis/playbook scans run at `10:25`, `13:25`, `16:25`, and `21:25`; set `HYPOTHESIS_CRON_ARGS=--no-llm` for deterministic-only scans
-- let the experimental TS forecast cron run at `11:20`, `14:20`, `17:20`, and `20:20`; evaluator runs at `18:20` and `21:20`
-- let operator health run at `08:05`, `12:05`, `17:05`, and `22:05` so fix hints and stale-data warnings stay current
-- let `all_advisory.sh` run once daily after 7pm for the slower batch recommendation cycle
-- let `all_research_evidence.sh` run at `22:20` on weekdays so context/event/action-transition evidence matures without weekly ML
-- let event-policy realized-return evaluation run at `23:10` on weekdays
-- let technical threshold calibration run weekly at `04:20` on Saturdays
-- let `all_ml.sh` run weekly at `03:10` on Sundays for event-model research evidence
-- use `all_advisory.sh --fast` for quick intermediate advisory refreshes; it avoids watch/news refresh, peer sync, and on-demand intraday repair
-
-The generated cron file is intended for `./go-crond config/stockey.generated.crontab --allow-unprivileged` or a system-crontab style runner because it includes the user column. A normal per-user `crontab` needs that user column removed first. Logs go under `logs/cron/`, and `scripts/with_lock.sh` skips overlapping runs instead of stacking them. The lock wrapper uses `flock` on Linux and `lockf` on macOS.
-
-Top-level operator scripts also emit deterministic lifecycle markers through `scripts/run_with_markers.sh`, for example `[stockey.script] name=all_ml status=start ...` followed by `done`, `failed`, or `interrupted`. The operator health page uses those markers before falling back to log-text heuristics, so successful reruns can clear older traceback noise correctly.
-
-Use:
-
-- `./complete_data.sh` for the full raw-data refresh
-- `./all_research_evidence.sh` for daily research-only context/event/action-transition evidence refresh
-- `./all_ml.sh` for optional research prep, readiness checks, model train, and score
-- `python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS` for experimental OHLCV forecast features
-- `python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for matured TS forecast evaluation
-- `python -m advisory.ts_forecast_paper_portfolio --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for research-only forecast paper-portfolio validation
-- `python -m advisory.ts_forecast_promotion_check --format json` for the read-only TS forecast promotion gate
-- `python -m advisory.ts_forecast_promotion --model-name timesfm_2p5_200m --horizon-days 10 --dry-run` for manual-only TS forecast promotion review guidance after the gate passes
-- `python -m advisory.config_change_assistant --source-type ts_forecast_review_rule --model-name timesfm_2p5_200m --horizon-days 10 --dry-run` for the preview-only disabled TS forecast config diff after operator approval
-- `/api/research/ts-forecast-review-rules` to verify any manually applied disabled TS forecast review rules remain review-only and broker-disabled
-- `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow
-- `python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m --max-symbols 80` for the default TS screener workflow
-- `python -m advisory.event_policy_evaluator --dry-run --horizons 5 10 20` for event-policy realized-return evidence
-- `python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20 --max-configs 512 --progress-every 128` for weekly technical threshold evidence
-- `python -m advisory.operator_health --skip-dhan` for a read-only local smoke test
-- `./all_advisory.sh` for the advisory and portfolio run
-
-The research-only TS forecast paper-portfolio summaries are validation evidence only; they do not approve action queue rows, portfolio rows, or Dhan execution.
-- `./all_advisory.sh --fast` for a quicker lifecycle/action refresh when data is already current
-- `./all_watchers.sh --loop` for the lightweight live monitoring loop
-- `./all_frontend.sh` for the operator API + Nuxt frontend
-
-Operator health:
-
-- `fix_hints` show the next concrete command for stale data, dependency problems, active cron failures, and recovered historical errors
-- API latency is checked through `OPERATOR_API_HEALTH_URL`, defaulting to the local FastAPI `/api/health` endpoint
-- Dhan cache metadata shows token cache age, expiry timestamp, and time left without triggering broker login
-- the Nuxt Health hub (`/health-hub`) surfaces data freshness, cron/pipeline status, API errors, and the LLM systematic-error monitor in one place
-- manual `KeyboardInterrupt` is downgraded to recovered when mapped output tables have fresher rows than the interrupted log
-
-Operator trace inspection:
-
-- the per-symbol detail page (`/symbols/{symbol}`) and the per-symbol "why" drill-in surface readable evidence/decision context
-- use `python -m advisory.symbol_trace --symbol RELIANCE` for CLI symbol traces
-- use `python -m advisory.decision_trace --unique-id <event-id>` for CLI event traces
-
-### Dhan master
+### Dhan
 
 ```sh
 python -m data.dhanlive.scrip_master
-```
-
-### Dhan OHLCV
-
-The Dhan historical loader supports two auth modes:
-
-- `DHAN_ACCESS_TOKEN` directly, if you already have a valid user token
-- API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, and `DHAN_API_SECRET`
-
-With the API key flow, the default manual path opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry. When `CDP_ENDPOINT`, `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured, Dhan clients auto-refresh through Playwright after token cache expiry. You can also force that path with `DHAN_AUTO_LOGIN_ENABLED=true`.
-
-If the cached token becomes invalid before its stored expiry, refresh it directly with:
-
-```sh
 python -m data.dhanlive.auth_cli status
-python -m data.dhanlive.auth_cli refresh --clear-cache-first
-python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login
-python -m data.dhanlive.auth_cli validate
-```
-
-```sh
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
 python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
 python -m data.dhanlive.ohlcv_pull RELIANCE
 ```
 
-By default the loader syncs:
+By default the loader syncs 5 years of daily candles plus the last 1 day of
+1-minute intraday candles. Supported asset types: `stock`, `index`, `benchmark`.
+See `README.md` for Chrome CDP / auto-login setup.
 
-- 5 years of daily candles
-- the last 1 day of 1-minute intraday candles
-
-Supported asset types are `stock`, `index`, and `benchmark`.
-
-### Screener.in screeners
-
-The recurring Screener.in downloader reads active production screener URLs from `screenerin_screeners`.
-Screener.in flows require a running Chrome CDP session plus `SCREENER_IN_LOGIN` and `SCREENER_IN_PASSWORD` in `.env`.
-
-Typical flow:
-
-```sh
-python -m data.screenerin.auth --check
-python -m data.screenerin.auth
-python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
-python -m data.screenerin.screener_registry list
-python -m data.screenerin.screener_parser
-python -m data.screenerin.screener_registry latest --screener my-production-screen
-```
-
-Use `--raw` with `latest` if you want the full stored JSON payload instead of the summary view.
-
-For one-off research, use ad hoc queries instead of registering everything:
-
-```sh
-python -m data.screenerin.ad_hoc_query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
-```
-
-### Sharpely masters
+### Sharpely (market-cap slice only)
 
 ```sh
 python -m data.sharpelydata.scrip_master
-```
-
-### Sharpely fundamentals
-
-```sh
 python -m data.sharpelydata.sharpely_data
-python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
 ```
 
-Key extractors:
+Fundamentals/shareholding extraction was removed in the pure-TA cut
+(`docs/DATA_INVENTORY.md`) — `sharpely_data.py` now writes `historical_mcap` only.
 
-- `get_financial_statement(symbol)`
-- `get_shareholding(symbol)`
-- `get_historical_mcap(symbol)`
-
-### US macro and ISM
+### RBI / FBIL
 
 ```sh
-python -m data.fred.us_macro
+python -m data.rbi.download_bank_rates
+python -m data.rbi.download_fbil_gsec
+python -m data.rbi.download_currency_rates
 ```
 
-This writes to `macro_usa`, `macro_india_gdp`, and `macro_usa_ism`.
-
-### NSE bhavcopy and related parsers
-
-This is the legacy/reference NSE pipeline. It is still useful for identity maintenance, reconciliation, and historical audit work, but it is no longer required for the advisory runtime path.
-
-Downloaders:
+### NSE bhavcopy, indices, identity
 
 ```sh
 python -m data.nseindia.bhavcopy_downloader
 python -m data.nseindia.indices_downloader
 python -m data.nseindia.offmarket
-```
-
-Parsers:
-
-```sh
 python -m data.nseindia.bhavcopy_parser
+python -m data.nseindia.indices_parser
+python -m data.nseindia.offmarket_parser
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
 python -m data.nseindia.adjusted_prices --only all
-python -m features.price_daily
-python -m data.nseindia.indices_parser
-python -m data.nseindia.offmarket_parser
-python -m data.nseindia.corporate_actions --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
-python -m data.nseindia.earnings_events --symbols RELIANCE TCS
-python -m data.nseindia.insider_deals --symbols RELIANCE TCS
 ```
 
-Recommended cron shape:
+Chrome remote debugging is required for the Playwright/browser-driven flows:
 
 ```sh
-./complete_data.sh
-./all_watchers.sh
-```
-
-Chrome remote debugging is still required for the Playwright/browser-driven flows:
-
-```sh
-Ubuntu:
-/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
-
-OSX:
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
-
-```
-
-### RBI
-
-```sh
-python -m data.rbi.download_bank_rates
-python -m data.rbi.download_fbil_gsec
-```
-
-### CPI / WPI / FPI
-
-```sh
-python -m data.mospi.cpi
-python -m data.eaindustry.wpi
-python -m data.nsdl.fpi
+scripts/start_chrome_cdp.sh
 ```
 
 ## Schema docs
-
-Human-readable table summaries:
 
 ```sh
 python -m utils.db_schema_dump --schemas public
 ```
 
-Use [`docs/crawl_schema.md`](crawl_schema.md) and [`docs/feature_schema.md`](feature_schema.md) as the maintained references. [`docs/schema.sql`](schema.sql) now contains only targeted admin SQL instead of a full `pg_dump`.
+There is no longer a maintained static schema dump doc — `docs/DATA_INVENTORY.md`
+is the authoritative table inventory; run `db_schema_dump` directly for live
+column-level detail.
 
 ## Agent-facing tool surface
 
@@ -368,84 +148,16 @@ python scripts/agent_tool_runner.py list
 python scripts/agent_tool_runner.py list --category storage
 ```
 
-The runner uses the invoking interpreter for downstream Python commands, so starting it from the project venv keeps the entire agent tool chain in the same environment.
-
-## Advisory roadmap
-
-Use [`todo.md`](../todo.md) as the maintained roadmap for current priorities, bottlenecks, and next implementation steps.
-
-Use [`docs/implementation.md`](implementation.md) as the current architecture summary for the live advisory stack.
-
-For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](advisory_manual.md). That is the practical runbook for:
-
-- running the advisory stack
-- adding or removing screeners
-- changing setup rules
-- understanding stage ownership
-- debugging outputs and failures
-
-Start-here docs for the LLM decision system (the trade-decision authority subsystem):
-
-- conceptual overview for an investor: [`docs/investor_overview.md`](investor_overview.md)
-- developer onboarding + module map: [`docs/developer_onboarding.md`](developer_onboarding.md)
-- decision-subsystem architecture: [`docs/llm_decision_authority.md`](llm_decision_authority.md)
-- authoring investor hypotheses: [`docs/hypothesis_authoring.md`](hypothesis_authoring.md)
-- multi-factor model + validation: [`docs/price_factor_model.md`](price_factor_model.md)
-- announcement event taxonomy: [`docs/announcement_event_taxonomy.md`](announcement_event_taxonomy.md)
-- operator UI review + simplification plan: [`docs/ui_simplification_plan.md`](ui_simplification_plan.md)
-- operator console (implemented redesign: unified per-symbol state, the "why", endpoints): [`docs/operator_ui.md`](operator_ui.md)
-
-Future operator UX and research design:
-
-- operator app and decision trace design (SUPERSEDED — historical; see `docs/operator_ui.md` for the current UI): `docs/operator_app_prd.md`
-- hypothesis research design: `docs/hypothesis_lab.md`
-
-For the short command-focused runbook, use [`docs/operators_manual.md`](operators_manual.md).
-
-For copy-paste change recipes, use [`docs/advisory_change_cookbook.md`](advisory_change_cookbook.md).
-
-Current advisory bootstrap commands:
-
-```sh
-python -m advisory.screener_parser
-python -m advisory.macro_snapshot
-python -m advisory.macro_features
-python -m advisory.fundamental_snapshot
-python -m advisory.regime_engine
-python -m advisory.peer_sync --symbols HDFCBANK
-python -m advisory.technical_features
-python -m advisory.rule_engine
-python -m advisory.watchlist_builder
-python -m data.economictimes.rss
-python -m advisory.announcement_watch
-python -m advisory.news_watch --refresh-feeds
-python -m advisory.symbol_trace HDFCBANK --format text
-python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
-python -m advisory.dashboard --format text
-python -m advisory.llm_event_evaluator
-python -m advisory.risk_engine
-python -m advisory.portfolio_engine
-python -m advisory.position_lifecycle
-python -m advisory.execution_engine
-python -m advisory.pipeline --dry-run --stop-at portfolio
-python -m advisory.pipeline --include-watch --include-news --dry-run
-python -m pytest tests/test_advisory_regression.py
-python scripts/cleanup_deprecated_tables.py --dry-run
-```
-
-For advisory execution, use Dhan daily OHLCV as the canonical price source. The NSE bhavcopy and adjusted-price jobs remain optional reference pipelines and are no longer required by the advisory technical/rule stack.
-
-The fundamentals and technical builders refresh peer membership on normal runs before computing peer-relative features. The technical builder also fills missing peer OHLCV before computing `rs_vs_sector`. Use `--skip-peer-sync` to disable that preflight.
-
-For live order placement through Dhan, the API static IP must be whitelisted on the Dhan side. Use `advisory.execution_engine` without `--live` to stage and inspect broker handoff rows safely before any live submission.
+The runner uses the invoking interpreter for downstream Python commands, so
+starting it from the project venv keeps the whole tool chain in the same
+environment. See `docs/agents.md` for the recommended agent-access split.
 
 ## Notes
 
 1. `ISIN` is not unique. A single underlying can trade in multiple series.
 2. `symbol + ISIN` is not unique across series.
 3. Company renames usually change symbol, but not `ISIN`.
-4. `dim_security_history` is the canonical source for rename continuity and review flags.
+4. `dim_security_history` is the canonical source for rename continuity and review flags — see `docs/identity.md`.
 5. `dim_security_overrides` is where manual merger / demerger / scheme mappings should be curated.
 6. Large runtime artifacts such as `base_chromed_data/` and `http_cache/` should stay out of git.
-7. Run `security_history`, `security_dimension`, `adjusted_prices`, and `features.price_daily` sequentially, not in parallel when you need the legacy NSE identity/adjusted-price reference pipeline.
-8. `all_watchers.sh` and symbol-scoped runs still use `config/watchlist_symbols.txt` and fall back to `config/tracked_symbols.txt` if the watchlist file is empty.
+7. Run `security_history`, `security_dimension`, and `adjusted_prices` sequentially, not in parallel — they touch the same derived identity tables.

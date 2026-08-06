@@ -41,9 +41,11 @@ python -m utils.ocr /path/to/file.pdf --provider openai --pages 1,3-5
 python -m utils.ocr /path/to/file.pdf --provider both --pages all
 ```
 
-Announcement ingestion uses Codex CLI for OCR when `OCR_USING=codex` or `OCR_USING=codex:<model>` is set. Use `CODEX_CLI_OCR_MODEL` to choose the default model for this path.
-
-For structured extraction, the Codex adapter asks the CLI to emit strict JSON, then validates it locally with the same Pydantic schemas used by the old hosted structured-output path. Invalid JSON or schema violations fail the row instead of silently writing bad data.
+Standalone utility, not invoked by any cron/KEEP-scope collector (the
+announcement pipeline that used to call it was removed in the pure-TA cut —
+`docs/DATA_INVENTORY.md`). Set `OCR_USING=codex` or `OCR_USING=codex:<model>`
+to route through Codex CLI instead of hosted APIs; `CODEX_CLI_OCR_MODEL`
+chooses the default model for that path.
 
 Tested locally with:
 
@@ -96,24 +98,28 @@ Manual overrides go into `dim_security_overrides`. Use them for mergers, demerge
 
 ## Recheck Dhan/security identity issues
 
-Open Dhan security mapping failures are stored in `advisory_identity_issues` and surfaced in Health, Manual Review, and the Identity Issues page.
+Open Dhan security mapping failures are stored in `advisory_identity_issues`
+(table name predates the pure-TA cut; the module itself now lives in `utils/`,
+not `advisory/`). There is no operator UI for this anymore — CLI only.
 
-Preferred operator path: open the Nuxt `Identity Issues` page, click `Recheck mappings`, review the `would_resolve` rows, then click `Close resolved mappings`. This only closes identity issue rows; it does not edit Dhan/company mappings or broker execution.
+The recheck path understands common index aliases such as `NIFTY50`,
+`NIFTY 50`, `BANKNIFTY`, `NIFTY BANK`, `INDIAVIX`, and `INDIA VIX`, so
+alias-only benchmark/index failures should close through the same
+preview/apply flow after the Dhan master is fresh.
 
-The recheck path also understands common index aliases such as `NIFTY50`, `NIFTY 50`, `BANKNIFTY`, `NIFTY BANK`, `INDIAVIX`, and `INDIA VIX`, so alias-only benchmark/index failures should be closed through the same preview/apply flow after the Dhan master is fresh.
-
-Use the dry run first:
+Dry run first:
 
 ```sh
 python -m data.dhanlive.scrip_master
-python -m advisory.identity_issues --limit 100
+python -m utils.identity_issues --limit 100
 ```
 
 If the dry run shows rows as `would_resolve`, close them:
 
 ```sh
-python -m advisory.identity_issues --apply --limit 100
-python -m advisory.operator_health --skip-dhan
+python -m utils.identity_issues --apply --limit 100
 ```
 
-Do not manually delete identity rows. The resolver keeps attempt counts and resolution metadata so later Health/UI output can distinguish active issues from fixed mappings.
+Do not manually delete identity rows. The resolver keeps attempt counts and
+resolution metadata so later runs can distinguish active issues from fixed
+mappings.

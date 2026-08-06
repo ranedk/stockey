@@ -14,9 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_DOC_PATHS = (
     "README.md",
-    "todo.md",
+    "CLAUDE.md",
+    "DATA_CONTRACT.md",
     "docs",
-    "apps/operator-web/README.md",
 )
 
 EXCLUDED_PARTS = {
@@ -50,43 +50,26 @@ class Finding:
         }
 
 
+# Stockey is a pure data platform for Indian-equity price/reference data (operator
+# decision 2026-07-27, docs/PURE_TA_MIGRATION_PLAN.md). All research/signal/LLM
+# authority moved to systrader. These checks assert that framing stays documented
+# and that removed-scope terminology (advisory decision system, Nuxt frontend,
+# fundamentals/announcements/news pipelines) doesn't creep back into operational
+# docs without an explicit historical/removed-scope note.
 REQUIRED_COVERAGE = {
     "README.md": [
-        ("Nuxt operator frontend", re.compile(r"\bNuxt\b.*\boperator frontend\b", re.IGNORECASE | re.DOTALL)),
-        ("go-crond command", re.compile(r"\./go-crond\s+config/stockey\.generated\.crontab\s+--allow-unprivileged")),
-        ("weekly all_ml", re.compile(r"\ball_ml\.sh\b.*\bweekly\b|\bweekly\b.*\ball_ml\.sh\b", re.IGNORECASE | re.DOTALL)),
-        ("daily research evidence", re.compile(r"\ball_research_evidence\.sh\b.*\bresearch[- ]only\b|\bresearch[- ]only\b.*\ball_research_evidence\.sh\b", re.IGNORECASE | re.DOTALL)),
-        ("daily all_advisory", re.compile(r"\ball_advisory\.sh\b.*\bonce daily\b|\bonce daily\b.*\ball_advisory\.sh\b", re.IGNORECASE | re.DOTALL)),
+        ("pure data platform framing", re.compile(r"pure data platform", re.IGNORECASE)),
+        ("DATA_INVENTORY pointer", re.compile(r"docs/DATA_INVENTORY\.md")),
+        ("cron entrypoint", re.compile(r"\./start_cron\.sh")),
     ],
-    "todo.md": [
-        # date regex widened from the hardcoded 2026-06 (broke on every update); the UI-first +
-        # Nuxt coverage requirements moved off todo.md when it was rewritten for the
-        # discovery-engine arc -- the Nuxt/static-dashboard fact stays enforced in
-        # docs/operators_manual.md, and todo.md now must reference the governing spec instead.
-        ("current roadmap date", re.compile(r"Updated:\s*`2026-\d{2}-\d{2}`")),
-        ("governing spec reference", re.compile(r"discovery_engine\.md", re.IGNORECASE)),
-    ],
-    "docs/operators_manual.md": [
-        ("operator decision effects", re.compile(r"operator decision effects", re.IGNORECASE)),
-        ("frontend replaces static dashboard", re.compile(r"Static `live_dashboard/` generation is deprecated|Nuxt operator frontend", re.IGNORECASE)),
-        ("research evidence cron", re.compile(r"22:20.*all_research_evidence\.sh|all_research_evidence\.sh.*22:20", re.IGNORECASE | re.DOTALL)),
+    "CLAUDE.md": [
+        ("pure data platform framing", re.compile(r"pure data platform", re.IGNORECASE)),
+        ("systrader boundary", re.compile(r"\bsystrader\b", re.IGNORECASE)),
+        ("DATA_INVENTORY pointer", re.compile(r"docs/DATA_INVENTORY\.md")),
     ],
     "docs/scripts.md": [
         ("script inventory", re.compile(r"Script Inventory", re.IGNORECASE)),
-        ("env audit", re.compile(r"env_example_audit\.py")),
-        ("research evidence wrapper", re.compile(r"all_research_evidence\.sh.*advisory\.research_evidence_runner|advisory\.research_evidence_runner.*all_research_evidence\.sh", re.IGNORECASE | re.DOTALL)),
-    ],
-    "docs/index.md": [
-        ("research evidence operator path", re.compile(r"all_research_evidence\.sh.*lighter daily evidence-refresh path|lighter daily evidence-refresh path.*all_research_evidence\.sh", re.IGNORECASE | re.DOTALL)),
-    ],
-    "docs/tool_registry.json": [
-        ("research evidence operator command", re.compile(r'"name"\s*:\s*"run_research_evidence".*"command"\s*:\s*\[\s*"bash"\s*,\s*"all_research_evidence\.sh"\s*\]', re.IGNORECASE | re.DOTALL)),
-    ],
-    "config/stockey.crontab.template": [
-        ("research evidence scheduled template", re.compile(r"all_research_evidence\.sh.*research_evidence\.log|research_evidence\.log.*all_research_evidence\.sh", re.IGNORECASE)),
-    ],
-    "config/stockey.generated.crontab": [
-        ("research evidence scheduled generated", re.compile(r"all_research_evidence\.sh.*research_evidence\.log|research_evidence\.log.*all_research_evidence\.sh", re.IGNORECASE)),
+        ("download_runner registry pointer", re.compile(r"download_runner", re.IGNORECASE)),
     ],
 }
 
@@ -100,7 +83,24 @@ STALE_ERROR_PATTERNS = [
 STALE_WARNING_PATTERNS = [
     ("legacy_promotion_audit_label", re.compile(r"\bpromotion[- ]audit\b", re.IGNORECASE)),
     ("legacy_live_dashboard_path", re.compile(r"\blive_dashboard/")),
+    ("legacy_advisory_module_reference", re.compile(r"\badvisory\.[a-zA-Z_][a-zA-Z0-9_]*\b")),
+    ("legacy_features_module_reference", re.compile(r"\bfeatures\.[a-zA-Z_][a-zA-Z0-9_]*\b")),
+    ("legacy_removed_scope_module_reference", re.compile(r"\bdata\.(screenerin|fred|mospi|eaindustry|nsdl|announcements|economictimes)\.")),
+    ("legacy_nuxt_operator_frontend", re.compile(r"\bNuxt\b")),
+    ("legacy_removed_cron_script", re.compile(
+        r"\ball_(advisory|ml|watchers|frontend|llm_decisions|research_evidence|hypothesis_scan|"
+        r"event_policy_evaluator|technical_threshold_calibration|operator_health|api_latency_probe|"
+        r"context_to_entry_repair|advisory_preflight|advisory_codex|analysis_codex|"
+        r"ts_forecast_workflow|ts_forecast_evaluator|ts_forecast_paper_portfolio|downloaders|parsers)\.sh\b"
+    )),
 ]
+
+_REMOVED_SCOPE_ALLOWLIST = re.compile(
+    r"\b(legacy|removed|deleted|remove|delete|archive|archived|archives|historical|history|"
+    r"migration|migrated|cut|phase|superseded|before|prior|used to|no longer|deprecated|"
+    r"was|were|pre-2026-07-27)\b",
+    re.IGNORECASE,
+)
 
 WARNING_ALLOWLIST = {
     "legacy_promotion_audit_label": re.compile(
@@ -111,6 +111,11 @@ WARNING_ALLOWLIST = {
         r"\b(deprecated|legacy|remove|removed|reuse|reuses|compatibility|not rebuild|operator-feed|if you run it directly)\b",
         re.IGNORECASE,
     ),
+    "legacy_advisory_module_reference": _REMOVED_SCOPE_ALLOWLIST,
+    "legacy_features_module_reference": _REMOVED_SCOPE_ALLOWLIST,
+    "legacy_removed_scope_module_reference": _REMOVED_SCOPE_ALLOWLIST,
+    "legacy_nuxt_operator_frontend": _REMOVED_SCOPE_ALLOWLIST,
+    "legacy_removed_cron_script": _REMOVED_SCOPE_ALLOWLIST,
 }
 
 

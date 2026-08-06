@@ -42,21 +42,25 @@ Recommended usage:
 - `nseindia_ohlcv_adjusted` now carries `security_id`
 - `features_price_daily` groups on `security_id`
 
-This keeps the legacy/reference NSE adjusted-price pipeline stable when the market identifier changes.
+This keeps the identity-aware NSE adjusted-price pipeline stable when the
+market identifier changes.
 
-For the advisory runtime path, OHLCV now comes from `dhan_ohlcv_daily`; the identity-aware NSE pipeline remains useful for reconciliation, audit, and other non-advisory derived features.
+systrader consumes `dhan_ohlcv_daily` (raw) and `advisory_adjusted_ohlcv_daily`
+(systrader's PRIMARY series, built by `data/nseindia/price_adjustment.py` from
+price steps) — see `DATA_CONTRACT.md`. The identity-aware NSE pipeline below
+remains useful for reconciliation, audit, and corporate-action corroboration
+(`nseindia_corporate_actions_normalized`), not as systrader's primary feed.
 
 ## Run order
 
-Run these sequentially:
+Run these sequentially — they touch the same derived identity tables, do not run in parallel:
 
 ```sh
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
 python -m data.nseindia.adjusted_prices --only all
-python -m features.price_daily
 ```
 
-Do not run the first three in parallel. They touch the same derived identity tables.
-
-For the current operator flow, use `./complete_data.sh` for the broad refresh or run the individual Python modules directly when debugging identity issues.
+For the current operator flow, use `./complete_data.sh` for the broad refresh
+(it runs `adjusted_prices --only normalize` daily) or run the individual
+Python modules directly when debugging identity issues.

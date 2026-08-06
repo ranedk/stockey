@@ -9,8 +9,8 @@
       "read_only": false,
       "examples": [
         {
-          "args": ["--read-only", "select * from macro_usa order by date desc limit 5"],
-          "description": "Read recent macro rows"
+          "args": ["--read-only", "select * from nseindia_ohlcv order by trade_date desc limit 5"],
+          "description": "Read recent NSE OHLCV rows"
         }
       ]
     },
@@ -67,42 +67,18 @@
       ]
     },
     {
-      "name": "load_us_macro",
-      "category": "ingestion",
-      "description": "Run the FRED and ISM macro loaders.",
-      "command": ["python", "-m", "data.fred.us_macro"],
-      "read_only": false,
-      "examples": []
-    },
-    {
-      "name": "load_nsdl_fpi",
-      "category": "ingestion",
-      "description": "Run the NSDL FPI loader.",
-      "command": ["python", "-m", "data.nsdl.fpi"],
-      "read_only": false,
-      "examples": []
-    },
-    {
-      "name": "load_sharpely_master",
-      "category": "ingestion",
-      "description": "Refresh Sharpely security master tables.",
-      "command": ["python", "-m", "data.sharpelydata.scrip_master"],
-      "read_only": false,
-      "examples": []
-    },
-    {
-      "name": "load_sharpely_fundamentals",
-      "category": "ingestion",
-      "description": "Run the Sharpely fundamentals loader.",
-      "command": ["python", "-m", "data.sharpelydata.sharpely_data"],
-      "read_only": false,
-      "examples": []
-    },
-    {
       "name": "load_dhan_master",
       "category": "ingestion",
       "description": "Refresh the Dhan master instrument table.",
       "command": ["python", "-m", "data.dhanlive.scrip_master"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_dhan_ohlcv",
+      "category": "ingestion",
+      "description": "Sync Dhan daily/intraday OHLCV for the tracked universe.",
+      "command": ["python", "-m", "data.dhanlive.ohlcv"],
       "read_only": false,
       "examples": []
     },
@@ -113,41 +89,32 @@
       "command": ["python", "-m", "data.dhanlive.ohlcv_pull"],
       "read_only": true,
       "examples": [
-        {
-          "args": ["RELIANCE"],
-          "description": "Pull the last 60 minutes of 5-minute NSE equity candles."
-        },
-        {
-          "args": ["HDFCBANK", "--interval-minutes", "1"],
-          "description": "Pull the last 60 minutes of 1-minute candles."
-        },
-        {
-          "args": ["RELIANCE", "--mode", "daily", "--last-days", "90"],
-          "description": "Pull the last 90 days of daily candles."
-        },
-        {
-          "args": ["RELIANCE", "--source", "db", "--format", "json"],
-          "description": "Inspect locally stored OHLCV rows instead of calling Dhan."
-        }
+        {"args": ["RELIANCE"], "description": "Pull the last 60 minutes of 5-minute NSE equity candles."},
+        {"args": ["HDFCBANK", "--interval-minutes", "1"], "description": "Pull the last 60 minutes of 1-minute candles."},
+        {"args": ["RELIANCE", "--mode", "daily", "--last-days", "90"], "description": "Pull the last 90 days of daily candles."},
+        {"args": ["RELIANCE", "--source", "db", "--format", "json"], "description": "Inspect locally stored OHLCV rows instead of calling Dhan."}
       ]
     },
     {
-      "name": "load_economic_times_rss",
+      "name": "load_sharpely_master",
       "category": "ingestion",
-      "description": "Fetch and store Economic Times RSS items.",
-      "command": ["python", "-m", "data.economictimes.rss"],
+      "description": "Refresh Sharpely security master tables.",
+      "command": ["python", "-m", "data.sharpelydata.scrip_master"],
       "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview fetched ET RSS items without writing."
-        }
-      ]
+      "examples": []
+    },
+    {
+      "name": "load_sharpely_mcap",
+      "category": "ingestion",
+      "description": "Refresh historical market-cap rows (mcap-only slice; fundamentals extraction was removed in the pure-TA cut).",
+      "command": ["python", "-m", "data.sharpelydata.sharpely_data"],
+      "read_only": false,
+      "examples": []
     },
     {
       "name": "download_nse_bhavcopy",
       "category": "download",
-      "description": "Run the legacy/reference NSE bhavcopy downloader.",
+      "description": "Run the NSE bhavcopy downloader.",
       "command": ["python", "-m", "data.nseindia.bhavcopy_downloader"],
       "read_only": false,
       "examples": []
@@ -155,7 +122,7 @@
     {
       "name": "parse_nse_bhavcopy",
       "category": "ingestion",
-      "description": "Parse downloaded NSE bhavcopy archives for the legacy/reference NSE pipeline.",
+      "description": "Parse downloaded NSE bhavcopy archives.",
       "command": ["python", "-m", "data.nseindia.bhavcopy_parser"],
       "read_only": false,
       "examples": []
@@ -193,30 +160,28 @@
       "examples": []
     },
     {
-      "name": "build_advisory_screener_constituents",
+      "name": "load_rbi_bank_rates",
       "category": "ingestion",
-      "description": "Normalize stored Screener.in snapshots into advisory_screener_constituents.",
-      "command": ["python", "-m", "advisory.screener_parser"],
+      "description": "Refresh RBI key policy bank rates.",
+      "command": ["python", "-m", "data.rbi.download_bank_rates"],
       "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview normalized screener rows without writing."
-        }
-      ]
+      "examples": []
     },
     {
-      "name": "run_screener_ad_hoc_query",
+      "name": "load_rbi_fbil_gsec",
       "category": "ingestion",
-      "description": "Run an authenticated ad hoc Screener.in raw query, parse the HTML table, and store the result rows.",
-      "command": ["python", "-m", "data.screenerin.ad_hoc_query"],
+      "description": "Refresh FBIL G-sec quote and par-curve rates.",
+      "command": ["python", "-m", "data.rbi.download_fbil_gsec"],
       "read_only": false,
-      "examples": [
-        {
-          "args": ["--name", "Deep Value ROCE", "--query", "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"],
-          "description": "Run and store one ad hoc fundamental screener query."
-        }
-      ]
+      "examples": []
+    },
+    {
+      "name": "load_rbi_currency_rates",
+      "category": "ingestion",
+      "description": "Refresh RBI reference currency rates.",
+      "command": ["python", "-m", "data.rbi.download_currency_rates"],
+      "read_only": false,
+      "examples": []
     },
     {
       "name": "run_complete_data",
@@ -225,567 +190,43 @@
       "command": ["bash", "complete_data.sh"],
       "read_only": false,
       "examples": [
-        {
-          "args": [],
-          "description": "Run the combined downloader and parser flow."
-        },
-        {
-          "args": ["--continue-on-error"],
-          "description": "Continue through later data-refresh modules even if one fails."
-        }
+        {"args": [], "description": "Run the combined downloader and parser flow."}
       ]
     },
     {
-      "name": "run_all_watchers",
+      "name": "run_ohlcv_reconcile",
       "category": "orchestration",
-      "description": "Run the lightweight continuous watch loop for active watchlist names and open positions, with OHLCV, announcements, ET/news, Redis pub-sub updates, and operator frontend status.",
-      "command": ["bash", "all_watchers.sh"],
+      "description": "Backfill any universe symbol whose latest Dhan daily bar predates the last completed trading day.",
+      "command": ["bash", "all_ohlcv_reconcile.sh"],
       "read_only": false,
       "examples": [
-        {
-          "args": ["--loop"],
-          "description": "Run the continuous watch loop with default intervals."
-        },
-        {
-          "args": ["--loop", "--sleep-seconds", "300"],
-          "description": "Run the continuous watch loop every 5 minutes."
-        }
+        {"args": ["--dry-run", "--format", "json"], "description": "Report stale coverage without syncing."}
       ]
     },
     {
-      "name": "run_all_downloaders",
+      "name": "run_price_adjustment",
       "category": "orchestration",
-      "description": "Run the raw downloader modules only, without parser modules.",
-      "command": ["bash", "all_downloaders.sh"],
+      "description": "Rebuild the split/bonus-adjusted daily close table (systrader's PRIMARY series) from price steps.",
+      "command": ["bash", "all_price_adjustment.sh"],
       "read_only": false,
-      "examples": [
-        {
-          "args": [],
-          "description": "Run only the downloader phase."
-        },
-        {
-          "args": ["--continue-on-error"],
-          "description": "Continue through later downloader modules even if one fails."
-        }
-      ]
+      "examples": []
     },
     {
-      "name": "run_all_parsers",
+      "name": "run_data_readiness",
       "category": "orchestration",
-      "description": "Run the parser modules only, assuming the raw files are already present.",
-      "command": ["bash", "all_parsers.sh"],
+      "description": "Check bhavcopy/Dhan/benchmark freshness and run bounded repairs.",
+      "command": ["python", "-m", "data.data_readiness", "--fix"],
       "read_only": false,
-      "examples": [
-        {
-          "args": [],
-          "description": "Run only the parser phase."
-        },
-        {
-          "args": ["--continue-on-error"],
-          "description": "Continue through later parser modules even if one fails."
-        }
-      ]
+      "examples": []
     },
     {
-      "name": "run_all_advisory",
-      "category": "orchestration",
-      "description": "Run the advisory pipeline and portfolio generation without the raw download phase.",
-      "command": ["bash", "all_advisory.sh"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": [],
-          "description": "Run the normal advisory and portfolio flow."
-        },
-        {
-          "args": ["--date", "2026-04-13"],
-          "description": "Run the advisory flow for a specific as-of date."
-        }
-      ]
-    },
-    {
-      "name": "run_context_to_entry_repair",
-      "category": "orchestration",
-      "description": "Run the bounded context-to-entry repair chain before full advisory: review-only context signal refresh, CONTEXT_OVERLAY_WATCH reconciliation, rules-through-actions, Action Queue refresh, and diagnostics.",
-      "command": ["bash", "all_context_to_entry_repair.sh"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": [],
-          "description": "Run context-to-entry repair for the latest trading day."
-        },
-        {
-          "args": ["--date", "2026-06-19"],
-          "description": "Run context-to-entry repair for a specific advisory date."
-        }
-      ]
-    },
-    {
-      "name": "route_live_updates",
-      "category": "orchestration",
-      "description": "Route fresh continuous-watch alerts and events into targeted symbol-level advisory reevaluation, including lifecycle-aware reruns for exit alerts.",
-      "command": ["python", "-m", "advisory.event_router"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the current live-routing plan."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_macro_daily",
-      "category": "ingestion",
-      "description": "Build the advisory point-in-time macro snapshot table.",
-      "command": ["python", "-m", "advisory.macro_snapshot"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the advisory macro snapshot without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_macro_features_daily",
-      "category": "ingestion",
-      "description": "Build point-in-time derived macro features for regime, model, and risk inputs.",
-      "command": ["python", "-m", "advisory.macro_features"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview derived advisory macro features without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_exchange_events",
-      "category": "ingestion",
-      "description": "Normalize NSE block, bulk, short-selling, insider, corporate-action, and earnings rows into advisory exchange events.",
-      "command": ["python", "-m", "advisory.exchange_events"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview normalized advisory exchange events without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_exchange_features_daily",
-      "category": "ingestion",
-      "description": "Build daily symbol-level exchange-event features for LLM context, event-model predictors, adversarial review, and risk sizing.",
-      "command": ["python", "-m", "advisory.exchange_features"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview derived advisory exchange-event features without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_fundamentals_daily",
-      "category": "ingestion",
-      "description": "Build the advisory point-in-time fundamentals snapshot table.",
-      "command": ["python", "-m", "advisory.fundamental_snapshot"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the advisory fundamentals snapshot without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_market_regime",
-      "category": "ingestion",
-      "description": "Build REGIME_ALGO_V1 market regime classifications.",
-      "command": ["python", "-m", "advisory.regime_engine"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the advisory market regime output without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_regime_overlay",
-      "category": "analysis",
-      "description": "Build review-only dynamic regime overlay proposals from macro, market-context, news, and event-count evidence.",
-      "command": ["python", "-m", "advisory.regime_overlay"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run", "--no-llm"],
-          "description": "Preview the deterministic review-only regime overlay proposal without writing."
-        },
-        {
-          "args": ["--llm"],
-          "description": "Use Codex to propose a structured review-only regime overlay and candidate rules."
-        }
-      ]
-    },
-    {
-      "name": "sync_advisory_peers",
-      "category": "ingestion",
-      "description": "Incrementally refresh Sharpely peer snapshots, peer fundamentals, and Dhan peer OHLCV.",
-      "command": ["python", "-m", "advisory.peer_sync"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--symbols", "HDFCBANK"],
-          "description": "Refresh the latest peer universe and peer market data for HDFCBANK."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_technical_daily",
-      "category": "ingestion",
-      "description": "Build the TA-Lib based advisory technical feature table.",
-      "command": ["python", "-m", "advisory.technical_features"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the advisory technical features without writing."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_rule_engine",
-      "category": "analysis",
-      "description": "Apply setup rules on advisory snapshots and persist candidates plus reject reasons.",
-      "command": ["python", "-m", "advisory.rule_engine"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory setup candidates and rejections without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_watchlist",
-      "category": "analysis",
-      "description": "Build announcement watchlist rows from advisory candidates.",
-      "command": ["python", "-m", "advisory.watchlist_builder"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory watchlist rows without writing."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_announcement_watch",
-      "category": "analysis",
-      "description": "Run managed announcement ingest for active watchlist rows and persist watch events.",
-      "command": ["python", "-m", "advisory.announcement_watch"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory announcement watch execution without writing."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_news_watch",
-      "category": "analysis",
-      "description": "Match Economic Times RSS items onto active advisory watchlist rows and persist advisory news events.",
-      "command": ["python", "-m", "advisory.news_watch"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview matched ET RSS watch events without writing."
-        },
-        {
-          "args": ["--refresh-feeds", "--dry-run"],
-          "description": "Refresh ET RSS feeds first, then preview matched advisory news events."
-        }
-      ]
-    },
-    {
-      "name": "trace_advisory_symbol",
-      "category": "analysis",
-      "description": "Trace one symbol through screener, rule, watch, event, allocation, portfolio, lifecycle, and execution stages.",
-      "command": ["python", "-m", "advisory.symbol_trace"],
+      "name": "run_data_coverage_report",
+      "category": "monitoring",
+      "description": "Per-KEEP-table row counts, staleness, and duplicate checks.",
+      "command": ["python", "scripts/data_coverage_report.py"],
       "read_only": true,
       "examples": [
-        {
-          "args": ["HDFCBANK"],
-          "description": "Show the latest JSON trace for one symbol."
-        },
-        {
-          "args": ["HDFCBANK", "--setup", "LARGECAP_BREAKOUT_V1", "--format", "text"],
-          "description": "Show a setup-specific text trace for one symbol."
-        }
-      ]
-    },
-    {
-      "name": "trace_advisory_setup",
-      "category": "analysis",
-      "description": "Trace one setup through screener universe, candidates, rejections, watch, event, allocation, portfolio, lifecycle, and execution stages.",
-      "command": ["python", "-m", "advisory.setup_trace"],
-      "read_only": true,
-      "examples": [
-        {
-          "args": ["LARGECAP_BREAKOUT_V1"],
-          "description": "Show the latest JSON trace for one setup."
-        },
-        {
-          "args": ["LARGECAP_BREAKOUT_V1", "--format", "text"],
-          "description": "Show a text summary for one setup."
-        }
-      ]
-    },
-    {
-      "name": "show_advisory_dashboard",
-      "category": "analysis",
-      "description": "Show a compact all-setups dashboard with funnel counts, regime, and top rejection reason.",
-      "command": ["python", "-m", "advisory.dashboard"],
-      "read_only": true,
-      "examples": [
-        {
-          "args": ["--format", "text"],
-          "description": "Show the setup dashboard as a compact text table."
-        },
-        {
-          "args": ["--format", "json"],
-          "description": "Show the setup dashboard as JSON."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_llm_event_evaluator",
-      "category": "analysis",
-      "description": "Evaluate triggered announcement and ET RSS watch events with point-in-time advisory context and persist verdicts plus risks.",
-      "command": ["python", "-m", "advisory.llm_event_evaluator"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory LLM event evaluations without writing."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_event_meta_model",
-      "category": "analysis",
-      "description": "Train or score the event meta-model on structured advisory event tensors plus future daily returns.",
-      "command": ["python", "-m", "advisory.event_meta_model"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["train", "--horizon-days", "10"],
-          "description": "Train the event meta-model on a 10-trading-day forward-return label."
-        },
-        {
-          "args": ["score", "--dry-run"],
-          "description": "Score current event rows with the latest trained artifact without writing."
-        }
-      ]
-    },
-    {
-      "name": "sync_advisory_training_universe",
-      "category": "analysis",
-      "description": "Run broad ad hoc Screener.in training queries and sync the resulting research-only universes into advisory_screener_constituents.",
-      "command": ["python", "-m", "advisory.training_universe"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the broad training-universe sync without writing."
-        }
-      ]
-    },
-    {
-      "name": "prepare_advisory_event_model_data",
-      "category": "analysis",
-      "description": "Prepare event-model training data by syncing broad ad hoc training universes, normalizing screener dates, backfilling historical event evaluations, refreshing daily OHLCV for event symbols, and summarizing label coverage.",
-      "command": ["python", "-m", "advisory.event_model_data_prep"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--format", "text"],
-          "description": "Run the full event-model data prep flow and print a training-readiness summary."
-        },
-        {
-          "args": ["--from-date", "2026-03-01", "--to-date", "2026-04-01", "--dry-run", "--format", "text"],
-          "description": "Preview the scoped event-model prep window without writing."
-        }
-      ]
-    },
-    {
-      "name": "run_all_ml",
-      "category": "analysis",
-      "description": "Run event-model prep, check label coverage for the requested horizon, then train and score only when the readiness gate passes.",
-      "command": ["bash", "all_ml.sh"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": [],
-          "description": "Run the full gated event-model training flow."
-        },
-        {
-          "args": ["--prep-only"],
-          "description": "Run only the prep and readiness-check stage."
-        }
-      ]
-    },
-    {
-      "name": "run_research_evidence",
-      "category": "analysis",
-      "description": "Run the research-only evidence refresh for context, event, adversarial-review, action-transition, causal-memory, provenance, and reliability evidence without event-model training, live policy changes, portfolio mutation, config mutation, or broker behavior.",
-      "command": ["bash", "all_research_evidence.sh"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": [],
-          "description": "Run the default daily research-evidence refresh with narrowed split reports enabled."
-        },
-        {
-          "args": ["--skip-signal-quality", "--skip-causal-event-memory"],
-          "description": "Run a scoped refresh that skips the heavier signal-quality and causal-memory steps."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_adversarial_review",
-      "category": "analysis",
-      "description": "Run the deterministic adversarial reviewer over structured event evaluations and persist clear, penalize, manual-review, or veto decisions.",
-      "command": ["python", "-m", "advisory.adversarial_review"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview adversarial event-review outputs without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_allocations",
-      "category": "analysis",
-      "description": "Build advisory risk buckets, position sizing, and invalidation guidance from evaluated watch events.",
-      "command": ["python", "-m", "advisory.risk_engine"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory allocations without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_portfolio_orders",
-      "category": "analysis",
-      "description": "Build capital-aware portfolio order plans from advisory allocations.",
-      "command": ["python", "-m", "advisory.portfolio_engine"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory portfolio orders without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_position_lifecycle",
-      "category": "analysis",
-      "description": "Build paper-position lifecycle states and rebalance suggestions from approved advisory portfolio orders.",
-      "command": ["python", "-m", "advisory.position_lifecycle"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory lifecycle and rebalance outputs without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_execution_orders",
-      "category": "analysis",
-      "description": "Build broker handoff orders from approved advisory portfolio orders and optionally reconcile live Dhan execution state.",
-      "command": ["python", "-m", "advisory.execution_engine"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview advisory execution orders without writing."
-        },
-        {
-          "args": ["--reconcile-only", "--dry-run"],
-          "description": "Preview live execution reconciliation without writing."
-        }
-      ]
-    },
-    {
-      "name": "build_advisory_intraday_features",
-      "category": "analysis",
-      "description": "Build and persist on-demand advisory intraday pattern features from stored Dhan candles for the active screener universe.",
-      "command": ["python", "-m", "advisory.intraday_features"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--date", "2026-04-01", "--dry-run"],
-          "description": "Preview the intraday feature slice for one advisory date."
-        },
-        {
-          "args": ["--date", "2026-04-01", "--intervals", "1", "5", "15"],
-          "description": "Build the intraday feature slice across multiple candle intervals."
-        }
-      ]
-    },
-    {
-      "name": "run_master_advisory_pipeline",
-      "category": "analysis",
-      "description": "Run the single top-level advisory workflow that chains data download, news/theme routing, advisory, risk, portfolio, lifecycle, and execution planning.",
-      "command": ["python", "-m", "advisory.master_pipeline"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run"],
-          "description": "Preview the full repo-level advisory workflow without writing."
-        },
-        {
-          "args": ["--dry-run", "--stop-at", "portfolio"],
-          "description": "Preview the master workflow through portfolio planning without writing."
-        }
-      ]
-    },
-    {
-      "name": "list_advisory_research_runs",
-      "category": "analysis",
-      "description": "Inspect the advisory research ledger for recorded experiment runs and their statuses.",
-      "command": ["python", "-m", "advisory.research_ledger"],
-      "read_only": true,
-      "examples": [
-        {
-          "args": ["--limit", "20"],
-          "description": "Show the 20 most recent recorded research runs."
-        }
-      ]
-    },
-    {
-      "name": "run_advisory_pipeline",
-      "category": "analysis",
-      "description": "Run the component-level advisory orchestrator with stage controls from screener normalization through portfolio/execution planning.",
-      "command": ["python", "-m", "advisory.pipeline"],
-      "read_only": false,
-      "examples": [
-        {
-          "args": ["--dry-run", "--stop-at", "portfolio"],
-          "description": "Preview the component advisory pipeline through portfolio planning without writing."
-        },
-        {
-          "args": ["--include-watch", "--include-news", "--include-lifecycle", "--dry-run"],
-          "description": "Preview the component advisory pipeline including announcement watch, ET RSS news watch, and lifecycle stages."
-        }
+        {"args": ["--format", "json"], "description": "Machine-readable coverage report."}
       ]
     }
   ]

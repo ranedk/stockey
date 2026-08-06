@@ -1,125 +1,107 @@
 # Stockey
 
-Stockey is an Indian-equity advisory research and operator system.
+Stockey is a **pure data platform** for Indian-equity price/reference data. It
+collects, adjusts, and identity-maps bhavcopy, corporate actions, indices,
+calendar, Dhan broker, and RBI/FBIL rate data, then writes it to the cloud
+Postgres for `systrader` (the sibling research/trading repo) to consume. It
+does no research, signal generation, backtesting, sizing, execution,
+fundamental analysis, news/announcement processing, or LLM-token consumption
+— all of that lives in `systrader` now (operator decision 2026-07-27).
 
-**New to the system?** Open `docs/stockey_overview.html` in a browser for a layered, plain-English
-explainer &mdash; pick a depth (Overview / How it works / The detail) and tap any term for its meaning.
-The one measured edge (RS-selected, risk-sized, breadth-floored) is surfaced as a **review-only daily
-advisory** via `python -m advisory.paper_advisory` (no broker; the funnel path still produces ~no BUYs).
+See `CLAUDE.md` for the full operating guide, `docs/DATA_INVENTORY.md` for the
+authoritative keep/remove table+module inventory, `docs/DATA_COVERAGE.md` for
+what's inside each kept table and its coverage, and `docs/PURE_TA_MIGRATION_PLAN.md`
+for how the cut happened. `DATA_CONTRACT.md` is the boundary contract with
+systrader (table API, cloud-DB load rule, Dhan auth handoff).
 
-Core flow:
+## Pipeline
 
-1. `./complete_data.sh` downloads, parses, and refreshes compact/context evidence from raw data.
-2. `./all_watchers.sh` incrementally watches OHLCV, news, and announcements, including lower-priority market/context-overlay targets, review-only watch discovery from positive/watch overlays, review-only de-risk pressure from negative theme plus direct announcement/exchange/bhavcopy overlays, and bounded `CONTEXT_OVERLAY_WATCH` reconciliation. It matches hypothesis Wait Signals and writes fast per-symbol signal refresh rows. It self-locks, so overlapping cron/manual runs are skipped, and it resumes from `advisory_sync_state` cursors so skipped ticks do not lose the missed interval.
-3. `./all_context_to_entry_repair.sh` runs the bounded context-to-entry repair chain: review-only context signal refresh, durable `CONTEXT_OVERLAY_WATCH` reconciliation, targeted context-watch technical refresh, rules-through-actions advisory, Action Queue refresh, and recommendation diagnostics. Use it when positive context exists but no BUY rows are produced because watch rows, technical confirmation, or candidates are stale.
-4. `./all_advisory.sh` first runs bounded review-only context signal refresh when its sync state is not already current, reconciles durable `CONTEXT_OVERLAY_WATCH` rows, runs causal-memory signal refresh, then runs the authoritative batch advisory, lifecycle, risk, action consolidation, and execution-planning flow.
-5. `./all_frontend.sh` runs the FastAPI operator API and Nuxt operator frontend.
-6. `./all_research_evidence.sh` refreshes research-only context/event/action-transition evidence without event-model training or live policy changes.
-7. `./all_ml.sh` is optional research for event-model training plus signal-quality/source-family/adversarial-review evidence refresh and stable multi-window gated promotion-review creation; it is not the default production decision path.
+The whole pipeline is cron jobs defined in `config/stockey.crontab.template`:
 
-The operator frontend includes a `/screeners` workbench for validating Screener.in query syntax, fetching bounded preview rows with `persist=false`, and reviewing read-only screener contribution metrics before any query is registered as a production screener.
+1. `complete_data.sh` (07:10 + 17:30) — `data.download_runner --phase all`:
+   downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
+   scrip master + OHLCV, RBI/FBIL rates, Sharpely market-cap, and normalizes
+   corporate actions.
+2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30
+   and +5 min) — queue single-client NSE/Dhan work and drain it, so parallel
+   NSE/Dhan sessions don't collide.
+3. `all_ohlcv_reconcile.sh` (18:45) — backfills any universe symbol whose
+   latest Dhan daily bar predates the last completed trading day.
+4. `all_price_adjustment.sh` (18:50) — rebuilds `advisory_adjusted_ohlcv_daily`,
+   systrader's PRIMARY equity series.
+5. `all_data_readiness.sh` (22:30) — checks bhavcopy/Dhan/benchmark freshness
+   and runs bounded repairs.
+6. `all_data_coverage_report.sh` — non-fatal daily coverage/health report
+   across every KEEP table (see `docs/DATA_COVERAGE.md`).
+7. Log rotation (06:50, `scripts/rotate_logs.sh`).
 
-## Script Groups
+`data/nseindia/earnings_events.py` and `data/nseindia/recent_events.py` are
+BORDERLINE (LLM-free, kept for possible future FnO event-vol research) — the
+files stay but are deliberately not scheduled.
 
-### Recurring Cron Scripts
+## Key commands
 
-These are safe to run from `config/stockey.generated.crontab` at regular intervals because they are locked, incremental, or bounded:
+Daily/operator (matches the crontab):
 
-| Script | When | Why |
-| --- | --- | --- |
-| `./all_frontend.sh` | every few minutes | Keeps the FastAPI operator API and Nuxt frontend alive, exits for cron restart when API/Nuxt source changes, and supports `--api-only`, `--web-only`, or `--both` for targeted manual restarts |
-| `./all_watchers.sh` | every `10` minutes during market hours plus one post-close pass | Watches OHLCV, news, announcements, wait signals, and context-overlay watchlist pressure from persisted cursors; self-locks to avoid overlap |
-| `./all_downloaders_queue.sh` | a few times during the day | Enqueues NSE/Dhan/Screener work instead of opening multiple single-client sessions |
-| `./all_external_workers.sh` | after queued downloader enqueue | Drains Dhan, Screener, and NSE queues serially |
-| `./complete_data.sh` | morning safety net and end-of-day pre-advisory catch-up | Runs full raw download + parser refresh + context-overlay refresh; use this to repair anything intraday jobs missed before advisory |
-| `./all_advisory_preflight.sh` | before manual or post-close advisory | Refreshes/validates Dhan auth and runs compact operator smoke without running advisory |
-| `./all_context_to_entry_repair.sh` | post-close before full advisory, or manually from recommendation diagnostics | Runs the bounded context-to-entry repair chain so positive news/macro/announcement/bhavcopy pressure is not blocked by stale context-watch rows, stale context-watch technical features, or stale same-date candidates |
-| `./all_advisory.sh` | once daily after market close | Runs bounded review-only signal refresh only when not already current, persists context-overlay watchlist pressure, then produces the authoritative portfolio/action reconciliation |
-| `./all_ml.sh --run-signal-quality-window-runner --include-signal-quality-split-reports` | weekly research window, if enabled | Long-running event-model research training plus research-only signal-quality/source-family evidence refresh, stable multi-window manual review-row creation, and split diagnostics for unstable families; not part of live decision authority |
-| `./all_api_latency_probe.sh` | several times per market day | Probes operator API latency and records slow endpoints |
-| `./all_operator_health.sh` | several times per market day | Runs read-only operator health with Dhan login skipped by default |
-| `./all_hypothesis_scan.sh` | after watcher passes | Scans newly collected events against investor playbooks/hypotheses |
-| `./all_ts_forecast_workflow.sh` | research-only intraday schedule | Refreshes experimental TS forecast watch rows |
-| `./all_ts_forecast_evaluator.sh` | post-close research schedule | Evaluates matured TS forecasts after costs |
-| `./all_ts_forecast_paper_portfolio.sh` | post-close research schedule | Builds a research-only forecast paper portfolio and compares it with naive momentum/advisory alignment |
-| `./all_llm_decisions.sh` | post-advisory schedule | Generates review-only graded/sized LLM decisions per symbol over the active universe and matures elapsed-horizon outcomes for the monitor; deterministic by default, never moves capital (`broker_execution_allowed=false`) |
-| `./all_research_evidence.sh` | post-close research schedule | Refreshes context/event/action-transition research evidence without event-model prep/training/scoring, config mutation, portfolio mutation, or broker behavior |
-| `./all_event_policy_evaluator.sh` | post-close research schedule | Evaluates event-policy actions/classes after costs |
-| `./all_technical_threshold_calibration.sh` | weekly research schedule | Calibrates technical thresholds for manual review |
+```sh
+./complete_data.sh
+./all_downloaders_queue.sh
+./all_external_workers.sh
+./all_ohlcv_reconcile.sh
+./all_price_adjustment.sh
+./all_data_readiness.sh
+./all_data_coverage_report.sh
+```
 
-Cron uses named shell wrappers for recurring jobs so logs and Operations status have stable script names and `[stockey.script]` markers.
-
-### Manual / Catch-Up / Long-Running Scripts
-
-Use these when a day was missed, data looks stale, or you explicitly want a broad repair/backfill. They can take a long time and should not be run frequently during market hours:
-
-| Script | Use |
-| --- | --- |
-| `./all_downloaders.sh` | Download-only broad catch-up for missing raw data |
-| `./all_parsers.sh` | Parse-only catch-up after raw files are present |
-| `./complete_data.sh` | Full download + parse + context-overlay catch-up/backfill; useful end-of-day, after a missed day, or before a major advisory rerun |
-| `./all_advisory_preflight.sh` | Dhan/CDP/token and compact smoke preflight before spending hours on `all_advisory.sh` |
-| `./all_ml.sh --run-signal-quality-window-runner --include-signal-quality-split-reports` | Long-running research/model-training flow; run manually when validating model quality, signal-quality overlays, source-family evidence, and split diagnostics, or rerun weekly in a dedicated research cron window |
-| `./all_advisory_codex.sh` | Debug/repair wrapper for advisory failures; use manually, not as normal cron |
-| `./all_analysis_codex.sh` | Manual bounded Codex development loop that picks the next `todo.md` slice, implements it, validates it, and updates the board |
-
-Important docs:
-
-- `docs/operators_manual.md`: daily runbook and cron behavior.
-- `docs/scripts.md`: script and table inventory.
-- `docs/operator_app_prd.md`: operator frontend/API contract.
-- `todo.md`: current roadmap, including the long-term performance architecture backlog.
-
-Current architecture keeps LLM use bounded to extraction, review notes, hypothesis/playbook assistance, and manual-review context. Production action decisions are consolidated through deterministic policy, technical, risk, lifecycle, and reason-contract layers before any execution planning.
-
-Cron startup:
+Cron:
 
 ```sh
 python builder.py
 python scripts/cron_preflight.py
-nohup ./start_cron.sh >> logs/cron/go-crond.log 2>&1 &
+./start_cron.sh          # supported way to (re)start go-crond; reconciles OHLCV first
 ```
 
-`start_cron.sh` reconciles daily OHLCV universe coverage first (so a scheduler that was
-down during market hours never starts the day on stale bars), then execs the underlying
-runner (`./go-crond config/stockey.generated.crontab --allow-unprivileged`). Running that
-go-crond command directly also works but skips the startup reconciliation.
-
-The generated cron file is `go-crond`/system-crontab style and includes a username column. Use the Operations page or `python scripts/cron_preflight.py` before starting it after config changes.
-
-Starting `go-crond` only *schedules* jobs; it does not run them all immediately. Almost every job is weekday-bound (`* * 1-5`) — on a weekend only `all_frontend.sh` (every 5 min) runs until Monday; `all_ml.sh` is Sunday and technical calibration is Saturday. `go-crond` is foreground and unsupervised (run it under `nohup`/`tmux` or launchd; the crontab does not restart it), and the Dhan-backed jobs need the Chrome CDP session up. To run the full pipeline immediately instead of waiting for the schedule, run `./complete_data.sh && ./all_advisory_preflight.sh && ./all_context_to_entry_repair.sh && ./all_advisory.sh && ./all_llm_decisions.sh`. See `docs/operators_manual.md` -> "Running the schedule (operational reality)".
-
-Dhan and Screener browser-backed automation need a Chrome remote-debugging session when auto-login is required:
+Dhan/NSE browser-backed automation needs a Chrome remote-debugging session:
 
 ```sh
 scripts/start_chrome_cdp.sh
 ```
 
-Keep `CDP_ENDPOINT=http://localhost:9222` configured. Dhan auto-login fails hard when Chrome/CDP is unavailable; start this session before retrying `python -m data.dhanlive.auth_cli ensure --auto-login` or `./all_advisory.sh`. If Dhan pages are slow between mobile, TOTP, PIN, and redirect steps, tune `DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS` rather than falling back to manual browser consent.
+Keep `CDP_ENDPOINT=http://localhost:9222` configured. Dhan auto-login fails
+hard when Chrome/CDP is unavailable. Login attempts are serialized across
+processes (`data/dhanlive/auth.py`'s `_dhan_login_lock`) so concurrent
+processes don't trigger Dhan's "too many attempts" block.
 
-General flow of data:
+## Setup
 
-  1. `complete_data.sh` downloads and parses raw market, macro, company, NSE, news, and announcement data, then refreshes compact evidence and review-only context overlays.
-  2. Screener.in production/ad hoc screeners create the candidate universe.
-  3. Snapshot builders create macro, macro-context-overlay, compact bhavcopy/context-overlay, compact announcement/context-overlay, regime, fundamental, technical, intraday, exchange-event, exchange-context-overlay, and market-context rows.
-  4. Feature freshness checks explain whether required inputs are fresh, stale, missing, or intentionally skipped for visible action rows; rules, risk, portfolio, lifecycle, and actions now record dependency-gate summaries. Blocked rules gates move `PASS_NOW` to watch, blocked risk gates move positive allocations to manual review, blocked portfolio gates defer positive planned capital, lifecycle gates annotate outputs without hiding exits, and blocked action gates downgrade positive broker actions to Manual Review.
-  5. Rule and technical engines score setups into pass, watch, abstain, or reject states.
-  6. Watchers refresh active watchlist and open-position symbols with OHLCV, news, and announcements.
-  7. Watcher cursors advance only after persisted source work succeeds; if a watcher run is skipped or fails, the next run catches up from the last successful cursor.
-  8. Router reevaluates only symbols with changed evidence, then refreshes bounded review-only Action Queue rows for successfully refreshed symbols without granting portfolio or broker authority.
-  9. Codex/LLM is used for extraction, summaries, playbook notes, and manual-review context, not direct trade authority.
-  10. Event policy, adversarial review, regime, risk, and lifecycle layers produce entry/hold/add/partial-exit/full-exit intent.
-  11. Action consolidation creates one final action per symbol.
-  12. Execution planning converts only validated action contracts into broker-order plans.
-  13. Nuxt/FastAPI expose recommendations, traces, health, stage feature-gate blockers, per-symbol gate effects, feature freshness, errors, fallbacks, and fix hints.
-  14. Research jobs evaluate TS forecasts, forecast-only paper portfolios, event policies, technical thresholds, and optional ML separately from live policy; TS forecast promotion can create manual review/decision audit rows only after paper gates pass.
+```sh
+python builder.py
+source .xstockey/bin/activate
+```
 
-Current next-development focus:
+`builder.py` is safe to import and only runs when executed directly; it also
+creates `logs/cron` and installs `go-crond` if missing.
 
-1. Keep source degradation semantics strict where operator trust depends on them: no-data, source-unavailable, auth-unavailable, parser-bug, and fallback-used should be visible in Health/Data Health instead of buried in logs.
-2. Continue fallback telemetry triage using `python scripts/fallback_telemetry_coverage_report.py --format json`; prioritize source/API paths over intentionally best-effort JSON parsing helpers.
-3. Continue UI-first operations for unresolved manual, research, S3 artifact, and reviewed-config workflows.
-4. Use `python scripts/api_performance_report.py --limit 20`, backed by cron-generated `logs/performance/latest_api_latency_probe.json` and slow-operation state, to choose the next frontend/API latency fix from evidence.
-5. Keep `.env.example` and docs current with `python scripts/env_example_audit.py --strict` and `python scripts/docs_state_audit.py --strict`.
-6. Run `python scripts/cron_preflight.py` before starting `go-crond`; the same safe read-only check is available from Operations as `Cron Preflight`.
-7. Run `python scripts/context_gate_policy_audit.py --fail-on-single-regime` after env/config changes; it should exit 0 unless a broad single-regime hard BUY gate was intentionally re-enabled.
+```sql
+CREATE DATABASE stockey;
+CREATE USER stockey WITH ENCRYPTED PASSWORD 'stockey';
+GRANT ALL PRIVILEGES ON DATABASE stockey TO stockey;
+ALTER DATABASE stockey OWNER TO stockey;
+\c stockey
+GRANT ALL ON SCHEMA public TO stockey;
+GRANT USAGE ON SCHEMA public TO stockey;
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+```
+
+See `docs/index.md` for Redis/S3 backup layout and per-source run commands,
+and `docs/db_setup.md` for provisioning a fresh Postgres/Redis server.
+
+## Other docs
+
+- `docs/scripts.md` — script inventory.
+- `docs/operators_manual.md` — daily runbook and cron behavior.
+- `docs/db_setup.md` — provisioning a fresh Postgres/Redis server.
+- `docs/utils.md` — one-off utility commands (table dump/restore, OCR, identity review).
+- `docs/identity.md` — the `dim_security*` identity layer.
+- `docs/security_series.md` — NSE security series tag reference.
+- `docs/agents.md` — notes for exposing this repo to agent/LLM tool access.
