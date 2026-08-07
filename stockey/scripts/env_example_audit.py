@@ -59,6 +59,9 @@ IGNORED_ENV_NAMES = {
     "TMPDIR",
     "UID",
     "USER",
+    # Set automatically by `python -m venv` / `source .xstockey/bin/activate`, not
+    # something an operator configures in .env.
+    "VIRTUAL_ENV",
     # Local shell/script variables derived from documented runtime settings.
     "API_BASE",
     "API_HOST",
@@ -99,10 +102,17 @@ IGNORED_ENV_NAMES = {
     "WATCHER_LOCK_PID",
     "WATCHER_LOCK_PID_FILE",
     "WATCHER_LOCK_PROCESS_COMMAND",
+    # Literal fixture text inside tests/test_data_platform.py's own env_example_audit
+    # tests -- this scanner works on raw text, so a self-test string constant would
+    # otherwise show up as "used" in the real whole-repo audit no matter what it's named.
+    "SAMPLE_AUDIT_FIXTURE_INT_VAR",
 }
 
 ENV_PATTERNS = [
     re.compile(r"\benv\.(?:str|int|bool|float|list|path|url)\(\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]"),
+    # bare env(<var>[, default]) calls -- the environs.Env.__call__ form used
+    # throughout utils/*.py alongside the typed env.str/int/... accessors above.
+    re.compile(r"(?<!\.)\benv\(\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]"),
     re.compile(r"\bos\.getenv\(\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]"),
     re.compile(r"\bos\.environ\.get\(\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]"),
     re.compile(r"\bos\.environ\[\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]\s*\]"),

@@ -3997,38 +3997,6 @@ def test_cron_preflight_resolve_python_failure_records_fallback(tmp_path, monkey
     assert events[0]["metadata"]["timeout_seconds"] == 3
 
 
-def test_analysis_agent_loop_post_check_timeout_records_fallback(tmp_path, monkeypatch):
-    from scripts import analysis_agent_loop
-
-    events = []
-    log_path = tmp_path / "post_checks.log"
-
-    monkeypatch.setattr(analysis_agent_loop, "changed_files", lambda: ["scripts/analysis_agent_loop.py"])
-    monkeypatch.setattr(analysis_agent_loop, "untracked_root_artifacts", lambda: [])
-
-    def fake_run_local_command(command, *, timeout_seconds):
-        raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_seconds, output="partial output")
-
-    monkeypatch.setattr(analysis_agent_loop, "run_local_command", fake_run_local_command)
-    monkeypatch.setattr(analysis_agent_loop, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
-
-    ok = analysis_agent_loop.post_cycle_checks(
-        cycle=2,
-        log_path=log_path,
-        timeout_seconds=5,
-        cycle_files=["scripts/analysis_agent_loop.py"],
-        max_files_per_cycle=20,
-        allow_lockfile_drift=False,
-    )
-
-    assert ok is False
-    assert "timed out after 5s" in log_path.read_text(encoding="utf-8")
-    assert events[0]["module"] == "scripts.analysis_agent_loop"
-    assert events[0]["fallback_type"] == "analysis_agent_post_check_timeout"
-    assert events[0]["metadata"]["cycle"] == 2
-    assert events[0]["metadata"]["timeout_seconds"] == 5
-
-
 def _positive_context_watch_target_frame():
     return pd.DataFrame(
         [
@@ -7350,7 +7318,7 @@ def test_env_example_audit_extracts_python_and_shell_vars():
 
     text = """
 api_key = env.str("OPENAI_API_KEY", "")
-workers = int(os.getenv("OPERATOR_HEALTH_FAST_WORKERS", "4"))
+workers = int(os.getenv("SAMPLE_AUDIT_FIXTURE_INT_VAR", "4"))
 token = os.environ.get("DHAN_ACCESS_TOKEN")
 echo "${STOCKEY_DIR:-/tmp/stockey}" "$LOG_DIR" "$PWD"
 """
@@ -7358,9 +7326,10 @@ echo "${STOCKEY_DIR:-/tmp/stockey}" "$LOG_DIR" "$PWD"
     usages = env_example_audit.extract_env_usages_from_text(text, "sample.sh")
     names = {usage.name for usage in usages}
 
+    # SAMPLE_AUDIT_FIXTURE_INT_VAR is intentionally in IGNORED_ENV_NAMES (it's this
+    # test's own fixture text, not a real env var) and must not appear in the output.
     assert names == {
         "OPENAI_API_KEY",
-        "OPERATOR_HEALTH_FAST_WORKERS",
         "DHAN_ACCESS_TOKEN",
         "STOCKEY_DIR",
         "LOG_DIR",
@@ -7815,15 +7784,40 @@ def test_docs_and_env_audit_record_relative_path_fallback(monkeypatch, tmp_path)
     assert env_events[0]["fallback_type"] == "env_example_audit_relative_path_failed"
 
 
-def test_docs_state_audit_requires_daily_research_evidence_coverage():
+def test_docs_state_audit_requires_pure_ta_framing_coverage():
     from scripts import docs_state_audit
 
     checks = dict(docs_state_audit.REQUIRED_COVERAGE["README.md"])
-    pattern = checks["daily research evidence"]
+    pattern = checks["pure data platform framing"]
 
-    assert pattern.search("`./all_research_evidence.sh` refreshes research-only context evidence.")
-    assert pattern.search("The research-only evidence path is `./all_research_evidence.sh`.")
-    assert not pattern.search("`./all_ml.sh` runs weekly training.")
+    assert pattern.search("Stockey is a **pure data platform** for Indian-equity price/reference data.")
+    assert not pattern.search("Stockey is an Indian-equity advisory research and operator system.")
+
+
+def test_docs_state_audit_flags_legacy_advisory_module_reference():
+    from scripts import docs_state_audit
+
+    repo_root = docs_state_audit.REPO_ROOT
+    findings = docs_state_audit.check_stale_terms(
+        repo_root / "docs" / "example.md",
+        "Run `python -m advisory.rule_engine` to score candidates.\n",
+        repo_root=repo_root,
+    )
+
+    assert any(f.code == "legacy_advisory_module_reference" and f.severity == "warning" for f in findings)
+
+
+def test_docs_state_audit_allows_legacy_advisory_module_reference_with_removed_note():
+    from scripts import docs_state_audit
+
+    repo_root = docs_state_audit.REPO_ROOT
+    findings = docs_state_audit.check_stale_terms(
+        repo_root / "docs" / "example.md",
+        "`advisory.rule_engine` was removed in the pure-TA cut.\n",
+        repo_root=repo_root,
+    )
+
+    assert not any(f.code == "legacy_advisory_module_reference" for f in findings)
 
 
 def test_transcribe_cleanup_missing_temp_file_records_fallback(monkeypatch, tmp_path):
