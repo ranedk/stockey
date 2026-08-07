@@ -19,12 +19,25 @@ const ForecastCap = 20.0
 
 type Rule interface {
 	Name() string
+	// Story states the economic rationale — WHO is on the losing side and WHY
+	// they keep paying (Law 1, law_1_story.md). The engine refuses rules with
+	// an empty story: no story, no backtest. Post-hoc stories are near-
+	// worthless (HARKing); write it before looking at performance data.
+	Story() string
 	// Raw returns the unscaled forecast, aligned to inst.Prices dates.
 	// vol is daily price-unit volatility (core.PriceUnitVol).
 	Raw(inst *data.Instrument, vol core.Series) core.Series
 	// Scalar converts raw values to the average-absolute-10 convention.
 	// Fixed constants fitted by Carver WITHOUT performance data (Law 8).
 	Scalar() float64
+}
+
+// Validate enforces the story rule mechanically.
+func Validate(r Rule) error {
+	if len(r.Story()) < 40 {
+		return fmt.Errorf("rule %q violates Law 1: economic story missing or too thin (%d chars) — state who is on the losing side and why they keep paying", r.Name(), len(r.Story()))
+	}
+	return nil
 }
 
 // Forecast applies scalar + cap (+ long-only clipping) to a rule's raw output.
@@ -58,6 +71,13 @@ var ewmacScalars = map[int]float64{
 
 func (e EWMAC) Name() string { return fmt.Sprintf("ewmac%d_%d", e.Fast, e.Fast*4) }
 
+func (EWMAC) Story() string {
+	return "Counterparties are disposition-effect sellers exiting winners early, " +
+		"mechanical rebalancers selling strength by mandate, and anchored traders " +
+		"fading moves on stale information. Trend followers are paid for absorbing " +
+		"these non-forecast-driven flows (under-reaction → drift toward fair value)."
+}
+
 func (e EWMAC) Scalar() float64 {
 	if s, ok := ewmacScalars[e.Fast]; ok {
 		return s
@@ -90,6 +110,13 @@ func (e EWMAC) Raw(inst *data.Instrument, vol core.Series) core.Series {
 type Carry struct{}
 
 func (Carry) Name() string { return "carry" }
+
+func (Carry) Story() string {
+	return "Hedgers and constrained investors pay a premium to shed exposure they " +
+		"must not hold (producers locking prices, funds barred from leverage). " +
+		"The carry trader is paid for bearing the unpleasant negative skew they " +
+		"are offloading — income that accrues when prices stand still."
+}
 
 // Carver's carry forecast scalar (appendix B).
 func (Carry) Scalar() float64 { return 30.0 }

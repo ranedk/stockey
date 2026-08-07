@@ -14,29 +14,46 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 
 	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/data"
+	"github.com/ranedk/systrader/internal/research"
 	"github.com/ranedk/systrader/internal/rules"
 	"github.com/ranedk/systrader/internal/store"
 )
 
+// envFloat: capital & risk enter via .env (Law 10); flags only override.
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
 func main() {
+	_ = godotenv.Load()
 	tickers := flag.String("tickers", "", "comma-separated tickers from systrade db (empty = synthetic demo)")
-	capital := flag.Float64("capital", 5_000_000, "trading capital")
-	volTarget := flag.Float64("voltarget", 0.20, "annual volatility target (fraction)")
+	capital := flag.Float64("capital", envFloat("TRADING_CAPITAL", 5_000_000), "trading capital (default from TRADING_CAPITAL)")
+	volTarget := flag.Float64("voltarget", envFloat("VOL_TARGET_PCT", 0.20), "annual volatility target (default from VOL_TARGET_PCT)")
+	weekly := flag.Bool("weekly", false, "decide weekly (Friday close) instead of daily")
 	flag.Parse()
 	if *tickers != "" {
-		runReal(strings.Split(*tickers, ","), *capital, *volTarget)
+		runReal(strings.Split(*tickers, ","), *capital, *volTarget, *weekly)
 		return
 	}
 	runSynthetic()
 }
 
-func runReal(tickers []string, capital, volTarget float64) {
+func runReal(tickers []string, capital, volTarget float64, weekly bool) {
 	ctx := context.Background()
 	st, err := store.Open(ctx)
 	if err != nil {
@@ -48,14 +65,22 @@ func runReal(tickers []string, capital, volTarget float64) {
 	weights := map[string]float64{}
 	for _, tk := range tickers {
 		tk = strings.TrimSpace(tk)
-		// Adjusted closes first (splits/bonuses corrected, 2013+, delisted
-		// included); raw dhan series only as a fallback for names the
-		// adjusted table lacks (ETFs etc.) — raw returns lie at CA dates.
-		prices, err := st.AdjustedCloses(ctx, tk)
-		src := "adjusted"
-		if err != nil {
-			prices, err = st.DailyCloses(ctx, tk)
-			src = "dhan RAW (beware corporate actions)"
+		// Adjusted OHLC first (splits/bonuses corrected, 2013+, delisted
+		// included, opens for T+1 fills); adjusted closes if the bhavcopy
+		// row is missing; raw dhan series as the last resort — raw returns
+		// lie at corporate-action dates.
+		var opens *core.Series
+		src := "adjusted OHLC"
+		o, prices, err := st.AdjustedOHLC(ctx, tk)
+		if err == nil {
+			opens = &o
+		} else {
+			prices, err = st.AdjustedCloses(ctx, tk)
+			src = "adjusted close-only"
+			if err != nil {
+				prices, err = st.DailyCloses(ctx, tk)
+				src = "dhan RAW (beware corporate actions)"
+			}
 		}
 		if err != nil {
 			fmt.Printf("skip %s: %v\n", tk, err)
@@ -67,6 +92,7 @@ func runReal(tickers []string, capital, volTarget float64) {
 				// (delivery), 0.1% STT+charges per side
 				SpreadPoints: 0, FeePerBlock: 0, PercentValueFee: 0.0012},
 			Prices: prices,
+			Opens:  opens,
 		})
 		fmt.Printf("%s: %d bars (%s → %s) [%s]\n", tk, prices.Len(),
 			prices.Times[0].Format("2006-01-02"), prices.Times[prices.Len()-1].Format("2006-01-02"), src)
@@ -77,8 +103,6 @@ func runReal(tickers []string, capital, volTarget float64) {
 	for _, in := range instruments {
 		weights[in.Meta.Symbol] = 1.0 / float64(len(instruments))
 	}
-	idm := math.Min(math.Sqrt(float64(len(instruments))), 2.5) // rough; handcraft later
-
 	cfg := backtest.Config{
 		Capital: capital, VolTargetPct: volTarget, Compounding: true,
 		Rules: []backtest.RuleSpec{
@@ -88,14 +112,25 @@ func runReal(tickers []string, capital, volTarget float64) {
 		},
 		FDM:               1.1, // three correlated EWMAC variations only
 		InstrumentWeights: weights,
-		IDM:               idm,
+		IDM:               0,   // derive point-in-time from realized correlations
+		MaxGrossLeverage:  1.0, // cash delivery account: no borrowing, ever
+		ExecuteAtOpen:     true,
+	}
+	if weekly {
+		cfg.Schedule = backtest.Weekly
 	}
 	res, err := backtest.Run(cfg, instruments)
 	if err != nil {
 		panic(err)
 	}
+	ledgerM, lerr := research.CountM("research/LEDGER.md")
+	if lerr != nil {
+		ledgerM = 2 // inherited rows; never report a bar easier than reality
+		fmt.Printf("WARN: cannot read research/LEDGER.md (%v), assuming M=%d\n", lerr, ledgerM)
+	}
 	fmt.Println("\n=== REAL DATA (cash-equity economics, long-only) ===")
-	fmt.Println(res.Metrics.Report(2))
+	fmt.Printf("IDM (correlation-derived, point-in-time): %.2f\n", res.IDMUsed)
+	fmt.Println(res.Metrics.Report(ledgerM))
 	fmt.Println()
 	for _, in := range instruments {
 		ir := res.Instruments[in.Meta.Symbol]

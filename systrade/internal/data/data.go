@@ -35,6 +35,10 @@ type Meta struct {
 type Instrument struct {
 	Meta   Meta
 	Prices core.Series
+	// Opens: session opening prices aligned to Prices dates (optional).
+	// When present and the engine runs ExecuteAtOpen, fills happen at the
+	// open AFTER the decision close instead of at the decision close itself.
+	Opens *core.Series
 	// AnnCarry: expected return if prices never move, in PRICE UNITS PER YEAR
 	// (e.g. futures: (nearer − traded)/year-gap; equity: (div yield − funding) × price).
 	// nil if unavailable → the carry rule emits NaN and is renormalized away.

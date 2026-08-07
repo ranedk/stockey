@@ -19,6 +19,43 @@ func Target(subsystem, instrumentWeight, idm float64) float64 {
 	return subsystem * instrumentWeight * idm
 }
 
+// IDMFromCorrelation derives the instrument diversification multiplier from
+// realized return correlations: IDM = 1/√(w'Cw), negative correlations
+// floored at 0 (Law 9 — never let anti-correlation inflate leverage),
+// result clamped to [1, MaxIDM]. Correlations are the trustworthy statistic
+// (Law 6); √N-style guesses assume zero correlation and oversize risk.
+func IDMFromCorrelation(w []float64, corr [][]float64) float64 {
+	if len(w) == 0 || len(corr) != len(w) {
+		return 1
+	}
+	var sum float64
+	for i := range w {
+		for j := range w {
+			c := corr[i][j]
+			switch {
+			case i == j:
+				c = 1
+			case math.IsNaN(c):
+				c = 1 // unknown correlation = assume the worst (Law 20)
+			case c < 0:
+				c = 0 // never let anti-correlation inflate leverage (Law 9)
+			}
+			sum += w[i] * w[j] * c
+		}
+	}
+	if sum <= 0 {
+		return 1
+	}
+	idm := 1 / math.Sqrt(sum)
+	if idm > MaxIDM {
+		idm = MaxIDM
+	}
+	if idm < 1 {
+		idm = 1
+	}
+	return idm
+}
+
 // ApplyInertia decides the new held position given the current one and the
 // unrounded target. block is the minimum increment (normally 1).
 func ApplyInertia(current, target, block float64) float64 {

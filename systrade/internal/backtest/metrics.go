@@ -11,26 +11,40 @@ import (
 // multiple-testing verdict.
 type Metrics struct {
 	Days         int
-	AnnReturnPct float64 // on initial capital
-	AnnVolPct    float64
+	AnnReturnPct float64 // geometric-mean daily % return, annualized
+	AnnVolPct    float64 // of daily % returns on running equity
 	Sharpe       float64
 	TStat        float64
 	Skew         float64
-	MaxDDPct     float64 // max drawdown as % of initial capital
+	MaxDDPct     float64 // max % drawdown from peak equity
 	CostDragSR   float64 // annual costs expressed in Sharpe units
 	DeflatedSR   float64 // Sharpe × 0.75 (Law 7 pessimism factor)
 }
 
+// ComputeMetrics measures everything in PERCENT RETURNS ON RUNNING EQUITY.
+// Dividing compounded cash P&L by initial capital inflates vol and drawdown
+// by however much the account grew (the pre-2026-07-26 bug: a 20%-vol system
+// reported 75% vol and a 349% "drawdown").
 func ComputeMetrics(res *Result, capital float64) Metrics {
 	pnl := res.Daily.Values
+	eq := res.Equity.Values
 	n := len(pnl)
-	if n == 0 || capital <= 0 {
+	if n == 0 || capital <= 0 || len(eq) != n {
 		return Metrics{}
 	}
 	rets := make([]float64, n)
+	var avgEquity float64
 	for i, v := range pnl {
-		rets[i] = v / capital
+		base := capital
+		if i > 0 {
+			base = eq[i-1]
+		}
+		if base > 0 {
+			rets[i] = v / base
+		}
+		avgEquity += eq[i]
 	}
+	avgEquity /= float64(n)
 	mean, sd := meanStd(rets)
 	m := Metrics{Days: n}
 	m.AnnReturnPct = mean * 256 * 100
@@ -40,7 +54,7 @@ func ComputeMetrics(res *Result, capital float64) Metrics {
 		m.TStat = mean / (sd / math.Sqrt(float64(n)))
 	}
 	m.Skew = skew(rets, mean, sd)
-	m.MaxDDPct = maxDrawdown(pnl) / capital * 100
+	m.MaxDDPct = maxDrawdownPct(eq, capital) * 100
 	m.DeflatedSR = m.Sharpe * 0.75
 
 	var costCash float64
@@ -48,7 +62,7 @@ func ComputeMetrics(res *Result, capital float64) Metrics {
 		costCash += ir.CostCash
 	}
 	years := float64(n) / 256.0
-	annVolCash := sd * 16 * capital
+	annVolCash := sd * 16 * avgEquity
 	if years > 0 && annVolCash > 0 {
 		m.CostDragSR = (costCash / years) / annVolCash
 	}
@@ -110,16 +124,19 @@ func skew(x []float64, mean, sd float64) float64 {
 	return s3 / float64(len(x))
 }
 
-// maxDrawdown on the cumulative cash P&L curve.
-func maxDrawdown(pnl []float64) float64 {
-	var cum, peak, maxDD float64
-	for _, v := range pnl {
-		cum += v
-		if cum > peak {
-			peak = cum
+// maxDrawdownPct: worst peak-to-trough decline of the equity curve, as a
+// fraction of the peak (initial capital seeds the first peak).
+func maxDrawdownPct(equity []float64, initial float64) float64 {
+	peak := initial
+	var maxDD float64
+	for _, e := range equity {
+		if e > peak {
+			peak = e
 		}
-		if dd := peak - cum; dd > maxDD {
-			maxDD = dd
+		if peak > 0 {
+			if dd := (peak - e) / peak; dd > maxDD {
+				maxDD = dd
+			}
 		}
 	}
 	return maxDD

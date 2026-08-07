@@ -1,0 +1,8 @@
+[
+  {
+    "name": "ensemble-family-2020-01-to-2021-07",
+    "configHash": "stockey-advisory-adaptive_ensemble-v0.1-frozen-json",
+    "burnedAt": "2026-07-01T00:00:00+05:30",
+    "note": "Burned by the stockey session's adaptive_ensemble.py holdout run (NO-GO). Imported 2026-07-27: any ensemble-family verification overlapping 2020-01..2021-07 is contaminated; systrader Part B for this family starts 2021-08 or later."
+  }
+]

@@ -60,10 +60,14 @@ go run ./cmd/run -config config.json -data ./data
 
 ## Data & broker layer
 
+**Boundary with stockey: `docs/DATA_CONTRACT.md`** — stockey = data platform
+(cloud postgres, small, never load it); systrader = ALL research/TA/trading,
+reading only the local mirror.
+
 - **Local DB**: postgres `systrade` (user/pass `systrade`), tables mirrored
-  1:1 from the stockey project so the DBs can be merged later. Sync:
-  `./scripts/sync_from_stockey.sh` (remote 172.26.39.7, falls back to local;
-  full-refresh for small tables, incremental on `date` for the big ones).
+  1:1 from stockey. Sync: `./scripts/sync_from_stockey.sh` (remote
+  172.26.39.7, falls back to local; atomic spooled copies; incremental
+  tables fingerprint-reconciled against source).
 - **Primary equity history**: `advisory_adjusted_ohlcv_daily` — CA-adjusted
   closes, 2013+, ~3,950 symbols incl. delisted (survivorship-honest). Use
   `Store.AdjustedCloses`; raw `dhan_ohlcv_daily` (2015+) is fallback only.
@@ -96,7 +100,16 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
 - [x] Backfill ETF/index/futures history via Dhan API (`cmd/dhan backfill` →
       `systrader_ohlcv_daily`; futures caveat in `docs/data_notes.md`)
 - [x] Corporate-action price adjustment (`advisory_adjusted_ohlcv_daily` →
-      `Store.AdjustedCloses`; backtests prefer adjusted, raw is labelled)
+      `Store.AdjustedCloses`/`AdjustedOHLC`; backtests prefer adjusted)
+- [x] Engine hardening (2026-07-26): equity-based metrics (old ones inflated
+      vol/DD under compounding), gross-leverage cap for cash sleeves,
+      correlation-derived point-in-time IDM, decide-at-close→fill-at-next-open,
+      daily/weekly schedules, Law-1 story enforcement (`rules.Validate`),
+      holdout-burn registry + walk-forward + ledger M-accounting
+      (`internal/research`), property tests for all of the above
+- [ ] Indicator library for the adaptive-ensemble spec (storied signals only;
+      correlation report) + combination policies (handcrafted | Hedge | ML)
+      judged vs matched-control baseline
 - [ ] Futures stitching (Panama over Dhan slot splices, roll = expiry calendar)
       + carry from position-1/position-2 basis (splice-safe, see data_notes)
 - [ ] Matched-control baseline harness; bootstrap weight estimation

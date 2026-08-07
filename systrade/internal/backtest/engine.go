@@ -36,10 +36,42 @@ type Config struct {
 	FDM   float64    // forecast diversification multiplier (≤ 2.5)
 
 	InstrumentWeights map[string]float64 // handcrafted, sum ≈ 1
-	IDM               float64            // instrument diversification multiplier (≤ 2.5)
+	// IDM: instrument diversification multiplier (≤ 2.5). 0 = derive it
+	// point-in-time from realized return correlations (recomputed quarterly
+	// on an expanding window; 1.0 until 250 days of history exist).
+	IDM float64
+
+	// MaxGrossLeverage caps Σ|position notional| / current capital.
+	// 0 = uncapped (futures margin). Cash sleeves must set 1.0: a delivery
+	// account cannot borrow, whatever the vol math asks for.
+	MaxGrossLeverage float64
+
+	// Schedule: how often positions are re-decided. Daily (default) or
+	// Weekly (decide at Friday's close; holiday Fridays skip that week).
+	// Between decisions positions are held — cheaper, slower, Law 15's bias.
+	Schedule Schedule
+
+	// ExecuteAtOpen: decisions made at close(T) fill at open(T+1) (needs
+	// Instrument.Opens; instruments without opens fall back to close fills).
+	// False = legacy model: fill at the decision close itself.
+	ExecuteAtOpen bool
 
 	VolSpan int // EWMA span for price vol; default 36 (≈ 25-day window)
 	Workers int // parallelism for per-instrument prep; default GOMAXPROCS
+}
+
+type Schedule int
+
+const (
+	Daily Schedule = iota
+	Weekly
+)
+
+func (s Schedule) decisionDay(t time.Time) bool {
+	if s == Weekly {
+		return t.Weekday() == time.Friday
+	}
+	return true
 }
 
 type InstrumentResult struct {
@@ -57,7 +89,9 @@ type InstrumentResult struct {
 type Result struct {
 	Config      Config
 	Daily       core.Series // portfolio daily cash P&L on the union calendar
+	Equity      core.Series // end-of-day capital (initial + cumulative P&L)
 	EndCapital  float64
+	IDMUsed     float64 // last IDM applied (dynamic or configured)
 	Instruments map[string]*InstrumentResult
 	Metrics     Metrics
 }
@@ -79,6 +113,11 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 	}
 	if len(cfg.Rules) == 0 {
 		return nil, fmt.Errorf("backtest: no rules")
+	}
+	for _, rs := range cfg.Rules {
+		if err := rules.Validate(rs.Rule); err != nil {
+			return nil, err // Law 1: no story, no backtest
+		}
 	}
 	volSpan := cfg.VolSpan
 	if volSpan == 0 {
@@ -122,6 +161,8 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 		pos       float64
 		lastPrice float64
 		hasPrice  bool
+		pending   bool    // a decision awaits execution at the next open
+		target    float64 // the pending unrounded target
 	}, len(preps))
 	irs := make([]*InstrumentResult, len(preps))
 	for i, p := range preps {
@@ -134,10 +175,28 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 		res.Instruments[p.inst.Meta.Symbol] = irs[i]
 	}
 
+	// Dynamic IDM state: per-instrument daily %returns on the union calendar
+	// (NaN when absent), correlation recomputed quarterly, expanding window.
+	idm := cfg.IDM
+	dynamicIDM := idm == 0
+	if dynamicIDM {
+		idm = 1 // until 250 days of evidence exist (Law 6: don't guess)
+	}
+	retHist := make([][]float64, len(preps))
+	for i := range retHist {
+		retHist[i] = filledNaN(len(days))
+	}
+	normW := normalizedWeights(cfg.InstrumentWeights, preps)
+
 	dailyPnL := make([]float64, len(days))
+	equity := make([]float64, len(days))
+	targets := make([]float64, len(preps))
+	var cumPnL float64
 	for di, day := range days {
 		var dayPnL float64
-		// Mark-to-market with positions decided at the previous close.
+		// Phase 1: mark-to-market close→close — unless a pending decision
+		// executes at today's open, in which case the old position earns
+		// lastClose→open and the new one earns open→close.
 		for pi, p := range preps {
 			i, ok := p.dateIdx[day]
 			if !ok {
@@ -145,12 +204,51 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 			}
 			price := p.inst.Prices.Values[i]
 			st := &state[pi]
-			if st.hasPrice && st.pos != 0 {
-				move := (price - st.lastPrice) * p.inst.Meta.PointValue * st.pos
+			pv := p.inst.Meta.PointValue
+			if st.hasPrice && st.pending {
+				openP := price // fall back to close fill if no open exists
+				if p.inst.Opens != nil && i < p.inst.Opens.Len() {
+					if v := p.inst.Opens.Values[i]; !math.IsNaN(v) && v > 0 {
+						openP = v
+					}
+				}
+				if st.pos != 0 {
+					move := (openP - st.lastPrice) * pv * st.pos
+					irs[pi].PnL.Values[i] += move
+					dayPnL += move
+				}
+				newPos := portfolio.ApplyInertia(st.pos, st.target, p.inst.Meta.Block)
+				if newPos != st.pos {
+					blocks := math.Abs(newPos - st.pos)
+					cost := blocks * p.inst.Meta.CostPerBlockCash(openP)
+					irs[pi].PnL.Values[i] -= cost
+					irs[pi].CostCash += cost
+					irs[pi].BlocksTraded += blocks
+					dayPnL -= cost
+					if cfg.Compounding {
+						capital -= cost
+					}
+					st.pos = newPos
+				}
+				if st.pos != 0 {
+					move := (price - openP) * pv * st.pos
+					irs[pi].PnL.Values[i] += move
+					dayPnL += move
+				}
+				st.pending = false
+			} else if st.hasPrice && st.pos != 0 {
+				move := (price - st.lastPrice) * pv * st.pos
 				irs[pi].PnL.Values[i] += move
 				dayPnL += move
 			}
+			if st.hasPrice && st.lastPrice > 0 {
+				retHist[pi][di] = price/st.lastPrice - 1
+			}
 			st.lastPrice, st.hasPrice = price, true
+			irs[pi].Positions.Values[i] = st.pos
+			if a := math.Abs(st.pos); a > irs[pi].MaxAbsPos {
+				irs[pi].MaxAbsPos = a
+			}
 		}
 		if cfg.Compounding {
 			capital += dayPnL
@@ -158,42 +256,87 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 				capital = 0 // busted; positions will go to zero below
 			}
 		}
+		if dynamicIDM && di >= 250 && di%63 == 0 {
+			idm = portfolio.IDMFromCorrelation(normW, corrMatrix(retHist, di))
+		}
 		dailyCashVolTarget := sizing.DailyCashVolTarget(capital, cfg.VolTargetPct)
 
-		// Decide new positions at today's close (info ≤ today only).
-		for pi, p := range preps {
-			i, ok := p.dateIdx[day]
-			if !ok {
-				continue
-			}
-			st := &state[pi]
-			price := p.inst.Prices.Values[i]
-			ivv := p.vol.Values[i] * p.inst.Meta.PointValue
-			vs := sizing.VolScalar(dailyCashVolTarget, ivv)
-			sub := sizing.Subsystem(vs, p.forecast.Values[i])
-			w := cfg.InstrumentWeights[p.inst.Meta.Symbol]
-			target := portfolio.Target(sub, w, cfg.IDM)
-			newPos := portfolio.ApplyInertia(st.pos, target, p.inst.Meta.Block)
-
-			if newPos != st.pos {
-				blocks := math.Abs(newPos - st.pos)
-				cost := blocks * p.inst.Meta.CostPerBlockCash(price)
-				irs[pi].PnL.Values[i] -= cost
-				irs[pi].CostCash += cost
-				irs[pi].BlocksTraded += blocks
-				dayPnL -= cost
-				if cfg.Compounding {
-					capital -= cost
+		// Decision at today's close (info ≤ today only) — on schedule days.
+		if cfg.Schedule.decisionDay(day) {
+			// Pass 1: unrounded targets.
+			for pi, p := range preps {
+				targets[pi] = math.NaN()
+				i, ok := p.dateIdx[day]
+				if !ok {
+					continue
 				}
-				st.pos = newPos
+				ivv := p.vol.Values[i] * p.inst.Meta.PointValue
+				vs := sizing.VolScalar(dailyCashVolTarget, ivv)
+				sub := sizing.Subsystem(vs, p.forecast.Values[i])
+				w := cfg.InstrumentWeights[p.inst.Meta.Symbol]
+				targets[pi] = portfolio.Target(sub, w, idm)
 			}
-			irs[pi].Positions.Values[i] = st.pos
-			if a := math.Abs(st.pos); a > irs[pi].MaxAbsPos {
-				irs[pi].MaxAbsPos = a
+
+			// Pass 2: gross-leverage cap — a cash account cannot borrow.
+			// Scale ALL targets proportionally (preserves relative forecasts).
+			if cfg.MaxGrossLeverage > 0 && capital > 0 {
+				var gross float64
+				for pi, p := range preps {
+					i, ok := p.dateIdx[day]
+					if !ok || math.IsNaN(targets[pi]) {
+						continue
+					}
+					gross += math.Abs(targets[pi]) * p.inst.Prices.Values[i] * p.inst.Meta.PointValue
+				}
+				if gross > cfg.MaxGrossLeverage*capital {
+					scale := cfg.MaxGrossLeverage * capital / gross
+					for pi := range targets {
+						targets[pi] *= scale
+					}
+				}
+			}
+
+			// Pass 3: execute. ExecuteAtOpen defers the fill to the next
+			// session's open (phase 1 above); legacy mode fills at this close.
+			for pi, p := range preps {
+				i, ok := p.dateIdx[day]
+				if !ok {
+					continue
+				}
+				st := &state[pi]
+				if cfg.ExecuteAtOpen {
+					st.pending, st.target = true, targets[pi]
+					continue
+				}
+				price := p.inst.Prices.Values[i]
+				newPos := portfolio.ApplyInertia(st.pos, targets[pi], p.inst.Meta.Block)
+				if newPos != st.pos {
+					blocks := math.Abs(newPos - st.pos)
+					cost := blocks * p.inst.Meta.CostPerBlockCash(price)
+					irs[pi].PnL.Values[i] -= cost
+					irs[pi].CostCash += cost
+					irs[pi].BlocksTraded += blocks
+					dayPnL -= cost
+					if cfg.Compounding {
+						capital -= cost
+					}
+					st.pos = newPos
+				}
+				irs[pi].Positions.Values[i] = st.pos
+				if a := math.Abs(st.pos); a > irs[pi].MaxAbsPos {
+					irs[pi].MaxAbsPos = a
+				}
 			}
 		}
 		dailyPnL[di] = dayPnL
+		cumPnL += dayPnL
+		if cfg.Compounding {
+			equity[di] = capital
+		} else {
+			equity[di] = cfg.Capital + cumPnL
+		}
 	}
+	res.IDMUsed = idm
 
 	// Per-instrument turnover stats.
 	years := float64(len(days)) / 256.0
@@ -215,10 +358,79 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 	}
 
 	res.Daily = core.New(days, dailyPnL)
+	res.Equity = core.New(days, equity)
 	res.EndCapital = cfg.Capital + total(dailyPnL)
 	res.Metrics = ComputeMetrics(res, cfg.Capital)
 	return res, nil
 }
+
+// normalizedWeights returns cfg weights for the loaded instruments, in prep
+// order, normalized to sum 1 (equal weights if none configured).
+func normalizedWeights(w map[string]float64, preps []prepared) []float64 {
+	out := make([]float64, len(preps))
+	var sum float64
+	for i, p := range preps {
+		out[i] = w[p.inst.Meta.Symbol]
+		sum += out[i]
+	}
+	if sum <= 0 {
+		for i := range out {
+			out[i] = 1 / float64(len(out))
+		}
+		return out
+	}
+	for i := range out {
+		out[i] /= sum
+	}
+	return out
+}
+
+// corrMatrix computes pairwise Pearson correlations of daily returns using
+// history up to (and excluding) day index `until` — point-in-time only.
+func corrMatrix(retHist [][]float64, until int) [][]float64 {
+	n := len(retHist)
+	c := make([][]float64, n)
+	for i := range c {
+		c[i] = make([]float64, n)
+		c[i][i] = 1
+	}
+	for i := range n {
+		for j := i + 1; j < n; j++ {
+			c[i][j] = pearson(retHist[i][:until], retHist[j][:until])
+			c[j][i] = c[i][j]
+		}
+	}
+	return c
+}
+
+func pearson(a, b []float64) float64 {
+	var sx, sy, sxx, syy, sxy float64
+	n := 0
+	for k := range a {
+		x, y := a[k], b[k]
+		if math.IsNaN(x) || math.IsNaN(y) {
+			continue
+		}
+		sx += x
+		sy += y
+		sxx += x * x
+		syy += y * y
+		sxy += x * y
+		n++
+	}
+	if n < 60 { // too little overlap to trust
+		return math.NaN()
+	}
+	fn := float64(n)
+	cov := sxy/fn - sx/fn*sy/fn
+	vx := sxx/fn - sx/fn*sx/fn
+	vy := syy/fn - sy/fn*sy/fn
+	if vx <= 0 || vy <= 0 {
+		return math.NaN()
+	}
+	return cov / math.Sqrt(vx*vy)
+}
+
 
 func filledNaN(n int) []float64 {
 	v := make([]float64, n)

@@ -73,6 +73,49 @@ func (s *Store) AdjustedCloses(ctx context.Context, symbol string) (core.Series,
 	return scanSeries(rows.Next, rows.Scan, rows.Err)
 }
 
+// AdjustedOHLC loads adjusted open AND close series for a symbol: raw
+// opens/closes from nseindia_ohlcv (bhavcopy, 2013+) × cum_adj_factor from
+// the advisory table. Opens exist so backtests can fill at open(T+1) after
+// deciding at close(T) — filling at the decision close is mild look-ahead.
+func (s *Store) AdjustedOHLC(ctx context.Context, symbol string) (opens, closes core.Series, err error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT o.date, o.open * a.cum_adj_factor, o.close * a.cum_adj_factor
+		FROM nseindia_ohlcv o
+		JOIN advisory_adjusted_ohlcv_daily a
+		  ON a.symbol = o.symbol AND a.date = o.date AND a.series = o.series
+		WHERE o.symbol = $1 AND o.series = 'EQ'
+		  AND o.open > 0 AND o.close > 0 AND a.cum_adj_factor > 0
+		ORDER BY o.date ASC`, symbol)
+	if err != nil {
+		return core.Series{}, core.Series{}, err
+	}
+	defer rows.Close()
+	var times []time.Time
+	var ovals, cvals []float64
+	for rows.Next() {
+		var t time.Time
+		var o, c float64
+		if err := rows.Scan(&t, &o, &c); err != nil {
+			return core.Series{}, core.Series{}, err
+		}
+		d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		if len(times) > 0 && times[len(times)-1].Equal(d) {
+			ovals[len(ovals)-1], cvals[len(cvals)-1] = o, c
+			continue
+		}
+		times = append(times, d)
+		ovals = append(ovals, o)
+		cvals = append(cvals, c)
+	}
+	if err := rows.Err(); err != nil {
+		return core.Series{}, core.Series{}, err
+	}
+	if len(times) == 0 {
+		return core.Series{}, core.Series{}, fmt.Errorf("store: no adjusted OHLC for %s", symbol)
+	}
+	return core.New(times, ovals), core.New(times, cvals), nil
+}
+
 // AdjustedSymbols lists symbols in the adjusted table with at least minBars
 // EQ-series bars — the widest point-in-time-honest universe we have
 // (delisted symbols included, so no survivorship filter is applied here).
