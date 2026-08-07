@@ -18,13 +18,6 @@ CRON_TEMPLATE_PATH = PROJECT_ROOT / "config" / "stockey.crontab.template"
 GENERATED_CRONTAB_PATH = PROJECT_ROOT / "config" / "stockey.generated.crontab"
 LOCK_WRAPPER_PATH = PROJECT_ROOT / "scripts" / "with_lock.sh"
 FRONTEND_SCRIPT_PATH = PROJECT_ROOT / "all_frontend.sh"
-OPTIONAL_TS_FORECAST_PACKAGES = [
-    "torch",
-    os.getenv(
-        "STOCKEY_TIMESFM_PACKAGE",
-        "git+https://github.com/google-research/timesfm.git#egg=timesfm[torch]",
-    ),
-]
 
 
 def _log(message: str) -> None:
@@ -59,47 +52,6 @@ def install_requirements(folder, project_name):
         _log(f"Failed to install requirements for {project_name}: {e}")
     finally:
         os.chdir(original_cwd)
-
-
-def venv_pip_path(folder: str | Path, project_name: str) -> str:
-    return str(Path(folder) / f".x{project_name}" / "bin" / "pip")
-
-
-def venv_python_path(folder: str | Path, project_name: str) -> str:
-    return str(Path(folder) / f".x{project_name}" / "bin" / "python")
-
-
-def install_optional_packages(folder: str | Path, project_name: str, packages: list[str], *, label: str) -> None:
-    if not packages:
-        return
-    pip_path = venv_pip_path(folder, project_name)
-    if not Path(pip_path).exists():
-        raise FileNotFoundError(f"Virtualenv pip not found at {pip_path}; run base setup first")
-    _log(f"Installing optional {label} packages: {', '.join(packages)}")
-    subprocess.check_call([pip_path, "install", "--upgrade", *packages])  # nosec B603, B404
-
-
-def ensure_timesfm_setup(folder: str | Path, project_name: str, *, install: bool = False, check: bool = True) -> None:
-    if install:
-        install_optional_packages(
-            folder,
-            project_name,
-            OPTIONAL_TS_FORECAST_PACKAGES,
-            label="time-series forecast",
-        )
-    if not check:
-        return
-    python_path = venv_python_path(folder, project_name)
-    if not Path(python_path).exists():
-        _log(f"Skipping TimesFM check; virtualenv python not found at {python_path}")
-        return
-    check_code = (
-        "import importlib.util, sys; "
-        "missing=[name for name in ['torch','timesfm'] if importlib.util.find_spec(name) is None]; "
-        "print('TimesFM optional deps available' if not missing else 'TimesFM optional deps missing: ' + ', '.join(missing)); "
-        "sys.exit(0)"
-    )
-    subprocess.check_call([python_path, "-c", check_code])  # nosec B603, B404
 
 
 def vscode_config(folder, project_name):
@@ -254,14 +206,8 @@ project_name = "stockey"
 SERVICES = ["notebooks", "live", "backtest", "data"]
 
 
-def setup_env(*, install_timesfm: bool = True, check_timesfm: bool = True):
+def setup_env():
     install_requirements(original_dir, "stockey")
-    ensure_timesfm_setup(
-        original_dir,
-        "stockey",
-        install=install_timesfm,
-        check=check_timesfm or install_timesfm,
-    )
     ensure_runtime_directories()
     ensure_script_permissions()
     install_go_crond()
@@ -274,28 +220,8 @@ def setup_env(*, install_timesfm: bool = True, check_timesfm: bool = True):
 
 def main():
     parser = argparse.ArgumentParser(description="Bootstrap Stockey local runtime.")
-    parser.add_argument(
-        "--install-timesfm",
-        action="store_true",
-        help="Install TimesFM/torch packages into the project virtualenv. This is now the default.",
-    )
-    parser.add_argument(
-        "--skip-timesfm-install",
-        action="store_true",
-        help="Skip TimesFM/torch installation for lightweight setup runs.",
-    )
-    parser.add_argument(
-        "--skip-timesfm-check",
-        action="store_true",
-        help="Skip optional TimesFM dependency availability check.",
-    )
-    args = parser.parse_args()
-    env_skip_timesfm = str(os.getenv("STOCKEY_SKIP_TIMESFM_INSTALL") or "").strip().lower() in {"1", "true", "yes", "y"}
-    install_timesfm = not bool(args.skip_timesfm_install or env_skip_timesfm)
-    setup_env(
-        install_timesfm=install_timesfm,
-        check_timesfm=not bool(args.skip_timesfm_check),
-    )
+    parser.parse_args()
+    setup_env()
 
 
 if __name__ == "__main__":
