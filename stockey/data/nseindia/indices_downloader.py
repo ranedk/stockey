@@ -481,9 +481,23 @@ def main() -> int:
         "fallback_used": bool(gave_up_count),
         "state_advanced": downloaded_count > 0,
     }
-    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    # A hardcoded "ok"/0 here regardless of outcome would hide a fully failed run (e.g. NSE
+    # blocking this session) behind a false success -- this module's purpose is CRITICAL in
+    # download_runner's classification, so an accurate status/return code is what lets a
+    # blocked run actually surface as a failure instead of silently reporting "ok". This is
+    # distinct from the stopped_after_failures (7-consecutive) sys.exit below, which only
+    # covers the circuit-breaker case, not "every candidate date failed but stayed under 7".
+    # Only a TOTAL failure (nothing downloaded despite attempts) flips this -- a partial run
+    # is still real forward progress and stays "ok", matching download_runner's own
+    # partial_failed-vs-source_unavailable distinction.
+    total_failure = attempted_count > 0 and downloaded_count == 0
+    run_status = "source_unavailable" if total_failure else "ok"
+    print(json.dumps({"status": run_status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
     if stopped_after_failures:
         sys.exit("Stopped after 7 consecutive failures during backfill.")
+    if total_failure:
+        print(f"Done with {failed_attempt_count} failed date(s), nothing downloaded.")
+        return 1
     print("All caught up! Done")
     return 0
 

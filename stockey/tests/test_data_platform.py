@@ -5026,6 +5026,41 @@ def test_bhavcopy_downloader_exports_retry_run_state(monkeypatch):
     assert state["state_advanced"] is True
 
 
+def test_bhavcopy_downloader_total_failure_reports_source_unavailable(monkeypatch, capsys):
+    """A run where every attempted date fails (e.g. NSE blocking this session) must not report
+    "ok"/exit 0 -- download_runner's overall pass/fail check reads this raw status directly, and
+    bhavcopy_downloader's purpose is CRITICAL there. A partial run stays "ok" (see the sibling
+    retry_run_state test above); only a total failure (nothing downloaded) flips it."""
+
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    dates = [bhavcopy_downloader.datetime(2026, 6, 10), bhavcopy_downloader.datetime(2026, 6, 9)]
+
+    monkeypatch.setattr(bhavcopy_downloader, "get_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(bhavcopy_downloader, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(bhavcopy_downloader, "load_downloaded_dates_from_store", lambda: set())
+    monkeypatch.setattr(bhavcopy_downloader, "reverse_daterange", lambda start, end: dates)
+    monkeypatch.setattr(bhavcopy_downloader, "filter_missing_date_members", lambda all_dates, existing: list(all_dates))
+    monkeypatch.setattr(bhavcopy_downloader, "download_bhavcopy_for_date", lambda *args, **kwargs: False)
+
+    assert bhavcopy_downloader.main() == 1
+
+    state = bhavcopy_downloader.STOCKEY_RUN_STATE
+    assert state["downloaded_dates"] == 0
+    assert state["failed_attempt_count"] == 2
+    printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert printed["status"] == "source_unavailable"
+
+
 def test_bhavcopy_downloader_records_download_failure_fallback(monkeypatch):
     events: list[dict[str, object]] = []
 
@@ -5234,6 +5269,35 @@ def test_bhavcopy_parser_main_exports_runner_state(monkeypatch, capsys):
     assert bhavcopy_parser.STOCKEY_RUN_STATE["empty_processed_count"] == 1
     assert bhavcopy_parser.STOCKEY_RUN_STATE["failed_count"] == 1
     assert bhavcopy_parser.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_bhavcopy_parser_total_failure_reports_parse_failed(monkeypatch, capsys):
+    """A run where every considered file fails to parse (rows_written == 0) must not report
+    "ok"/exit 0 -- this module's purpose is CRITICAL in download_runner's classification. A
+    partial run (some files parsed, one bad file) stays "ok" (see the sibling test above)."""
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "run_parser",
+        lambda **kw: {
+            "source": "bhavcopy",
+            "rows": 0,
+            "rows_read": 2,
+            "rows_written": 0,
+            "files_seen": 2,
+            "files_considered": 2,
+            "parsed_count": 0,
+            "empty_processed_count": 0,
+            "failed_count": 2,
+            "from_date": "2026-06-01",
+            "to_date": "2026-06-02",
+            "fallback_used": False,
+            "state_advanced": False,
+        },
+    )
+
+    assert bhavcopy_parser.main() == 1
+    printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert printed["status"] == "parse_failed"
 
 
 def test_indices_parser_main_exports_runner_state(monkeypatch, capsys):

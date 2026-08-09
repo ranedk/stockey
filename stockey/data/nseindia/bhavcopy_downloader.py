@@ -201,6 +201,15 @@ def main() -> int:
         rop.close()
 
     skipped_after_failure_stop = max(len(missing_dates) - attempted_count, 0)
+    # A hardcoded "ok"/0 here regardless of outcome would hide a fully failed run (e.g. NSE
+    # blocking this session) behind a false success -- bhavcopy_downloader's purpose is
+    # CRITICAL in download_runner's classification, so this status/return code is what lets a
+    # blocked run actually surface as a failure instead of silently reporting "ok". Only a
+    # TOTAL failure (nothing downloaded despite attempts) flips this -- a partial run (some
+    # dates succeeded, one flaky date didn't) is still real forward progress and stays "ok",
+    # matching download_runner's own partial_failed-vs-source_unavailable distinction.
+    total_failure = attempted_count > 0 and downloaded_count == 0
+    status = "source_unavailable" if total_failure else "ok"
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "rows": downloaded_count,
@@ -221,8 +230,8 @@ def main() -> int:
         "fallback_used": False,
         "state_advanced": downloaded_count > 0,
     }
-    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
-    return 0
+    print(json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 1 if total_failure else 0
 
 
 if __name__ == "__main__":

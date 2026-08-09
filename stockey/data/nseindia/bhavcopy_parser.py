@@ -1118,8 +1118,17 @@ def main() -> int:
     args, _ = ap.parse_known_args()          # tolerate a test/pytest argv
     STOCKEY_RUN_STATE = run_parser(backfill=args.backfill, from_date=args.from_date,
                                    to_date=args.to_date, force=args.force)
-    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
-    return 0
+    # A hardcoded "ok"/0 here regardless of outcome would hide real parse failures behind a
+    # false success -- this module's purpose is CRITICAL in download_runner's classification.
+    # Only a TOTAL failure (nothing parsed despite failures) flips this -- a partial run (one
+    # bad file among many good ones) is still real forward progress and stays "ok", matching
+    # download_runner's own partial_failed-vs-parse_failed distinction.
+    failed_count = int(STOCKEY_RUN_STATE.get("failed_count") or 0)
+    rows_written = int(STOCKEY_RUN_STATE.get("rows_written") or STOCKEY_RUN_STATE.get("rows") or 0)
+    total_failure = failed_count > 0 and rows_written == 0
+    run_status = "parse_failed" if total_failure else "ok"
+    print(json.dumps({"status": run_status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 1 if total_failure else 0
 
 
 if __name__ == "__main__":

@@ -263,8 +263,15 @@ def main() -> int:
     state["source_unavailable_count"] = int(state["skipped_blocks"])
     state["state_advanced"] = int(state["downloaded_blocks"]) > 0
     STOCKEY_RUN_STATE = state
-    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
-    return 0
+    # A hardcoded "ok"/0 here regardless of outcome would hide a fully failed run (e.g. NSE
+    # blocking this session) behind a false success -- this module's purpose is CRITICAL in
+    # download_runner's classification. Only a TOTAL failure (nothing downloaded despite
+    # attempts) flips this -- a partial run is still real forward progress and stays "ok",
+    # matching download_runner's own partial_failed-vs-source_unavailable distinction.
+    total_failure = int(state["blocks_attempted"]) > 0 and int(state["downloaded_blocks"]) == 0
+    run_status = "source_unavailable" if total_failure else "ok"
+    print(json.dumps({"status": run_status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 1 if total_failure else 0
 
 
 if __name__ == "__main__":
