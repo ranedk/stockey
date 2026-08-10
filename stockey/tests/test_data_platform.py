@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -47,6 +48,7 @@ from fundamentals.collectors import bse_announcements as fundamentals_bse_announ
 from fundamentals.collectors import events_store as fundamentals_events_store
 from fundamentals.collectors import nse_pit as fundamentals_nse_pit
 from fundamentals.collectors import rating_agencies as fundamentals_rating_agencies
+from fundamentals.collectors import ocr_pipeline as fundamentals_ocr_pipeline
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -9990,3 +9992,172 @@ def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkey
 
     assert result["failed"] == 1
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "failed"}]
+
+
+# fundamentals/collectors/ocr_pipeline.py -- L3/L4 OCR fetch+store (step 6).
+
+
+def test_resolve_document_source_prefers_icra_rationale_over_bse_attachment():
+    row = {"attachment_name": "some.pdf", "rationale_pdf_url": "https://www.icra.in/Rating/GetRationalReportFilePdf?Id=1"}
+    assert fundamentals_ocr_pipeline.resolve_document_source(row) == ("icra", "https://www.icra.in/Rating/GetRationalReportFilePdf?Id=1")
+
+
+def test_resolve_document_source_falls_back_to_bse_attachment():
+    row = {"attachment_name": "abc-123.pdf", "rationale_pdf_url": None}
+    domain, url = fundamentals_ocr_pipeline.resolve_document_source(row)
+    assert domain == "bse"
+    assert url == "https://www.bseindia.com/xml-data/corpfiling/AttachLive/abc-123.pdf"
+
+
+def test_resolve_document_source_returns_none_without_either():
+    assert fundamentals_ocr_pipeline.resolve_document_source({"attachment_name": None, "rationale_pdf_url": None}) is None
+
+
+def test_fetch_document_bytes_raises_on_non_200(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+
+    class FakeResponse:
+        status_code = 404
+        content = b""
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline.requests, "get", lambda *a, **k: FakeResponse())
+    with pytest.raises(fundamentals_ocr_pipeline.DocumentFetchError):
+        fundamentals_ocr_pipeline.fetch_document_bytes("https://example.com/x.pdf", domain="bse")
+
+
+def test_fetch_document_bytes_raises_on_empty_body(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+
+    class FakeResponse:
+        status_code = 200
+        content = b""
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline.requests, "get", lambda *a, **k: FakeResponse())
+    with pytest.raises(fundamentals_ocr_pipeline.DocumentFetchError):
+        fundamentals_ocr_pipeline.fetch_document_bytes("https://example.com/x.pdf", domain="bse")
+
+
+def test_fetch_document_bytes_returns_content_on_success(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+
+    class FakeResponse:
+        status_code = 200
+        content = b"%PDF-1.4 fake pdf bytes"
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline.requests, "get", lambda *a, **k: FakeResponse())
+    assert fundamentals_ocr_pipeline.fetch_document_bytes("https://example.com/x.pdf", domain="icra") == b"%PDF-1.4 fake pdf bytes"
+
+
+def test_ocr_pdf_bytes_writes_temp_file_and_joins_pages(monkeypatch):
+    captured = {}
+
+    def fake_ocr_pdf_with_local(path):
+        captured["path_exists"] = Path(path).exists()
+        captured["path_suffix"] = Path(path).suffix
+        return {2: "page two", 1: "page one"}
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_with_local", fake_ocr_pdf_with_local)
+
+    result = fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
+
+    assert result == "page one\n\npage two"  # sorted by page number, not dict order
+    assert captured["path_exists"] is True
+    assert captured["path_suffix"] == ".pdf"
+
+
+def test_load_pending_ocr_targets_queries_expected_filters(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "sql_to_df", fake_sql_to_df)
+    fundamentals_ocr_pipeline.load_pending_ocr_targets()
+    assert "ocr_status IS NULL OR ocr_status = 'pending'" in captured["query"]
+    assert "attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL" in captured["query"]
+
+
+def test_run_ocr_pipeline_returns_early_when_nothing_pending(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False}
+
+
+def test_run_ocr_pipeline_marks_rows_with_no_document_reference(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": None}])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["no_document"] == 1
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "no_document"}]
+
+
+def test_run_ocr_pipeline_happy_path_stores_pdf_and_text(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "icra", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": "https://www.icra.in/Rating/GetRationalReportFilePdf?Id=1"}]
+    )
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", lambda url, **k: b"%PDF-1.4 fake")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", lambda pdf_bytes: "extracted rationale text")
+
+    saved_files = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "save_file_content", lambda key, content: saved_files.append((key, content)))
+
+    from utils.blob_store import TextBlobMetadata
+
+    fake_metadata = TextBlobMetadata(key="fundamentals/ocr/icra/n1.txt", sha256="abc123", char_count=24, byte_count=24, excerpt="extracted rationale text")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "put_text_blob", lambda text, key: fake_metadata)
+
+    status_calls = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["ocred"] == 1
+    assert result["blocked"] is False
+    assert saved_files == [("fundamentals/filings/icra/n1.pdf", b"%PDF-1.4 fake")]
+    assert len(status_calls) == 1
+    call = status_calls[0]
+    assert call["status"] == "done"
+    assert call["fields"]["ocr_text_s3_key"] == "fundamentals/ocr/icra/n1.txt"
+    assert call["fields"]["ocr_text_excerpt"] == "extracted rationale text"
+    assert call["fields"]["source_pdf_s3_key"] == "fundamentals/filings/icra/n1.pdf"
+    assert call["fields"]["source_pdf_sha256"] == hashlib.sha256(b"%PDF-1.4 fake").hexdigest()
+
+
+def test_run_ocr_pipeline_trips_circuit_breaker_per_domain(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": f"n{i}", "attachment_name": f"file{i}.pdf", "rationale_pdf_url": None}
+            for i in range(5)
+        ]
+    )
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+
+    def always_fails(url, **k):
+        raise fundamentals_ocr_pipeline.DocumentFetchError("boom")
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", always_fails)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_ocr_pipeline.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "ocr_pipeline_circuit_breaker_tripped" for a, k in fallback_events)
