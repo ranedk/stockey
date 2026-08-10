@@ -20,6 +20,7 @@ from typing import Any
 import pandas as pd
 import pytest
 import requests
+from bs4 import BeautifulSoup
 
 from utils import identity_issues
 from utils import fallback_telemetry
@@ -40,6 +41,7 @@ from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
 from fundamentals.collectors import screenerin as fundamentals_screenerin
 from fundamentals.screens import l1_universe as fundamentals_l1_universe
+from fundamentals.screens import l2_state as fundamentals_l2_state
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8584,3 +8586,231 @@ def test_run_l1_universe_refresh_builds_a_session_when_none_given(monkeypatch):
     fundamentals_l1_universe.run_l1_universe_refresh()
 
     assert seen_sessions == ["the-session"]
+
+
+# fundamentals/screens/l2_state.py -- L2 watch-state store (step 4).
+
+# Real shape captured live 2026-08-10 from a company's #balance-sheet table
+# (fundamentals/screens/l2_state.py's docstring) -- Mar 2025 then Mar 2026 columns,
+# Borrowings/CWIP/Fixed Assets rows (the "+"-suffixed expandable-row marker included,
+# same as the live markup).
+BALANCE_SHEET_FIXTURE_HTML = """
+<table><tr>
+<th></th><th>Mar 2025</th><th>Mar 2026</th>
+</tr>
+<tr><td>Borrowings +</td><td>17</td><td>3</td></tr>
+<tr><td>CWIP</td><td>0</td><td>4</td></tr>
+<tr><td>Fixed Assets +</td><td>76</td><td>95</td></tr>
+</table>
+"""
+
+PROFIT_LOSS_FIXTURE_HTML = """
+<table><tr>
+<th></th><th>Mar 2025</th><th>Mar 2026</th><th>TTM</th>
+</tr>
+<tr><td>Operating Profit</td><td>32</td><td>31</td><td>31</td></tr>
+<tr><td>Interest</td><td>4</td><td>3</td><td>3</td></tr>
+</table>
+"""
+
+SHAREHOLDING_FIXTURE_HTML = """
+<table><tr>
+<th></th><th>Sep 2025</th><th>Dec 2025</th><th>Mar 2026</th><th>Jun 2026</th>
+</tr>
+<tr><td>Promoters +</td><td>74.37%</td><td>74.37%</td><td>74.37%</td><td>74.37%</td></tr>
+</table>
+"""
+
+
+def _table(html):
+    return BeautifulSoup(html, "html.parser").select_one("table")
+
+
+def test_parse_period_table_strips_expandable_marker_and_parses_numbers():
+    parsed = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
+    assert parsed["periods"] == ["Mar 2025", "Mar 2026"]
+    assert parsed["rows"] == {
+        "Borrowings": [17, 3],
+        "CWIP": [0, 4],
+        "Fixed Assets": [76, 95],
+    }
+
+
+def test_parse_period_table_strips_percent_signs():
+    parsed = fundamentals_l2_state._parse_period_table(_table(SHAREHOLDING_FIXTURE_HTML))
+    assert parsed["rows"]["Promoters"] == [74.37, 74.37, 74.37, 74.37]
+
+
+def test_parse_period_table_handles_missing_table():
+    assert fundamentals_l2_state._parse_period_table(None) == {"periods": [], "rows": {}}
+
+
+def test_compute_debt_trajectory_matches_hand_computed_values():
+    balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
+    profit_loss = fundamentals_l2_state._parse_period_table(_table(PROFIT_LOSS_FIXTURE_HTML))
+
+    result = fundamentals_l2_state.compute_debt_trajectory(balance_sheet, profit_loss)
+
+    assert result == {
+        "net_debt_rscr": 3,
+        "net_debt_yoy_delta_rscr": 3 - 17,
+        "interest_coverage": 31 / 3,
+        "debt_to_ebitda": 3 / 31,
+    }
+
+
+def test_compute_debt_trajectory_returns_none_ratios_when_interest_is_zero():
+    balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
+    profit_loss = fundamentals_l2_state._parse_period_table(
+        _table("<table><tr><th></th><th>Mar 2025</th><th>Mar 2026</th></tr>"
+               "<tr><td>Operating Profit</td><td>32</td><td>31</td></tr>"
+               "<tr><td>Interest</td><td>0</td><td>0</td></tr></table>")
+    )
+
+    result = fundamentals_l2_state.compute_debt_trajectory(balance_sheet, profit_loss)
+
+    assert result["interest_coverage"] is None
+    assert result["debt_to_ebitda"] == 3 / 31
+
+
+def test_compute_cwip_ratio_matches_hand_computed_values():
+    balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
+
+    result = fundamentals_l2_state.compute_cwip_ratio(balance_sheet)
+
+    assert result["cwip_ratio"] == 4 / 95
+    assert result["cwip_ratio_yoy_delta"] == (4 / 95) - (0 / 76)
+
+
+def test_compute_cwip_ratio_handles_zero_fixed_assets():
+    balance_sheet = {"periods": ["Mar 2026"], "rows": {"CWIP": [4], "Fixed Assets": [0]}}
+    result = fundamentals_l2_state.compute_cwip_ratio(balance_sheet)
+    assert result == {"cwip_ratio": None, "cwip_ratio_yoy_delta": None}
+
+
+@pytest.mark.parametrize(
+    "values,expected_direction",
+    [
+        ([74.37, 74.37, 74.37, 74.37], "flat"),
+        ([70.0, 71.0, 72.0, 73.0], "increasing"),
+        ([73.0, 72.0, 71.0, 70.0], "decreasing"),
+    ],
+)
+def test_compute_promoter_stake_direction_over_last_4_quarters(values, expected_direction):
+    shareholding = {"rows": {"Promoters": values}}
+    result = fundamentals_l2_state.compute_promoter_stake(shareholding)
+    assert result["promoter_pct"] == values[-1]
+    assert result["promoter_stake_direction"] == expected_direction
+
+
+def test_compute_promoter_stake_direction_is_none_with_fewer_than_4_quarters():
+    shareholding = {"rows": {"Promoters": [74.37, 74.37]}}
+    result = fundamentals_l2_state.compute_promoter_stake(shareholding)
+    assert result["promoter_pct"] == 74.37
+    assert result["promoter_stake_direction"] is None
+
+
+def test_fetch_pledge_levels_builds_dict_keyed_by_company_id(monkeypatch):
+    companies = [
+        {"company_id": 3163, "metrics": {"pledged_pct": 96.64}},
+        {"company_id": 1274762, "metrics": {}},  # no pledged_pct -- must be skipped, not KeyError
+    ]
+    monkeypatch.setattr(fundamentals_l2_state, "run_query", lambda session, query_text: ("url", companies))
+
+    levels = fundamentals_l2_state.fetch_pledge_levels(object())
+
+    assert levels == {3163: 96.64}
+
+
+def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
+    universe = pd.DataFrame(
+        [
+            {"company_id": 1, "company_name": "Aarey Drugs", "ticker": "AAREYDRUGS"},
+            {"company_id": 2, "company_name": "TCC Concept", "ticker": "TCC"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {1: 5.0})
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"rows": {"Promoters": [74.37, 74.37, 74.37, 74.37]}},
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["rows"] == 2
+    assert result["failed_companies"] == []
+    assert result["checks_deferred"] == list(fundamentals_l2_state.DEFERRED_FIELDS)
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_l2_state.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["company_id", "run_date", "state_vector_version"]
+    assert set(df["company_id"]) == {1, 2}
+    row1 = df[df["company_id"] == 1].iloc[0]
+    assert row1["pledge_pct"] == 5.0
+    row2 = df[df["company_id"] == 2].iloc[0]
+    assert row2["pledge_pct"] == 0.0  # not in pledge_levels -> defaults to unpledged
+    assert row1["sector_cycle_phase"] is None
+    assert row1["valuation_percentile"] is None
+    assert any(e["fallback_type"] == "l2_fields_not_sourced" for e in fallback_events)
+
+
+def test_run_l2_state_refresh_skips_a_company_whose_detail_fetch_fails(monkeypatch):
+    universe = pd.DataFrame(
+        [
+            {"company_id": 1, "company_name": "Good Co", "ticker": "GOOD"},
+            {"company_id": 2, "company_name": "Bad Co", "ticker": "BAD"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"rows": {"Promoters": [74.37, 74.37, 74.37, 74.37]}},
+    }
+
+    def fake_fetch(session, ticker):
+        if ticker == "BAD":
+            raise RuntimeError("boom")
+        return detail
+
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", fake_fetch)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["rows"] == 1
+    assert result["failed_companies"] == ["BAD"]
+    assert len(upserts) == 1
+    assert any(e["fallback_type"] == "l2_company_detail_fetch_failed" and e["metadata"]["ticker"] == "BAD" for e in fallback_events)
+
+
+def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: pd.DataFrame())
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result == {"rows": 0, "failed_companies": [], "checks_deferred": list(fundamentals_l2_state.DEFERRED_FIELDS), "companies": []}
+    assert upserts == []
+    assert any(e["fallback_type"] == "l2_no_l1_universe" for e in fallback_events)
