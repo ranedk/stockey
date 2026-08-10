@@ -1,4 +1,4 @@
 {
-    "python.defaultInterpreterPath": "/Users/rane/code/trading/stockey/.xstockey/bin/python",
+    "python.defaultInterpreterPath": "/home/dev/code/trading/stockey/.xstockey/bin/python",
     "python.analysis.extraPaths": []
 }

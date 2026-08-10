@@ -1,16 +1,16 @@
 SHELL=/bin/bash
-PATH=/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/rane/.local/bin
+PATH=/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/dev/.local/bin
 CRON_TZ=Asia/Kolkata
 MAILTO=""
 
-STOCKEY_DIR=/Users/rane/code/trading/stockey
-LOG_DIR=/Users/rane/code/trading/stockey/logs/cron
+STOCKEY_DIR=/home/dev/code/trading/stockey
+LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 
 # Create log directory once before enabling the crontab:
-#   mkdir -p /Users/rane/code/trading/stockey/logs/cron
+#   mkdir -p /home/dev/code/trading/stockey/logs/cron
 #
 # Run with go-crond:
-#   ./go-crond /Users/rane/code/trading/stockey/config/stockey.generated.crontab --allow-unprivileged
+#   ./go-crond /home/dev/code/trading/stockey/config/stockey.generated.crontab --allow-unprivileged
 #
 # This file includes a username field. Remove that field before installing into a normal per-user crontab.
 #
@@ -25,45 +25,45 @@ LOG_DIR=/Users/rane/code/trading/stockey/logs/cron
 # Late-night data catch-up: Dhan publishes EOD bars staggered (only a fraction of the
 # universe has them at the 18:45 reconcile), and a bad morning bhavcopy fetch must not
 # survive the night. Checks bhavcopy/Dhan/benchmark coverage and runs bounded fixes.
-30 22 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
+30 22 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
 
 # Daily coverage/staleness report across every KEEP table (docs/DATA_COVERAGE.md).
 # Non-fatal visibility layer, not a gate: writes to data_coverage_report (queryable
 # trend history) and the log below. Runs after data_readiness so its own freshness
 # reflects that pass's fixes.
-40 22 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
+40 22 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
 
 # Daily log rotation before the morning jobs: archive sizable logs as
 # logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running
 # processes keep their handles) and prune archives past LOG_ROTATE_KEEP_DAYS.
-50 06 * * * rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
+50 06 * * * dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
 
 # Daily broad raw download + parse safety net before market open on weekdays.
 # A second end-of-day complete_data.sh run below repairs anything intraday jobs missed.
-10 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
+10 07 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
 # Queue single-client downloader work and drain it without parallel NSE/Dhan/Screener sessions.
 # The direct complete_data.sh path remains the broad catch-up/backfill safety net.
 # all_external_workers.sh is NOT optional: all_downloaders_queue.sh routes every
 # data.nseindia.* module plus Dhan scrip_master/ohlcv into the nse/dhan queues instead of
 # running them inline -- this is the only thing that drains those queues (see DATA_INVENTORY.md).
-30 08,12,16 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
-35 08,12,16 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
+30 08,12,16 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
+35 08,12,16 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
 
 # End-of-day broad catch-up. This intentionally runs the full download+parse path so any
 # downloader/parser work missed earlier in the day is repaired.
-30 17 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
+30 17 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
 
 # Daily OHLCV coverage reconciliation. Backfills any universe symbol whose latest daily bar
 # predates the last completed trading day (e.g. after the scheduler was down during market
 # hours), so systrader never reads silently stale bars.
-45 18 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
+45 18 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
 
 # Split/bonus-adjusted price table (price-step derived) -- systrader's PRIMARY equity series
 # (advisory_adjusted_ohlcv_daily), promoted out of advisory/ 2026-07-28. Scheduled right after
 # the OHLCV reconcile now that the downstream advisory/research chain that used to sit between
 # them is gone -- no need to wait until 21:38 anymore.
-50 18 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+50 18 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
 
 # ---------------------------------------------------------------------------
 # Manual / catch-up / long-running scripts. Keep these commented unless you
@@ -71,5 +71,5 @@ LOG_DIR=/Users/rane/code/trading/stockey/logs/cron
 # ---------------------------------------------------------------------------
 #
 # Optional split refreshes if you want explicit control instead of complete_data.sh.
-# 05 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
-# 40 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
+# 05 07 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
+# 40 07 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
