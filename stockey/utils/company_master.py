@@ -156,7 +156,15 @@ def attach_company_master_id(
 
 
 def map_company_master_ids(tickers: Iterable[object], *, exchange: str) -> pd.Series:
-    ticker_series = pd.Series(list(tickers), dtype="string")
+    # Preserve the caller's index when they pass a Series (e.g. df["symbol"] on a
+    # filtered/non-contiguous-indexed df) -- list(tickers) previously discarded it in
+    # favor of a fresh 0-based RangeIndex, so a caller doing df["x"] = map_company_master_ids(df["y"])
+    # would silently misalign by index whenever df wasn't already 0-based-contiguous
+    # (e.g. any prior row filter), scrambling which company_master_id lands on which row
+    # with no error. Plain iterables (lists, etc.) have no index to preserve and keep the
+    # old default-RangeIndex behavior.
+    original_index = tickers.index if isinstance(tickers, pd.Series) else None
+    ticker_series = pd.Series(list(tickers), dtype="string", index=original_index)
     cleaned = _clean_text_series(ticker_series)
     if cleaned.dropna().empty:
         return pd.Series(pd.NA, index=ticker_series.index, dtype="string")

@@ -47,7 +47,7 @@ def build_dim_security() -> pd.DataFrame:
         SELECT
             company_master_id,
             nse_ticker AS symbol,
-            bse_ticker,
+            cm.bse_ticker,
             company_name,
             sector_code
         FROM company_master cm

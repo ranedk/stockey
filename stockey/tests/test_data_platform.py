@@ -993,6 +993,39 @@ def test_company_master_success_path_does_not_record_fallback(monkeypatch):
     assert events == []
 
 
+def test_company_master_preserves_index_for_non_contiguous_series(monkeypatch):
+    """Regression test: map_company_master_ids() used to do list(tickers) internally,
+    discarding the caller's index in favor of a fresh 0-based RangeIndex. A caller doing
+    df["company_master_id"] = map_company_master_ids(df["symbol"], ...) on a df with a
+    non-contiguous index (e.g. any row-filtered df, which is the common case) would then
+    silently misalign by index and scramble which company_master_id lands on which row --
+    found live while building fundamentals/collectors/security_master.py, where AARNAV
+    ended up mapped to nse:ASTAR's id. No exception, no warning -- just wrong data."""
+
+    def fake_sql_to_df(*_args, **_kwargs):
+        return pd.DataFrame(
+            [
+                {"ticker": "AARNAV", "company_master_id": "nse:AARNAV"},
+                {"ticker": "AASTHA", "company_master_id": "nse:AASTHA"},
+            ]
+        )
+
+    monkeypatch.setattr(company_master_utils, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: None)
+
+    # Simulates a filtered dataframe: non-contiguous index, exactly the shape
+    # fundamentals/collectors/security_master.py's new_symbols subset has.
+    tickers = pd.Series(["AARNAV", "AASTHA"], index=[14, 22])
+
+    out = company_master_utils.map_company_master_ids(tickers, exchange="NSE")
+
+    assert list(out.index) == [14, 22]
+    df = pd.DataFrame({"symbol": tickers})
+    df["company_master_id"] = out
+    assert df.loc[14, "company_master_id"] == "nse:AARNAV"
+    assert df.loc[22, "company_master_id"] == "nse:AASTHA"
+
+
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
     calls = {"attempts": 0}
     events: list[dict[str, object]] = []
