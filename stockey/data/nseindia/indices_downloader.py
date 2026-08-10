@@ -12,6 +12,7 @@ from playwright.sync_api import sync_playwright
 from utils.fallback_telemetry import record_local_fallback_event
 from utils import store
 from utils.date import reverse_daterange
+from utils.nse_rate_limiter import nse_goto
 from utils.sync import get_redis_client
 
 try:
@@ -179,9 +180,9 @@ def download_indices_for_date(
 
     try:
         page.wait_for_timeout(get_random(2000, 5000))
-        page.goto("https://www.nseindia.com")
+        nse_goto(page, "https://www.nseindia.com")
         page.wait_for_timeout(get_random(1000, 3000))
-        page.goto("https://www.nseindia.com/all-reports")
+        nse_goto(page, "https://www.nseindia.com/all-reports")
         page.wait_for_timeout(get_random(1000, 2000))
 
         page.get_by_role("tab", name="Indices").click()

@@ -27,6 +27,7 @@ import pandas as pd
 import requests
 
 from utils.db import upsert_to_db
+from utils.nse_rate_limiter import nse_request_gate
 
 UDIFF_CUTOVER = pd.Timestamp("2024-07-08")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -158,7 +159,8 @@ def backfill_ohlcv_from_store(from_date: str, to_date: str, *, batch: int = 25, 
 def _session() -> requests.Session:
     s = requests.Session(); s.headers.update(HEADERS)
     try:
-        s.get("https://www.nseindia.com/", timeout=15)      # best-effort cookie prime (archive works w/o it)
+        with nse_request_gate():
+            s.get("https://www.nseindia.com/", timeout=15)  # best-effort cookie prime (archive works w/o it)
     except Exception:
         pass
     return s
@@ -166,12 +168,15 @@ def _session() -> requests.Session:
 
 def fetch_day(session: requests.Session, d: pd.Timestamp) -> pd.DataFrame | None:
     """Download + parse one day's bhavcopy, picking the right format for the date and falling back to the
-    other on a miss. Returns None for holidays / genuinely absent days."""
+    other on a miss. Returns None for holidays / genuinely absent days. Each candidate URL goes through the
+    shared cross-process NSE rate gate -- this loops over many days for a backfill, and nsearchives.nseindia.com
+    sits behind the same anti-bot protection as the main site."""
     pairs = ([(_oldcm_url, parse_oldcm), (_udiff_url, parse_udiff)] if d < UDIFF_CUTOVER
              else [(_udiff_url, parse_udiff), (_oldcm_url, parse_oldcm)])
     for url_fn, parser in pairs:
         try:
-            r = session.get(url_fn(d), timeout=30)
+            with nse_request_gate():
+                r = session.get(url_fn(d), timeout=30)
             if r.status_code == 200 and r.content[:2] == b"PK":
                 return parser(_extract_csv(r.content))
         except Exception:

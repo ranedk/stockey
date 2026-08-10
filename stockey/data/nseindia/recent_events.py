@@ -12,6 +12,7 @@ from utils.fallback_telemetry import record_local_fallback_event
 from utils.sync_state import persist_sync_state
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
+from utils.nse_rate_limiter import nse_goto
 from utils.sync import get_redis_client
 
 
@@ -82,9 +83,9 @@ def dowload_events(
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()
 
-    page.goto("https://www.nseindia.com")
+    nse_goto(page, "https://www.nseindia.com")
     page.wait_for_timeout(get_random(1000, 3000))
-    page.goto('https://www.nseindia.com/companies-listing/corporate-filings-event-calendar')
+    nse_goto(page, 'https://www.nseindia.com/companies-listing/corporate-filings-event-calendar')
     page.wait_for_timeout(get_random(8000, 10000))
 
     with page.expect_download(timeout=5_000) as download_info:

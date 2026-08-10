@@ -162,6 +162,15 @@ python scripts/docs_state_audit.py --strict
   without checking the cost — one prior collector ran full browser automation
   daily against a 2-symbol placeholder list for a year with zero value; a
   wider scope on a slow per-symbol scraper can mean thousands of daily calls.
+- Do not call `page.goto()` (or `requests.get()`) against nseindia.com /
+  nsearchives.nseindia.com directly from a new collector. NSE's Akamai WAF blocks
+  fast on request rate (2026-08-09/10 incident) and now effectively requires a
+  real browser — route every navigation through `utils/nse_rate_limiter.py`'s
+  `nse_goto(page, url)` (or `nse_request_gate()` for plain `requests` calls). It
+  enforces a cross-process floor (`NSE_MIN_REQUEST_INTERVAL_SECONDS`, default
+  10s) and serializes so no two processes ever have an NSE request in flight at
+  once — bypassing it for "just this one call" defeats the whole point, since
+  the WAF scores the domain's total request rate, not per-script.
 
 ## Boundary with systrader (2026-07-27, migration completed 2026-08-05)
 

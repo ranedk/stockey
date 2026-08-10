@@ -11,6 +11,7 @@ from utils.fallback_telemetry import record_local_fallback_event
 from utils.ingestion_state import get_failed_entries
 from utils import store
 from utils.date import reverse_daterange
+from utils.nse_rate_limiter import nse_goto
 from utils.sync import get_redis_client, filter_missing_date_members
 
 env = Env()
@@ -79,9 +80,9 @@ def download_bhavcopy_for_date(
 
     try:
         page.wait_for_timeout(get_random(2000, 5000))
-        page.goto("https://www.nseindia.com")
+        nse_goto(page, "https://www.nseindia.com")
         page.wait_for_timeout(get_random(1000, 3000))
-        page.goto("https://www.nseindia.com/all-reports")
+        nse_goto(page, "https://www.nseindia.com/all-reports")
         page.wait_for_timeout(get_random(1000, 2000))
 
         page.get_by_role("tab", name="Archives").click()

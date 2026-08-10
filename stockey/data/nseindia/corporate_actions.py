@@ -13,6 +13,7 @@ from utils.sync_state import persist_sync_state
 from data.dhanlive.dhan_db import get_nse_equity
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
+from utils.nse_rate_limiter import nse_goto
 from utils.sync import choose_from_date, get_db_max_date, get_redis_client, get_redis_cursor, load_tracked_symbols, normalize_date_window, parse_datetime_arg, set_redis_cursor
 
 env = Env()
@@ -31,7 +32,7 @@ def get_random(min_ms: int, max_ms: int) -> int:
 
 
 def fetch_corporate_actions(page, symbol: str, issuer: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
-    page.goto("https://www.nseindia.com/companies-listing/corporate-filings-actions")
+    nse_goto(page, "https://www.nseindia.com/companies-listing/corporate-filings-actions")
     page.wait_for_timeout(get_random(1000, 2000))
 
     params = {
@@ -118,7 +119,7 @@ def sync_corporate_actions(symbols: List[str], from_date: datetime | None = None
                         continue
 
                     if counter % 10 == 0:
-                        page.goto("https://www.nseindia.com")
+                        nse_goto(page, "https://www.nseindia.com")
                         page.wait_for_timeout(get_random(1000, 3000))
 
                     df = fetch_corporate_actions(page, symbol, issuer, effective_from_date, to_date)

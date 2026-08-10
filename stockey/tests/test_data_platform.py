@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import shlex
@@ -44,6 +45,7 @@ from utils import redaction
 from utils import redis_bkp_restore
 from utils.ocr import llm_ocr
 from utils import poppler as poppler_utils
+from utils import nse_rate_limiter
 from utils import redis_utils
 from utils import sync as sync_utils
 
@@ -2603,6 +2605,7 @@ def test_indices_downloader_confirmed_gap_reconciliation():
 
 def test_indices_downloader_empty_download_is_not_persisted_and_retries(monkeypatch, tmp_path):
     """A 0-byte download must never be saved (it would look downloaded forever) and must be retried."""
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
     saved: list[str] = []
     monkeypatch.setattr(indices_downloader.store, "save_file", lambda **kw: saved.append(kw))
 
@@ -4679,6 +4682,7 @@ def test_nse_offmarket_exports_retry_run_state(monkeypatch):
 
 
 def test_nse_offmarket_records_download_failure_fallback(monkeypatch):
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
     events: list[dict[str, object]] = []
 
     class FakePage:
@@ -5059,6 +5063,87 @@ def test_bhavcopy_downloader_total_failure_reports_source_unavailable(monkeypatc
     assert state["failed_attempt_count"] == 2
     printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert printed["status"] == "source_unavailable"
+
+
+def test_nse_request_gate_sleeps_out_the_remaining_interval(monkeypatch, tmp_path):
+    lock_path = tmp_path / "gate.lock"
+    timestamp_path = tmp_path / "last_request_at"
+    timestamp_path.write_text(repr(1000.0), encoding="utf-8")  # "last request" at t=1000
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(nse_rate_limiter.time, "time", lambda: 1004.0)  # "now" -- 4s since last request
+
+    with nse_rate_limiter.nse_request_gate(
+        lock_path=lock_path, timestamp_path=timestamp_path, min_interval_seconds=10.0
+    ):
+        pass
+
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(6.0)  # 10s floor - 4s already elapsed
+    assert timestamp_path.read_text(encoding="utf-8") == repr(1004.0)  # stamped at request time, not entry time
+
+
+def test_nse_request_gate_skips_sleep_once_interval_already_elapsed(monkeypatch, tmp_path):
+    lock_path = tmp_path / "gate.lock"
+    timestamp_path = tmp_path / "last_request_at"
+    timestamp_path.write_text(repr(1000.0), encoding="utf-8")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(nse_rate_limiter.time, "time", lambda: 1015.0)  # 15s since last request, > 10s floor
+
+    with nse_rate_limiter.nse_request_gate(
+        lock_path=lock_path, timestamp_path=timestamp_path, min_interval_seconds=10.0
+    ):
+        pass
+
+    assert sleeps == []
+
+
+def test_nse_request_gate_first_ever_request_does_not_sleep(monkeypatch, tmp_path):
+    lock_path = tmp_path / "gate.lock"
+    timestamp_path = tmp_path / "last_request_at"  # no prior timestamp file at all
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with nse_rate_limiter.nse_request_gate(lock_path=lock_path, timestamp_path=timestamp_path):
+        pass
+
+    assert sleeps == []
+    assert timestamp_path.exists()
+
+
+def test_nse_request_gate_times_out_when_another_process_holds_it(tmp_path):
+    lock_path = tmp_path / "gate.lock"
+    holder = open(lock_path, "a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)  # simulate another process mid-request
+    try:
+        with pytest.raises(TimeoutError, match="Timed out"):
+            with nse_rate_limiter.nse_request_gate(lock_path=lock_path, timeout_seconds=0.2):
+                pass
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+
+
+def test_nse_goto_calls_page_goto_through_the_gate(monkeypatch, tmp_path):
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(nse_rate_limiter, "DEFAULT_LOCK_PATH", tmp_path / "gate.lock")
+    monkeypatch.setattr(nse_rate_limiter, "DEFAULT_TIMESTAMP_PATH", tmp_path / "last_request_at")
+
+    calls: list[tuple[str, dict]] = []
+
+    class FakePage:
+        def goto(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return "response"
+
+    result = nse_rate_limiter.nse_goto(FakePage(), "https://www.nseindia.com", timeout=15000)
+
+    assert result == "response"
+    assert calls == [("https://www.nseindia.com", {"timeout": 15000})]
 
 
 def test_bhavcopy_downloader_records_download_failure_fallback(monkeypatch):
@@ -5843,6 +5928,7 @@ def test_sharpely_data_main_exports_runner_state(monkeypatch, capsys):
 
 
 def test_nse_corporate_actions_sync_returns_standard_run_state(monkeypatch):
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
     persisted: list[dict[str, object]] = []
     upserts: list[pd.DataFrame] = []
     cursors: list[tuple[str, object]] = []
@@ -7222,6 +7308,7 @@ def test_nse_holidays_exports_source_unavailable_state(monkeypatch):
 def test_nse_holidays_records_unknown_segment_fallback(monkeypatch):
     from data.nseindia import holidays as nse_holidays
 
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
     events: list[dict[str, object]] = []
     captured: dict[str, object] = {}
 
@@ -7290,6 +7377,7 @@ def test_nse_holidays_records_unknown_segment_fallback(monkeypatch):
 def test_nse_holidays_records_generic_download_failure(monkeypatch):
     from data.nseindia import holidays as nse_holidays
 
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
     events: list[dict[str, object]] = []
 
     class FakePage:
