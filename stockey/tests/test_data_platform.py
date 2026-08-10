@@ -42,6 +42,7 @@ from fundamentals.collectors import security_master as fundamentals_security_mas
 from fundamentals.collectors import screenerin as fundamentals_screenerin
 from fundamentals.screens import l1_universe as fundamentals_l1_universe
 from fundamentals.screens import l2_state as fundamentals_l2_state
+from fundamentals.collectors import bse_announcements as fundamentals_bse_announcements
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8814,3 +8815,253 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
     assert result == {"rows": 0, "failed_companies": [], "checks_deferred": list(fundamentals_l2_state.DEFERRED_FIELDS), "companies": []}
     assert upserts == []
     assert any(e["fallback_type"] == "l2_no_l1_universe" for e in fallback_events)
+
+
+# fundamentals/collectors/bse_announcements.py -- L3 detection, BSE half (step 5).
+
+
+@pytest.mark.parametrize(
+    "subcategory,headline,expected",
+    [
+        ("Insider Trading / SAST-Trading Window", "Closure of trading window", "pit_sast"),
+        # Real SUBCATNAME, captured live 2026-08-10 against actual BSE announcement
+        # history -- no "insider"/"sast" substring at all; the first classifier draft
+        # missed this (see PIT_SAST_KEYWORDS' comment).
+        ("Closure of Trading Window", "Intimation for closure of trading window", "pit_sast"),
+        (None, "Disclosure under Regulation 29(2) of SEBI (SAST) Regulations", "pit_sast"),
+        ("Credit Rating", "Rating action by CRISIL Ratings", "rating_action"),
+        (None, "ICRA has revised the rating outlook", "rating_action"),
+        ("Financial Results", "Board approves financial results for Q1 FY27", "results"),
+        ("AGM/EGM", "Notice of Annual General Meeting", "other"),
+        (None, "Earnings call transcript uploaded", "other"),
+        # Real (subcategory, headline) pair, captured live 2026-08-10: a routine
+        # newspaper-ad filing whose headline happens to mention "Financial Results" --
+        # must NOT be classified as an actual results announcement (see
+        # classify_announcement's docstring on why "results" has no headline fallback).
+        ("Newspaper Publication", "Newspaper Publication of the Unaudited Financial Results", "other"),
+    ],
+)
+def test_classify_announcement(subcategory, headline, expected):
+    assert fundamentals_bse_announcements.classify_announcement(subcategory, headline) == expected
+
+
+def test_build_announcement_row_returns_none_for_uninteresting_filings():
+    raw = {"SUBCATNAME": "AGM/EGM", "HEADLINE": "Notice of AGM", "NEWSID": "abc-1"}
+    assert fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", raw) is None
+
+
+def test_build_announcement_row_builds_expected_fields_for_pit_sast():
+    raw = {
+        "NEWSID": "abc-123",
+        "SUBCATNAME": "Insider Trading / SAST-Trading Window",
+        "HEADLINE": "Closure of trading window",
+        "DissemDT": "2026-08-01T10:15:00.00",
+        "ATTACHMENTNAME": "somefile.pdf",
+        "NSURL": "https://www.bseindia.com/stock-share-price/x/y/524412/",
+    }
+    row = fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", raw)
+    assert row["source"] == "bse"
+    assert row["news_id"] == "abc-123"
+    assert row["scrip_code"] == "524412"
+    assert row["company_master_id"] == "nse:AAREYDRUGS"
+    assert row["filing_type"] == "pit_sast"
+    assert row["headline"] == "Closure of trading window"
+    assert row["disclosure_date"] == pd.Timestamp("2026-08-01T10:15:00", tz="UTC").date()
+    assert row["attachment_name"] == "somefile.pdf"
+    assert row["detection_source"] == "bse_announcements"
+    assert row["enrichment_status"] == "pending"
+    assert json.loads(row["raw_json"]) == raw
+
+
+def test_build_announcement_row_handles_missing_timestamp_gracefully():
+    raw = {"NEWSID": "abc-2", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}
+    row = fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", raw)
+    assert row["disclosure_date"] is None
+    assert row["announcement_timestamp"] is None
+
+
+def test_build_result_calendar_row_parses_meeting_date():
+    raw = {"scrip_Code": "524412", "meeting_date": "23 Oct 2026", "URL": "https://example.com"}
+    row = fundamentals_bse_announcements.build_result_calendar_row("524412", "nse:AAREYDRUGS", raw)
+    assert row["filing_type"] == "results_calendar"
+    assert row["disclosure_date"] == date(2026, 10, 23)
+    assert row["news_id"] == "resultcal:524412:23 Oct 2026"
+    assert row["detection_source"] == "bse_result_calendar"
+
+
+def test_build_result_calendar_row_handles_unparseable_date():
+    raw = {"scrip_Code": "524412", "meeting_date": "garbage-date", "URL": "https://example.com"}
+    row = fundamentals_bse_announcements.build_result_calendar_row("524412", "nse:AAREYDRUGS", raw)
+    assert row["disclosure_date"] is None
+
+
+def test_resolve_company_identity_joins_on_ticker_and_preserves_index(monkeypatch):
+    tickers = pd.Series(["AAREYDRUGS", "UNKNOWNTICKER"], index=[5, 9])
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "map_company_master_ids",
+        lambda series, **k: pd.Series(["nse:AAREYDRUGS", pd.NA], index=series.index, dtype="string"),
+    )
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "sql_to_df",
+        lambda *_a, **_k: pd.DataFrame({"company_master_id": ["nse:AAREYDRUGS"], "bse_scrip_code": ["524412"]}),
+    )
+
+    result = fundamentals_bse_announcements.resolve_company_identity(tickers)
+
+    assert list(result.index) == [5, 9]
+    assert result.loc[5, "bse_scrip_code"] == "524412"
+    assert pd.isna(result.loc[9, "bse_scrip_code"])
+
+
+def _bse_universe_df(n=3):
+    return pd.DataFrame(
+        {
+            "company_id": list(range(1, n + 1)),
+            "company_name": [f"Company {i}" for i in range(1, n + 1)],
+            "ticker": [f"TICK{i}" for i in range(1, n + 1)],
+        }
+    )
+
+
+def _bse_identity_df(tickers, scrip_codes):
+    return pd.DataFrame(
+        {"company_master_id": [f"nse:{t}" for t in tickers], "bse_scrip_code": scrip_codes},
+        index=tickers.index,
+    )
+
+
+def test_run_bse_l3_detection_happy_path_upserts_announcements_and_calendar(monkeypatch):
+    universe = _bse_universe_df(2)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_company_identity",
+        lambda tickers: _bse_identity_df(tickers, ["111111", "222222"]),
+    )
+
+    interesting_raw = {"NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [interesting_raw])
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "fetch_result_calendar",
+        lambda: [{"scrip_Code": "111111", "meeting_date": "23 Oct 2026", "URL": "https://x"}],
+    )
+
+    upserts = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert result["companies_scanned"] == 2
+    assert result["announcement_rows"] == 2  # one per company
+    assert result["result_calendar_rows"] == 1  # only scrip 111111 matched the universe
+    assert result["blocked"] is False
+    assert result["failed_companies"] == []
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_bse_announcements.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["source", "news_id"]
+    assert len(df) == 3
+
+
+def test_run_bse_l3_detection_trips_circuit_breaker_after_consecutive_failures(monkeypatch):
+    universe = _bse_universe_df(5)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_company_identity",
+        lambda tickers: _bse_identity_df(tickers, ["1", "2", "3", "4", "5"]),
+    )
+
+    def always_fails(scrip, **k):
+        raise fundamentals_bse_announcements.BseBlockedError("HTTP 403")
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", always_fails)
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert result["blocked"] is True
+    # stopped after CIRCUIT_BREAKER_THRESHOLD consecutive failures, not all 5 companies
+    assert len(result["failed_companies"]) == fundamentals_bse_announcements.CIRCUIT_BREAKER_THRESHOLD
+    assert result["companies_scanned"] == 0
+    assert any(e["fallback_type"] == "l3_bse_circuit_breaker_tripped" for e in fallback_events)
+    # a tripped breaker must not then go on to call the result-calendar endpoint either
+    assert result["result_calendar_rows"] == 0
+
+
+def test_run_bse_l3_detection_resets_failure_streak_on_a_success(monkeypatch):
+    universe = _bse_universe_df(4)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_company_identity",
+        lambda tickers: _bse_identity_df(tickers, ["1", "2", "3", "4"]),
+    )
+
+    call_log = []
+
+    def flaky_fetch(scrip, **k):
+        call_log.append(scrip)
+        # fail, fail, succeed, fail -- never CIRCUIT_BREAKER_THRESHOLD (3) in a row
+        if scrip in ("1", "2", "4"):
+            raise fundamentals_bse_announcements.BseBlockedError("boom")
+        return []
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", flaky_fetch)
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert call_log == ["1", "2", "3", "4"]  # ran through the whole universe
+    assert result["blocked"] is False
+    assert result["companies_scanned"] == 1
+    assert result["failed_companies"] == ["TICK1", "TICK2", "TICK4"]
+
+
+def test_run_bse_l3_detection_skips_companies_with_no_bse_scrip_code(monkeypatch):
+    universe = _bse_universe_df(2)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_company_identity",
+        lambda tickers: _bse_identity_df(tickers, ["111111", pd.NA]),
+    )
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert result["companies_total"] == 1  # TICK2 dropped for missing scrip code
+    assert any(e["fallback_type"] == "l3_bse_scrip_code_missing" for e in fallback_events)
+
+
+def test_run_bse_l3_detection_returns_early_on_empty_universe(monkeypatch):
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: pd.DataFrame())
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+    assert any(e["fallback_type"] == "l3_bse_no_l1_universe" for e in fallback_events)

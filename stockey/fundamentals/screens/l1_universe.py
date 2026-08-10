@@ -59,7 +59,7 @@ import json
 import pandas as pd
 
 from fundamentals.collectors.screenerin import build_authenticated_session, run_query
-from utils.db import upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
 SYNC_SOURCE_NAME = "fundamentals.screens.l1_universe"
@@ -140,6 +140,22 @@ def run_l1_universe_refresh(session=None) -> dict[str, object]:
         "checks_deferred": list(DEFERRED_CHECKS),
         "companies": [c["name"] for c in companies][:20],
     }
+
+
+def load_l1_universe_tickers() -> pd.DataFrame:
+    """The latest L1 refresh's (company_id, company_name, ticker) rows -- shared reader
+    for downstream steps (L2 state, L3 feeds) that need "which companies are we
+    watching", not the full query-result metrics blob. Ticker here is the NSE symbol
+    (screener.in's own ticker slug), the same identity callers already resolve to
+    company_master via utils.company_master.map_company_master_ids(..., exchange="NSE")."""
+    return sql_to_df(
+        """
+        SELECT company_id, company_name, ticker
+        FROM fundamentals_l1_universe
+        WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
+        ORDER BY company_id
+        """
+    )
 
 
 def main() -> int:

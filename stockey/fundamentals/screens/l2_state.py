@@ -70,7 +70,8 @@ from bs4 import BeautifulSoup
 
 from fundamentals.collectors.screenerin import build_authenticated_session, clean_text, run_query
 from fundamentals.collectors.screenerin import to_number as _screenerin_to_number
-from utils.db import sql_to_df, upsert_to_db
+from fundamentals.screens.l1_universe import load_l1_universe_tickers
+from utils.db import upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -261,14 +262,7 @@ def fetch_company_detail(session, ticker: str) -> dict[str, object]:
 
 
 def load_l1_universe() -> pd.DataFrame:
-    return sql_to_df(
-        """
-        SELECT company_id, company_name, ticker
-        FROM fundamentals_l1_universe
-        WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
-        ORDER BY company_id
-        """
-    )
+    return load_l1_universe_tickers()
 
 
 def build_l2_state_row(company: dict[str, object], pledge_levels: dict[int, float], detail: dict[str, object]) -> dict[str, object]:
