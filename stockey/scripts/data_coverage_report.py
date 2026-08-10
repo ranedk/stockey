@@ -65,7 +65,13 @@ TABLES: list[tuple[str, str | None, str | None, str, str]] = [
     ("nseindia_52wk", "date", "symbol", "daily", "NSE bhavcopy"),
     ("nseindia_cmvolt", "date", "symbol", "daily", "NSE bhavcopy"),
     ("nseindia_circuit_hit", "date", "symbol", "informational", "NSE bhavcopy"),
-    ("nseindia_cat_turnover", "trade_date", None, "daily", "NSE bhavcopy"),
+    # NSE bundles cat_turnover_*.xls (and Margintrdg_*.zip) into the bhavcopy archive
+    # intermittently, not every trading day -- confirmed 2026-08-10 by diffing the actual
+    # zip contents of two ordinary trading days (2026-07-15: 22 files, no cat_turnover;
+    # 2026-07-24: 24 files, cat_turnover present). Coverage also dropped from ~95-100%
+    # (2025) to ~30% (2026-04 onward) -- a real change in NSE's publishing pattern, not a
+    # parser regression. "daily" here was alerting on a source that was never daily.
+    ("nseindia_cat_turnover", "trade_date", None, "informational", "NSE bhavcopy"),
     ("nseindia_catg", None, "symbol", "informational", "NSE bhavcopy"),
     ("nseindia_var1", "for_date", "symbol", "daily", "NSE bhavcopy"),
     ("nseindia_short_selling", "date", "symbol", "informational", "NSE bhavcopy"),

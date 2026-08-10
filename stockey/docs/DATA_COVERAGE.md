@@ -111,11 +111,17 @@ yesterday is already captured. Now always requests a >=1-day window.
   publishing the disclosure.
 - `nseindia_var1`'s large symbol count — legitimate breadth (equity + bonds +
   SME + govt securities + MF units), verified via series-code breakdown.
-- `nseindia_cat_turnover` occasionally lagging — its source is a separate NSE
-  Excel workbook the parser already treats as "occasionally corrupt at
-  source" (see `data/nseindia/bhavcopy_parser.py`'s `soft_error_substrings`
-  handling); a multi-day gap is more likely a run of bad source files than a
-  code bug, but worth watching via the daily report if it doesn't self-heal.
+- `nseindia_cat_turnover` gaps — **corrected 2026-08-10.** Not "occasionally
+  corrupt" — NSE simply doesn't include `cat_turnover_*.xls` (and
+  `Margintrdg_*.zip`, always the same pair) in the bhavcopy archive every
+  trading day. Confirmed by diffing the actual zip contents of two ordinary
+  2026-07 trading days: one had 22 files (no cat_turnover), the other 24
+  (with it) — no error, no corruption, the file just wasn't generated that
+  day. Coverage also genuinely dropped: ~95-100% through 2025, ~30% from
+  2026-04 onward (real shift in NSE's publishing cadence, not a parser
+  regression). `data_coverage_report.py` reclassified it "informational"
+  (like `nseindia_short_selling`) instead of "daily" — it was alerting on a
+  source that was never actually daily.
 
 ## Still open (not resolved by this pass)
 
