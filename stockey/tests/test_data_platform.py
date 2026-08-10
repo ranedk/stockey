@@ -38,6 +38,7 @@ from data.sharpelydata import sharpely_data
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
+from fundamentals.collectors import screenerin as fundamentals_screenerin
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8320,4 +8321,187 @@ def test_copy_bse_scrip_code_from_ticker_skips_when_nothing_eligible(monkeypatch
     monkeypatch.setattr(fundamentals_security_master, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
 
     assert fundamentals_security_master.copy_bse_scrip_code_from_ticker() == 0
+    assert upserts == []
+
+
+# fundamentals/collectors/screenerin.py -- deleveraging screen (step 2).
+
+SCREENERIN_FIXTURE_HTML = """
+<div data-page-results><table>
+<tr>
+<th><a>S.No.</a></th>
+<th><a>Name</a></th>
+<th><a>CMP<span>Rs.</span></a></th>
+<th><a>Mar Cap<span>Rs.Cr.</span></a></th>
+<th><a>ROCE<span>%</span></a></th>
+</tr>
+<tr data-row-company-id="3163">
+<td class="text">1.</td>
+<td class="text"><a href="/company/AQYLON/" target="_blank">Aqylon Nexus</a></td>
+<td>26.68</td><td>676.20</td><td>131.18</td>
+</tr>
+<tr data-row-company-id="1274762">
+<td class="text">2.</td>
+<td class="text"><a href="/company/KSOLVES/" target="_blank">Ksolves India</a></td>
+<td>277.25</td><td>652.52</td><td>127.40</td>
+</tr>
+</table></div>
+"""
+
+
+def test_parse_screener_results_parses_header_and_rows():
+    # Structurally-minimal but real fixture (captured live 2026-08-10 against a plain
+    # market-cap/volume query, trimmed of screener.in's per-column sort-link/tooltip
+    # markup which parse_screener_results ignores).
+    results = fundamentals_screenerin.parse_screener_results(SCREENERIN_FIXTURE_HTML)
+    assert results == [
+        {
+            "company_id": 3163,
+            "name": "Aqylon Nexus",
+            "url": "/company/AQYLON/",
+            "ticker": "AQYLON",
+            "metrics": {"cmp_rs": 26.68, "mar_cap_rscr": 676.2, "roce_pct": 131.18},
+        },
+        {
+            "company_id": 1274762,
+            "name": "Ksolves India",
+            "url": "/company/KSOLVES/",
+            "ticker": "KSOLVES",
+            "metrics": {"cmp_rs": 277.25, "mar_cap_rscr": 652.52, "roce_pct": 127.4},
+        },
+    ]
+
+
+def test_parse_screener_results_raises_when_table_missing():
+    with pytest.raises(ValueError):
+        fundamentals_screenerin.parse_screener_results("<div>no results table here</div>")
+
+
+def test_parse_screener_results_skips_rows_without_company_id():
+    html = """
+    <div data-page-results><table>
+    <tr><th><a>Name</a></th></tr>
+    <tr><td>not a data row</td></tr>
+    </table></div>
+    """
+    assert fundamentals_screenerin.parse_screener_results(html) == []
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("1,234", 1234),
+        ("26.68", 26.68),
+        ("-5.5", -5.5),
+        ("-", None),
+        ("--", None),
+        ("NA", None),
+        ("N/A", None),
+        (None, None),
+        ("  42  ", 42),
+    ],
+)
+def test_to_number_parses_screener_value_formats(raw, expected):
+    assert fundamentals_screenerin.to_number(raw) == expected
+
+
+def test_metric_key_normalizes_labels():
+    assert fundamentals_screenerin._metric_key("Mar Cap") == "mar_cap"
+    assert fundamentals_screenerin._metric_key("ROCE %") == "roce_pct"
+    assert fundamentals_screenerin._metric_key("Qtr Profit Var") == "qtr_profit_var"
+    assert fundamentals_screenerin._metric_key("P/E") == "p_e"
+
+
+def test_run_query_stops_after_a_short_final_page(monkeypatch):
+    # page_size=2 for pages 1-2, page 3 comes back short (1 row) -- must fetch page 3
+    # then stop, not loop forever or drop the short page.
+    pages = {
+        1: ("url?page=1", [{"company_id": 1}, {"company_id": 2}]),
+        2: ("url?page=2", [{"company_id": 3}, {"company_id": 4}]),
+        3: ("url?page=3", [{"company_id": 5}]),
+    }
+    calls = []
+
+    def fake_fetch(session, query_text, *, page):
+        calls.append(page)
+        return pages[page]
+
+    monkeypatch.setattr(fundamentals_screenerin, "_fetch_query_page", fake_fetch)
+
+    first_url, companies = fundamentals_screenerin.run_query(object(), "some query")
+
+    assert calls == [1, 2, 3]
+    assert first_url == "url?page=1"
+    assert [c["company_id"] for c in companies] == [1, 2, 3, 4, 5]
+
+
+def test_run_query_small_first_page_fetches_one_confirming_empty_page(monkeypatch):
+    # run_query has no fixed page-size constant to compare against (screener.in's real
+    # limit, 50, is never hardcoded) -- it infers "full page" from len(first_page), so
+    # a first page smaller than the true limit still triggers one extra page fetch to
+    # confirm there's nothing more. That confirming page must come back empty and the
+    # loop must stop there, not treat "still short" as "keep going".
+    pages = {1: ("url?page=1", [{"company_id": 1}]), 2: ("url?page=2", [])}
+    calls = []
+
+    def fake_fetch(session, query_text, *, page):
+        calls.append(page)
+        return pages[page]
+
+    monkeypatch.setattr(fundamentals_screenerin, "_fetch_query_page", fake_fetch)
+
+    _, companies = fundamentals_screenerin.run_query(object(), "some query")
+
+    assert calls == [1, 2]
+    assert [c["company_id"] for c in companies] == [1]
+
+
+def test_run_query_zero_results_does_not_fetch_a_second_page(monkeypatch):
+    calls = []
+
+    def fake_fetch(session, query_text, *, page):
+        calls.append(page)
+        return "url?page=1", []
+
+    monkeypatch.setattr(fundamentals_screenerin, "_fetch_query_page", fake_fetch)
+
+    _, companies = fundamentals_screenerin.run_query(object(), "some query")
+
+    assert calls == [1]
+    assert companies == []
+
+
+def test_run_deleveraging_screen_upserts_and_summarizes(monkeypatch):
+    companies = [
+        {"company_id": 1274762, "name": "Ksolves India", "ticker": "KSOLVES", "url": "/company/KSOLVES/", "metrics": {"mar_cap_rscr": 652.52}},
+        {"company_id": 3163, "name": "Aqylon Nexus", "ticker": "AQYLON", "url": "/company/AQYLON/", "metrics": {"mar_cap_rscr": 676.2}},
+    ]
+    monkeypatch.setattr(fundamentals_screenerin, "run_query", lambda session, query_text: ("screener_url", companies))
+
+    upserts = []
+    monkeypatch.setattr(fundamentals_screenerin, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_screenerin.run_deleveraging_screen(session=object())
+
+    assert result == {
+        "query_name": "deleveraging",
+        "rows": 2,
+        "companies": ["Ksolves India", "Aqylon Nexus"],
+    }
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_screenerin.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["query_name", "run_date", "company_id"]
+    assert set(df["company_id"]) == {1274762, 3163}
+    assert json.loads(df.iloc[0]["metrics_json"]) == companies[0]["metrics"]
+
+
+def test_run_deleveraging_screen_skips_upsert_when_no_results(monkeypatch):
+    monkeypatch.setattr(fundamentals_screenerin, "run_query", lambda session, query_text: ("screener_url", []))
+    upserts = []
+    monkeypatch.setattr(fundamentals_screenerin, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
+
+    result = fundamentals_screenerin.run_deleveraging_screen(session=object())
+
+    assert result == {"query_name": "deleveraging", "rows": 0, "companies": []}
     assert upserts == []
