@@ -59,10 +59,11 @@ import pandas as pd
 import requests
 from environs import Env
 
+from fundamentals.collectors.events_store import RESULTS_TABLE, resolve_isin, upsert_events_with_dedup
 from fundamentals.collectors.security_master import BSE_HEADERS
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
 from utils.company_master import map_company_master_ids
-from utils.db import sql_to_df, upsert_to_db
+from utils.db import sql_to_df
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -75,7 +76,6 @@ ANNOUNCEMENTS_URL = f"{BSE_API_BASE}/AnnSubCategoryGetData/w"
 RESULT_CALENDAR_URL = f"{BSE_API_BASE}/Corpforthresults/w"
 
 SYNC_SOURCE_NAME = "fundamentals.collectors.bse_announcements"
-RESULTS_TABLE = "fundamentals_events"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 LOOKBACK_DAYS = env.int("BSE_ANNOUNCEMENTS_LOOKBACK_DAYS", 7)
@@ -170,10 +170,11 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
 
 def resolve_company_identity(tickers: pd.Series) -> pd.DataFrame:
     """NSE ticker (as stored in fundamentals_l1_universe) -> (company_master_id,
-    bse_scrip_code), via company_master -- reuses the step-0 backfill
-    (fundamentals/collectors/security_master.py) rather than looking scrip codes up
-    again here. Returns a DataFrame indexed like `tickers`, so callers can `.join()` it
-    straight onto their own frame."""
+    bse_scrip_code, isin), via company_master/dim_security -- reuses the step-0
+    backfill (fundamentals/collectors/security_master.py) rather than looking scrip
+    codes up again here, and fundamentals.collectors.events_store.resolve_isin for the
+    cross-source dedup key. Returns a DataFrame indexed like `tickers`, so callers can
+    `.join()` it straight onto their own frame."""
     company_master_ids = map_company_master_ids(tickers, exchange="NSE")
     lookup_df = sql_to_df("SELECT company_master_id, bse_scrip_code FROM company_master WHERE bse_scrip_code IS NOT NULL")
     scrip_by_company_master_id = dict(zip(lookup_df["company_master_id"], lookup_df["bse_scrip_code"]))
@@ -181,6 +182,7 @@ def resolve_company_identity(tickers: pd.Series) -> pd.DataFrame:
         {
             "company_master_id": company_master_ids,
             "bse_scrip_code": company_master_ids.map(scrip_by_company_master_id),
+            "isin": resolve_isin(company_master_ids),
         },
         index=tickers.index,
     )
@@ -238,7 +240,7 @@ def _parse_bse_timestamp(value: str | None):
         return None
 
 
-def build_announcement_row(scrip_code: str, company_master_id: str, raw: dict) -> dict | None:
+def build_announcement_row(scrip_code: str, company_master_id: str, isin: str | None, raw: dict) -> dict | None:
     filing_type = classify_announcement(raw.get("SUBCATNAME"), raw.get("HEADLINE") or raw.get("NEWSSUB"))
     if filing_type == "other":
         return None
@@ -248,20 +250,29 @@ def build_announcement_row(scrip_code: str, company_master_id: str, raw: dict) -
         "news_id": str(raw.get("NEWSID")),
         "scrip_code": scrip_code,
         "company_master_id": company_master_id,
+        "isin": isin,
         "filing_type": filing_type,
         "headline": raw.get("HEADLINE") or raw.get("NEWSSUB"),
         "subcategory": raw.get("SUBCATNAME"),
         "disclosure_date": disclosure_ts.date() if disclosure_ts is not None else None,
         "announcement_timestamp": disclosure_ts,
+        # BSE's announcement text never carries structured PIT fields (see
+        # fundamentals/collectors/events_store.py) -- left NULL here so a later NSE
+        # corporates-pit row for the same disclosure can fill them in via merge.
+        "quantity": None,
+        "insider_name": None,
+        "transaction_type": None,
         "attachment_name": raw.get("ATTACHMENTNAME"),
         "detail_url": raw.get("NSURL"),
         "detection_source": "bse_announcements",
         "enrichment_status": "pending",
+        "sources": "bse",
         "raw_json": json.dumps(raw, ensure_ascii=False, default=str),
+        "load_ts": pd.Timestamp.now(tz="UTC"),
     }
 
 
-def build_result_calendar_row(scrip_code: str, company_master_id: str, raw: dict) -> dict | None:
+def build_result_calendar_row(scrip_code: str, company_master_id: str, isin: str | None, raw: dict) -> dict | None:
     meeting_date = raw.get("meeting_date")
     parsed_date = None
     if meeting_date:
@@ -274,16 +285,22 @@ def build_result_calendar_row(scrip_code: str, company_master_id: str, raw: dict
         "news_id": f"resultcal:{scrip_code}:{meeting_date}",
         "scrip_code": scrip_code,
         "company_master_id": company_master_id,
+        "isin": isin,
         "filing_type": "results_calendar",
         "headline": f"Expected results announcement around {meeting_date}" if meeting_date else "Expected results announcement",
         "subcategory": None,
         "disclosure_date": parsed_date,
         "announcement_timestamp": None,
+        "quantity": None,
+        "insider_name": None,
+        "transaction_type": None,
         "attachment_name": None,
         "detail_url": raw.get("URL"),
         "detection_source": "bse_result_calendar",
         "enrichment_status": "pending",
+        "sources": "bse",
         "raw_json": json.dumps(raw, ensure_ascii=False, default=str),
+        "load_ts": pd.Timestamp.now(tz="UTC"),
     }
 
 
@@ -322,6 +339,7 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
     for _, company in universe.iterrows():
         scrip_code = str(int(company["bse_scrip_code"]))
         company_master_id = company["company_master_id"]
+        isin = company["isin"] if pd.notna(company.get("isin")) else None
         try:
             raw_rows = fetch_company_announcements(scrip_code, from_date=from_date, to_date=to_date)
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
@@ -352,20 +370,24 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
         consecutive_failures = 0
         companies_scanned += 1
         for raw in raw_rows:
-            row = build_announcement_row(scrip_code, company_master_id, raw)
+            row = build_announcement_row(scrip_code, company_master_id, isin, raw)
             if row is not None:
                 rows.append(row)
 
     result_calendar_rows: list[dict] = []
     if not blocked:
         try:
-            calendar_scrip_codes = {str(int(v)): cmid for v, cmid in zip(universe["bse_scrip_code"], universe["company_master_id"])}
+            calendar_identity = {
+                str(int(v)): (cmid, isin)
+                for v, cmid, isin in zip(universe["bse_scrip_code"], universe["company_master_id"], universe["isin"])
+            }
             calendar_raw = fetch_result_calendar()
             for raw in calendar_raw:
                 scrip_code = str(raw.get("scrip_Code") or "")
-                if scrip_code not in calendar_scrip_codes:
+                if scrip_code not in calendar_identity:
                     continue
-                row = build_result_calendar_row(scrip_code, calendar_scrip_codes[scrip_code], raw)
+                company_master_id, isin = calendar_identity[scrip_code]
+                row = build_result_calendar_row(scrip_code, company_master_id, isin if pd.notna(isin) else None, raw)
                 if row is not None:
                     result_calendar_rows.append(row)
         except Exception as exc:  # noqa: BLE001 -- calendar is best-effort, does not block announcements
@@ -376,13 +398,13 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
             )
 
     all_rows = rows + result_calendar_rows
-    if all_rows:
-        upsert_to_db(pd.DataFrame(all_rows), RESULTS_TABLE, unique_keys=["source", "news_id"])
+    upsert_result = upsert_events_with_dedup(all_rows)
 
     return {
         "rows": len(all_rows),
         "announcement_rows": len(rows),
         "result_calendar_rows": len(result_calendar_rows),
+        "merged_rows": upsert_result["merged"],
         "companies_scanned": companies_scanned,
         "companies_total": int(len(universe)),
         "failed_companies": failed_companies,

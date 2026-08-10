@@ -43,6 +43,8 @@ from fundamentals.collectors import screenerin as fundamentals_screenerin
 from fundamentals.screens import l1_universe as fundamentals_l1_universe
 from fundamentals.screens import l2_state as fundamentals_l2_state
 from fundamentals.collectors import bse_announcements as fundamentals_bse_announcements
+from fundamentals.collectors import events_store as fundamentals_events_store
+from fundamentals.collectors import nse_pit as fundamentals_nse_pit
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8847,7 +8849,7 @@ def test_classify_announcement(subcategory, headline, expected):
 
 def test_build_announcement_row_returns_none_for_uninteresting_filings():
     raw = {"SUBCATNAME": "AGM/EGM", "HEADLINE": "Notice of AGM", "NEWSID": "abc-1"}
-    assert fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", raw) is None
+    assert fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", "INE000A01011", raw) is None
 
 
 def test_build_announcement_row_builds_expected_fields_for_pit_sast():
@@ -8859,39 +8861,47 @@ def test_build_announcement_row_builds_expected_fields_for_pit_sast():
         "ATTACHMENTNAME": "somefile.pdf",
         "NSURL": "https://www.bseindia.com/stock-share-price/x/y/524412/",
     }
-    row = fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", raw)
+    row = fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", "INE000A01011", raw)
     assert row["source"] == "bse"
     assert row["news_id"] == "abc-123"
     assert row["scrip_code"] == "524412"
     assert row["company_master_id"] == "nse:AAREYDRUGS"
+    assert row["isin"] == "INE000A01011"
     assert row["filing_type"] == "pit_sast"
     assert row["headline"] == "Closure of trading window"
     assert row["disclosure_date"] == pd.Timestamp("2026-08-01T10:15:00", tz="UTC").date()
+    assert row["quantity"] is None
+    assert row["insider_name"] is None
+    assert row["transaction_type"] is None
     assert row["attachment_name"] == "somefile.pdf"
     assert row["detection_source"] == "bse_announcements"
     assert row["enrichment_status"] == "pending"
+    assert row["sources"] == "bse"
     assert json.loads(row["raw_json"]) == raw
 
 
 def test_build_announcement_row_handles_missing_timestamp_gracefully():
     raw = {"NEWSID": "abc-2", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}
-    row = fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", raw)
+    row = fundamentals_bse_announcements.build_announcement_row("524412", "nse:AAREYDRUGS", None, raw)
+    assert row["isin"] is None
     assert row["disclosure_date"] is None
     assert row["announcement_timestamp"] is None
 
 
 def test_build_result_calendar_row_parses_meeting_date():
     raw = {"scrip_Code": "524412", "meeting_date": "23 Oct 2026", "URL": "https://example.com"}
-    row = fundamentals_bse_announcements.build_result_calendar_row("524412", "nse:AAREYDRUGS", raw)
+    row = fundamentals_bse_announcements.build_result_calendar_row("524412", "nse:AAREYDRUGS", "INE000A01011", raw)
     assert row["filing_type"] == "results_calendar"
+    assert row["isin"] == "INE000A01011"
     assert row["disclosure_date"] == date(2026, 10, 23)
     assert row["news_id"] == "resultcal:524412:23 Oct 2026"
     assert row["detection_source"] == "bse_result_calendar"
+    assert row["sources"] == "bse"
 
 
 def test_build_result_calendar_row_handles_unparseable_date():
     raw = {"scrip_Code": "524412", "meeting_date": "garbage-date", "URL": "https://example.com"}
-    row = fundamentals_bse_announcements.build_result_calendar_row("524412", "nse:AAREYDRUGS", raw)
+    row = fundamentals_bse_announcements.build_result_calendar_row("524412", "nse:AAREYDRUGS", None, raw)
     assert row["disclosure_date"] is None
 
 
@@ -8907,11 +8917,17 @@ def test_resolve_company_identity_joins_on_ticker_and_preserves_index(monkeypatc
         "sql_to_df",
         lambda *_a, **_k: pd.DataFrame({"company_master_id": ["nse:AAREYDRUGS"], "bse_scrip_code": ["524412"]}),
     )
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_isin",
+        lambda company_master_ids: pd.Series(["INE000A01011", pd.NA], index=company_master_ids.index, dtype="string"),
+    )
 
     result = fundamentals_bse_announcements.resolve_company_identity(tickers)
 
     assert list(result.index) == [5, 9]
     assert result.loc[5, "bse_scrip_code"] == "524412"
+    assert result.loc[5, "isin"] == "INE000A01011"
     assert pd.isna(result.loc[9, "bse_scrip_code"])
 
 
@@ -8925,9 +8941,13 @@ def _bse_universe_df(n=3):
     )
 
 
-def _bse_identity_df(tickers, scrip_codes):
+def _bse_identity_df(tickers, scrip_codes, isins=None):
     return pd.DataFrame(
-        {"company_master_id": [f"nse:{t}" for t in tickers], "bse_scrip_code": scrip_codes},
+        {
+            "company_master_id": [f"nse:{t}" for t in tickers],
+            "bse_scrip_code": scrip_codes,
+            "isin": isins if isins is not None else [f"ISIN{t}" for t in tickers],
+        },
         index=tickers.index,
     )
 
@@ -8949,8 +8969,12 @@ def test_run_bse_l3_detection_happy_path_upserts_announcements_and_calendar(monk
         lambda: [{"scrip_Code": "111111", "meeting_date": "23 Oct 2026", "URL": "https://x"}],
     )
 
-    upserts = []
-    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    dedup_calls = []
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "upsert_events_with_dedup",
+        lambda rows: dedup_calls.append(rows) or {"inserted": len(rows), "merged": 0},
+    )
     fallback_events = []
     monkeypatch.setattr(
         fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
@@ -8961,13 +8985,12 @@ def test_run_bse_l3_detection_happy_path_upserts_announcements_and_calendar(monk
     assert result["companies_scanned"] == 2
     assert result["announcement_rows"] == 2  # one per company
     assert result["result_calendar_rows"] == 1  # only scrip 111111 matched the universe
+    assert result["merged_rows"] == 0
     assert result["blocked"] is False
     assert result["failed_companies"] == []
-    assert len(upserts) == 1
-    df, table, kwargs = upserts[0]
-    assert table == fundamentals_bse_announcements.RESULTS_TABLE
-    assert kwargs["unique_keys"] == ["source", "news_id"]
-    assert len(df) == 3
+    assert len(dedup_calls) == 1
+    assert len(dedup_calls[0]) == 3
+    assert all(row["isin"] for row in dedup_calls[0])
 
 
 def test_run_bse_l3_detection_trips_circuit_breaker_after_consecutive_failures(monkeypatch):
@@ -8984,7 +9007,7 @@ def test_run_bse_l3_detection_trips_circuit_breaker_after_consecutive_failures(m
 
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", always_fails)
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
-    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     fallback_events = []
     monkeypatch.setattr(
         fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
@@ -9021,7 +9044,7 @@ def test_run_bse_l3_detection_resets_failure_streak_on_a_success(monkeypatch):
 
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", flaky_fetch)
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
-    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
 
     result = fundamentals_bse_announcements.run_bse_l3_detection()
@@ -9042,7 +9065,7 @@ def test_run_bse_l3_detection_skips_companies_with_no_bse_scrip_code(monkeypatch
     )
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
-    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     fallback_events = []
     monkeypatch.setattr(
         fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
@@ -9065,3 +9088,516 @@ def test_run_bse_l3_detection_returns_early_on_empty_universe(monkeypatch):
 
     assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
     assert any(e["fallback_type"] == "l3_bse_no_l1_universe" for e in fallback_events)
+
+
+# fundamentals/collectors/events_store.py -- shared fundamentals_events dedup/merge.
+
+
+def test_resolve_isin_picks_most_recent_row_per_company(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_events_store,
+        "sql_to_df",
+        lambda *_a, **_k: pd.DataFrame({"company_master_id": ["nse:X", "nse:Y"], "isin": ["INE111", "INE222"]}),
+    )
+    company_master_ids = pd.Series(["nse:X", "nse:Y", "nse:Z"])
+
+    result = fundamentals_events_store.resolve_isin(company_master_ids)
+
+    assert result.iloc[0] == "INE111"
+    assert result.iloc[1] == "INE222"
+    assert pd.isna(result.iloc[2])
+
+
+def test_resolve_issuer_names_picks_most_recent_row_per_company(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_events_store,
+        "sql_to_df",
+        lambda *_a, **_k: pd.DataFrame({"company_master_id": ["nse:X"], "display_name": ["X Industries Ltd"]}),
+    )
+    company_master_ids = pd.Series(["nse:X", "nse:UNKNOWN"])
+
+    result = fundamentals_events_store.resolve_issuer_names(company_master_ids)
+
+    assert result.iloc[0] == "X Industries Ltd"
+    assert pd.isna(result.iloc[1])
+
+
+def test_find_dedup_candidate_returns_none_without_isin_or_disclosure_date():
+    assert fundamentals_events_store.find_dedup_candidate(None, "pit_sast", date(2026, 8, 1)) is None
+    assert fundamentals_events_store.find_dedup_candidate("INE111", "pit_sast", None) is None
+    assert fundamentals_events_store.find_dedup_candidate("INE111", None, date(2026, 8, 1)) is None
+
+
+def test_find_dedup_candidate_queries_and_returns_earliest_match(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["params"] = params
+        return pd.DataFrame(
+            [{"source": "bse", "news_id": "n1", "quantity": None, "insider_name": None, "transaction_type": None, "announcement_timestamp": None, "sources": "bse"}]
+        )
+
+    monkeypatch.setattr(fundamentals_events_store, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_events_store.find_dedup_candidate("INE111", "pit_sast", date(2026, 8, 1))
+
+    # compared as text, not date -- fundamentals_events.disclosure_date is TEXT in the
+    # DB (found live 2026-08-10, see find_dedup_candidate's docstring); str(date(...))
+    # matches the stored 'YYYY-MM-DD' format exactly.
+    assert captured["params"] == ("INE111", "pit_sast", "2026-08-01")
+    assert result["source"] == "bse"
+    assert result["news_id"] == "n1"
+
+
+def test_merge_row_fields_fills_missing_structured_fields_without_clobbering():
+    # existing's announcement_timestamp arrives as a plain string -- it's a TEXT
+    # column in the DB (see find_dedup_candidate's docstring) -- while incoming's is a
+    # freshly-built pd.Timestamp; a bare `min(str, Timestamp)` raises TypeError, which
+    # is exactly the live bug this regression-tests.
+    existing = {
+        "quantity": None,
+        "insider_name": None,
+        "transaction_type": None,
+        "announcement_timestamp": "2026-08-02 00:00:00+00:00",
+        "sources": "bse",
+    }
+    incoming = {
+        "source": "nse",
+        "quantity": 25000,
+        "insider_name": "Jane Promoter",
+        "transaction_type": "Purchase",
+        "announcement_timestamp": pd.Timestamp("2026-08-01", tz="UTC"),
+    }
+    merged = fundamentals_events_store._merge_row_fields(existing, incoming)
+    assert merged["quantity"] == 25000
+    assert merged["insider_name"] == "Jane Promoter"
+    assert merged["transaction_type"] == "Purchase"
+    assert merged["announcement_timestamp"] == pd.Timestamp("2026-08-01", tz="UTC").isoformat()  # earliest of the two, as a string
+    assert isinstance(merged["announcement_timestamp"], str)
+    assert merged["sources"] == "bse,nse"
+
+
+def test_merge_row_fields_never_overwrites_an_existing_real_value():
+    existing = {
+        "quantity": 99999,
+        "insider_name": "Original Name",
+        "transaction_type": None,
+        "announcement_timestamp": None,
+        "sources": "bse,nse",
+    }
+    incoming = {"source": "nse", "quantity": 1, "insider_name": "Different Name", "transaction_type": "Sale", "announcement_timestamp": None}
+    merged = fundamentals_events_store._merge_row_fields(existing, incoming)
+    assert merged["quantity"] == 99999
+    assert merged["insider_name"] == "Original Name"
+    assert merged["transaction_type"] == "Sale"  # existing had none, fills from incoming
+    assert merged["sources"] == "bse,nse"  # already present, not duplicated
+
+
+def test_ensure_events_schema_skips_alter_when_table_does_not_exist_yet(monkeypatch):
+    executed = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+        def fetchone(self):
+            return None  # table doesn't exist
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, FakeCursor()
+
+    monkeypatch.setattr(fundamentals_events_store, "db_session", fake_db_session)
+
+    fundamentals_events_store._ensure_events_schema()
+
+    # only the existence check ran, no ALTER TABLE statements
+    assert len(executed) == 1
+
+
+def test_ensure_events_schema_adds_missing_columns_when_table_exists(monkeypatch):
+    executed = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+        def fetchone(self):
+            return (1,)  # table exists
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, FakeCursor()
+
+    monkeypatch.setattr(fundamentals_events_store, "db_session", fake_db_session)
+
+    fundamentals_events_store._ensure_events_schema()
+
+    alter_statements = [q for q, _ in executed if "ALTER TABLE" in q]
+    assert len(alter_statements) == len(fundamentals_events_store._DEDUP_COLUMN_TYPES)
+
+
+def test_upsert_events_with_dedup_merges_a_matching_isin_row_instead_of_inserting(monkeypatch):
+    existing_row = {
+        "source": "bse",
+        "news_id": "bse-1",
+        "quantity": None,
+        "insider_name": None,
+        "transaction_type": None,
+        "announcement_timestamp": None,
+        "sources": "bse",
+    }
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda isin, ft, d: existing_row)
+    monkeypatch.setattr(fundamentals_events_store, "_ensure_events_schema", lambda: None)
+    merge_calls = []
+    monkeypatch.setattr(
+        fundamentals_events_store, "_apply_merge", lambda **kwargs: merge_calls.append(kwargs)
+    )
+    upsert_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "upsert_to_db", lambda df, table, **k: upsert_calls.append((df, table, k)))
+
+    incoming_row = {
+        "source": "nse",
+        "news_id": "nse-1",
+        "isin": "INE111",
+        "filing_type": "pit_sast",
+        "disclosure_date": date(2026, 8, 1),
+        "quantity": 25000,
+    }
+    result = fundamentals_events_store.upsert_events_with_dedup([incoming_row])
+
+    assert result == {"inserted": 0, "merged": 1}
+    assert len(merge_calls) == 1
+    assert merge_calls[0]["source"] == "bse"
+    assert merge_calls[0]["news_id"] == "bse-1"
+    assert upsert_calls == []
+
+
+def test_upsert_events_with_dedup_inserts_when_no_match(monkeypatch):
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda isin, ft, d: None)
+    monkeypatch.setattr(fundamentals_events_store, "_ensure_events_schema", lambda: None)
+    upsert_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "upsert_to_db", lambda df, table, **k: upsert_calls.append((df, table, k)))
+
+    incoming_row = {"source": "bse", "news_id": "bse-1", "isin": "INE111", "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1)}
+    result = fundamentals_events_store.upsert_events_with_dedup([incoming_row])
+
+    assert result == {"inserted": 1, "merged": 0}
+    assert len(upsert_calls) == 1
+    df, table, kwargs = upsert_calls[0]
+    assert table == fundamentals_events_store.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["source", "news_id"]
+
+
+def test_upsert_events_with_dedup_does_not_match_itself(monkeypatch):
+    # find_dedup_candidate can legitimately return the SAME row that's about to be
+    # (re-)upserted (e.g. a re-run of the same source) -- must insert/overwrite via the
+    # normal path, not treat a row as a duplicate of itself.
+    same_row = {"source": "bse", "news_id": "bse-1", "quantity": None, "insider_name": None, "transaction_type": None, "announcement_timestamp": None, "sources": "bse"}
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda isin, ft, d: same_row)
+    monkeypatch.setattr(fundamentals_events_store, "_ensure_events_schema", lambda: None)
+    merge_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "_apply_merge", lambda **kwargs: merge_calls.append(kwargs))
+    upsert_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "upsert_to_db", lambda df, table, **k: upsert_calls.append((df, table, k)))
+
+    incoming_row = {"source": "bse", "news_id": "bse-1", "isin": "INE111", "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1)}
+    result = fundamentals_events_store.upsert_events_with_dedup([incoming_row])
+
+    assert result == {"inserted": 1, "merged": 0}
+    assert merge_calls == []
+    assert len(upsert_calls) == 1
+
+
+def test_upsert_events_with_dedup_empty_rows_is_a_noop(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda *a: calls.append(a))
+    assert fundamentals_events_store.upsert_events_with_dedup([]) == {"inserted": 0, "merged": 0}
+    assert calls == []
+
+
+# fundamentals/collectors/nse_pit.py -- L3 detection, NSE half (step 5).
+
+
+def test_parse_nse_pit_date_parses_dd_mon_yyyy():
+    assert fundamentals_nse_pit._parse_nse_pit_date("15-Jul-2026") == date(2026, 7, 15)
+
+
+def test_parse_nse_pit_date_handles_missing_and_garbage():
+    assert fundamentals_nse_pit._parse_nse_pit_date(None) is None
+    assert fundamentals_nse_pit._parse_nse_pit_date("") is None
+    assert fundamentals_nse_pit._parse_nse_pit_date("not-a-date") is None
+
+
+def test_parse_nse_pit_timestamp_parses_with_and_without_seconds():
+    ts1 = fundamentals_nse_pit._parse_nse_pit_timestamp("15-Jul-2026 14:30")
+    ts2 = fundamentals_nse_pit._parse_nse_pit_timestamp("15-Jul-2026 14:30:05")
+    assert ts1 is not None and ts2 is not None
+    assert ts1.tzinfo is not None  # converted to UTC from Asia/Kolkata
+
+
+def test_parse_nse_pit_timestamp_handles_missing_and_garbage():
+    assert fundamentals_nse_pit._parse_nse_pit_timestamp(None) is None
+    assert fundamentals_nse_pit._parse_nse_pit_timestamp("garbage") is None
+
+
+def test_build_pit_row_maps_structured_fields_with_no_pdf():
+    raw = {
+        "did": "D1",
+        "pid": "P1",
+        "acqName": "Jane Promoter",
+        "personCategory": "Promoter",
+        "tdpTransactionType": "Purchase",
+        "secAcq": "25,000",
+        "intimDt": "01-Aug-2026",
+        "date": "01-Aug-2026 10:15",
+    }
+    row = fundamentals_nse_pit.build_pit_row("AAREYDRUGS", "nse:AAREYDRUGS", "INE198H01019", raw)
+    assert row["source"] == "nse"
+    assert row["news_id"] == "nse-pit:D1:P1:01-Aug-2026"
+    assert row["scrip_code"] == "AAREYDRUGS"
+    assert row["isin"] == "INE198H01019"
+    assert row["filing_type"] == "pit_sast"
+    assert row["quantity"] == 25000
+    assert row["insider_name"] == "Jane Promoter"
+    assert row["transaction_type"] == "Purchase"
+    assert row["disclosure_date"] == date(2026, 8, 1)
+    assert row["announcement_timestamp"] is not None
+    assert row["detection_source"] == "nse_corporates_pit"
+    assert row["enrichment_status"] == "structured"  # no OCR needed, unlike BSE's rows
+    assert row["sources"] == "nse"
+
+
+def test_build_pit_row_matches_a_real_captured_disclosure():
+    # Real corporates-pit row, captured live 2026-08-10 against RELIANCE (the L1
+    # smallcap/microcap universe itself had zero PIT disclosures in a 90-day window
+    # across 21 companies -- plausible, not a bug, confirmed by sanity-checking
+    # against a large-cap known for frequent promoter-family transactions).
+    raw = {
+        "acqMode": "Off Market", "acqName": "Shaila Narayan", "acqfromDt": "13-Feb-2026", "acqtoDt": "13-Feb-2026",
+        "afterAcqSharesNo": "29620", "afterAcqSharesPer": "0", "anex": "7(2)", "befAcqSharesNo": "26500", "befAcqSharesPer": "0",
+        "buyQuantity": "0", "buyValue": "0", "company": "Reliance Industries Limited", "date": "18-Feb-2026 19:06",
+        "derivativeType": "-", "did": "563849", "exchange": "NA", "intimDt": "16-Feb-2026", "personCategory": "Immediate relative",
+        "pid": "1194033", "remarks": "-", "secAcq": "3120", "secType": "Equity Shares", "secVal": "4430088",
+        "securitiesTypePost": "Equity Shares", "sellValue": "0", "sellquantity": "0", "symbol": "RELIANCE",
+        "tdpDerivativeContractType": "-", "tdpTransactionType": "Buy", "tkdAcqm": None,
+        "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/IT_1194033_1627626_18022026070637_WEB.xml", "xbrlFileSize": None,
+    }
+    row = fundamentals_nse_pit.build_pit_row("RELIANCE", "nse:RELIANCE", "INE002A01018", raw)
+    assert row["news_id"] == "nse-pit:563849:1194033:16-Feb-2026"
+    assert row["quantity"] == 3120
+    assert row["insider_name"] == "Shaila Narayan"
+    assert row["transaction_type"] == "Buy"
+    assert row["disclosure_date"] == date(2026, 2, 16)
+    # 18-Feb-2026 19:06 IST -> 13:36 UTC
+    assert row["announcement_timestamp"] == pd.Timestamp("2026-02-18 13:36:00", tz="UTC")
+    assert json.loads(row["raw_json"]) == raw
+
+
+def test_resolve_company_identity_uses_events_store_helpers(monkeypatch):
+    tickers = pd.Series(["AAREYDRUGS"], index=[0])
+    monkeypatch.setattr(
+        fundamentals_nse_pit, "map_company_master_ids", lambda series, **k: pd.Series(["nse:AAREYDRUGS"], index=series.index, dtype="string")
+    )
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_isin", lambda cmids: pd.Series(["INE198H01019"], index=cmids.index))
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_issuer_names", lambda cmids: pd.Series(["Aarey Drugs & Pharmaceuticals"], index=cmids.index))
+
+    result = fundamentals_nse_pit.resolve_company_identity(tickers)
+
+    assert result.loc[0, "company_master_id"] == "nse:AAREYDRUGS"
+    assert result.loc[0, "isin"] == "INE198H01019"
+    assert result.loc[0, "issuer"] == "Aarey Drugs & Pharmaceuticals"
+
+
+def test_fetch_company_pit_raises_on_missing_data_key(monkeypatch):
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", lambda **kwargs: contextlib.nullcontext())
+
+    class FakePage:
+        def evaluate(self, script, url):
+            return {"unexpected": "shape"}
+
+    with pytest.raises(fundamentals_nse_pit.NsePitBlockedError):
+        fundamentals_nse_pit.fetch_company_pit(
+            FakePage(), symbol="X", issuer="X Ltd", from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8)
+        )
+
+
+def test_fetch_company_pit_wraps_page_evaluate_exceptions(monkeypatch):
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", lambda **kwargs: contextlib.nullcontext())
+
+    class FakePage:
+        def evaluate(self, script, url):
+            raise RuntimeError("HTTP 403")
+
+    with pytest.raises(fundamentals_nse_pit.NsePitBlockedError):
+        fundamentals_nse_pit.fetch_company_pit(
+            FakePage(), symbol="X", issuer="X Ltd", from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8)
+        )
+
+
+def test_fetch_company_pit_returns_data_rows(monkeypatch):
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", lambda **kwargs: contextlib.nullcontext())
+
+    class FakePage:
+        def evaluate(self, script, url):
+            return {"data": [{"did": "D1"}]}
+
+    rows = fundamentals_nse_pit.fetch_company_pit(
+        FakePage(), symbol="X", issuer="X Ltd", from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8)
+    )
+    assert rows == [{"did": "D1"}]
+
+
+class _FakeNsePitPage:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+class _FakeNsePitContext:
+    def __init__(self, page):
+        self._page = page
+
+    def new_page(self):
+        return self._page
+
+
+class _FakeNsePitBrowser:
+    def __init__(self, page):
+        self.contexts = [_FakeNsePitContext(page)]
+
+
+def _patch_fake_playwright(monkeypatch, page):
+    class _FakeChromium:
+        @staticmethod
+        def connect_over_cdp(endpoint):
+            return _FakeNsePitBrowser(page)
+
+    class _FakePlaywrightHandle:
+        chromium = _FakeChromium()
+
+    @contextlib.contextmanager
+    def _fake_sync_playwright():
+        yield _FakePlaywrightHandle()
+
+    monkeypatch.setattr(fundamentals_nse_pit, "sync_playwright", _fake_sync_playwright)
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_goto", lambda page, url, **k: None)
+    monkeypatch.setattr(fundamentals_nse_pit, "CDP_ENDPOINT", "http://localhost:9222")
+
+
+def _nse_universe_df(n=3):
+    return pd.DataFrame(
+        {
+            "company_id": list(range(1, n + 1)),
+            "company_name": [f"Company {i}" for i in range(1, n + 1)],
+            "ticker": [f"TICK{i}" for i in range(1, n + 1)],
+        }
+    )
+
+
+def _nse_identity_df(tickers):
+    return pd.DataFrame(
+        {
+            "company_master_id": [f"nse:{t}" for t in tickers],
+            "isin": [f"ISIN{t}" for t in tickers],
+            "issuer": [f"{t} Ltd" for t in tickers],
+        },
+        index=tickers.index,
+    )
+
+
+def test_run_nse_pit_detection_happy_path(monkeypatch):
+    universe = _nse_universe_df(2)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
+    _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
+
+    raw = {"did": "D1", "pid": "P1", "acqName": "Someone", "tdpTransactionType": "Purchase", "secAcq": "100", "intimDt": "01-Aug-2026", "date": "01-Aug-2026 10:00"}
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_company_pit", lambda page, **k: [raw])
+    dedup_calls = []
+    monkeypatch.setattr(
+        fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: dedup_calls.append(rows) or {"inserted": len(rows), "merged": 0}
+    )
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **k: None)
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result["companies_scanned"] == 2
+    assert result["rows"] == 2  # one PIT row per company
+    assert result["blocked"] is False
+    assert result["failed_companies"] == []
+    assert len(dedup_calls) == 1 and len(dedup_calls[0]) == 2
+
+
+def test_run_nse_pit_detection_trips_circuit_breaker(monkeypatch):
+    universe = _nse_universe_df(5)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
+    _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
+
+    def always_fails(page, **k):
+        raise fundamentals_nse_pit.NsePitBlockedError("boom")
+
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_company_pit", always_fails)
+    monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result["blocked"] is True
+    assert len(result["failed_companies"]) == fundamentals_nse_pit.CIRCUIT_BREAKER_THRESHOLD
+    assert result["companies_scanned"] == 0
+    assert any(e["fallback_type"] == "l3_nse_circuit_breaker_tripped" for e in fallback_events)
+
+
+def test_run_nse_pit_detection_skips_companies_with_no_issuer(monkeypatch):
+    universe = _nse_universe_df(2)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+
+    def identity_with_one_missing_issuer(tickers):
+        df = _nse_identity_df(tickers)
+        df.loc[df.index[-1], "issuer"] = pd.NA
+        return df
+
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", identity_with_one_missing_issuer)
+    _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_company_pit", lambda page, **k: [])
+    monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result["companies_total"] == 1
+    assert any(e["fallback_type"] == "l3_nse_issuer_missing" for e in fallback_events)
+
+
+def test_run_nse_pit_detection_returns_early_without_cdp_endpoint(monkeypatch):
+    universe = _nse_universe_df(1)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
+    monkeypatch.setattr(fundamentals_nse_pit, "CDP_ENDPOINT", "")
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+    assert any(e["fallback_type"] == "l3_nse_no_cdp_endpoint" for e in fallback_events)
+
+
+def test_run_nse_pit_detection_returns_early_on_empty_universe(monkeypatch):
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: pd.DataFrame())
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+    assert any(e["fallback_type"] == "l3_nse_no_l1_universe" for e in fallback_events)
