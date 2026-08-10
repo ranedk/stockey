@@ -39,6 +39,7 @@ from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
 from fundamentals.collectors import screenerin as fundamentals_screenerin
+from fundamentals.screens import l1_universe as fundamentals_l1_universe
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8505,3 +8506,81 @@ def test_run_deleveraging_screen_skips_upsert_when_no_results(monkeypatch):
 
     assert result == {"query_name": "deleveraging", "rows": 0, "companies": []}
     assert upserts == []
+
+
+# fundamentals/screens/l1_universe.py -- L1 universe filter (step 3).
+
+
+def test_run_l1_universe_refresh_upserts_and_summarizes(monkeypatch):
+    companies = [
+        {"company_id": 1, "name": "Menon Pistons", "ticker": "MENNPIS", "url": "/company/MENNPIS/", "metrics": {"mar_cap_rscr": 381.73}},
+        {"company_id": 2, "name": "Coral India Fin.", "ticker": "CORALFINAC", "url": "/company/CORALFINAC/", "metrics": {"mar_cap_rscr": 137.9}},
+    ]
+    monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", companies))
+
+    upserts = []
+    monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "record_local_fallback_event",
+        lambda **kwargs: fallback_events.append(kwargs),
+    )
+
+    result = fundamentals_l1_universe.run_l1_universe_refresh(session=object())
+
+    assert result == {
+        "query_name": "l1_universe",
+        "query_version": 1,
+        "rows": 2,
+        "checks_deferred": list(fundamentals_l1_universe.DEFERRED_CHECKS),
+        "companies": ["Menon Pistons", "Coral India Fin."],
+    }
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_l1_universe.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["query_name", "query_version", "run_date", "company_id"]
+    assert set(df["company_id"]) == {1, 2}
+    assert json.loads(df.iloc[0]["metrics_json"]) == companies[0]["metrics"]
+
+    # Deferred auditor/RPT checks must be visibly logged on every run, not silent.
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["fallback_type"] == "l1_checks_not_sourced"
+    assert set(fallback_events[0]["metadata"]["deferred_checks"]) == set(fundamentals_l1_universe.DEFERRED_CHECKS)
+
+
+def test_run_l1_universe_refresh_skips_upsert_when_no_results_but_still_logs_deferred(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", []))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "record_local_fallback_event",
+        lambda **kwargs: fallback_events.append(kwargs),
+    )
+
+    result = fundamentals_l1_universe.run_l1_universe_refresh(session=object())
+
+    assert result["rows"] == 0
+    assert result["companies"] == []
+    assert upserts == []
+    assert len(fallback_events) == 1
+
+
+def test_run_l1_universe_refresh_builds_a_session_when_none_given(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "build_authenticated_session", lambda: "the-session")
+    seen_sessions = []
+
+    def fake_run_query(session, query_text):
+        seen_sessions.append(session)
+        return "screener_url", []
+
+    monkeypatch.setattr(fundamentals_l1_universe, "run_query", fake_run_query)
+    monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_l1_universe, "record_local_fallback_event", lambda **k: None)
+
+    fundamentals_l1_universe.run_l1_universe_refresh()
+
+    assert seen_sessions == ["the-session"]
