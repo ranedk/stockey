@@ -45,6 +45,7 @@ from fundamentals.screens import l2_state as fundamentals_l2_state
 from fundamentals.collectors import bse_announcements as fundamentals_bse_announcements
 from fundamentals.collectors import events_store as fundamentals_events_store
 from fundamentals.collectors import nse_pit as fundamentals_nse_pit
+from fundamentals.collectors import rating_agencies as fundamentals_rating_agencies
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -9601,3 +9602,270 @@ def test_run_nse_pit_detection_returns_early_on_empty_universe(monkeypatch):
 
     assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
     assert any(e["fallback_type"] == "l3_nse_no_l1_universe" for e in fallback_events)
+
+
+# fundamentals/collectors/rating_agencies.py -- L3 enrichment, rating agencies (step 5).
+
+# Real (trimmed) fragment, captured live 2026-08-10 from ICRA's own
+# /Rating/GetAllRatingRational search response for a real detected event (ZF Steering
+# Gear, disclosed 2026-08-04).
+ICRA_SEARCH_RESULT_FIXTURE_HTML = """
+<div class="customTable table-responsive border rounded-3 mt-3">
+<table class="table align-middle mb-0">
+<thead><tr><th>Date</th><th>Sector</th><th>Reports</th><th>Action</th></tr></thead>
+<tbody>
+<tr>
+<td>04 Aug 2026</td>
+<td>Corporate Debt Rating</td>
+<td><a href="/Rationale/ShowRationaleReport?Id=144806">ZF Steering Gear (India) Limited: Ratings reaffirmed</a></td>
+<td>Lender-wise facilities</td>
+</tr>
+<tr>
+<td>26 Jun 2025</td>
+<td>Corporate Debt Rating</td>
+<td><a href="/Rationale/ShowRationaleReport?Id=135978">ZF Steering Gear (India) Limited: Ratings reaffirmed, rated amount enhanced</a></td>
+<td>Lender-wise facilities</td>
+</tr>
+<tr>
+<td>20 May 2024</td>
+<td>&mdash;</td>
+<td><a href="/Rationale/ShowRationaleReport?Id=127574">ZF Steering Gear (India) Limited: Ratings reaffirmed</a></td>
+<td>Lender-wise facilities</td>
+</tr>
+</tbody>
+</table>
+</div>
+"""
+
+
+@pytest.mark.parametrize(
+    "keyword_text,expected",
+    [
+        ("Reaffirmation of Credit Ratings by ICRA", "icra"),
+        ("CRISIL Ratings has downgraded", "crisil"),
+        ("CARE Ratings assigns rating", "care"),
+        ("India Ratings affirms", "india ratings"),
+        ("Acuité Ratings revises outlook", "acuite"),
+        ("Board Meeting Notice", None),
+    ],
+)
+def test_detect_agency_from_headline(keyword_text, expected):
+    assert fundamentals_rating_agencies.detect_agency(keyword_text, None) == expected
+
+
+@pytest.mark.parametrize(
+    "headline,expected",
+    [
+        ("Ratings downgraded", "downgraded"),
+        ("Ratings upgraded", "upgraded"),
+        ("Rating withdrawn", "withdrawn"),
+        ("Rating suspended", "suspended"),
+        ("Placed on credit watch", "placed_on_watch"),
+        ("Ratings reaffirmed", "reaffirmed"),
+        ("Rating assigned", "assigned"),
+        ("Something unrelated", "other"),
+    ],
+)
+def test_classify_rating_action_type(headline, expected):
+    assert fundamentals_rating_agencies.classify_rating_action_type(headline) == expected
+
+
+def test_parse_icra_search_results_extracts_real_row_shape():
+    results = fundamentals_rating_agencies.parse_icra_search_results(ICRA_SEARCH_RESULT_FIXTURE_HTML)
+    assert results == [
+        {"date_text": "04 Aug 2026", "sector": "Corporate Debt Rating", "headline": "ZF Steering Gear (India) Limited: Ratings reaffirmed", "rationale_id": "144806"},
+        {"date_text": "26 Jun 2025", "sector": "Corporate Debt Rating", "headline": "ZF Steering Gear (India) Limited: Ratings reaffirmed, rated amount enhanced", "rationale_id": "135978"},
+        {"date_text": "20 May 2024", "sector": "—", "headline": "ZF Steering Gear (India) Limited: Ratings reaffirmed", "rationale_id": "127574"},
+    ]
+
+
+def test_parse_icra_search_results_empty_when_no_table():
+    assert fundamentals_rating_agencies.parse_icra_search_results("<div>no results</div>") == []
+
+
+def test_match_rationale_picks_closest_within_tolerance():
+    results = fundamentals_rating_agencies.parse_icra_search_results(ICRA_SEARCH_RESULT_FIXTURE_HTML)
+    matched = fundamentals_rating_agencies.match_rationale(results, date(2026, 8, 4))
+    assert matched["rationale_id"] == "144806"
+
+
+def test_match_rationale_returns_none_outside_tolerance():
+    results = fundamentals_rating_agencies.parse_icra_search_results(ICRA_SEARCH_RESULT_FIXTURE_HTML)
+    # nothing within MATCH_DATE_TOLERANCE_DAYS of an unrelated date
+    assert fundamentals_rating_agencies.match_rationale(results, date(2020, 1, 1)) is None
+
+
+def test_match_rationale_returns_none_without_target_date():
+    results = fundamentals_rating_agencies.parse_icra_search_results(ICRA_SEARCH_RESULT_FIXTURE_HTML)
+    assert fundamentals_rating_agencies.match_rationale(results, None) is None
+
+
+def test_match_rationale_skips_unparseable_dates():
+    results = [{"date_text": "not-a-date", "sector": "-", "headline": "X", "rationale_id": "1"}]
+    assert fundamentals_rating_agencies.match_rationale(results, date(2026, 8, 4)) is None
+
+
+def test_open_icra_session_raises_when_token_missing(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+
+    class FakeResponse:
+        status_code = 200
+        text = "<html>no token here</html>"
+
+    class FakeSession:
+        def get(self, url, headers=None, timeout=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "Session", FakeSession)
+    with pytest.raises(fundamentals_rating_agencies.IcraBlockedError):
+        fundamentals_rating_agencies.open_icra_session()
+
+
+def test_open_icra_session_raises_on_non_200(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+
+    class FakeResponse:
+        status_code = 500
+        text = ""
+
+    class FakeSession:
+        def get(self, url, headers=None, timeout=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "Session", FakeSession)
+    with pytest.raises(fundamentals_rating_agencies.IcraBlockedError):
+        fundamentals_rating_agencies.open_icra_session()
+
+
+def test_load_pending_rating_actions_queries_expected_filters(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", fake_sql_to_df)
+    fundamentals_rating_agencies.load_pending_rating_actions()
+    assert "filing_type = 'rating_action'" in captured["query"]
+    assert "enrichment_status = 'pending'" in captured["query"]
+
+
+def test_run_rating_agency_enrichment_returns_early_when_nothing_pending(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result == {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0, "blocked": False}
+
+
+def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "CRISIL downgrades rating", "subcategory": None, "disclosure_date": date(2026, 8, 4)}]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    status_calls = []
+    monkeypatch.setattr(
+        fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs)
+    )
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["unsupported_agency"] == 1
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "unsupported_agency"}]
+    assert len(fallback_events) == 1
+
+
+def test_run_rating_agency_enrichment_matches_icra_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:ZFSTEERING", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "ZF Steering Gear")
+    monkeypatch.setattr(fundamentals_rating_agencies, "open_icra_session", lambda: ("fake-session", "fake-token"))
+    matched_result = {"date_text": "04 Aug 2026", "sector": "Corporate Debt Rating", "headline": "ZF Steering Gear (India) Limited: Ratings reaffirmed", "rationale_id": "144806"}
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_icra_rationales", lambda session, token, issuer: [matched_result])
+    status_calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["matched"] == 1
+    assert result["blocked"] is False
+    assert len(status_calls) == 1
+    call = status_calls[0]
+    assert call["status"] == "matched"
+    assert call["fields"]["rating_agency"] == "icra"
+    assert call["fields"]["rating_action_type"] == "reaffirmed"
+    assert call["fields"]["rationale_id"] == "144806"
+
+
+def test_run_rating_agency_enrichment_no_match_when_search_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:ZFSTEERING", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "ZF Steering Gear")
+    monkeypatch.setattr(fundamentals_rating_agencies, "open_icra_session", lambda: ("fake-session", "fake-token"))
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_icra_rationales", lambda session, token, issuer: [])
+    status_calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["no_match"] == 1
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "no_match"}]
+
+
+def test_run_rating_agency_enrichment_trips_circuit_breaker(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": f"n{i}", "company_master_id": f"nse:X{i}", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}
+            for i in range(5)
+        ]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "Some Company")
+    monkeypatch.setattr(fundamentals_rating_agencies, "open_icra_session", lambda: ("fake-session", "fake-token"))
+
+    def always_fails(session, token, issuer):
+        raise fundamentals_rating_agencies.IcraBlockedError("boom")
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_icra_rationales", always_fails)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_rating_agencies.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "rating_enrichment_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:UNKNOWN", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: None)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["failed"] == 1
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "failed"}]
