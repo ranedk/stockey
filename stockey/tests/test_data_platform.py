@@ -20,6 +20,7 @@ from typing import Any
 import pandas as pd
 import pytest
 import requests
+import torch
 from bs4 import BeautifulSoup
 
 from utils import identity_issues
@@ -4215,6 +4216,126 @@ def test_ocr_pdf_with_codex_routes_rendered_images(monkeypatch):
     assert calls[0][0] == llm_ocr.OCR_PROMPT
     assert calls[0][1] == "gpt-test"
     assert calls[0][2][0].endswith(".png")
+
+
+# utils/ocr/llm_ocr.py -- ocr_page_with_local / ocr_pdf_with_local (GLM-OCR, self-
+# hosted via transformers -- fundamental screener step 6). The heavy model load and
+# CPU inference itself is never exercised in this test suite (confirmed live
+# 2026-08-10 separately: ~95-290s per page depending on image size) -- these tests
+# fake the (processor, model) pair _load_local_model returns, matching the same
+# "mock the boundary, not the library internals" pattern the codex tests above use.
+
+
+class _FakeLocalOcrInputs(dict):
+    def to(self, device):
+        return self
+
+
+class _FakeLocalOcrProcessor:
+    def __init__(self, calls, decoded_text="  OCR'd text  "):
+        self.calls = calls
+        self.decoded_text = decoded_text
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls["messages"] = messages
+        self.calls["apply_chat_template_kwargs"] = kwargs
+        return _FakeLocalOcrInputs({"input_ids": torch.tensor([[1, 2, 3]])})
+
+    def decode(self, ids, skip_special_tokens=True):
+        self.calls["decoded_ids"] = ids
+        self.calls["skip_special_tokens"] = skip_special_tokens
+        return self.decoded_text
+
+
+class _FakeLocalOcrModel:
+    device = "cpu"
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def generate(self, **kwargs):
+        self.calls["generate_kwargs"] = kwargs
+        return torch.tensor([[1, 2, 3, 4, 5]])
+
+
+def test_ocr_page_with_local_uses_task_prompt_and_downscales_image(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        llm_ocr, "_load_local_model", lambda model: (_FakeLocalOcrProcessor(calls), _FakeLocalOcrModel(calls))
+    )
+
+    big_image = llm_ocr.Image.new("RGB", (4000, 3000), color="white")
+    result = llm_ocr.ocr_page_with_local(big_image, max_image_dimension=1280, max_new_tokens=512)
+
+    assert result == "OCR'd text"  # stripped
+    messages = calls["messages"]
+    content = messages[0]["content"]
+    assert content[1] == {"type": "text", "text": llm_ocr.LOCAL_OCR_TASK_PROMPT}
+    passed_image = content[0]["image"]
+    assert max(passed_image.size) <= 1280
+    assert calls["generate_kwargs"]["max_new_tokens"] == 512
+
+
+def test_ocr_page_with_local_does_not_mutate_caller_image(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        llm_ocr, "_load_local_model", lambda model: (_FakeLocalOcrProcessor(calls), _FakeLocalOcrModel(calls))
+    )
+    original = llm_ocr.Image.new("RGB", (4000, 3000), color="white")
+    llm_ocr.ocr_page_with_local(original, max_image_dimension=1280)
+    assert original.size == (4000, 3000)  # caller's image untouched -- only a copy was resized
+
+
+def test_load_local_model_caches_by_model_name(monkeypatch):
+    llm_ocr._local_model_cache.clear()
+    load_calls = []
+
+    import transformers
+
+    # Patch the from_pretrained *method* on the real classes, not the class names on
+    # the module -- transformers' top-level __init__.py lazily resolves these names
+    # via module __getattr__, so monkeypatch.setattr(transformers, "AutoProcessor",
+    # Fake) doesn't reliably intercept llm_ocr's own `from transformers import
+    # AutoProcessor` (confirmed live: the real from_pretrained still ran and hit the
+    # network). Patching the method on the already-resolved class object does.
+    monkeypatch.setattr(
+        transformers.AutoProcessor, "from_pretrained", staticmethod(lambda name: load_calls.append(("processor", name)) or object())
+    )
+    monkeypatch.setattr(
+        transformers.AutoModelForImageTextToText,
+        "from_pretrained",
+        staticmethod(lambda name, **kwargs: load_calls.append(("model", name)) or object()),
+    )
+
+    first = llm_ocr._load_local_model("fake-model")
+    second = llm_ocr._load_local_model("fake-model")
+
+    assert first is second  # cached, not reloaded
+    assert load_calls == [("processor", "fake-model"), ("model", "fake-model")]
+    llm_ocr._local_model_cache.clear()
+
+
+def test_ocr_pdf_with_local_routes_rendered_images(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        llm_ocr,
+        "render_pdf_pages",
+        lambda pdf_path, pages: [(1, llm_ocr.Image.new("RGB", (8, 8), color="white"))],
+    )
+    monkeypatch.setattr(
+        llm_ocr, "ocr_page_with_local", lambda image, **kwargs: calls.append((image, kwargs)) or "local OCR text"
+    )
+
+    result = llm_ocr.ocr_pdf_with_local("/tmp/test.pdf", pages="1", model="local-test")
+
+    assert result == {1: "local OCR text"}
+    assert calls[0][1]["model"] == "local-test"
+
+
+def test_ocr_pdf_routes_to_local_provider(monkeypatch):
+    monkeypatch.setattr(llm_ocr, "ocr_pdf_with_local", lambda pdf_path, **k: {1: "local text"})
+    result = llm_ocr.ocr_pdf("/tmp/test.pdf", provider="local")
+    assert result == {"local": {1: "local text"}}
 
 
 def test_download_runner_preserves_string_state_advanced_false():
