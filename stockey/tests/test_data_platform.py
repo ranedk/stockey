@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import fcntl
 import json
 import os
@@ -36,6 +37,7 @@ from data.nseindia import bhavcopy_downloader, bhavcopy_parser, corporate_action
 from data.sharpelydata import sharpely_data
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
+from fundamentals.collectors import security_master as fundamentals_security_master
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -45,6 +47,7 @@ from utils import redaction
 from utils import redis_bkp_restore
 from utils.ocr import llm_ocr
 from utils import poppler as poppler_utils
+from utils import exchange_rate_limiter
 from utils import nse_rate_limiter
 from utils import redis_utils
 from utils import sync as sync_utils
@@ -5163,8 +5166,10 @@ def test_nse_request_gate_times_out_when_another_process_holds_it(tmp_path):
 
 def test_nse_goto_calls_page_goto_through_the_gate(monkeypatch, tmp_path):
     monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(nse_rate_limiter, "DEFAULT_LOCK_PATH", tmp_path / "gate.lock")
-    monkeypatch.setattr(nse_rate_limiter, "DEFAULT_TIMESTAMP_PATH", tmp_path / "last_request_at")
+    lock_path = tmp_path / "gate.lock"
+    timestamp_path = tmp_path / "last_request_at"
+    monkeypatch.setattr(nse_rate_limiter, "DEFAULT_LOCK_PATH", lock_path)
+    monkeypatch.setattr(nse_rate_limiter, "DEFAULT_TIMESTAMP_PATH", timestamp_path)
 
     calls: list[tuple[str, dict]] = []
 
@@ -5177,6 +5182,42 @@ def test_nse_goto_calls_page_goto_through_the_gate(monkeypatch, tmp_path):
 
     assert result == "response"
     assert calls == [("https://www.nseindia.com", {"timeout": 15000})]
+    # DEFAULT_LOCK_PATH/DEFAULT_TIMESTAMP_PATH are read inside nse_request_gate()'s body
+    # (not baked into an early-bound parameter default), so the monkeypatch above must
+    # actually be honored -- these files, not the real .cache/ ones, should now exist.
+    assert lock_path.exists()
+    assert timestamp_path.exists()
+
+
+def test_exchange_rate_limiter_domains_use_separate_lock_and_timestamp_files():
+    assert exchange_rate_limiter.default_lock_path("nse") != exchange_rate_limiter.default_lock_path("bse")
+    assert exchange_rate_limiter.default_timestamp_path("nse") != exchange_rate_limiter.default_timestamp_path("bse")
+
+
+def test_exchange_rate_limiter_reads_domain_specific_env_var(monkeypatch):
+    monkeypatch.setattr(exchange_rate_limiter.env, "float", lambda name, default: 42.0 if name == "BSE_MIN_REQUEST_INTERVAL_SECONDS" else default)
+    assert exchange_rate_limiter.default_min_interval_seconds("bse") == 42.0
+    assert exchange_rate_limiter.default_min_interval_seconds("nse") == 10.0
+
+
+def test_exchange_rate_limiter_two_domains_do_not_block_each_other(monkeypatch, tmp_path):
+    monkeypatch.setattr(exchange_rate_limiter.time, "sleep", lambda *a, **k: None)
+
+    with exchange_rate_limiter.exchange_request_gate(
+        domain="nse",
+        lock_path=tmp_path / "nse.lock",
+        timestamp_path=tmp_path / "nse_ts",
+    ):
+        # A concurrent BSE request must not wait on the held NSE lock -- separate domains,
+        # separate locks. timeout_seconds is short specifically so this would fail loudly
+        # (TimeoutError) rather than hang if domain isolation were broken.
+        with exchange_rate_limiter.exchange_request_gate(
+            domain="bse",
+            lock_path=tmp_path / "bse.lock",
+            timestamp_path=tmp_path / "bse_ts",
+            timeout_seconds=2.0,
+        ):
+            pass
 
 
 def test_bhavcopy_downloader_records_download_failure_fallback(monkeypatch):
@@ -8213,3 +8254,70 @@ def test_data_coverage_report_main_require_exits_nonzero_on_error(monkeypatch, c
 
     monkeypatch.setattr(dcr, "build_report", lambda: {"report_date": "2026-08-05", "overall": "warn", "counts": {"ok": 0, "warn": 1, "error": 0}, "tables": []})
     assert dcr.main(["--require"]) == 0
+
+
+def test_bse_search_response_parses_single_match():
+    # Captured live 2026-08-10 (fundamentals/collectors/security_master.py's docstring).
+    text = (
+        "\"<li class='quotemenu quotemenuselect' ng-click=\\\"liclick('543235','ANGEL ONE LTD')\\\">"
+        "<a><strong>ANGEL ONE</strong> LTD<br /><span>ANGELONE&nbsp;&nbsp;&nbsp;"
+        "INE732I01021&nbsp;&nbsp;&nbsp;543235</span></a></li>\""
+    )
+    results = fundamentals_security_master.parse_bse_search_response(text)
+    assert results == [
+        {"scrip_code": "543235", "company_name": "ANGEL ONE LTD", "symbol": "ANGELONE", "isin": "INE732I01021"}
+    ]
+
+
+def test_bse_search_response_parses_strong_wrapped_isin():
+    # Searching by ISIN highlights the matched term in <strong> -- must parse the same
+    # as an unwrapped match, not silently drop the ISIN.
+    text = (
+        "\"<li class='quotemenu quotemenuselect' ng-click=\\\"liclick('532067','3B BLACKBIO DX LTD')\\\">"
+        "<a>3B BLACKBIO DX LTD<br /><span>3BBLACKBIO&nbsp;&nbsp;&nbsp;"
+        "<strong>INE994E01018</strong>&nbsp;&nbsp;&nbsp;532067</span></a></li>\""
+    )
+    results = fundamentals_security_master.parse_bse_search_response(text)
+    assert results == [
+        {"scrip_code": "532067", "company_name": "3B BLACKBIO DX LTD", "symbol": "3BBLACKBIO", "isin": "INE994E01018"}
+    ]
+
+
+def test_bse_search_response_no_match_returns_empty():
+    # Confirmed live 2026-08-10: BSE's literal response for an ISIN it doesn't carry
+    # (e.g. an NSE-SME-only listing never cross-listed on BSE) -- no <li ng-click=...>
+    # block at all, so this must parse to zero results, not raise.
+    text = "\"<li class='quotemenu'><a>No Match Found<br /><span></span></a></li>\""
+    assert fundamentals_security_master.parse_bse_search_response(text) == []
+
+
+def test_lookup_bse_scrip_code_rejects_non_exact_isin_match(monkeypatch):
+    """Defensive check: only trust an exact ISIN match in the response. A fuzzy/partial
+    match returned by BSE's search must never silently attach the wrong scrip code."""
+    monkeypatch.setattr(fundamentals_security_master, "exchange_request_gate", lambda **kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(
+        fundamentals_security_master,
+        "parse_bse_search_response",
+        lambda text: [{"scrip_code": "999999", "company_name": "SOMETHING ELSE LTD", "symbol": "SMELSE", "isin": "INE000000000"}],
+    )
+
+    class FakeResponse:
+        text = "irrelevant, parse_bse_search_response is mocked"
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(fundamentals_security_master.requests, "get", lambda *a, **k: FakeResponse())
+
+    result = fundamentals_security_master.lookup_bse_scrip_code("INE732I01021")
+
+    assert result is None
+
+
+def test_copy_bse_scrip_code_from_ticker_skips_when_nothing_eligible(monkeypatch):
+    monkeypatch.setattr(fundamentals_security_master, "sql_to_df", lambda *_a, **_k: pd.DataFrame())
+    upserts = []
+    monkeypatch.setattr(fundamentals_security_master, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
+
+    assert fundamentals_security_master.copy_bse_scrip_code_from_ticker() == 0
+    assert upserts == []

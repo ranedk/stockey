@@ -1,33 +1,45 @@
-"""EQUITY_L.csv ingestion -- fundamental screener step 0
-(docs/FUNDAMENTAL_SCREENER_PRD.md sec 5, sec 8 step 0).
+"""Security master -- fundamental screener step 0
+(docs/FUNDAMENTAL_SCREENER_PRD.md sec 5, sec 8 step 0). Two independent pieces:
 
-stockey's existing identity layer (dim_security / dim_security_history) is derived
-ONLY from observed nseindia_ohlcv price rows (data.nseindia.security_history), so it
-misses any currently-listed name that hasn't shown up in a parsed bhavcopy day yet --
-recent listings, thinly-traded microcaps, or names whose ISIN changed without a
-follow-up identity-break resolution. EQUITY_L.csv (the full NSE-listed universe) is a
-second, independent observation source that fills that gap.
+1. EQUITY_L.csv ingestion. stockey's existing identity layer (dim_security /
+   dim_security_history) is derived ONLY from observed nseindia_ohlcv price rows
+   (data.nseindia.security_history), so it misses any currently-listed name that
+   hasn't shown up in a parsed bhavcopy day yet -- recent listings, thinly-traded
+   microcaps, or names whose ISIN changed without a follow-up identity-break
+   resolution. EQUITY_L.csv (the full NSE-listed universe) is a second, independent
+   observation source that fills that gap.
 
-This module is additive to the existing identity pipeline, not a fork of it: it
-reuses data.nseindia.security_history's exact security_id-minting and
-identity-break-detection helpers (default_security_id, hash_key) rather than
-duplicating that logic, then calls data.nseindia.security_dimension.run() (unmodified)
-to propagate the result into dim_security the same way the pure-TA pipeline already
-does. No pure-TA file is modified by this module.
+   This is additive to the existing identity pipeline, not a fork of it: it reuses
+   data.nseindia.security_history's exact security_id-minting and
+   identity-break-detection helpers (default_security_id, hash_key) rather than
+   duplicating that logic, then calls data.nseindia.security_dimension.run()
+   (unmodified) to propagate the result into dim_security the same way the pure-TA
+   pipeline already does. No pure-TA file is modified by this module.
 
-Two outcomes per missing ISIN, handled differently:
-  - symbol never seen before -> new dim_security_history row (mapping_source=
-    "equity_master"), no ambiguity, inserted directly.
-  - symbol already known under a DIFFERENT isin -> NOT inserted blind; written to
-    dim_security_review_events as event_type="identity_break_candidate" via the same
-    schema data.nseindia.security_history.build_review_events already uses, for the
-    existing manual-review workflow (docs/identity.md) to resolve.
+   Two outcomes per missing ISIN, handled differently:
+     - symbol never seen before -> new dim_security_history row (mapping_source=
+       "equity_master"), no ambiguity, inserted directly.
+     - symbol already known under a DIFFERENT isin -> NOT inserted blind; written to
+       dim_security_review_events as event_type="identity_break_candidate" via the
+       same schema data.nseindia.security_history.build_review_events already uses,
+       for the existing manual-review workflow (docs/identity.md) to resolve.
+
+2. BSE numeric scrip code backfill. BSE's APIs key on a numeric scrip code (e.g.
+   543235), not the ticker (bse_ticker, already in company_master) -- fundamentals'
+   BSE crawlers (announcements, PIT/SAST) need this to query BSE at all. Looked up
+   by ISIN (never by name -- ISIN is the one unambiguous key, per docs sec 4) against
+   BSE's public smart-search endpoint, confirmed live 2026-08-10:
+   api.bseindia.com/BseIndiaAPI/api/PeerSmartSearch/w?Type=SS&text=<ISIN>. No cookie
+   gate (matches the source PRD sec 3.2's characterization of BSE vs NSE), but rate
+   gated the same as everything else -- this is still bseindia.com, untested for how
+   fast it blocks, and the NSE lesson (2026-08-09/10) is not to find out the hard way.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import re
 
 import pandas as pd
 import requests
@@ -43,6 +55,7 @@ from data.nseindia.security_history import (
 from utils import store
 from utils.company_master import map_company_master_ids
 from utils.db import sql_to_df, upsert_to_db
+from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.nse_rate_limiter import nse_request_gate
 
@@ -55,6 +68,17 @@ UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 HEADERS = {"User-Agent": UA, "Referer": "https://www.nseindia.com/all-reports", "Accept": "*/*"}
+
+BSE_SEARCH_URL = "https://api.bseindia.com/BseIndiaAPI/api/PeerSmartSearch/w"
+BSE_HEADERS = {"User-Agent": UA, "Referer": "https://www.bseindia.com/", "Accept": "application/json, text/plain, */*"}
+# BSE's smart-search response is an HTML fragment per match, e.g.:
+#   <li ... ng-click="liclick('543235','ANGEL ONE LTD')">...<span>ANGELONE&nbsp;&nbsp;&nbsp;INE732I01021&nbsp;&nbsp;&nbsp;543235</span>...</li>
+# with the matched search term sometimes wrapped in <strong>...</strong> (e.g. an
+# ISIN search highlights the ISIN) -- confirmed against 3 live responses 2026-08-10.
+_BSE_LI_BLOCK_RE = re.compile(r"liclick\('(?P<scrip_code>\d+)','(?P<name>[^']*)'\)(?P<rest>.*?)</li>", re.DOTALL)
+_BSE_SPAN_RE = re.compile(r"<span>(?P<content>.*?)</span>", re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
 SYNC_SOURCE_NAME = "fundamentals.collectors.security_master"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
@@ -192,10 +216,121 @@ def build_identity_break_events(identity_breaks: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(events)
 
 
-def main() -> int:
-    global STOCKEY_RUN_STATE
-    ensure_identity_tables()
+def parse_bse_search_response(text: str) -> list[dict[str, str | None]]:
+    """Extract (scrip_code, company_name, symbol, isin) from every <li> match in a
+    BSE smart-search response. Strips HTML tags from the <span> content before
+    splitting on whitespace so a highlighted <strong>ISIN</strong> (as happens when
+    searching by ISIN) parses the same as a plain match."""
+    results: list[dict[str, str | None]] = []
+    for block in _BSE_LI_BLOCK_RE.finditer(text):
+        span_match = _BSE_SPAN_RE.search(block.group("rest"))
+        if span_match is None:
+            continue
+        span_text = _HTML_TAG_RE.sub("", span_match.group("content")).replace("&nbsp;", " ")
+        parts = [p for p in span_text.split() if p]
+        results.append(
+            {
+                "scrip_code": block.group("scrip_code"),
+                "company_name": block.group("name"),
+                "symbol": parts[0] if len(parts) > 0 else None,
+                "isin": parts[1] if len(parts) > 1 else None,
+            }
+        )
+    return results
 
+
+def lookup_bse_scrip_code(isin: str) -> dict[str, str | None] | None:
+    """Look up one ISIN's BSE scrip code through the shared cross-process BSE rate
+    gate. Only trusts an exact ISIN match in the response (defensive: a fuzzy/partial
+    match would silently attach the wrong scrip code to a company)."""
+    with exchange_request_gate(domain="bse"):
+        response = requests.get(
+            BSE_SEARCH_URL, params={"Type": "SS", "text": isin}, headers=BSE_HEADERS, timeout=20
+        )
+    response.raise_for_status()
+    matches = [m for m in parse_bse_search_response(response.text) if m["isin"] == isin]
+    return matches[0] if matches else None
+
+
+def copy_bse_scrip_code_from_ticker() -> int:
+    """Fast path, zero BSE requests: company_master.bse_ticker is already the numeric
+    BSE scrip code for every populated row observed so far (confirmed live 2026-08-10:
+    5429/5429 non-null bse_ticker values are purely numeric -- whatever originally
+    populated bse_ticker, likely Sharpely's own master, already used BSE's scrip code
+    as the identifier). Copy directly rather than re-deriving the same value through a
+    rate-limited live lookup -- the live path (backfill_bse_scrip_codes) is only worth
+    it for the genuine gap: companies with no bse_ticker at all."""
+    df = sql_to_df(
+        """
+        SELECT company_master_id, bse_ticker AS bse_scrip_code
+        FROM company_master
+        WHERE bse_ticker IS NOT NULL AND bse_ticker != ''
+          AND bse_ticker ~ '^[0-9]+$'
+          AND (bse_scrip_code IS NULL OR bse_scrip_code = '')
+        """
+    )
+    if df.empty:
+        return 0
+    upsert_to_db(df, "company_master", unique_keys=["company_master_id"])
+    return len(df)
+
+
+def load_bse_scrip_code_targets(limit: int | None = None) -> pd.DataFrame:
+    """One row per company (its single most recent ISIN, via dim_security) that
+    doesn't have a bse_scrip_code in company_master yet -- a company with multiple
+    historical ISINs (renames) must not generate one lookup per ISIN, that would
+    waste BSE requests on superseded identities with no value. Handles the bootstrap
+    case where the column doesn't exist at all yet (upsert_to_db adds it dynamically
+    on first write, same pattern master_dhan_instruments already uses)."""
+    has_column = not sql_to_df(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'company_master' AND column_name = 'bse_scrip_code'"
+    ).empty
+    filter_clause = "AND (cm.bse_scrip_code IS NULL OR cm.bse_scrip_code = '')" if has_column else ""
+    limit_clause = f"LIMIT {int(limit)}" if limit else ""
+    return sql_to_df(
+        f"""
+        SELECT DISTINCT ON (ds.company_master_id) ds.company_master_id, ds.isin
+        FROM dim_security ds
+        LEFT JOIN company_master cm ON cm.company_master_id = ds.company_master_id
+        WHERE ds.isin IS NOT NULL AND ds.company_master_id IS NOT NULL
+        {filter_clause}
+        ORDER BY ds.company_master_id, ds.last_trade_date DESC NULLS LAST, ds.effective_to DESC NULLS LAST
+        {limit_clause}
+        """
+    )
+
+
+def backfill_bse_scrip_codes(limit: int | None = None) -> dict[str, object]:
+    """Fast free copy first (copy_bse_scrip_code_from_ticker, zero BSE requests), then
+    live BSE lookups only for the genuine gap (companies with no bse_ticker at all),
+    bounded by `limit` per run (rate-gated at BSE_MIN_REQUEST_INTERVAL_SECONDS/request
+    -- a full live backfill is a multi-hour job by design, meant to run incrementally
+    over several cron cycles, not synchronously in one sitting)."""
+    copied = copy_bse_scrip_code_from_ticker()
+
+    targets = load_bse_scrip_code_targets(limit=limit)
+    found_rows: list[dict[str, object]] = []
+    not_found = 0
+    for row in targets.itertuples():
+        result = lookup_bse_scrip_code(row.isin)
+        if result is None or not result.get("scrip_code"):
+            not_found += 1
+            continue
+        found_rows.append({"company_master_id": row.company_master_id, "bse_scrip_code": result["scrip_code"]})
+
+    if found_rows:
+        upsert_to_db(pd.DataFrame(found_rows), "company_master", unique_keys=["company_master_id"])
+
+    return {
+        "copied_from_existing_ticker": copied,
+        "live_lookup_targets_considered": len(targets),
+        "live_lookup_found": len(found_rows),
+        "live_lookup_not_found": not_found,
+    }
+
+
+def run_equity_l_reconciliation() -> dict[str, object]:
     equity_l = fetch_equity_l()
     new_symbols, identity_breaks = classify_gaps(equity_l)
 
@@ -215,8 +350,7 @@ def main() -> int:
         # unmodified, reused as-is.
         security_dimension.run()
 
-    STOCKEY_RUN_STATE = {
-        "source": SYNC_SOURCE_NAME,
+    return {
         "rows": len(new_rows),
         "rows_written": len(new_rows),
         "equity_l_rows": len(equity_l),
@@ -224,8 +358,53 @@ def main() -> int:
         "identity_break_candidates": len(identity_breaks),
         "review_events_written": len(review_events),
         "company_master_id_missing": int(new_rows["company_master_id"].isna().sum()) if not new_rows.empty else 0,
-        "fallback_used": False,
         "state_advanced": len(new_rows) > 0 or len(review_events) > 0,
+    }
+
+
+def main() -> int:
+    import argparse
+
+    global STOCKEY_RUN_STATE
+    parser = argparse.ArgumentParser(description="Security master: EQUITY_L.csv reconciliation + BSE scrip code backfill.")
+    parser.add_argument(
+        "--only",
+        choices=["equity-l", "bse-scrip-codes"],
+        default=None,
+        help="Run only one step. Default: both, EQUITY_L.csv first.",
+    )
+    parser.add_argument(
+        "--bse-limit",
+        type=int,
+        default=200,
+        help=(
+            "Max BSE scrip-code lookups this run (rate-gated at "
+            "BSE_MIN_REQUEST_INTERVAL_SECONDS/lookup -- a full backfill is a multi-hour "
+            "job by design; this bounds one run so it fits a daily cron slot and picks "
+            "up where it left off next run). 0 = unbounded."
+        ),
+    )
+    args = parser.parse_args()
+
+    ensure_identity_tables()
+    run_equity_l = args.only in (None, "equity-l")
+    run_bse = args.only in (None, "bse-scrip-codes")
+
+    equity_l_state: dict[str, object] = {}
+    bse_state: dict[str, object] = {}
+    if run_equity_l:
+        equity_l_state = run_equity_l_reconciliation()
+    if run_bse:
+        bse_state = backfill_bse_scrip_codes(limit=args.bse_limit or None)
+
+    STOCKEY_RUN_STATE = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": equity_l_state.get("rows", 0),
+        "rows_written": equity_l_state.get("rows_written", 0),
+        "fallback_used": False,
+        "state_advanced": bool(equity_l_state.get("state_advanced")) or bse_state.get("found", 0) > 0,
+        **({f"equity_l_{k}": v for k, v in equity_l_state.items()} if equity_l_state else {}),
+        **({f"bse_scrip_code_{k}": v for k, v in bse_state.items()} if bse_state else {}),
     }
     status = "ok"
     print(json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
