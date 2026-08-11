@@ -50,6 +50,7 @@ from fundamentals.collectors import nse_pit as fundamentals_nse_pit
 from fundamentals.collectors import rating_agencies as fundamentals_rating_agencies
 from fundamentals.collectors import ocr_pipeline as fundamentals_ocr_pipeline
 from fundamentals.collectors import structured_extraction as fundamentals_structured_extraction
+from fundamentals.screens import l3_triggers as fundamentals_l3_triggers
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -10306,3 +10307,157 @@ def test_run_structured_extraction_trips_circuit_breaker(monkeypatch):
     assert result["blocked"] is True
     assert result["failed"] == fundamentals_structured_extraction.CIRCUIT_BREAKER_THRESHOLD
     assert any(a and a[0] == "structured_extraction_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+# fundamentals/screens/l3_triggers.py -- L3 rule-based alerting (step 7, rule half).
+
+
+def test_evaluate_rating_action_trigger_downgrade_always_alerts():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger(
+        {"rating_action_type": "downgraded"}, {"net_debt_yoy_delta_rscr": 5}
+    )
+    assert result["trigger_type"] == "rating_downgrade"
+
+
+def test_evaluate_rating_action_trigger_downgrade_alerts_even_without_l2_state():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger({"rating_action_type": "downgraded"}, None)
+    assert result["trigger_type"] == "rating_downgrade"
+
+
+def test_evaluate_rating_action_trigger_reaffirmed_with_declining_debt_alerts():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger(
+        {"rating_action_type": "reaffirmed"}, {"net_debt_yoy_delta_rscr": -12}
+    )
+    assert result["trigger_type"] == "rating_confirms_deleveraging"
+
+
+def test_evaluate_rating_action_trigger_upgraded_with_declining_debt_alerts():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger(
+        {"rating_action_type": "upgraded"}, {"net_debt_yoy_delta_rscr": -1}
+    )
+    assert result["trigger_type"] == "rating_confirms_deleveraging"
+
+
+def test_evaluate_rating_action_trigger_reaffirmed_with_rising_debt_does_not_alert():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger(
+        {"rating_action_type": "reaffirmed"}, {"net_debt_yoy_delta_rscr": 5}
+    )
+    assert result is None
+
+
+def test_evaluate_rating_action_trigger_reaffirmed_without_l2_state_does_not_alert():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger({"rating_action_type": "reaffirmed"}, None)
+    assert result is None
+
+
+def test_evaluate_pit_sast_trigger_buy_always_alerts():
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": "Buy", "insider_name": "X"}, {"promoter_stake_direction": "flat"}
+    )
+    assert result["trigger_type"] == "insider_buy"
+
+
+def test_evaluate_pit_sast_trigger_sell_surprise_alerts():
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": "Sell", "insider_name": "X"}, {"promoter_stake_direction": "flat"}
+    )
+    assert result["trigger_type"] == "insider_sell_surprise"
+
+
+def test_evaluate_pit_sast_trigger_sell_confirming_known_trend_does_not_alert():
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": "Sell", "insider_name": "X"}, {"promoter_stake_direction": "decreasing"}
+    )
+    assert result is None
+
+
+def test_evaluate_pit_sast_trigger_no_transaction_data_does_not_alert():
+    # the common real case -- a trading-window-closure procedural notice
+    assert fundamentals_l3_triggers.evaluate_pit_sast_trigger({"transaction_type": None}, {"promoter_stake_direction": "flat"}) is None
+
+
+def test_load_candidate_events_queries_expected_filters(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", fake_sql_to_df)
+    fundamentals_l3_triggers.load_candidate_events()
+    assert "rating_action" in captured["query"]
+    assert "pit_sast" in captured["query"]
+    assert "rule_trigger_status IS NULL OR rule_trigger_status = 'pending'" in captured["query"]
+
+
+def test_run_l3_rule_triggers_returns_early_when_no_candidates(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_l3_triggers.run_l3_rule_triggers()
+
+    assert result == {"alerted": 0, "not_alert_worthy": 0, "no_l2_state": 0}
+
+
+def test_run_l3_rule_triggers_writes_an_alert_for_a_downgrade(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "rating_action",
+                "headline": "downgrade notice", "rating_action_type": "downgraded", "transaction_type": None,
+                "insider_name": None, "quantity": None, "disclosure_date": date(2026, 8, 1),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
+    l2_state = pd.DataFrame([{"ticker": "X", "company_name": "X Ltd", "net_debt_yoy_delta_rscr": 3, "run_date": date(2026, 7, 1)}])
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: l2_state)
+
+    upserts = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    status_calls = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "_set_rule_trigger_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_l3_triggers.run_l3_rule_triggers()
+
+    assert result == {"alerted": 1, "not_alert_worthy": 0, "no_l2_state": 0}
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_l3_triggers.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["source", "news_id", "trigger_type"]
+    assert df.iloc[0]["trigger_type"] == "rating_downgrade"
+    assert df.iloc[0]["origin"] == "rule"
+    assert df.iloc[0]["company_master_id"] == "nse:X"
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "alerted"}]
+
+
+def test_run_l3_rule_triggers_marks_not_alert_worthy_and_skips_upsert(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "pit_sast",
+                "headline": "trading window closed", "rating_action_type": None, "transaction_type": None,
+                "insider_name": None, "quantity": None, "disclosure_date": date(2026, 8, 1),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: pd.DataFrame(columns=["ticker"]))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    status_calls = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "_set_rule_trigger_status", lambda **kwargs: status_calls.append(kwargs))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_l3_triggers.run_l3_rule_triggers()
+
+    assert result == {"alerted": 0, "not_alert_worthy": 1, "no_l2_state": 1}
+    assert upserts == []
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "not_alert_worthy"}]
+    assert any(a and a[0] == "l3_trigger_no_l2_state" for a, k in fallback_events)
