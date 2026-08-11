@@ -49,6 +49,7 @@ from fundamentals.collectors import events_store as fundamentals_events_store
 from fundamentals.collectors import nse_pit as fundamentals_nse_pit
 from fundamentals.collectors import rating_agencies as fundamentals_rating_agencies
 from fundamentals.collectors import ocr_pipeline as fundamentals_ocr_pipeline
+from fundamentals.collectors import structured_extraction as fundamentals_structured_extraction
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8965,6 +8966,14 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
         # must NOT be classified as an actual results announcement (see
         # classify_announcement's docstring on why "results" has no headline fallback).
         ("Newspaper Publication", "Newspaper Publication of the Unaudited Financial Results", "other"),
+        # Real (subcategory, headline) pair, captured live 2026-08-11 via structured_
+        # extraction.py's own output flagging a bad prior classification: BSE's own
+        # subcategory is unambiguously "Board Meeting", but the headline cites "LODR
+        # Regulation 29" (prior board-meeting intimation) -- an unrelated regulation
+        # that just happens to share a number with SEBI (SAST) Regulations' own
+        # Reg 29. Must NOT match on the bare regulation number (see PIT_SAST_KEYWORDS'
+        # comment on why "regulation 29"/"regulation 31" were removed).
+        ("Board Meeting", "Bal Pharma Ltd has informed BSE... Pursuant to Regulation 29 and other applicable provisions...", "other"),
     ],
 )
 def test_classify_announcement(subcategory, headline, expected):
@@ -10161,3 +10170,139 @@ def test_run_ocr_pipeline_trips_circuit_breaker_per_domain(monkeypatch):
     assert result["blocked"] is True
     assert result["failed"] == fundamentals_ocr_pipeline.CIRCUIT_BREAKER_THRESHOLD
     assert any(a and a[0] == "ocr_pipeline_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+# fundamentals/collectors/structured_extraction.py -- L3/L4 OCR-text -> typed fields
+# (step 6, second stage). gpt-5.4-mini itself is never called in this test suite
+# (verified live 2026-08-11 against 3 real documents instead, see module docstring for
+# what that testing found and fixed) -- these tests cover schema routing, the
+# extraction-target query, and run_structured_extraction's orchestration, all with the
+# OpenAI/DB/S3 calls mocked.
+
+
+def test_extract_structured_fields_raises_for_unsupported_filing_type():
+    with pytest.raises(fundamentals_structured_extraction.UnsupportedFilingTypeError):
+        fundamentals_structured_extraction.extract_structured_fields("some text", "results_calendar_unknown_type")
+
+
+def test_extract_structured_fields_routes_to_the_right_schema(monkeypatch):
+    captured = {}
+
+    class FakeMessage:
+        content = '{"ok": true}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(fundamentals_structured_extraction, "OpenAI", lambda api_key: FakeClient())
+
+    result = fundamentals_structured_extraction.extract_structured_fields("some rating text", "rating_action", model="test-model")
+
+    assert result == {"ok": True}
+    assert captured["model"] == "test-model"
+    assert captured["messages"][1]["content"] == "some rating text"
+    assert captured["response_format"]["json_schema"]["name"] == "rating_action_extraction"
+    assert captured["response_format"]["json_schema"]["schema"] == fundamentals_structured_extraction.RATING_ACTION_SCHEMA
+
+
+@pytest.mark.parametrize("filing_type", ["results", "results_calendar", "rating_action", "pit_sast"])
+def test_every_supported_filing_type_has_a_schema(filing_type):
+    assert filing_type in fundamentals_structured_extraction.SCHEMAS_BY_FILING_TYPE
+
+
+def test_load_pending_extraction_targets_queries_expected_filters(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_structured_extraction, "sql_to_df", fake_sql_to_df)
+    fundamentals_structured_extraction.load_pending_extraction_targets()
+    assert "ocr_status = 'done'" in captured["query"]
+    assert "structured_extraction_status IS NULL OR structured_extraction_status = 'pending'" in captured["query"]
+
+
+def test_run_structured_extraction_returns_early_when_nothing_pending(monkeypatch):
+    monkeypatch.setattr(fundamentals_structured_extraction, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_structured_extraction, "_bootstrap_extraction_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_structured_extraction, "load_pending_extraction_targets", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_structured_extraction.run_structured_extraction()
+
+    assert result == {"extracted": 0, "failed": 0, "unsupported_filing_type": 0, "blocked": False}
+
+
+def test_run_structured_extraction_marks_unsupported_filing_types(monkeypatch):
+    monkeypatch.setattr(fundamentals_structured_extraction, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_structured_extraction, "_bootstrap_extraction_columns", lambda: None)
+    pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "filing_type": "something_new", "ocr_text_s3_key": "key1"}])
+    monkeypatch.setattr(fundamentals_structured_extraction, "load_pending_extraction_targets", lambda limit=None: pending)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_structured_extraction, "_set_extraction_result", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_structured_extraction.run_structured_extraction()
+
+    assert result["unsupported_filing_type"] == 1
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "unsupported_filing_type"}]
+
+
+def test_run_structured_extraction_happy_path(monkeypatch):
+    monkeypatch.setattr(fundamentals_structured_extraction, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_structured_extraction, "_bootstrap_extraction_columns", lambda: None)
+    pending = pd.DataFrame([{"source": "icra", "news_id": "n1", "filing_type": "rating_action", "ocr_text_s3_key": "fundamentals/ocr/icra/n1.txt"}])
+    monkeypatch.setattr(fundamentals_structured_extraction, "load_pending_extraction_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_structured_extraction, "get_text_blob", lambda key: "the ocr text")
+    extracted = {"company_name": "X Ltd", "rating_action": "reaffirmed"}
+    monkeypatch.setattr(fundamentals_structured_extraction, "extract_structured_fields", lambda text, filing_type, **k: extracted)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_structured_extraction, "_set_extraction_result", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_structured_extraction.run_structured_extraction(model="test-model")
+
+    assert result["extracted"] == 1
+    assert result["blocked"] is False
+    assert len(status_calls) == 1
+    call = status_calls[0]
+    assert call["status"] == "done"
+    assert json.loads(call["fields"]["structured_extraction_json"]) == extracted
+    assert call["fields"]["structured_extraction_model"] == "test-model"
+    assert call["fields"]["structured_extraction_schema_version"] == fundamentals_structured_extraction.SCHEMA_VERSION
+
+
+def test_run_structured_extraction_trips_circuit_breaker(monkeypatch):
+    monkeypatch.setattr(fundamentals_structured_extraction, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_structured_extraction, "_bootstrap_extraction_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": f"n{i}", "filing_type": "results", "ocr_text_s3_key": f"key{i}"} for i in range(5)]
+    )
+    monkeypatch.setattr(fundamentals_structured_extraction, "load_pending_extraction_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_structured_extraction, "get_text_blob", lambda key: "text")
+
+    def always_fails(text, filing_type, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_structured_extraction, "extract_structured_fields", always_fails)
+    monkeypatch.setattr(fundamentals_structured_extraction, "_set_extraction_result", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_structured_extraction, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_structured_extraction.run_structured_extraction()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_structured_extraction.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "structured_extraction_circuit_breaker_tripped" for a, k in fallback_events)

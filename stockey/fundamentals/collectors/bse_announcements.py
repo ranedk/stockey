@@ -122,14 +122,25 @@ PIT_SAST_KEYWORDS = (
     # Confirmed live 2026-08-10 against real BSE announcement history (SUBCATNAME=
     # "Closure of Trading Window" appeared with no "insider"/"sast" substring at all --
     # the first classifier draft missed it entirely): trading-window control notices
-    # and Reg. 29/31 SAST disclosures are the actual recurring phrasings BSE uses.
+    # are the other recurring PIT-related phrasing BSE uses.
     "trading window",
-    "regulation 29",
-    "regulation 31",
-    "reg. 29",
-    "reg. 31",
-    "reg.29",
-    "reg.31",
+    # Deliberately NOT matching bare "regulation 29"/"regulation 31"/"reg. 29"/
+    # "reg. 31" here -- found live 2026-08-11 via structured_extraction.py's own
+    # output on a real row: those regulation NUMBERS are overloaded across two
+    # unrelated regulation sets. SEBI (SAST) Regulations has a Reg 29 (substantial
+    # acquisition disclosure), but SEBI LODR *also* has its own Reg 29 (prior
+    # intimation of a board meeting -- a routine, frequent filing with nothing to do
+    # with insider trading) and its own Reg 31 (routine quarterly shareholding-pattern
+    # disclosure). A real "Prior Intimation of Board Meeting pursuant to Regulation 29"
+    # notice (SUBCATNAME="Board Meeting", genuinely unrelated to PIT/SAST) was
+    # misclassified as pit_sast purely because its headline cited "Regulation 29" --
+    # BSE's own subcategory had already correctly said "Board Meeting", and the
+    # headline-fallback keyword match overrode that with a false positive. Real SAST
+    # filings reliably name "SAST" or "insider trading" explicitly in their own text
+    # (confirmed: this doesn't cost real recall -- the existing regression test for a
+    # genuine "Regulation 29(2) of SEBI (SAST) Regulations" headline still matches via
+    # the "sast" keyword alone), so dropping the bare regulation-number match trades
+    # nothing real away while removing the LODR-collision false-positive risk.
 )
 
 
