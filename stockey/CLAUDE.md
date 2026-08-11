@@ -35,7 +35,7 @@ reintroduce research/signal/LLM logic here — it belongs in systrader.
 
 ## Current Architecture
 
-The whole pipeline is 6 cron jobs (`config/stockey.crontab.template`):
+The core pure-TA pipeline is 6 cron jobs (`config/stockey.crontab.template`):
 
 1. `complete_data.sh` (07:10 + 17:30) — runs `data.download_runner --phase all`:
    downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
@@ -60,6 +60,23 @@ BORDERLINE (LLM-free, useful for FnO event-vol research later per
 `docs/DATA_INVENTORY.md`) — the files stay but are deliberately **not** scheduled
 (frozen, not deleted).
 
+Plus two more jobs (2026-08-11) for the fundamentals screener, a deliberate,
+separate carve-out from the pure-TA boundary above (long-term fundamental
+screening — screener/watchlist/narrative/portfolio — not technicals/trading;
+`docs/FUNDAMENTAL_SCREENER_PRD.md`):
+
+7. `all_fundamentals_screener.sh` (19:15, weekdays) — runs
+   `fundamentals.run_pipeline`: L1/L2 refresh, event collectors, OCR + structured
+   extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive
+   technicals, and the watchlist/narrative/email pipeline, in dependency order.
+   One step failing does not abort the run.
+8. `all_fundamentals_api.sh` (every 5 min, no weekday restriction) — long-running
+   FastAPI service (`fundamentals/api/app.py`) serving the `screener/` Nuxt
+   frontend. Same respawn-under-lock pattern the old `all_frontend.sh` used: cron
+   retries every 5 minutes, `with_lock.sh` no-ops while a real instance holds the
+   lock, and the script's own `/api/health` check no-ops again if something is
+   already serving.
+
 ## Key Commands
 
 Daily/operator (matches the crontab exactly):
@@ -71,6 +88,8 @@ Daily/operator (matches the crontab exactly):
 ./all_ohlcv_reconcile.sh
 ./all_price_adjustment.sh
 ./all_data_readiness.sh
+./all_fundamentals_screener.sh
+./all_fundamentals_api.sh   # long-running -- serves the screener/ Nuxt frontend
 ```
 
 Cron:

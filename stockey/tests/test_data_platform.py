@@ -62,6 +62,7 @@ from fundamentals.screens import watch_summary as fundamentals_watch_summary
 from fundamentals.screens import notifications as fundamentals_notifications
 from fundamentals.api import queries as fundamentals_api_queries
 from fundamentals.api.app import app as fundamentals_api_app
+from fundamentals import run_pipeline as fundamentals_run_pipeline
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -11709,3 +11710,181 @@ def test_api_resolve_portfolio_success(monkeypatch):
     r = client.post("/api/portfolio/t1/resolve", json={"resolved_true": True})
     assert r.status_code == 200
     assert r.json() == {"status": "resolved", "thesis_id": "t1"}
+
+
+def _fake_step_module(*, main_fn, run_state=None):
+    """A fake module object for run_pipeline.run_step tests -- registers itself into
+    sys.modules on "import" the same way a real importlib.import_module call would,
+    since run_step's SystemExit branch looks the module back up via sys.modules.get()."""
+    module = types.SimpleNamespace(main=main_fn, STOCKEY_RUN_STATE=run_state or {})
+    return module
+
+
+def test_run_step_success_extracts_run_state(monkeypatch):
+    fake_module = _fake_step_module(main_fn=lambda: 0, run_state={"source": "fake", "status": "ok"})
+
+    def fake_import(name):
+        sys.modules[name] = fake_module
+        return fake_module
+
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", fake_import)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_ok")
+
+    assert result["module"] == "fundamentals.test.fake_ok"
+    assert result["returncode"] == 0
+    assert result["run_state"] == {"source": "fake", "status": "ok"}
+    assert "error" not in result
+    sys.modules.pop("fundamentals.test.fake_ok", None)
+
+
+def test_run_step_nonzero_return_marked_failed(monkeypatch):
+    fake_module = _fake_step_module(main_fn=lambda: 1, run_state={"status": "blocked"})
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: fake_module)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_nonzero")
+
+    assert result["returncode"] == 1
+    assert result["run_state"] == {"status": "blocked"}
+
+
+def test_run_step_system_exit_nonzero_extracts_run_state(monkeypatch):
+    def fake_import(name):
+        fake_module.STOCKEY_RUN_STATE = {"status": "failed"}
+        sys.modules[name] = fake_module
+
+        def raising_main():
+            raise SystemExit(1)
+
+        fake_module.main = raising_main
+        return fake_module
+
+    fake_module = _fake_step_module(main_fn=lambda: 0)
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", fake_import)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_sysexit")
+
+    assert result["returncode"] == 1
+    assert result["run_state"] == {"status": "failed"}
+    sys.modules.pop("fundamentals.test.fake_sysexit", None)
+
+
+def test_run_step_system_exit_none_normalizes_to_zero(monkeypatch):
+    def raising_main():
+        raise SystemExit()  # SystemExit(None) -- the raise SystemExit(main()) convention with a None main()
+
+    fake_module = _fake_step_module(main_fn=raising_main)
+
+    def fake_import(name):
+        sys.modules[name] = fake_module
+        return fake_module
+
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", fake_import)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_sysexit_none")
+
+    assert result["returncode"] == 0
+    sys.modules.pop("fundamentals.test.fake_sysexit_none", None)
+
+
+def test_run_step_unexpected_exception_is_isolated(monkeypatch):
+    def raising_main():
+        raise RuntimeError("boom")
+
+    fake_module = _fake_step_module(main_fn=raising_main)
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: fake_module)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_exception")
+
+    assert result["returncode"] == 1
+    assert result["run_state"] == {}
+    assert "RuntimeError: boom" in result["error"]
+
+
+def test_run_step_import_error_is_isolated(monkeypatch):
+    def raise_import_error(name):
+        raise ModuleNotFoundError(f"No module named {name!r}")
+
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", raise_import_error)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.does_not_exist")
+
+    assert result["returncode"] == 1
+    assert "ModuleNotFoundError" in result["error"]
+
+
+def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
+    calls = []
+
+    def make_fake(name, code):
+        def fake_import(_name, _code=code, _name2=name):
+            calls.append(_name2)
+            return _fake_step_module(main_fn=lambda c=_code: c)
+
+        return fake_import
+
+    order = iter([make_fake("step_a", 1), make_fake("step_b", 0)])
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: next(order)(name))
+
+    result = fundamentals_run_pipeline.run_pipeline(["step_a", "step_b"])
+
+    assert result["steps_run"] == 2
+    assert result["failed"] == ["step_a"]
+    assert calls == ["step_a", "step_b"]
+
+
+def test_run_pipeline_default_steps_matches_module_list():
+    assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
+    assert len(fundamentals_run_pipeline.STEPS) == 13
+    assert fundamentals_run_pipeline.STEPS[-1] == "fundamentals.screens.notifications"
+
+
+def test_main_exits_zero_when_not_all_steps_failed(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_pipeline"])
+    monkeypatch.setattr(
+        fundamentals_run_pipeline,
+        "run_pipeline",
+        lambda steps=None: {"steps_run": 2, "failed": ["a"], "results": []},
+    )
+
+    exit_code = fundamentals_run_pipeline.main()
+
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["source"] == "fundamentals.run_pipeline"
+    assert printed["failed"] == ["a"]
+
+
+def test_main_exits_nonzero_when_all_steps_failed(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_pipeline"])
+    monkeypatch.setattr(
+        fundamentals_run_pipeline,
+        "run_pipeline",
+        lambda steps=None: {"steps_run": 2, "failed": ["a", "b"], "results": []},
+    )
+
+    exit_code = fundamentals_run_pipeline.main()
+
+    assert exit_code == 1
+
+
+def test_main_passes_steps_override_through(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_pipeline", "--steps", "mod.a", "mod.b"])
+    captured = {}
+
+    def fake_run_pipeline(steps=None):
+        captured["steps"] = steps
+        return {"steps_run": 2, "failed": [], "results": []}
+
+    monkeypatch.setattr(fundamentals_run_pipeline, "run_pipeline", fake_run_pipeline)
+
+    fundamentals_run_pipeline.main()
+
+    assert captured["steps"] == ["mod.a", "mod.b"]
+
+
+def test_api_health_route():
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}

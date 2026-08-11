@@ -18,6 +18,8 @@ CRON_TEMPLATE_PATH = PROJECT_ROOT / "config" / "stockey.crontab.template"
 GENERATED_CRONTAB_PATH = PROJECT_ROOT / "config" / "stockey.generated.crontab"
 LOCK_WRAPPER_PATH = PROJECT_ROOT / "scripts" / "with_lock.sh"
 FRONTEND_SCRIPT_PATH = PROJECT_ROOT / "all_frontend.sh"
+FUNDAMENTALS_SCREENER_SCRIPT_PATH = PROJECT_ROOT / "all_fundamentals_screener.sh"
+FUNDAMENTALS_API_SCRIPT_PATH = PROJECT_ROOT / "all_fundamentals_api.sh"
 
 
 def _log(message: str) -> None:
@@ -139,7 +141,7 @@ def ensure_runtime_directories() -> None:
 
 
 def ensure_script_permissions() -> None:
-    for script_path in [LOCK_WRAPPER_PATH, FRONTEND_SCRIPT_PATH]:
+    for script_path in [LOCK_WRAPPER_PATH, FRONTEND_SCRIPT_PATH, FUNDAMENTALS_SCREENER_SCRIPT_PATH, FUNDAMENTALS_API_SCRIPT_PATH]:
         if script_path.exists():
             script_path.chmod(0o755)
             _log(f"Ensured executable script: {script_path}")

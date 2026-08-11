@@ -17,6 +17,12 @@ LOG_DIR={{LOG_DIR}}
 # Pure-TA cut (2026-08-02, PURE_TA_MIGRATION_PLAN.md Phase 4): only the 6 data-platform
 # jobs below remain. All advisory/paper-trading/research/frontend jobs were removed here;
 # their code lives on the advisory-archive-2026-07 branch until Phase 4 fully archives it.
+#
+# Fundamentals screener (2026-08-11, docs/FUNDAMENTAL_SCREENER_PRD.md): a deliberate,
+# separate carve-out from the pure-TA boundary above -- long-term fundamental screening
+# (screener/watchlist/narrative/portfolio), not technicals/trading. Two more jobs below:
+# the batch pipeline (fundamentals/run_pipeline.py) and its API server
+# (fundamentals/api/app.py), which serves the screener/ Nuxt frontend.
 
 # ---------------------------------------------------------------------------
 # Recurring cron-managed jobs.
@@ -64,6 +70,21 @@ LOG_DIR={{LOG_DIR}}
 # the OHLCV reconcile now that the downstream advisory/research chain that used to sit between
 # them is gone -- no need to wait until 21:38 anymore.
 50 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+
+# Fundamentals screener pipeline: L1/L2 refresh, event collectors, OCR + structured
+# extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive
+# technicals, and the watchlist/narrative/email pipeline (fundamentals/run_pipeline.py,
+# one step failing does not abort the run). Scheduled after price_adjustment
+# (18:50) so the descriptive-technicals step reads a same-day adjusted price series.
+15 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_screener.lock ./all_fundamentals_screener.sh >> "$LOG_DIR/fundamentals_screener.log" 2>&1
+
+# Fundamentals screener API (fundamentals/api/app.py), serving the screener/ Nuxt
+# frontend. Long-running service, same respawn-under-lock pattern the old
+# all_frontend.sh used (see stockey-service-management memory): cron retries every 5
+# minutes, with_lock.sh no-ops while a real instance holds the lock, and the script's
+# own /api/health check no-ops again if something is already serving. No weekday
+# restriction -- this is a local dashboard, not a market-hours job.
+*/5 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_api.lock ./all_fundamentals_api.sh >> "$LOG_DIR/fundamentals_api.log" 2>&1
 
 # ---------------------------------------------------------------------------
 # Manual / catch-up / long-running scripts. Keep these commented unless you

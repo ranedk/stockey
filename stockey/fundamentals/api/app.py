@@ -65,6 +65,15 @@ class PortfolioResolveRequest(BaseModel):
     failure_attribution: str | None = None
 
 
+@app.get("/api/health")
+def health() -> dict:
+    """No DB/dependency check on purpose -- this only tells the cron-managed launcher
+    (all_fundamentals_api.sh) whether a healthy instance already owns the port, not
+    whether the DB is reachable (a query-level failure surfaces on the actual routes,
+    where fallback_telemetry already applies)."""
+    return {"status": "ok"}
+
+
 @app.get("/api/universe")
 def universe() -> dict:
     return queries.get_universe()
