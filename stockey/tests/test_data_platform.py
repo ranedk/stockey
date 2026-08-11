@@ -55,6 +55,7 @@ from fundamentals.screens import llm_triage as fundamentals_llm_triage
 from fundamentals.screens import l4_thesis as fundamentals_l4_thesis
 from fundamentals.collectors import sector_data as fundamentals_sector_data
 from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
+from fundamentals.screens import technicals as fundamentals_technicals
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -11103,3 +11104,79 @@ def test_run_sector_cycle_aggregation_logs_missing_sector_code_and_upserts(monke
     assert upserts[0][1] == fundamentals_sector_cycle.RESULTS_TABLE
     assert upserts[0][2]["unique_keys"] == ["sector_code", "run_date"]
     assert any(a and a[0] == "sector_cycle_missing_sector_code" for a, k in fallback_events)
+
+
+def test_compute_technicals_empty_history_returns_none_stats():
+    result = fundamentals_technicals.compute_technicals(pd.DataFrame(columns=["date", "adj_close"]))
+    assert result == {"as_of_date": None, "close": None, "data_points_available": 0}
+
+
+def test_compute_technicals_partial_history_leaves_long_windows_none():
+    # only 30 rows -- shorter than every return/DMA window this module computes
+    dates = pd.date_range("2026-01-01", periods=30, freq="D")
+    history = pd.DataFrame({"date": dates, "adj_close": [100.0 + i for i in range(30)]})
+
+    result = fundamentals_technicals.compute_technicals(history)
+
+    assert result["data_points_available"] == 30
+    assert result["close"] == 129.0
+    assert result["return_3m_pct"] is None
+    assert result["dma_50"] is None
+    assert result["z_score_vs_200d_mean"] is None
+
+
+def test_compute_technicals_computes_returns_and_dma_with_full_history():
+    # 260 rows: enough for every window (63/126/252 trading days, 50/200 DMA)
+    dates = pd.date_range("2025-01-01", periods=260, freq="D")
+    closes = [100.0] * 259 + [110.0]  # flat history except the very last close, up 10%
+    history = pd.DataFrame({"date": dates, "adj_close": closes})
+
+    result = fundamentals_technicals.compute_technicals(history)
+
+    assert result["close"] == 110.0
+    assert result["return_3m_pct"] == 10.0
+    assert result["return_6m_pct"] == 10.0
+    assert result["return_12m_pct"] == 10.0
+    assert result["dma_50"] is not None
+    assert result["dma_200"] is not None
+    assert result["pct_vs_dma_50"] > 0  # last close above its own trailing average
+    assert result["z_score_vs_200d_mean"] is not None
+    assert result["z_score_vs_200d_mean"] > 0  # last close is an outlier above a flat run
+
+
+def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: pd.DataFrame())
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_technicals.run_technicals_refresh()
+
+    assert result == {"companies": 0, "no_history": 0}
+    assert any(a and a[0] == "technicals_no_l1_universe" for a, k in fallback_events)
+
+
+def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypatch):
+    tickers = pd.DataFrame([{"ticker": "AAA", "company_name": "A Co"}, {"ticker": "BBB", "company_name": "B Co"}])
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+
+    full_history = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=260, freq="D"), "adj_close": [100.0] * 260})
+    thin_history = pd.DataFrame({"date": pd.date_range("2026-07-01", periods=5, freq="D"), "adj_close": [50.0] * 5})
+
+    def fake_history(ticker, **kwargs):
+        return full_history if ticker == "AAA" else thin_history
+
+    monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", fake_history)
+    upserts = []
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_technicals.run_technicals_refresh()
+
+    assert result == {"companies": 2, "no_history": 1}
+    assert len(upserts) == 1
+    assert upserts[0][1] == fundamentals_technicals.RESULTS_TABLE
+    assert upserts[0][2]["unique_keys"] == ["company_master_id", "run_date"]
+    written = upserts[0][0]
+    assert set(written["company_master_id"]) == {"nse:AAA", "nse:BBB"}
+    assert any(a and a[0] == "technicals_insufficient_history" for a, k in fallback_events)
