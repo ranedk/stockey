@@ -56,6 +56,7 @@ from fundamentals.screens import l4_thesis as fundamentals_l4_thesis
 from fundamentals.collectors import sector_data as fundamentals_sector_data
 from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
 from fundamentals.screens import technicals as fundamentals_technicals
+from fundamentals.screens import watchlist as fundamentals_watchlist
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -11180,3 +11181,110 @@ def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypat
     written = upserts[0][0]
     assert set(written["company_master_id"]) == {"nse:AAA", "nse:BBB"}
     assert any(a and a[0] == "technicals_insufficient_history" for a, k in fallback_events)
+
+
+def test_load_price_near_prefers_adjusted_falls_back_to_raw(monkeypatch):
+    calls = []
+
+    def fake_sql_to_df(query, params=None):
+        calls.append(query)
+        if "advisory_adjusted_ohlcv_daily" in query:
+            return pd.DataFrame()  # no adjusted data -- forces fallback
+        return pd.DataFrame([{"close": 42.5}])
+
+    monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
+
+    price = fundamentals_watchlist.load_price_near("nse:FOO", "2026-08-01")
+
+    assert price == 42.5
+    assert len(calls) == 2  # tried adjusted first, then raw
+
+
+def test_load_price_near_returns_none_when_no_source_has_data(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_watchlist.load_price_near("nse:FOO", "2026-08-01") is None
+
+
+def test_load_price_near_returns_none_for_missing_ticker_or_date():
+    assert fundamentals_watchlist.load_price_near(None, "2026-08-01") is None
+    assert fundamentals_watchlist.load_price_near("nse:FOO", None) is None
+
+
+def test_sync_watchlist_from_alerts_returns_early_on_no_alerts(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: pd.DataFrame())
+
+    result = fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    assert result == {"companies": 0, "new_candidates": 0, "no_price_at_first_seen": 0}
+
+
+def test_sync_watchlist_from_alerts_new_company_looks_up_first_seen_price(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    alert_summary = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-03"), "alert_count": 2}]
+    )
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
+    monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_watchlist, "load_price_near", lambda cid, date: 100.0)
+    upserts = []
+    monkeypatch.setattr(fundamentals_watchlist, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    assert result["companies"] == 1
+    assert result["new_candidates"] == 1
+    assert result["new_candidate_ids"] == ["nse:FOO"]
+    assert result["no_price_at_first_seen"] == 0
+    written = upserts[0][0].iloc[0]
+    assert written["first_seen_at"] == pd.Timestamp("2026-08-01")
+    assert written["first_seen_price"] == 100.0
+    assert written["last_alert_at"] == pd.Timestamp("2026-08-03")
+    assert written["alert_count"] == 2
+    assert upserts[0][2]["unique_keys"] == ["company_master_id"]
+
+
+def test_sync_watchlist_from_alerts_existing_company_keeps_first_seen_updates_last_alert(monkeypatch):
+    # a company already on the watchlist gets a NEW alert -- first_seen_at/price must
+    # stay exactly as originally recorded, only last_alert_at/alert_count move.
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    alert_summary = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-05"), "alert_count": 3}]
+    )
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
+    existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
+    monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: existing)
+
+    def fail_if_called(cid, date):
+        raise AssertionError("load_price_near must not be called for an already-known company")
+
+    monkeypatch.setattr(fundamentals_watchlist, "load_price_near", fail_if_called)
+    upserts = []
+    monkeypatch.setattr(fundamentals_watchlist, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    assert result["new_candidates"] == 0
+    written = upserts[0][0].iloc[0]
+    assert written["first_seen_at"] == pd.Timestamp("2026-08-01")
+    assert written["first_seen_price"] == 100.0
+    assert written["last_alert_at"] == pd.Timestamp("2026-08-05")
+    assert written["alert_count"] == 3
+
+
+def test_sync_watchlist_from_alerts_flags_missing_price_without_failing(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    alert_summary = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
+    )
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
+    monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_watchlist, "load_price_near", lambda cid, date: None)
+    monkeypatch.setattr(fundamentals_watchlist, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_watchlist, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    assert result["no_price_at_first_seen"] == 1
+    assert any(a and a[0] == "watchlist_no_price_at_first_seen" for a, k in fallback_events)
