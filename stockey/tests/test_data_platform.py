@@ -23,6 +23,7 @@ import pytest
 import requests
 import torch
 from bs4 import BeautifulSoup
+from fastapi.testclient import TestClient
 
 from utils import identity_issues
 from utils import fallback_telemetry
@@ -59,6 +60,8 @@ from fundamentals.screens import technicals as fundamentals_technicals
 from fundamentals.screens import watchlist as fundamentals_watchlist
 from fundamentals.screens import watch_summary as fundamentals_watch_summary
 from fundamentals.screens import notifications as fundamentals_notifications
+from fundamentals.api import queries as fundamentals_api_queries
+from fundamentals.api.app import app as fundamentals_api_app
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -11518,3 +11521,191 @@ def test_run_watchlist_notification_pipeline_chains_all_three_steps(monkeypatch)
     assert result["narratives_generated"] == 1
     assert result["emails_sent"] == 1
     assert notify_calls == [narrative_events]
+
+
+def test_clean_records_converts_nan_to_none_and_timestamp_to_iso():
+    df = pd.DataFrame([{"a": float("nan"), "b": pd.Timestamp("2026-08-01", tz="UTC"), "c": "x"}])
+    records = fundamentals_api_queries._clean_records(df)
+    assert records == [{"a": None, "b": "2026-08-01T00:00:00.000Z", "c": "x"}]
+
+
+def test_clean_records_empty_df_returns_empty_list():
+    assert fundamentals_api_queries._clean_records(pd.DataFrame()) == []
+
+
+def test_get_universe_returns_query_and_parsed_metrics(monkeypatch):
+    df = pd.DataFrame(
+        [{"ticker": "FOO", "company_name": "Foo Co", "metrics_json": json.dumps({"cmp_rs": 100.0, "p_e": 15.0}), "run_date": date(2026, 8, 10)}]
+    )
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: df)
+
+    result = fundamentals_api_queries.get_universe()
+
+    assert result["query_text"] == fundamentals_api_queries.L1_QUERY
+    assert result["query_version"] == fundamentals_api_queries.L1_QUERY_VERSION
+    assert result["run_date"] == "2026-08-10"
+    assert result["companies"] == [{"ticker": "FOO", "company_name": "Foo Co", "cmp_rs": 100.0, "p_e": 15.0, "mar_cap_rscr": None, "div_yld_pct": None, "roce_pct": None, "qtr_sales_var_pct": None, "avg_vol_1mth": None}]
+
+
+def test_get_universe_empty_returns_empty_companies(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: pd.DataFrame())
+    result = fundamentals_api_queries.get_universe()
+    assert result["companies"] == []
+    assert result["run_date"] is None
+
+
+def test_get_watchlist_detail_returns_none_when_not_found(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_api_queries.get_watchlist_detail("nse:MISSING") is None
+
+
+def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypatch):
+    watchlist_df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 1}])
+    alerts_df = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "trigger_type": "insider_buy", "origin": "rule", "alert_date": date(2026, 8, 1), "reasoning": "r", "status": "new", "evidence_bundle_json": json.dumps({"event": {"headline": "h"}})}]
+    )
+    thesis_df = pd.DataFrame()
+
+    calls = {"watchlist": watchlist_df, "alerts": alerts_df, "thesis": thesis_df}
+    call_order = iter(["watchlist", "alerts", "thesis"])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
+    monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: {"ticker": "FOO"})
+    monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: {"close": 100})
+    monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: {"sector_code": "IN01"})
+
+    result = fundamentals_api_queries.get_watchlist_detail("nse:FOO")
+
+    assert result["watchlist"]["company_master_id"] == "nse:FOO"
+    assert result["alerts"][0]["evidence_bundle"] == {"event": {"headline": "h"}}
+    assert "evidence_bundle_json" not in result["alerts"][0]
+    assert result["l2_state"] == {"ticker": "FOO"}
+    assert result["technicals"] == {"close": 100}
+    assert result["sector_context"] == {"sector_code": "IN01"}
+    assert result["portfolio"] == []
+
+
+def test_get_sectors_groups_watched_companies_by_sector(monkeypatch):
+    sector_df = pd.DataFrame([{"sector_code": "IN01", "capacity_growth_pct": 5.0, "demand_growth_pct": 3.0, "phase": "capacity_expansion", "sample_size_confidence": "adequate", "n_companies_in_l1": 10, "sector_name": "Chemicals"}])
+    watched_df = pd.DataFrame([{"sector_code": "IN01", "company_master_id": "nse:FOO", "alert_count": 2, "narrative_text": "x" * 300}])
+    call_order = iter([sector_df, watched_df])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: next(call_order))
+
+    result = fundamentals_api_queries.get_sectors()
+
+    assert len(result) == 1
+    watched = result[0]["watched_companies"]
+    assert len(watched) == 1
+    assert watched[0]["company_master_id"] == "nse:FOO"
+    assert len(watched[0]["narrative_snippet"]) == 200
+
+
+def test_get_sectors_empty_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_api_queries.get_sectors() == []
+
+
+def test_get_sectors_no_watched_companies_gives_empty_list_per_sector(monkeypatch):
+    sector_df = pd.DataFrame([{"sector_code": "IN01", "capacity_growth_pct": 5.0, "demand_growth_pct": 3.0, "phase": "balanced", "sample_size_confidence": "low", "n_companies_in_l1": 2, "sector_name": "X"}])
+    call_order = iter([sector_df, pd.DataFrame()])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: next(call_order))
+    result = fundamentals_api_queries.get_sectors()
+    assert result[0]["watched_companies"] == []
+
+
+def test_create_portfolio_entry_delegates_to_create_thesis(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "create_thesis", lambda **kwargs: calls.append(kwargs) or {"thesis_id": "t1"})
+    result = fundamentals_api_queries.create_portfolio_entry({"company_master_id": "nse:FOO", "prediction_text": "p"})
+    assert result == {"thesis_id": "t1"}
+    assert calls == [{"company_master_id": "nse:FOO", "prediction_text": "p"}]
+
+
+def test_resolve_portfolio_entry_delegates_to_resolve_thesis(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "resolve_thesis", lambda **kwargs: calls.append(kwargs))
+    fundamentals_api_queries.resolve_portfolio_entry("t1", {"resolved_true": True})
+    assert calls == [{"thesis_id": "t1", "resolved_true": True}]
+
+
+# --- HTTP routing tests (fundamentals/api/app.py) -- queries.py mocked, so these
+# exercise only request/response wiring (status codes, validation, error translation),
+# not the DB-backed query logic already covered above. ---
+
+def test_api_universe_route_returns_queries_result(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_universe", lambda: {"query_text": "q", "query_version": 1, "run_date": None, "companies": []})
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/universe")
+    assert r.status_code == 200
+    assert r.json()["query_version"] == 1
+
+
+def test_api_watchlist_detail_route_404_when_not_found(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist_detail", lambda cmid: None)
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/nse:MISSING")
+    assert r.status_code == 404
+
+
+def test_api_watchlist_detail_route_200_when_found(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist_detail", lambda cmid: {"watchlist": {"company_master_id": cmid}})
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/nse:FOO")
+    assert r.status_code == 200
+    assert r.json()["watchlist"]["company_master_id"] == "nse:FOO"
+
+
+def test_api_create_portfolio_rejects_invalid_origin_tag():
+    client = TestClient(fundamentals_api_app)
+    payload = {
+        "company_master_id": "nse:FOO", "prediction_text": "p", "target_date": "2026-12-01",
+        "invalidation_criteria": "c", "origin_tag": "bogus",
+    }
+    r = client.post("/api/portfolio", json=payload)
+    assert r.status_code == 400
+
+
+def test_api_create_portfolio_success_calls_queries(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "create_portfolio_entry", lambda payload: calls.append(payload) or {"thesis_id": "t1"})
+    client = TestClient(fundamentals_api_app)
+    payload = {
+        "company_master_id": "nse:FOO", "prediction_text": "p", "target_date": "2026-12-01",
+        "invalidation_criteria": "c", "origin_tag": "ad_hoc",
+        "source_alert_source": "bse", "source_alert_news_id": "n1", "source_alert_trigger_type": "insider_buy",
+    }
+    r = client.post("/api/portfolio", json=payload)
+    assert r.status_code == 200
+    assert r.json() == {"thesis_id": "t1"}
+    assert calls[0]["source_alert"] == {"source": "bse", "news_id": "n1", "trigger_type": "insider_buy"}
+    assert "source_alert_source" not in calls[0]
+
+
+def test_api_create_portfolio_validation_error_becomes_400(monkeypatch):
+    def raise_validation(payload):
+        raise fundamentals_l4_thesis.ThesisValidationError("prediction_text is mandatory")
+
+    monkeypatch.setattr(fundamentals_api_queries, "create_portfolio_entry", raise_validation)
+    client = TestClient(fundamentals_api_app)
+    payload = {"company_master_id": "nse:FOO", "prediction_text": "p", "target_date": "2026-12-01", "invalidation_criteria": "c", "origin_tag": "ad_hoc"}
+    r = client.post("/api/portfolio", json=payload)
+    assert r.status_code == 400
+    assert "mandatory" in r.json()["detail"]
+
+
+def test_api_resolve_portfolio_validation_error_becomes_400(monkeypatch):
+    def raise_validation(thesis_id, payload):
+        raise fundamentals_l4_thesis.ThesisValidationError("failure_attribution required")
+
+    monkeypatch.setattr(fundamentals_api_queries, "resolve_portfolio_entry", raise_validation)
+    client = TestClient(fundamentals_api_app)
+    r = client.post("/api/portfolio/t1/resolve", json={"resolved_true": False})
+    assert r.status_code == 400
+    assert "failure_attribution" in r.json()["detail"]
+
+
+def test_api_resolve_portfolio_success(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "resolve_portfolio_entry", lambda thesis_id, payload: None)
+    client = TestClient(fundamentals_api_app)
+    r = client.post("/api/portfolio/t1/resolve", json={"resolved_true": True})
+    assert r.status_code == 200
+    assert r.json() == {"status": "resolved", "thesis_id": "t1"}
