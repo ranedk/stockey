@@ -1,5 +1,6 @@
 import base64
 import os
+import zlib
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
@@ -17,13 +18,27 @@ def _derive_key(secret: str) -> bytes:
     return raw + b"\x00" * (32 - len(raw)) if len(raw) < 32 else raw[:32]
 
 
-def decrypt_sharpely_v2(payload: str) -> str:
-    """Decrypt a 'base64(iv):base64(ciphertext)' sharpely v2 response body to plaintext JSON."""
+def _decrypt_sharpely_v2_bytes(payload: str) -> bytes:
     if not payload or ":" not in payload:
         raise ValueError("sharpely v2 payload is not in iv:ciphertext form")
     iv_b64, ct_b64 = payload.split(":", 1)
     cipher = AES.new(_derive_key(SHARPELY_V2_AES_KEY), AES.MODE_CBC, base64.b64decode(iv_b64))
-    return unpad(cipher.decrypt(base64.b64decode(ct_b64)), AES.block_size).decode("utf-8")
+    return unpad(cipher.decrypt(base64.b64decode(ct_b64)), AES.block_size)
+
+
+def decrypt_sharpely_v2(payload: str) -> str:
+    """Decrypt a 'base64(iv):base64(ciphertext)' sharpely v2 response body to plaintext JSON."""
+    return _decrypt_sharpely_v2_bytes(payload).decode("utf-8")
+
+
+def decrypt_sharpely_v2_compressed(payload: str) -> str:
+    """Same AES-256-CBC scheme as decrypt_sharpely_v2, but for endpoints whose
+    plaintext is additionally zlib-compressed before encryption -- confirmed live
+    2026-08-11 against /api/v2/core/getAllSectorData (decrypted bytes started with the
+    zlib header 0x78 0x9c, not valid UTF-8 on their own; the "statements" endpoint
+    decrypt_sharpely_v2 was built for is NOT compressed, so that function's contract
+    stays unchanged rather than guessing at decompression for every caller)."""
+    return zlib.decompress(_decrypt_sharpely_v2_bytes(payload)).decode("utf-8")
 
 
 def get_access_token():

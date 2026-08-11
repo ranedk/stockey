@@ -53,6 +53,8 @@ from fundamentals.collectors import structured_extraction as fundamentals_struct
 from fundamentals.screens import l3_triggers as fundamentals_l3_triggers
 from fundamentals.screens import llm_triage as fundamentals_llm_triage
 from fundamentals.screens import l4_thesis as fundamentals_l4_thesis
+from fundamentals.collectors import sector_data as fundamentals_sector_data
+from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -6298,6 +6300,27 @@ def test_sharpely_v2_decrypt_roundtrip():
         su.decrypt_sharpely_v2("not-encrypted")
 
 
+def test_sharpely_v2_decrypt_compressed_roundtrip():
+    # /api/v2/core/getAllSectorData's plaintext turned out to be zlib-compressed
+    # before encryption (confirmed live 2026-08-11, decrypted bytes started with the
+    # zlib header 0x78 0x9c) -- a different contract from decrypt_sharpely_v2's own
+    # "statements" endpoint, hence the separate function.
+    import base64
+    import zlib
+
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    from data.sharpelydata import sharpely_utils as su
+
+    key = su._derive_key(su.SHARPELY_V2_AES_KEY)
+    plaintext = '{"sector": {"EQ": [{"sector_code": "IN0101", "sector_desc": "Chemicals"}]}}'
+    compressed = zlib.compress(plaintext.encode("utf-8"))
+    iv = b"0123456789abcdef"
+    ct = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(compressed, 16))
+    payload = base64.b64encode(iv).decode() + ":" + base64.b64encode(ct).decode()
+    assert su.decrypt_sharpely_v2_compressed(payload) == plaintext
+
+
 def test_price_adjustment_derives_splits_from_price_steps():
     from data.nseindia import price_adjustment as pa
     dates = pd.bdate_range("2026-01-01", periods=8, tz="UTC")
@@ -10851,3 +10874,232 @@ def test_load_open_theses_past_target_date_queries_correctly(monkeypatch):
     fundamentals_l4_thesis.load_open_theses_past_target_date(as_of_date=date(2026, 8, 11))
     assert "status = 'open'" in captured["query"]
     assert captured["params"] == (date(2026, 8, 11),)
+
+
+# fundamentals/collectors/sector_data.py -- sector reference data (feeds step 9).
+
+# Real response shape, captured live 2026-08-11 from /api/v2/core/getAllSectorData
+# (trimmed to 2 entries per level; the "Construction\nMaterials" embedded newline is
+# real, not a typo -- see build_reference_rows' whitespace-collapsing).
+SECTOR_DATA_FIXTURE = {
+    "sector": {
+        "EQ": [
+            {"sector_code": "IN0101", "sector_desc": "Chemicals", "Debt to Equity": 0.414376, "ROCE": 10.2107, "ROE": 9.85546},
+            {"sector_code": "IN0102", "sector_desc": "Construction\nMaterials", "Debt to Equity": 0.79559, "ROCE": 7.92772, "ROE": 8.85059},
+        ]
+    },
+    "indgrp": {
+        "EQ": [
+            {"industry_code": "IN010101", "industry_desc": "Chemicals & Petrochemicals", "Debt to Equity": 0.334288, "ROCE": 9.25939, "ROE": 9.03159},
+        ]
+    },
+    "ind": {
+        "EQ": [
+            {"basic_industry_code": "IN010101001", "basic_industry_desc": "Commodity Chemicals", "Debt to Equity": 0.345999, "ROCE": 6.4822, "ROE": 4.2789},
+        ]
+    },
+}
+
+
+def test_build_reference_rows_extracts_all_three_levels():
+    rows = fundamentals_sector_data.build_reference_rows(SECTOR_DATA_FIXTURE, as_of_date=date(2026, 8, 11))
+    assert len(rows["sector"]) == 2
+    assert len(rows["industry_group"]) == 1
+    assert len(rows["basic_industry"]) == 1
+
+
+def test_build_reference_rows_collapses_embedded_whitespace():
+    rows = fundamentals_sector_data.build_reference_rows(SECTOR_DATA_FIXTURE, as_of_date=date(2026, 8, 11))
+    descriptions = {row["code"]: row["description"] for row in rows["sector"]}
+    assert descriptions["IN0102"] == "Construction Materials"
+
+
+def test_build_reference_rows_maps_ratio_fields():
+    rows = fundamentals_sector_data.build_reference_rows(SECTOR_DATA_FIXTURE, as_of_date=date(2026, 8, 11))
+    chemicals = next(row for row in rows["sector"] if row["code"] == "IN0101")
+    assert chemicals["roce"] == 10.2107
+    assert chemicals["roe"] == 9.85546
+    assert chemicals["debt_to_equity"] == 0.414376
+
+
+def test_build_reference_rows_skips_entries_without_code():
+    data = {"sector": {"EQ": [{"sector_desc": "No code here"}]}, "indgrp": {"EQ": []}, "ind": {"EQ": []}}
+    rows = fundamentals_sector_data.build_reference_rows(data, as_of_date=date(2026, 8, 11))
+    assert rows["sector"] == []
+
+
+def test_fetch_sector_reference_data_unwraps_double_encoded_json(monkeypatch):
+    class FakeResponse:
+        text = "encrypted-payload"
+
+    monkeypatch.setattr(fundamentals_sector_data, "get_sharpely_v2_headers", lambda: {})
+    monkeypatch.setattr(fundamentals_sector_data, "get_with_retries", lambda url, **k: FakeResponse())
+    # double-encoded: the decrypted plaintext is itself a JSON string containing JSON
+    monkeypatch.setattr(
+        fundamentals_sector_data, "decrypt_sharpely_v2_compressed", lambda payload: json.dumps(json.dumps(SECTOR_DATA_FIXTURE))
+    )
+
+    data = fundamentals_sector_data.fetch_sector_reference_data()
+    assert data == SECTOR_DATA_FIXTURE
+
+
+def test_fetch_sector_reference_data_handles_single_encoded_json(monkeypatch):
+    monkeypatch.setattr(fundamentals_sector_data, "get_sharpely_v2_headers", lambda: {})
+    monkeypatch.setattr(fundamentals_sector_data, "get_with_retries", lambda url, **k: type("R", (), {"text": "x"})())
+    monkeypatch.setattr(fundamentals_sector_data, "decrypt_sharpely_v2_compressed", lambda payload: json.dumps(SECTOR_DATA_FIXTURE))
+
+    data = fundamentals_sector_data.fetch_sector_reference_data()
+    assert data == SECTOR_DATA_FIXTURE
+
+
+def test_run_sector_reference_refresh_upserts_all_three_tables(monkeypatch):
+    monkeypatch.setattr(fundamentals_sector_data, "fetch_sector_reference_data", lambda: SECTOR_DATA_FIXTURE)
+    upserts = []
+    monkeypatch.setattr(fundamentals_sector_data, "upsert_to_db", lambda df, table, **k: upserts.append((table, len(df), k)))
+
+    result = fundamentals_sector_data.run_sector_reference_refresh()
+
+    assert result == {"sectors": 2, "industry_groups": 1, "basic_industries": 1}
+    tables_upserted = {table for table, _, _ in upserts}
+    assert tables_upserted == {
+        fundamentals_sector_data.SECTOR_TABLE,
+        fundamentals_sector_data.INDUSTRY_GROUP_TABLE,
+        fundamentals_sector_data.BASIC_INDUSTRY_TABLE,
+    }
+    for _, _, kwargs in upserts:
+        assert kwargs["unique_keys"] == ["code", "as_of_date"]
+
+
+# fundamentals/screens/sector_cycle.py -- sector capital-cycle aggregation (step 9).
+
+
+def test_classify_phase_expansion_when_capacity_outruns_demand():
+    assert fundamentals_sector_cycle.classify_phase(20.0, 5.0) == "capacity_expansion"
+
+
+def test_classify_phase_discipline_when_demand_outruns_capacity():
+    assert fundamentals_sector_cycle.classify_phase(2.0, 15.0) == "capacity_discipline"
+
+
+def test_classify_phase_balanced_within_threshold():
+    assert fundamentals_sector_cycle.classify_phase(10.0, 8.0) == "balanced"
+
+
+def test_classify_phase_none_when_either_input_missing():
+    assert fundamentals_sector_cycle.classify_phase(None, 5.0) is None
+    assert fundamentals_sector_cycle.classify_phase(10.0, None) is None
+
+
+def test_fetch_gross_block_data_filters_incomplete_rows(monkeypatch):
+    companies = [
+        {"company_id": 1, "metrics": {"gross_block_rscr": 120, "gross_block_py_rscr": 100}},
+        {"company_id": 2, "metrics": {"gross_block_rscr": None, "gross_block_py_rscr": 50}},  # incomplete -- excluded
+        {"company_id": 3, "metrics": {}},  # no gross block fields at all -- excluded
+    ]
+    monkeypatch.setattr(fundamentals_sector_cycle, "run_query", lambda session, query: ("url", companies))
+
+    result = fundamentals_sector_cycle.fetch_gross_block_data(session=object())
+
+    assert result == {1: {"gross_block_current_rscr": 120, "gross_block_preceding_rscr": 100}}
+
+
+def test_compute_sector_aggregates_computes_capacity_and_demand_growth():
+    l1 = pd.DataFrame(
+        [
+            {"company_id": 1, "company_name": "A", "ticker": "A", "sector_code": "IN0101", "qtr_sales_var_pct": 10.0},
+            {"company_id": 2, "company_name": "B", "ticker": "B", "sector_code": "IN0101", "qtr_sales_var_pct": 20.0},
+            {"company_id": 3, "company_name": "C", "ticker": "C", "sector_code": "IN0201", "qtr_sales_var_pct": 5.0},
+        ]
+    )
+    gross_block = {
+        1: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100},
+        2: {"gross_block_current_rscr": 220, "gross_block_preceding_rscr": 200},
+        # company 3 has no gross block data
+    }
+
+    result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
+
+    ch = result[result["sector_code"] == "IN0101"].iloc[0]
+    assert ch["n_companies_in_l1"] == 2
+    assert ch["n_companies_with_gross_block"] == 2
+    # (110+220 - 100-200) / (100+200) * 100 = 10.0
+    assert ch["capacity_growth_pct"] == 10.0
+    assert ch["demand_growth_pct"] == 15.0  # median(10, 20)
+
+    auto = result[result["sector_code"] == "IN0201"].iloc[0]
+    assert auto["n_companies_with_gross_block"] == 0
+    assert pd.isna(auto["capacity_growth_pct"])  # None -> NaN once mixed into a float64 DataFrame column
+    assert auto["demand_growth_pct"] == 5.0
+
+
+def test_compute_sector_aggregates_flags_low_sample_size_confidence():
+    # found live 2026-08-11: multiple real sectors had only 1 L1 company contributing
+    # gross-block data -- a single company is not a "sector aggregate".
+    l1 = pd.DataFrame(
+        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0101", "qtr_sales_var_pct": 10.0} for i in range(1, 7)]
+    )
+    # only 2 of 6 companies have gross-block data -- below MIN_COMPANIES_FOR_CONFIDENCE (5)
+    gross_block = {
+        1: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100},
+        2: {"gross_block_current_rscr": 220, "gross_block_preceding_rscr": 200},
+    }
+    result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
+    assert result.iloc[0]["sample_size_confidence"] == "low"
+
+
+def test_compute_sector_aggregates_flags_adequate_sample_size_confidence():
+    l1 = pd.DataFrame(
+        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0101", "qtr_sales_var_pct": 10.0} for i in range(1, 7)]
+    )
+    gross_block = {i: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100} for i in range(1, 6)}  # 5 of 6
+    result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
+    assert result.iloc[0]["sample_size_confidence"] == "adequate"
+
+
+def test_compute_sector_aggregates_excludes_companies_without_sector_code():
+    l1 = pd.DataFrame(
+        [
+            {"company_id": 1, "company_name": "A", "ticker": "A", "sector_code": "IN0101", "qtr_sales_var_pct": 10.0},
+            {"company_id": 2, "company_name": "B", "ticker": "B", "sector_code": None, "qtr_sales_var_pct": 20.0},
+        ]
+    )
+    result = fundamentals_sector_cycle.compute_sector_aggregates(l1, {})
+    assert list(result["sector_code"]) == ["IN0101"]
+
+
+def test_compute_sector_aggregates_empty_l1_returns_empty():
+    assert fundamentals_sector_cycle.compute_sector_aggregates(pd.DataFrame(), {}).empty
+
+
+def test_run_sector_cycle_aggregation_returns_early_on_empty_l1(monkeypatch):
+    monkeypatch.setattr(fundamentals_sector_cycle, "load_l1_companies_with_sector", lambda: pd.DataFrame())
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_sector_cycle, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_sector_cycle.run_sector_cycle_aggregation()
+
+    assert result == {"sectors": 0, "companies_without_sector_code": 0}
+    assert any(a and a[0] == "sector_cycle_no_l1_universe" for a, k in fallback_events)
+
+
+def test_run_sector_cycle_aggregation_logs_missing_sector_code_and_upserts(monkeypatch):
+    l1 = pd.DataFrame(
+        [
+            {"company_id": 1, "company_name": "A", "ticker": "A", "sector_code": "IN0101", "qtr_sales_var_pct": 10.0},
+            {"company_id": 2, "company_name": "B", "ticker": "B", "sector_code": None, "qtr_sales_var_pct": 20.0},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_sector_cycle, "load_l1_companies_with_sector", lambda: l1)
+    monkeypatch.setattr(fundamentals_sector_cycle, "fetch_gross_block_data", lambda: {})
+    upserts = []
+    monkeypatch.setattr(fundamentals_sector_cycle, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_sector_cycle, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_sector_cycle.run_sector_cycle_aggregation()
+
+    assert result == {"sectors": 1, "companies_without_sector_code": 1}
+    assert len(upserts) == 1
+    assert upserts[0][1] == fundamentals_sector_cycle.RESULTS_TABLE
+    assert upserts[0][2]["unique_keys"] == ["sector_code", "run_date"]
+    assert any(a and a[0] == "sector_cycle_missing_sector_code" for a, k in fallback_events)
