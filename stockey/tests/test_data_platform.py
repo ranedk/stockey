@@ -57,6 +57,7 @@ from fundamentals.collectors import sector_data as fundamentals_sector_data
 from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
 from fundamentals.screens import technicals as fundamentals_technicals
 from fundamentals.screens import watchlist as fundamentals_watchlist
+from fundamentals.screens import watch_summary as fundamentals_watch_summary
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -11288,3 +11289,122 @@ def test_sync_watchlist_from_alerts_flags_missing_price_without_failing(monkeypa
 
     assert result["no_price_at_first_seen"] == 1
     assert any(a and a[0] == "watchlist_no_price_at_first_seen" for a, k in fallback_events)
+
+
+def test_build_company_evidence_bundle_shapes_output():
+    alerts = pd.DataFrame([{"trigger_type": "rating_downgrade", "origin": "rule", "alert_date": date(2026, 8, 1), "reasoning": "r"}])
+    bundle = fundamentals_watch_summary.build_company_evidence_bundle("nse:X", alerts, {"ticker": "X"}, {"close": 100}, {"sector_code": "IN01"})
+    assert bundle["company_master_id"] == "nse:X"
+    assert bundle["alerts"] == [{"trigger_type": "rating_downgrade", "origin": "rule", "alert_date": date(2026, 8, 1), "reasoning": "r"}]
+    assert bundle["l2_state"] == {"ticker": "X"}
+    assert bundle["technicals"] == {"close": 100}
+    assert bundle["sector_context"] == {"sector_code": "IN01"}
+
+
+def test_build_company_evidence_bundle_empty_alerts():
+    bundle = fundamentals_watch_summary.build_company_evidence_bundle("nse:X", pd.DataFrame(), None, None, None)
+    assert bundle["alerts"] == []
+    assert bundle["l2_state"] is None
+
+
+def test_run_watch_summary_refresh_returns_early_when_no_candidates(monkeypatch):
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh()
+
+    assert result == {"generated": 0, "failed": 0, "blocked": False, "narrative_events": []}
+
+
+def _patch_watch_summary_evidence_loaders(monkeypatch):
+    monkeypatch.setattr(fundamentals_watch_summary, "load_company_alerts", lambda cmid: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_watch_summary, "load_latest_l2_state_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_watch_summary, "load_latest_technicals_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_watch_summary, "load_sector_context_for_company", lambda cmid: None)
+
+
+def test_run_watch_summary_refresh_new_candidate_marks_narrative_changed(monkeypatch):
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame([{"company_master_id": "nse:X", "last_alert_at": date(2026, 8, 1), "narrative_generated_at": None, "narrative_text": None}])
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+    monkeypatch.setattr(
+        fundamentals_watch_summary, "generate_watch_summary", lambda bundle, **k: {"narrative": "first narrative", "suggested_watch_duration_days": 30, "confidence": "high"}
+    )
+    updates = []
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: updates.append(kwargs))
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh(model="test-model")
+
+    assert result["generated"] == 1
+    assert result["failed"] == 0
+    assert result["blocked"] is False
+    event = result["narrative_events"][0]
+    assert event["company_master_id"] == "nse:X"
+    assert event["is_new_candidate"] is True
+    assert event["narrative_changed"] is True
+    assert event["narrative_text"] == "first narrative"
+    assert len(updates) == 1
+    assert updates[0]["company_master_id"] == "nse:X"
+    assert updates[0]["model"] == "test-model"
+
+
+def test_run_watch_summary_refresh_existing_candidate_detects_text_change(monkeypatch):
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame(
+        [{"company_master_id": "nse:X", "last_alert_at": date(2026, 8, 5), "narrative_generated_at": pd.Timestamp("2026-08-01", tz="UTC"), "narrative_text": "old narrative"}]
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+    monkeypatch.setattr(
+        fundamentals_watch_summary, "generate_watch_summary", lambda bundle, **k: {"narrative": "new narrative", "suggested_watch_duration_days": 10, "confidence": "medium"}
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: None)
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh()
+
+    event = result["narrative_events"][0]
+    assert event["is_new_candidate"] is False
+    assert event["narrative_changed"] is True
+
+
+def test_run_watch_summary_refresh_unchanged_text_not_flagged_as_changed(monkeypatch):
+    # edge case: a company already had a narrative and the LLM happens to return the
+    # exact same text again -- narrative_changed must be False so no spurious email.
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame(
+        [{"company_master_id": "nse:X", "last_alert_at": date(2026, 8, 5), "narrative_generated_at": pd.Timestamp("2026-08-01", tz="UTC"), "narrative_text": "same narrative"}]
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+    monkeypatch.setattr(
+        fundamentals_watch_summary, "generate_watch_summary", lambda bundle, **k: {"narrative": "same narrative", "suggested_watch_duration_days": 10, "confidence": "medium"}
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: None)
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh()
+
+    assert result["narrative_events"][0]["narrative_changed"] is False
+
+
+def test_run_watch_summary_refresh_trips_circuit_breaker(monkeypatch):
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame(
+        [{"company_master_id": f"nse:X{i}", "last_alert_at": date(2026, 8, 1), "narrative_generated_at": None, "narrative_text": None} for i in range(5)]
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+
+    def always_fails(bundle, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_watch_summary, "generate_watch_summary", always_fails)
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_watch_summary, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_watch_summary.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "watch_summary_circuit_breaker_tripped" for a, k in fallback_events)
