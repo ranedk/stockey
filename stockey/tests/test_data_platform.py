@@ -52,6 +52,7 @@ from fundamentals.collectors import ocr_pipeline as fundamentals_ocr_pipeline
 from fundamentals.collectors import structured_extraction as fundamentals_structured_extraction
 from fundamentals.screens import l3_triggers as fundamentals_l3_triggers
 from fundamentals.screens import llm_triage as fundamentals_llm_triage
+from fundamentals.screens import l4_thesis as fundamentals_l4_thesis
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -10650,3 +10651,203 @@ def test_run_llm_triage_trips_circuit_breaker(monkeypatch):
     assert result["blocked"] is True
     assert result["failed"] == fundamentals_llm_triage.CIRCUIT_BREAKER_THRESHOLD
     assert any(a and a[0] == "llm_triage_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+# fundamentals/screens/l4_thesis.py -- L4 thesis register + quarterly scoring (step 8).
+
+
+def test_create_thesis_requires_prediction_text(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.create_thesis(
+            company_master_id="nse:X", prediction_text="  ", target_date=date(2027, 1, 1),
+            invalidation_criteria="x", origin_tag="ad_hoc",
+        )
+
+
+def test_create_thesis_requires_target_date(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.create_thesis(
+            company_master_id="nse:X", prediction_text="p", target_date=None,
+            invalidation_criteria="x", origin_tag="ad_hoc",
+        )
+
+
+def test_create_thesis_requires_invalidation_criteria(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.create_thesis(
+            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+            invalidation_criteria="", origin_tag="ad_hoc",
+        )
+
+
+def test_create_thesis_requires_valid_origin_tag(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.create_thesis(
+            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+            invalidation_criteria="x", origin_tag="not_a_real_tag",
+        )
+
+
+def test_create_thesis_requires_valid_metric_operator(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.create_thesis(
+            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+            invalidation_criteria="x", origin_tag="ad_hoc", metric_operator="~=",
+        )
+
+
+def test_create_thesis_builds_expected_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    row = fundamentals_l4_thesis.create_thesis(
+        company_master_id="nse:X",
+        prediction_text="Net debt < 50 by Q3 FY27",
+        target_date=date(2027, 3, 31),
+        invalidation_criteria="Debt rises further before target date",
+        origin_tag="systematic_screen",
+        signal_definition_version="l3_rule:v1",
+        source_alert={"source": "bse", "news_id": "n1", "trigger_type": "rating_downgrade"},
+        metric_name="net_debt_rscr",
+        metric_operator="<",
+        metric_threshold=50.0,
+        created_date=date(2026, 8, 11),
+    )
+
+    assert row["thesis_id"].startswith("thesis:")
+    assert row["status"] == "open"
+    assert row["resolved_true"] is None
+    assert row["source_alert_source"] == "bse"
+    assert row["signal_definition_version"] == "l3_rule:v1"
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_l4_thesis.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["thesis_id"]
+
+
+def test_create_thesis_without_source_alert_is_ad_hoc(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: None)
+    row = fundamentals_l4_thesis.create_thesis(
+        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+        invalidation_criteria="x", origin_tag="ad_hoc",
+    )
+    assert row["source_alert_source"] is None
+    assert row["source_alert_news_id"] is None
+
+
+def test_resolve_thesis_requires_failure_attribution_when_false(monkeypatch):
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.resolve_thesis(thesis_id="thesis:x", resolved_true=False)
+
+
+def test_resolve_thesis_rejects_failure_attribution_when_true(monkeypatch):
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
+        fundamentals_l4_thesis.resolve_thesis(thesis_id="thesis:x", resolved_true=True, failure_attribution="thesis_wrong")
+
+
+def test_resolve_thesis_writes_expected_update(monkeypatch):
+    executed = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, FakeCursor()
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
+
+    fundamentals_l4_thesis.resolve_thesis(
+        thesis_id="thesis:x", resolved_true=False, failure_attribution="thesis_wrong",
+        resolution_notes="note", resolution_date=date(2026, 12, 31),
+    )
+
+    assert len(executed) == 1
+    query, params = executed[0]
+    assert "UPDATE fundamentals_l4_thesis" in query
+    assert params == (False, date(2026, 12, 31), "note", "thesis_wrong", "thesis:x")
+
+
+def test_check_structured_prediction_returns_none_without_metric_fields():
+    assert fundamentals_l4_thesis.check_structured_prediction({"company_master_id": "nse:X"}) is None
+
+
+def test_check_structured_prediction_evaluates_against_l2_state(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": 50.73}])
+    )
+    thesis_row = {"company_master_id": "nse:CINELINE", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is False
+
+    thesis_row["metric_threshold"] = 60.0
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is True
+
+
+def test_check_structured_prediction_returns_none_when_no_l2_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame())
+    thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+
+
+def test_check_structured_prediction_returns_none_when_value_is_null(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": None}])
+    )
+    thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+
+
+def test_compute_quarterly_scoring_with_no_theses(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, **k: pd.DataFrame())
+    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 8, 11))
+    assert result["total_theses"] == 0
+    assert result["hit_rate"] is None
+
+
+def test_compute_quarterly_scoring_computes_hit_rate_and_time_to_confirmation(monkeypatch):
+    theses = pd.DataFrame(
+        [
+            {
+                "status": "resolved", "resolved_true": True, "failure_attribution": None,
+                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 10, 1),
+            },
+            {
+                "status": "resolved", "resolved_true": False, "failure_attribution": "thesis_wrong",
+                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 12, 31),
+            },
+            {"status": "open", "resolved_true": None, "failure_attribution": None, "created_date": date(2026, 8, 1), "resolution_date": None},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, **k: theses)
+
+    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 8, 11))
+
+    assert result["total_theses"] == 3
+    assert result["open"] == 1
+    assert result["resolved"] == 2
+    assert result["hit_rate"] == 50.0
+    assert result["failure_attribution_breakdown"] == {"thesis_wrong": 1}
+    assert result["time_to_confirmation_days"]["count"] == 1
+    assert result["time_to_confirmation_days"]["median_days"] == 61.0
+
+
+def test_load_open_theses_past_target_date_queries_correctly(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
+    fundamentals_l4_thesis.load_open_theses_past_target_date(as_of_date=date(2026, 8, 11))
+    assert "status = 'open'" in captured["query"]
+    assert captured["params"] == (date(2026, 8, 11),)
