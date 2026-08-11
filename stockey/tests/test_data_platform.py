@@ -51,6 +51,7 @@ from fundamentals.collectors import rating_agencies as fundamentals_rating_agenc
 from fundamentals.collectors import ocr_pipeline as fundamentals_ocr_pipeline
 from fundamentals.collectors import structured_extraction as fundamentals_structured_extraction
 from fundamentals.screens import l3_triggers as fundamentals_l3_triggers
+from fundamentals.screens import llm_triage as fundamentals_llm_triage
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -10461,3 +10462,191 @@ def test_run_l3_rule_triggers_marks_not_alert_worthy_and_skips_upsert(monkeypatc
     assert upserts == []
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "not_alert_worthy"}]
     assert any(a and a[0] == "l3_trigger_no_l2_state" for a, k in fallback_events)
+
+
+# fundamentals/screens/llm_triage.py -- L3 LLM-judgment alerting (step 7, LLM half).
+# gpt-5.4-mini is never called in this suite (live-validated separately against real
+# events, see the module's own commit) -- these tests mock triage_event/OpenAI and
+# cover evidence-bundle construction, price-context math, and orchestration.
+
+
+def test_load_price_context_returns_empty_without_event_date():
+    assert fundamentals_llm_triage.load_price_context("nse:X", None) == {}
+
+
+def test_load_price_context_computes_expected_ratios(monkeypatch):
+    before = pd.DataFrame(
+        [
+            {"date": date(2026, 8, 4), "close": 100.0, "volume": 200},
+            {"date": date(2026, 8, 3), "close": 98.0, "volume": 50},
+            {"date": date(2026, 7, 8), "close": 90.0, "volume": 50},
+        ]
+    )
+    after = pd.DataFrame([{"date": date(2026, 8, 5), "close": 105.0, "volume": 60}])
+
+    calls = {"n": 0}
+
+    def fake_sql_to_df(query, params=None):
+        calls["n"] += 1
+        return before if calls["n"] == 1 else after
+
+    monkeypatch.setattr(fundamentals_llm_triage, "sql_to_df", fake_sql_to_df)
+
+    ctx = fundamentals_llm_triage.load_price_context("nse:X", date(2026, 8, 4))
+
+    assert ctx["close_on_or_before_event"] == 100.0
+    assert ctx["price_pct_change_last_3_sessions"] == round((100.0 - 90.0) / 90.0 * 100, 2)
+    assert ctx["volume_on_event_vs_avg_ratio"] == round(200 / before["volume"].mean(), 2)
+    assert ctx["price_pct_change_since_event"] == round((105.0 - 100.0) / 100.0 * 100, 2)
+    assert ctx["sessions_since_event_available"] == 1
+
+
+def test_load_price_context_returns_empty_when_no_prior_data(monkeypatch):
+    monkeypatch.setattr(fundamentals_llm_triage, "sql_to_df", lambda query, params=None: pd.DataFrame())
+    assert fundamentals_llm_triage.load_price_context("nse:X", date(2026, 8, 4)) == {}
+
+
+def test_build_evidence_bundle_parses_structured_extraction_json():
+    event = {
+        "filing_type": "rating_action", "headline": "h", "subcategory": "s", "disclosure_date": date(2026, 8, 4),
+        "rating_action_type": "downgraded", "transaction_type": None, "insider_name": None, "quantity": None,
+        "structured_extraction_json": '{"rating_action": "downgraded"}',
+    }
+    bundle = fundamentals_llm_triage.build_evidence_bundle(event, {"ticker": "X"}, {"volume_on_event_vs_avg_ratio": 2.0})
+    assert bundle["event"]["structured_extraction"] == {"rating_action": "downgraded"}
+    assert bundle["l2_state"] == {"ticker": "X"}
+    assert bundle["price_context"] == {"volume_on_event_vs_avg_ratio": 2.0}
+
+
+def test_build_evidence_bundle_handles_missing_structured_extraction():
+    event = {"filing_type": "pit_sast", "headline": "h", "subcategory": None, "disclosure_date": date(2026, 8, 4)}
+    bundle = fundamentals_llm_triage.build_evidence_bundle(event, None, {})
+    assert bundle["event"]["structured_extraction"] is None
+    assert bundle["l2_state"] is None
+
+
+def test_load_candidate_events_for_triage_queries_expected_filters(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_llm_triage, "sql_to_df", fake_sql_to_df)
+    fundamentals_llm_triage.load_candidate_events_for_triage()
+    assert "'rating_action', 'pit_sast', 'results'" in captured["query"]
+    assert "llm_triage_status IS NULL OR llm_triage_status = 'pending'" in captured["query"]
+
+
+def test_run_llm_triage_returns_early_when_no_candidates(monkeypatch):
+    monkeypatch.setattr(fundamentals_llm_triage, "_bootstrap_triage_column", lambda: None)
+    monkeypatch.setattr(fundamentals_llm_triage, "_ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(fundamentals_llm_triage, "load_candidate_events_for_triage", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_llm_triage.run_llm_triage()
+
+    assert result == {"flagged": 0, "not_interesting": 0, "failed": 0, "blocked": False}
+
+
+def test_run_llm_triage_writes_alert_when_flagged_interesting(monkeypatch):
+    monkeypatch.setattr(fundamentals_llm_triage, "_bootstrap_triage_column", lambda: None)
+    monkeypatch.setattr(fundamentals_llm_triage, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "rating_action",
+                "headline": "h", "subcategory": "s", "disclosure_date": date(2026, 8, 4),
+                "rating_action_type": "downgraded", "transaction_type": None, "insider_name": None,
+                "quantity": None, "structured_extraction_json": None,
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_llm_triage, "load_candidate_events_for_triage", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_llm_triage, "load_latest_l2_state", lambda: pd.DataFrame([{"ticker": "X", "run_date": date(2026, 7, 1)}]))
+    monkeypatch.setattr(fundamentals_llm_triage, "load_price_context", lambda cmid, d, **k: {"volume_on_event_vs_avg_ratio": 3.0})
+    monkeypatch.setattr(
+        fundamentals_llm_triage, "triage_event", lambda bundle, **k: {"interesting": True, "reasoning": "matters", "confidence": "high"}
+    )
+    upserts = []
+    monkeypatch.setattr(fundamentals_llm_triage, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    status_calls = []
+    monkeypatch.setattr(fundamentals_llm_triage, "_set_triage_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_llm_triage.run_llm_triage(model="test-model")
+
+    assert result == {"flagged": 1, "not_interesting": 0, "failed": 0, "blocked": False}
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_llm_triage.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["source", "news_id", "trigger_type"]
+    row = df.iloc[0]
+    assert row["trigger_type"] == "llm_flagged"
+    assert row["origin"] == "llm_triage"
+    assert row["reasoning"] == "matters"
+    assert row["model"] == "test-model"
+    assert row["prompt_version"] == fundamentals_llm_triage.PROMPT_VERSION
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "flagged"}]
+
+
+def test_run_llm_triage_skips_upsert_when_not_interesting(monkeypatch):
+    monkeypatch.setattr(fundamentals_llm_triage, "_bootstrap_triage_column", lambda: None)
+    monkeypatch.setattr(fundamentals_llm_triage, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "results",
+                "headline": "h", "subcategory": "s", "disclosure_date": date(2026, 8, 4),
+                "rating_action_type": None, "transaction_type": None, "insider_name": None,
+                "quantity": None, "structured_extraction_json": None,
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_llm_triage, "load_candidate_events_for_triage", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_llm_triage, "load_latest_l2_state", lambda: pd.DataFrame(columns=["ticker"]))
+    monkeypatch.setattr(fundamentals_llm_triage, "load_price_context", lambda cmid, d, **k: {})
+    monkeypatch.setattr(
+        fundamentals_llm_triage, "triage_event", lambda bundle, **k: {"interesting": False, "reasoning": "routine", "confidence": "high"}
+    )
+    upserts = []
+    monkeypatch.setattr(fundamentals_llm_triage, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    status_calls = []
+    monkeypatch.setattr(fundamentals_llm_triage, "_set_triage_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_llm_triage.run_llm_triage()
+
+    assert result == {"flagged": 0, "not_interesting": 1, "failed": 0, "blocked": False}
+    assert upserts == []
+    assert status_calls == [{"source": "bse", "news_id": "n1", "status": "not_interesting"}]
+
+
+def test_run_llm_triage_trips_circuit_breaker(monkeypatch):
+    monkeypatch.setattr(fundamentals_llm_triage, "_bootstrap_triage_column", lambda: None)
+    monkeypatch.setattr(fundamentals_llm_triage, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": f"n{i}", "company_master_id": "nse:X", "filing_type": "results",
+                "headline": "h", "subcategory": "s", "disclosure_date": date(2026, 8, 4),
+                "rating_action_type": None, "transaction_type": None, "insider_name": None,
+                "quantity": None, "structured_extraction_json": None,
+            }
+            for i in range(5)
+        ]
+    )
+    monkeypatch.setattr(fundamentals_llm_triage, "load_candidate_events_for_triage", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_llm_triage, "load_latest_l2_state", lambda: pd.DataFrame(columns=["ticker"]))
+    monkeypatch.setattr(fundamentals_llm_triage, "load_price_context", lambda cmid, d, **k: {})
+
+    def always_fails(bundle, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_llm_triage, "triage_event", always_fails)
+    monkeypatch.setattr(fundamentals_llm_triage, "_set_triage_status", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_llm_triage, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_llm_triage.run_llm_triage()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_llm_triage.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "llm_triage_circuit_breaker_tripped" for a, k in fallback_events)
