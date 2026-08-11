@@ -58,6 +58,7 @@ from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
 from fundamentals.screens import technicals as fundamentals_technicals
 from fundamentals.screens import watchlist as fundamentals_watchlist
 from fundamentals.screens import watch_summary as fundamentals_watch_summary
+from fundamentals.screens import notifications as fundamentals_notifications
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -11408,3 +11409,112 @@ def test_run_watch_summary_refresh_trips_circuit_breaker(monkeypatch):
     assert result["blocked"] is True
     assert result["failed"] == fundamentals_watch_summary.CIRCUIT_BREAKER_THRESHOLD
     assert any(a and a[0] == "watch_summary_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_build_email_content_distinguishes_new_candidate_vs_narrative_updated():
+    new_subject, new_body = fundamentals_notifications.build_email_content(
+        {"company_master_id": "nse:FOO", "is_new_candidate": True, "narrative_text": "n", "suggested_watch_until": "2026-09-01", "confidence": "high"}
+    )
+    updated_subject, updated_body = fundamentals_notifications.build_email_content(
+        {"company_master_id": "nse:FOO", "is_new_candidate": False, "narrative_text": "n", "suggested_watch_until": "2026-09-01", "confidence": "high"}
+    )
+    assert "New candidate" in new_subject
+    assert "Narrative updated" in updated_subject
+    assert "not a trade recommendation" in new_body
+    assert "not a trade recommendation" in updated_body
+
+
+def test_notify_watchlist_events_no_changed_events_returns_zero():
+    result = fundamentals_notifications.notify_watchlist_events(
+        [{"company_master_id": "nse:FOO", "narrative_changed": False}]
+    )
+    assert result == {"sent": 0, "skipped_disabled": 0, "failed": 0}
+
+
+def test_notify_watchlist_events_skips_when_disabled(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", False)
+    events = [{"company_master_id": "nse:FOO", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
+
+    result = fundamentals_notifications.notify_watchlist_events(events)
+
+    assert result == {"sent": 0, "skipped_disabled": 1, "failed": 0}
+
+
+def test_notify_watchlist_events_flags_missing_config_when_enabled(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "")
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_notifications, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+    events = [{"company_master_id": "nse:FOO", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
+
+    result = fundamentals_notifications.notify_watchlist_events(events)
+
+    assert result == {"sent": 0, "skipped_disabled": 0, "failed": 1}
+    assert any(a and a[0] == "watchlist_email_misconfigured" for a, k in fallback_events)
+
+
+def test_notify_watchlist_events_sends_when_enabled_and_configured(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "alerts@example.com")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "me@example.com")
+    sent_calls = []
+    monkeypatch.setattr(fundamentals_notifications, "send_email", lambda subject, body: sent_calls.append((subject, body)))
+    events = [
+        {"company_master_id": "nse:FOO", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n1"},
+        {"company_master_id": "nse:BAR", "narrative_changed": False, "is_new_candidate": False, "narrative_text": "n2"},
+    ]
+
+    result = fundamentals_notifications.notify_watchlist_events(events)
+
+    assert result == {"sent": 1, "skipped_disabled": 0, "failed": 0}
+    assert len(sent_calls) == 1  # only the narrative_changed=True event sends
+
+
+def test_notify_watchlist_events_one_failure_does_not_block_others(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "alerts@example.com")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "me@example.com")
+
+    def flaky_send(subject, body):
+        if "FOO" in subject:
+            raise RuntimeError("ses down")
+        return {"MessageId": "ok"}
+
+    monkeypatch.setattr(fundamentals_notifications, "send_email", flaky_send)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_notifications, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+    events = [
+        {"company_master_id": "nse:FOO", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n1"},
+        {"company_master_id": "nse:BAR", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n2"},
+    ]
+
+    result = fundamentals_notifications.notify_watchlist_events(events)
+
+    assert result == {"sent": 1, "skipped_disabled": 0, "failed": 1}
+    assert any(a and a[0] == "watchlist_email_send_failed" for a, k in fallback_events)
+
+
+def test_send_email_returns_none_when_disabled(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", False)
+    assert fundamentals_notifications.send_email("subject", "body") is None
+
+
+def test_run_watchlist_notification_pipeline_chains_all_three_steps(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_notifications, "sync_watchlist_from_alerts", lambda: {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0}
+    )
+    narrative_events = [{"company_master_id": "nse:A", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
+    monkeypatch.setattr(
+        fundamentals_notifications, "run_watch_summary_refresh", lambda: {"generated": 1, "failed": 0, "blocked": False, "narrative_events": narrative_events}
+    )
+    notify_calls = []
+    monkeypatch.setattr(fundamentals_notifications, "notify_watchlist_events", lambda events: notify_calls.append(events) or {"sent": 1, "skipped_disabled": 0, "failed": 0})
+
+    result = fundamentals_notifications.run_watchlist_notification_pipeline()
+
+    assert result["watchlist_companies"] == 5
+    assert result["new_candidates"] == 2
+    assert result["narratives_generated"] == 1
+    assert result["emails_sent"] == 1
+    assert notify_calls == [narrative_events]
