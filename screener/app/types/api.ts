@@ -116,3 +116,17 @@ export interface PortfolioResolvePayload {
   resolution_notes?: string | null
   failure_attribution?: 'thesis_wrong' | 'thesis_right_market_hasnt_paid' | null
 }
+
+export interface InvestorClassification {
+  investor_key: string
+  investor_name_display: string
+  llm_tier: 'marquee' | 'recognized' | 'unknown' | null
+  llm_reasoning: string | null
+  llm_model: string | null
+  llm_classified_at: string | null
+  override_tier: 'marquee' | 'recognized' | 'unknown' | null
+  override_notes: string | null
+  override_at: string | null
+  first_seen_source: string | null
+  first_seen_news_id: string | null
+}
