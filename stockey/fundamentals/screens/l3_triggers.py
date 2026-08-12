@@ -107,12 +107,14 @@ def _ensure_alerts_table() -> None:
 def load_candidate_events(limit: int | None = None) -> pd.DataFrame:
     """rating_action/pit_sast events not yet evaluated by this rule pass (an event
     already alerted, or already evaluated and found not alert-worthy, is tracked via
-    fundamentals_events.rule_trigger_status so re-runs don't redo work every day)."""
+    fundamentals_events.rule_trigger_status so re-runs don't redo work every day).
+    structured_extraction_json is included for _resolve_rating_action_type()'s
+    fallback -- see that function's docstring."""
     placeholders = ",".join(f"'{ft}'" for ft in SUPPORTED_FILING_TYPES)
     query = f"""
         SELECT source, news_id, company_master_id, filing_type, headline,
                rating_action_type, transaction_type, insider_name, quantity,
-               disclosure_date
+               disclosure_date, structured_extraction_json
         FROM fundamentals_events
         WHERE filing_type IN ({placeholders})
           AND (rule_trigger_status IS NULL OR rule_trigger_status = 'pending')
@@ -135,8 +137,33 @@ def load_latest_l2_state() -> pd.DataFrame:
     )
 
 
+def _resolve_rating_action_type(event: dict) -> str | None:
+    """rating_action_type is only ever populated by the ICRA-specific enrichment
+    path (fundamentals/collectors/rating_agencies.py) -- for other agencies, the
+    same fact (upgraded/downgraded/reaffirmed/...) is already sitting in
+    structured_extraction_json's own `rating_action` field, extracted from the
+    BSE-filed PDF by the generic OCR+extraction pipeline. Confirmed live 2026-08-12:
+    a company's own BSE filing states the actual rating change explicitly (previous
+    rating, new rating, action taken) -- it just doesn't carry the agency's
+    rationale, which genuinely does require agency-site enrichment (see
+    rating_agencies.py's own docstring). Falls back to structured_extraction_json
+    only when the dedicated column is empty, so ICRA's existing behavior (which
+    always has the column populated) is unchanged."""
+    action = event.get("rating_action_type")
+    if action:
+        return str(action)
+    raw_json = event.get("structured_extraction_json")
+    if not raw_json:
+        return None
+    try:
+        extracted = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return None
+    return extracted.get("rating_action")
+
+
 def evaluate_rating_action_trigger(event: dict, l2_row: dict | None) -> dict | None:
-    action = (event.get("rating_action_type") or "").lower()
+    action = (_resolve_rating_action_type(event) or "").lower()
     if action == "downgraded":
         return {
             "trigger_type": "rating_downgrade",

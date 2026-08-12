@@ -9889,6 +9889,15 @@ def test_match_rationale_skips_unparseable_dates():
     assert fundamentals_rating_agencies.match_rationale(results, date(2026, 8, 4)) is None
 
 
+@pytest.mark.parametrize("date_text", ["04 Aug 2026", "Aug 4, 2026", "2026-08-04T00:00:00"])
+def test_match_rationale_parses_every_agencys_date_format(date_text):
+    # ICRA uses "04 Aug 2026", CRISIL uses "Aug 4, 2026", India Ratings uses ISO --
+    # confirmed live 2026-08-12 all three parse through the same flexible call.
+    results = [{"date_text": date_text, "headline": "X", "rationale_id": "1"}]
+    matched = fundamentals_rating_agencies.match_rationale(results, date(2026, 8, 4))
+    assert matched["rationale_id"] == "1"
+
+
 def test_open_icra_session_raises_when_token_missing(monkeypatch):
     monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
 
@@ -9945,10 +9954,12 @@ def test_run_rating_agency_enrichment_returns_early_when_nothing_pending(monkeyp
 
 
 def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkeypatch):
+    # CARE has no plugin yet (unlike icra/india ratings/crisil, added 2026-08-12) --
+    # a genuinely still-unsupported agency, see module docstring.
     monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
     pending = pd.DataFrame(
-        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "CRISIL downgrades rating", "subcategory": None, "disclosure_date": date(2026, 8, 4)}]
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "CARE Ratings downgrades the rating", "subcategory": None, "disclosure_date": date(2026, 8, 4)}]
     )
     monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
     status_calls = []
@@ -10053,6 +10064,151 @@ def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkey
 
     assert result["failed"] == 1
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "failed"}]
+
+
+def test_agency_plugins_registry_covers_icra_india_ratings_crisil():
+    assert set(fundamentals_rating_agencies.AGENCY_PLUGINS.keys()) == {"icra", "india ratings", "crisil"}
+    for plugin in fundamentals_rating_agencies.AGENCY_PLUGINS.values():
+        assert callable(plugin["open_session"])
+        assert callable(plugin["search"])
+
+
+def test_search_india_ratings_rationales_parses_real_response_shape(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return [
+                {
+                    "issuerName": "Emaar India Limited",
+                    "pressReleaseTitle": "India Ratings Upgrades Emaar India and its Bank Loan Facilities to ‘IND AA-’/Stable",
+                    "effectiveDate": "2026-08-12T00:00:00",
+                    "pressReleaseID": 84832,
+                    "urlKey": "7nwgswxewzvyvccg7p4oxpeq",
+                },
+                {"issuerName": "No URL Key Co", "pressReleaseTitle": "Something", "effectiveDate": "2026-08-12T00:00:00", "pressReleaseID": 1, "urlKey": None},
+            ]
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+
+    results = fundamentals_rating_agencies.search_india_ratings_rationales("Emaar India")
+
+    assert len(results) == 1  # the row with no urlKey is skipped
+    assert results[0]["rationale_id"] == "84832"
+    assert results[0]["rationale_url"] is None  # detail page is JS-rendered, not guessed
+    assert "Upgrades" in results[0]["headline"]
+
+
+def test_search_india_ratings_rationales_raises_on_non_200(monkeypatch):
+    class FakeResponse:
+        status_code = 500
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+    with pytest.raises(fundamentals_rating_agencies.IndiaRatingsBlockedError):
+        fundamentals_rating_agencies.search_india_ratings_rationales("X")
+
+
+def test_search_crisil_rationales_parses_real_response_shape(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = '{"docs": [{"companyName": "Adani Renewable Energy Thirty Seven Limited", "heading": "Adani Renewable Energy Thirty Seven Limited:Update", "ratingDate": "Aug 12, 2026", "prId": "2194513"}]}'
+
+        def json(self):
+            import json as _json
+
+            return _json.loads(self.text)
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+
+    results = fundamentals_rating_agencies.search_crisil_rationales("Adani Renewable")
+
+    assert len(results) == 1
+    assert results[0]["rationale_id"] == "2194513"
+    assert results[0]["rationale_url"] is None
+
+
+def test_search_crisil_rationales_empty_body_is_a_clean_no_match(monkeypatch):
+    # confirmed live 2026-08-12: CRISIL returns an EMPTY body (not {"docs": []}) when
+    # nothing matches -- must not be treated as a parse failure.
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+
+    assert fundamentals_rating_agencies.search_crisil_rationales("Nonexistent Co") == []
+
+
+def test_search_crisil_rationales_raises_on_non_200(monkeypatch):
+    class FakeResponse:
+        status_code = 500
+        text = ""
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+    with pytest.raises(fundamentals_rating_agencies.CrisilBlockedError):
+        fundamentals_rating_agencies.search_crisil_rationales("X")
+
+
+def test_run_rating_agency_enrichment_handles_multiple_agencies_in_one_run(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": "n1", "company_master_id": "nse:A", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)},
+            {"source": "bse", "news_id": "n2", "company_master_id": "nse:B", "headline": "India Ratings upgrades the rating", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)},
+            {"source": "bse", "news_id": "n3", "company_master_id": "nse:C", "headline": "CRISIL downgrades the rating", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "Some Issuer")
+    monkeypatch.setattr(fundamentals_rating_agencies, "open_icra_session", lambda: ("s", "t"))
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_icra_rationales", lambda session, token, issuer: [{"date_text": "04 Aug 2026", "headline": "reaffirmed", "rationale_id": "1"}])
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_india_ratings_rationales", lambda issuer: [{"date_text": "04 Aug 2026", "headline": "upgraded", "rationale_id": "2"}])
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_crisil_rationales", lambda issuer: [{"date_text": "04 Aug 2026", "headline": "downgraded", "rationale_id": "3"}])
+    status_calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["matched"] == 3
+    assert result["blocked"] is False
+    agencies_matched = {call["fields"]["rating_agency"] for call in status_calls}
+    assert agencies_matched == {"icra", "india ratings", "crisil"}
+
+
+def test_run_rating_agency_enrichment_one_agencys_circuit_breaker_does_not_block_another(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    icra_rows = [
+        {"source": "bse", "news_id": f"icra{i}", "company_master_id": f"nse:X{i}", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}
+        for i in range(5)
+    ]
+    india_ratings_row = {"source": "bse", "news_id": "ir1", "company_master_id": "nse:Y", "headline": "India Ratings upgrades the rating", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}
+    pending = pd.DataFrame(icra_rows + [india_ratings_row])
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "Some Issuer")
+    monkeypatch.setattr(fundamentals_rating_agencies, "open_icra_session", lambda: ("s", "t"))
+
+    def icra_always_fails(session, token, issuer):
+        raise fundamentals_rating_agencies.IcraBlockedError("boom")
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_icra_rationales", icra_always_fails)
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_india_ratings_rationales", lambda issuer: [{"date_text": "04 Aug 2026", "headline": "upgraded", "rationale_id": "9"}])
+    status_calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["blocked"] is True  # icra tripped
+    assert result["matched"] == 1  # but india ratings still went through
+    assert any(call.get("fields", {}).get("rating_agency") == "india ratings" for call in status_calls if call["status"] == "matched")
 
 
 # fundamentals/collectors/ocr_pipeline.py -- L3/L4 OCR fetch+store (step 6).
@@ -10454,7 +10610,44 @@ def test_load_candidate_events_queries_expected_filters(monkeypatch):
     fundamentals_l3_triggers.load_candidate_events()
     assert "rating_action" in captured["query"]
     assert "pit_sast" in captured["query"]
+    assert "capital_raise" in captured["query"]
+    assert "structured_extraction_json" in captured["query"]
     assert "rule_trigger_status IS NULL OR rule_trigger_status = 'pending'" in captured["query"]
+
+
+def test_resolve_rating_action_type_prefers_column_over_json():
+    event = {"rating_action_type": "downgraded", "structured_extraction_json": json.dumps({"rating_action": "upgraded"})}
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) == "downgraded"
+
+
+def test_resolve_rating_action_type_falls_back_to_structured_extraction():
+    event = {"rating_action_type": None, "structured_extraction_json": json.dumps({"rating_action": "upgraded"})}
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) == "upgraded"
+
+
+def test_resolve_rating_action_type_none_when_column_empty_string():
+    event = {"rating_action_type": "", "structured_extraction_json": json.dumps({"rating_action": "reaffirmed"})}
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) == "reaffirmed"
+
+
+def test_resolve_rating_action_type_none_when_neither_source_has_it():
+    assert fundamentals_l3_triggers._resolve_rating_action_type({"rating_action_type": None, "structured_extraction_json": None}) is None
+    assert fundamentals_l3_triggers._resolve_rating_action_type({"rating_action_type": None, "structured_extraction_json": json.dumps({"other_field": 1})}) is None
+
+
+def test_resolve_rating_action_type_handles_unparseable_json():
+    event = {"rating_action_type": None, "structured_extraction_json": "not json"}
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) is None
+
+
+def test_evaluate_rating_action_trigger_uses_structured_extraction_fallback():
+    # real end-to-end shape: a non-ICRA rating action with no rating_action_type
+    # column populated, only structured_extraction_json (from the generic BSE-PDF
+    # OCR+extraction path) -- confirmed live 2026-08-12 against a real extracted
+    # IRIS RegTech/ICRA filing.
+    event = {"rating_action_type": None, "structured_extraction_json": json.dumps({"rating_action": "upgraded"})}
+    assert fundamentals_l3_triggers.evaluate_rating_action_trigger(event, {"net_debt_yoy_delta_rscr": -8})["trigger_type"] == "rating_confirms_deleveraging"
+    assert fundamentals_l3_triggers.evaluate_rating_action_trigger(event, None) is None
 
 
 def test_run_l3_rule_triggers_returns_early_when_no_candidates(monkeypatch):
