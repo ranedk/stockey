@@ -38,7 +38,11 @@ config:
   end-of-day summary, not a change alert. Both fire from
   run_watchlist_notification_pipeline() each time the daily fundamentals pipeline
   runs (cron: 19:15 weekdays), so "day end" here means "after the pipeline's own
-  daily run", not a separately scheduled job.
+  daily run", not a separately scheduled job. Rendered as an HTML table + narrative
+  section (2026-08-12, "more like a dashboard than a textual email" per the user) --
+  a plain-text part is always included alongside it as the universal fallback every
+  client falls back to when HTML rendering is off, per RFC 2046's multipart/
+  alternative convention.
 
 Both triggers collapse to one input: watch_summary.py's own narrative_events list
 already carries is_new_candidate and narrative_changed per company, computed by
@@ -59,9 +63,11 @@ rest of this fundamentals screener is run step-by-step
 
 from __future__ import annotations
 
+import html
 import json
 
 import boto3
+import pandas as pd
 from environs import Env
 
 from fundamentals.screens.watch_summary import run_watch_summary_refresh
@@ -86,6 +92,7 @@ AWS_SECRET_ACCESS_KEY = env.str("AWS_SECRET_ACCESS_KEY", "")
 
 def _parse_recipients(value: str) -> list[str]:
     return [addr for addr in (value or "").split() if addr]
+
 
 _SES_CLIENT: "boto3.client | None" = None  # cache, same pattern as utils/store.py's S3 client
 
@@ -136,18 +143,24 @@ def build_email_content(event: dict) -> tuple[str, str]:
     return subject, body
 
 
-def send_email(subject: str, body: str) -> dict | None:
-    """Sends via SES to every address in WATCHLIST_ALERT_EMAIL_TO. Returns None (not
-    an error) if sending is disabled -- callers that need to distinguish "disabled"
-    from "sent" should check WATCHLIST_ALERT_EMAIL_ENABLED themselves, same as
-    notify_watchlist_events/send_daily_digest do."""
+def send_email(subject: str, text_body: str, html_body: str | None = None) -> dict | None:
+    """Sends via SES to every address in WATCHLIST_ALERT_EMAIL_TO. Always includes a
+    plain-text part (universal fallback); html_body, when given, is attached
+    alongside it as the primary rendering most clients show (multipart/alternative,
+    per RFC 2046 -- a client picks whichever part it can render best, never both).
+    Returns None (not an error) if sending is disabled -- callers that need to
+    distinguish "disabled" from "sent" should check WATCHLIST_ALERT_EMAIL_ENABLED
+    themselves, same as notify_watchlist_events/send_daily_digest do."""
     if not WATCHLIST_ALERT_EMAIL_ENABLED:
         return None
     client = _get_ses_client()
+    body: dict = {"Text": {"Data": text_body, "Charset": "UTF-8"}}
+    if html_body:
+        body["Html"] = {"Data": html_body, "Charset": "UTF-8"}
     return client.send_email(
         Source=WATCHLIST_ALERT_EMAIL_FROM,
         Destination={"ToAddresses": _parse_recipients(WATCHLIST_ALERT_EMAIL_TO)},
-        Message={"Subject": {"Data": subject}, "Body": {"Text": {"Data": body}}},
+        Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": body},
     )
 
 
@@ -189,42 +202,137 @@ def notify_watchlist_events(narrative_events: list[dict]) -> dict[str, object]:
 
 def load_full_watchlist() -> list[dict]:
     """Every current watchlist row, company name joined from the latest L1 universe
-    run -- same join fundamentals/api/queries.py's get_watchlist() does, kept as its
-    own small query here rather than importing the API layer (screens/ modules stay
+    run and current_price from the latest technicals run (same two joins
+    fundamentals/api/queries.py's get_watchlist() does, kept as their own small
+    query here rather than importing the API layer -- screens/ modules stay
     independent of api/, not the other way around)."""
     df = sql_to_df(
         """
         SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
-               w.alert_count, w.narrative_text, w.suggested_watch_until, l1.company_name
+               w.alert_count, w.narrative_text, w.suggested_watch_until, l1.company_name,
+               tech.close AS current_price
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
             WHERE ticker = REPLACE(w.company_master_id, 'nse:', '')
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT close FROM fundamentals_technicals
+            WHERE company_master_id = w.company_master_id
+            ORDER BY run_date DESC LIMIT 1
+        ) tech ON TRUE
         ORDER BY w.last_alert_at DESC NULLS LAST
         """
     )
     return df.to_dict("records") if not df.empty else []
 
 
-def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str]:
+def _fmt_price(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "n/a"
+    return f"Rs.{value:,.2f}"
+
+
+def _fmt_plain(value) -> str:
+    return "n/a" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+
+
+def _price_change_cell_html(first_seen_price, current_price) -> str:
+    from_str = _fmt_price(first_seen_price)
+    to_str = _fmt_price(current_price)
+    if from_str == "n/a" or to_str == "n/a" or first_seen_price == 0:
+        return f"{from_str} &rarr; {to_str}"
+    pct = (current_price - first_seen_price) / first_seen_price * 100
+    css_class = "pos" if pct >= 0 else "neg"
+    sign = "+" if pct >= 0 else ""
+    return f'{from_str} &rarr; {to_str} <span class="{css_class}">({sign}{pct:.1f}%)</span>'
+
+
+_DIGEST_HTML_STYLE = (
+    "body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;background:#f8fafc;color:#0f172a;margin:0;padding:24px}"
+    ".card{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:20px;margin-bottom:16px}"
+    "table{width:100%;border-collapse:collapse;font-size:14px}"
+    "th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#64748b;border-bottom:1px solid #e2e8f0;padding:8px 10px}"
+    "td{padding:10px;border-bottom:1px solid #f1f5f9;vertical-align:top}"
+    "tr:last-child td{border-bottom:none}"
+    ".pos{color:#059669;font-weight:600}"
+    ".neg{color:#dc2626;font-weight:600}"
+    ".badge{display:inline-block;background:#f1f5f9;color:#475569;border-radius:999px;padding:2px 8px;font-size:11px;white-space:nowrap}"
+    ".narrative-block{padding:14px 0;border-bottom:1px solid #f1f5f9}"
+    ".narrative-block:last-child{border-bottom:none}"
+    ".narrative-ticker{font-weight:600;font-size:14px}"
+    ".narrative-text{font-size:13px;color:#334155;margin-top:4px}"
+    "h1{font-size:18px;margin:0 0 4px}"
+    ".sub{color:#64748b;font-size:13px;margin:0 0 4px}"
+    ".footer{color:#94a3b8;font-size:12px;margin-top:8px}"
+)
+
+
+def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, str]:
+    """Returns (subject, text_body, html_body). HTML is the primary rendering -- a
+    compact table (watching-since, entry-vs-today's-close, event count, watch-until)
+    plus a per-company narrative section below it -- the plain-text part is the
+    universal fallback every client falls back to when HTML rendering is off."""
+    today = pd.Timestamp.now(tz="UTC").date()
     if not watchlist_rows:
-        return "[Watchlist] Daily digest -- nothing on the watchlist", "No companies are on the watchlist yet."
+        subject = "[Watchlist] Daily digest -- nothing on the watchlist"
+        text_body = "No companies are on the watchlist yet."
+        html_body = f"<html><body style='font-family:sans-serif'><p>{text_body}</p></body></html>"
+        return subject, text_body, html_body
 
     subject = f"[Watchlist] Daily digest -- {len(watchlist_rows)} companies"
-    lines = [f"{len(watchlist_rows)} companies on the watchlist as of today. One consolidated summary, not a change alert.\n"]
+    text_lines = [f"{len(watchlist_rows)} companies on the watchlist as of {today}. One consolidated summary, not a change alert.\n"]
+    table_rows_html = []
+    narrative_blocks_html = []
+
     for row in watchlist_rows:
         ticker = str(row["company_master_id"]).removeprefix("nse:")
-        lines.append(f"--- {ticker} ({row.get('company_name') or 'name unknown'}) ---")
-        lines.append(f"Watching since {row.get('first_seen_at')} at {row.get('first_seen_price')} -- {row.get('alert_count')} event(s).")
-        lines.append(str(row.get("narrative_text") or "(narrative not generated yet)"))
-        if row.get("suggested_watch_until"):
-            lines.append(f"Suggested watch until: {row['suggested_watch_until']}")
-        lines.append("")
+        company_name = row.get("company_name") or "name unknown"
+        narrative = row.get("narrative_text") or "(narrative not generated yet)"
 
-    lines.append("This is a descriptive screener digest, not a trade recommendation.")
-    return subject, "\n".join(lines)
+        text_lines.append(f"--- {ticker} ({company_name}) ---")
+        text_lines.append(
+            f"Watching since {_fmt_plain(row.get('first_seen_at'))} at {_fmt_price(row.get('first_seen_price'))}, "
+            f"today's close {_fmt_price(row.get('current_price'))} -- {row.get('alert_count') or 0} event(s)."
+        )
+        text_lines.append(str(narrative))
+        if row.get("suggested_watch_until"):
+            text_lines.append(f"Suggested watch until: {row['suggested_watch_until']}")
+        text_lines.append("")
+
+        table_rows_html.append(
+            "<tr>"
+            f'<td><strong>{html.escape(ticker)}</strong><br>'
+            f'<span style="color:#64748b;font-size:12px">{html.escape(company_name)}</span></td>'
+            f"<td>{html.escape(_fmt_plain(row.get('first_seen_at')))}</td>"
+            f"<td>{_price_change_cell_html(row.get('first_seen_price'), row.get('current_price'))}</td>"
+            f'<td><span class="badge">{row.get("alert_count") or 0} events</span></td>'
+            f"<td>{html.escape(_fmt_plain(row.get('suggested_watch_until')))}</td>"
+            "</tr>"
+        )
+        narrative_blocks_html.append(
+            '<div class="narrative-block">'
+            f'<div class="narrative-ticker">{html.escape(ticker)} '
+            f'<span style="color:#94a3b8;font-weight:400">-- {html.escape(company_name)}</span></div>'
+            f'<div class="narrative-text">{html.escape(str(narrative))}</div>'
+            "</div>"
+        )
+
+    text_lines.append("This is a descriptive screener digest, not a trade recommendation.")
+    text_body = "\n".join(text_lines)
+
+    html_body = (
+        f'<html><head><meta charset="utf-8"><style>{_DIGEST_HTML_STYLE}</style></head><body>'
+        '<div class="card"><h1>Watchlist Digest</h1>'
+        f'<p class="sub">{len(watchlist_rows)} companies &middot; {today}</p>'
+        "<table><tr><th>Company</th><th>Watching since</th><th>Entry &rarr; Today's close</th>"
+        f"<th>Events</th><th>Watch until</th></tr>{''.join(table_rows_html)}</table></div>"
+        f'<div class="card"><h1>Why</h1>{"".join(narrative_blocks_html)}</div>'
+        '<p class="footer">Descriptive screener digest, not a trade recommendation.</p>'
+        "</body></html>"
+    )
+    return subject, text_body, html_body
 
 
 def send_daily_digest() -> dict[str, object]:
@@ -243,9 +351,9 @@ def send_daily_digest() -> dict[str, object]:
         )
         return {"sent": 0, "skipped_disabled": 0, "failed": 1}
 
-    subject, body = build_daily_digest_content(load_full_watchlist())
+    subject, text_body, html_body = build_daily_digest_content(load_full_watchlist())
     try:
-        send_email(subject, body)
+        send_email(subject, text_body, html_body)
         return {"sent": 1, "skipped_disabled": 0, "failed": 0}
     except Exception as exc:  # noqa: BLE001 -- classified as a failure, not raised
         _record_fallback(

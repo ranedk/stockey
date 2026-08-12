@@ -11947,6 +11947,28 @@ def test_send_email_passes_full_recipient_list_to_ses(monkeypatch):
     fundamentals_notifications.send_email("subject", "body")
 
     assert calls[0]["Destination"] == {"ToAddresses": ["a@x.com", "b@y.com"]}
+    assert calls[0]["Message"]["Body"] == {"Text": {"Data": "body", "Charset": "UTF-8"}}
+    assert calls[0]["Message"]["Subject"] == {"Data": "subject", "Charset": "UTF-8"}
+
+
+def test_send_email_includes_html_part_when_given(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "a@x.com")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "from@x.com")
+    calls = []
+
+    class FakeSesClient:
+        def send_email(self, **kwargs):
+            calls.append(kwargs)
+            return {"MessageId": "1"}
+
+    monkeypatch.setattr(fundamentals_notifications, "_get_ses_client", lambda: FakeSesClient())
+
+    fundamentals_notifications.send_email("subject", "text version", "<p>html version</p>")
+
+    body = calls[0]["Message"]["Body"]
+    assert body["Text"] == {"Data": "text version", "Charset": "UTF-8"}
+    assert body["Html"] == {"Data": "<p>html version</p>", "Charset": "UTF-8"}
 
 
 def test_load_full_watchlist_empty_returns_empty_list(monkeypatch):
@@ -11955,23 +11977,42 @@ def test_load_full_watchlist_empty_returns_empty_list(monkeypatch):
 
 
 def test_build_daily_digest_content_empty_watchlist():
-    subject, body = fundamentals_notifications.build_daily_digest_content([])
+    subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content([])
     assert "nothing on the watchlist" in subject.lower()
-    assert "No companies" in body
+    assert "No companies" in text_body
+    assert "No companies" in html_body
 
 
-def test_build_daily_digest_content_lists_every_company():
+def test_build_daily_digest_content_lists_every_company_in_both_parts():
     rows = [
-        {"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "alert_count": 2, "narrative_text": "foo narrative", "suggested_watch_until": "2026-11-01"},
-        {"company_master_id": "nse:BAR", "company_name": "Bar Co", "first_seen_at": "2026-08-02", "first_seen_price": 50.0, "alert_count": 1, "narrative_text": None, "suggested_watch_until": None},
+        {"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 2, "narrative_text": "foo narrative", "suggested_watch_until": "2026-11-01"},
+        {"company_master_id": "nse:BAR", "company_name": "Bar Co", "first_seen_at": "2026-08-02", "first_seen_price": 50.0, "current_price": float("nan"), "alert_count": 1, "narrative_text": None, "suggested_watch_until": None},
     ]
 
-    subject, body = fundamentals_notifications.build_daily_digest_content(rows)
+    subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
 
     assert subject == "[Watchlist] Daily digest -- 2 companies"
-    assert "FOO" in body and "Foo Co" in body and "foo narrative" in body
-    assert "BAR" in body and "narrative not generated yet" in body
-    assert "not a trade recommendation" in body
+    assert "FOO" in text_body and "Foo Co" in text_body and "foo narrative" in text_body
+    assert "BAR" in text_body and "narrative not generated yet" in text_body
+    assert "not a trade recommendation" in text_body
+
+    assert "FOO" in html_body and "foo narrative" in html_body
+    assert "<html" in html_body and "<table>" in html_body
+    assert 'class="pos"' in html_body  # FOO: 100 -> 110 is a gain
+    assert "n/a" in html_body  # BAR's NaN current_price rendered honestly, not as "nan%"
+
+
+def test_build_daily_digest_content_negative_change_gets_neg_class():
+    rows = [{"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "current_price": 90.0, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}]
+    _, _, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert 'class="neg"' in html_body
+
+
+def test_build_daily_digest_content_escapes_html_special_characters():
+    rows = [{"company_master_id": "nse:FOO", "company_name": "Foo & <Bar>", "first_seen_at": "2026-08-01", "first_seen_price": 1.0, "current_price": 1.0, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}]
+    _, _, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "Foo &amp; &lt;Bar&gt;" in html_body
+    assert "<Bar>" not in html_body
 
 
 def test_send_daily_digest_skips_when_disabled(monkeypatch):
@@ -11997,15 +12038,17 @@ def test_send_daily_digest_sends_successfully(monkeypatch):
     monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
     monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "from@x.com")
     monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "a@x.com b@y.com")
-    monkeypatch.setattr(fundamentals_notifications, "load_full_watchlist", lambda: [{"company_master_id": "nse:FOO", "company_name": "Foo", "first_seen_at": "2026-08-01", "first_seen_price": 1, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}])
+    monkeypatch.setattr(fundamentals_notifications, "load_full_watchlist", lambda: [{"company_master_id": "nse:FOO", "company_name": "Foo", "first_seen_at": "2026-08-01", "first_seen_price": 1, "current_price": 1, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}])
     sent_calls = []
-    monkeypatch.setattr(fundamentals_notifications, "send_email", lambda subject, body: sent_calls.append((subject, body)))
+    monkeypatch.setattr(fundamentals_notifications, "send_email", lambda subject, text_body, html_body=None: sent_calls.append((subject, text_body, html_body)))
 
     result = fundamentals_notifications.send_daily_digest()
 
     assert result == {"sent": 1, "skipped_disabled": 0, "failed": 0}
     assert len(sent_calls) == 1
-    assert "1 companies" in sent_calls[0][0]
+    subject, text_body, html_body = sent_calls[0]
+    assert "1 companies" in subject
+    assert html_body is not None and "<table>" in html_body
 
 
 def test_send_daily_digest_records_failure_without_raising(monkeypatch):
@@ -12014,7 +12057,7 @@ def test_send_daily_digest_records_failure_without_raising(monkeypatch):
     monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "a@x.com")
     monkeypatch.setattr(fundamentals_notifications, "load_full_watchlist", lambda: [])
 
-    def raise_error(subject, body):
+    def raise_error(subject, text_body, html_body=None):
         raise RuntimeError("ses down")
 
     monkeypatch.setattr(fundamentals_notifications, "send_email", raise_error)
