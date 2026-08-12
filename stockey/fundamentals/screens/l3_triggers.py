@@ -59,8 +59,9 @@ RESULTS_TABLE = "fundamentals_l3_alerts"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 # Trigger types this rule pass evaluates -- "results" deliberately not included yet,
-# see module docstring.
-SUPPORTED_FILING_TYPES = ("rating_action", "pit_sast")
+# see module docstring. capital_raise added 2026-08-12 (see evaluate_capital_raise_
+# trigger below).
+SUPPORTED_FILING_TYPES = ("rating_action", "pit_sast", "capital_raise")
 
 _ALERTS_TABLE_STATEMENT = """
     CREATE TABLE IF NOT EXISTS fundamentals_l3_alerts (
@@ -180,9 +181,24 @@ def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
     return None
 
 
+def evaluate_capital_raise_trigger(event: dict, l2_row: dict | None) -> dict | None:
+    """Always alert-worthy, unconditional on L2 state -- "company getting money
+    through any means is an important signal" (user, 2026-08-12), same reasoning as
+    insider buys: new capital in the door is new information regardless of what the
+    state vector already showed. Investor-level detail (name, tier) isn't evaluated
+    here -- it lands via structured_extraction.py's investor_names field and
+    fundamentals/screens/investor_classification.py, both independent of whether this
+    trigger fires."""
+    return {
+        "trigger_type": "capital_raise",
+        "reasoning": "Capital raise detected (preferential allotment / QIP / rights issue / warrants) -- new money in the door, alert-worthy regardless of prior L2 state.",
+    }
+
+
 TRIGGER_EVALUATORS = {
     "rating_action": evaluate_rating_action_trigger,
     "pit_sast": evaluate_pit_sast_trigger,
+    "capital_raise": evaluate_capital_raise_trigger,
 }
 
 

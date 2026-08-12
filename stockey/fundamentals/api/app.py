@@ -30,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from fundamentals.api import queries
+from fundamentals.screens.investor_classification import INVESTOR_TIERS
 from fundamentals.screens.l4_thesis import ORIGIN_TAGS, ThesisValidationError
 
 app = FastAPI(title="Stockey Fundamentals Screener API")
@@ -63,6 +64,11 @@ class PortfolioResolveRequest(BaseModel):
     resolved_true: bool
     resolution_notes: str | None = None
     failure_attribution: str | None = None
+
+
+class InvestorOverrideRequest(BaseModel):
+    tier: str
+    notes: str | None = None
 
 
 @app.get("/api/health")
@@ -134,3 +140,16 @@ def resolve_portfolio(thesis_id: str, payload: PortfolioResolveRequest) -> dict:
     except ThesisValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "resolved", "thesis_id": thesis_id}
+
+
+@app.get("/api/investors")
+def investors() -> list[dict]:
+    return queries.get_investor_classifications()
+
+
+@app.post("/api/investors/{investor_key}/override")
+def override_investor(investor_key: str, payload: InvestorOverrideRequest) -> dict:
+    if payload.tier not in INVESTOR_TIERS:
+        raise HTTPException(status_code=400, detail=f"tier must be one of {INVESTOR_TIERS}")
+    queries.set_investor_classification_override(investor_key, payload.model_dump())
+    return {"status": "updated", "investor_key": investor_key}

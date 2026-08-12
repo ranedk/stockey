@@ -63,6 +63,7 @@ from fundamentals.screens import notifications as fundamentals_notifications
 from fundamentals.api import queries as fundamentals_api_queries
 from fundamentals.api.app import app as fundamentals_api_app
 from fundamentals import run_pipeline as fundamentals_run_pipeline
+from fundamentals.screens import investor_classification as fundamentals_investor_classification
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -9008,6 +9009,23 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
         # Reg 29. Must NOT match on the bare regulation number (see PIT_SAST_KEYWORDS'
         # comment on why "regulation 29"/"regulation 31" were removed).
         ("Board Meeting", "Bal Pharma Ltd has informed BSE... Pursuant to Regulation 29 and other applicable provisions...", "other"),
+        # Real (subcategory, headline) pair, captured live 2026-08-12: a genuine
+        # warrant-conversion allotment filed under BSE's generic 'Outcome without
+        # intimation' bucket -- subcategory alone gives no signal, only the headline
+        # does (see CAPITAL_RAISE_KEYWORDS' comment).
+        ("Outcome without intimation", "Allotment of Equity Shares Pursuant to Conversion of Warrants", "capital_raise"),
+        # Real (subcategory, headline) pair, captured live 2026-08-12: an NCD (debt)
+        # allotment filed under BSE's 'Allotment of Equity Shares' subcategory despite
+        # not being equity -- must NOT classify as capital_raise (an investor buying a
+        # bond isn't the equity-investor-entry signal this trigger is for). See
+        # DEBT_INSTRUMENT_EXCLUSION_KEYWORDS.
+        ("Allotment of Equity Shares", "Allotment of NCDs to Clover Technologies Private Limited", "other"),
+        # Real subcategory, captured live 2026-08-12: employee stock options are not
+        # third-party investor capital -- must stay "other".
+        ("Allotment of ESOP / ESPS", "The Board allotted shares under ESOS 2022", "other"),
+        (None, "Allotment of shares on preferential basis to ABC Fund LP", "capital_raise"),
+        (None, "Allotment pursuant to Qualified Institutions Placement", "capital_raise"),
+        ("General", "Rights Issue - Allotment of Equity Shares", "capital_raise"),
     ],
 )
 def test_classify_announcement(subcategory, headline, expected):
@@ -10253,9 +10271,15 @@ def test_extract_structured_fields_routes_to_the_right_schema(monkeypatch):
     assert captured["response_format"]["json_schema"]["schema"] == fundamentals_structured_extraction.RATING_ACTION_SCHEMA
 
 
-@pytest.mark.parametrize("filing_type", ["results", "results_calendar", "rating_action", "pit_sast"])
+@pytest.mark.parametrize("filing_type", ["results", "results_calendar", "rating_action", "pit_sast", "capital_raise"])
 def test_every_supported_filing_type_has_a_schema(filing_type):
     assert filing_type in fundamentals_structured_extraction.SCHEMAS_BY_FILING_TYPE
+
+
+def test_capital_raise_schema_requires_investor_names_array():
+    schema = fundamentals_structured_extraction.CAPITAL_RAISE_SCHEMA
+    assert "investor_names" in schema["required"]
+    assert schema["properties"]["investor_names"]["type"] == "array"
 
 
 def test_load_pending_extraction_targets_queries_expected_filters(monkeypatch):
@@ -10407,6 +10431,16 @@ def test_evaluate_pit_sast_trigger_sell_confirming_known_trend_does_not_alert():
 def test_evaluate_pit_sast_trigger_no_transaction_data_does_not_alert():
     # the common real case -- a trading-window-closure procedural notice
     assert fundamentals_l3_triggers.evaluate_pit_sast_trigger({"transaction_type": None}, {"promoter_stake_direction": "flat"}) is None
+
+
+def test_evaluate_capital_raise_trigger_always_alerts_regardless_of_l2_state():
+    assert fundamentals_l3_triggers.evaluate_capital_raise_trigger({}, {"promoter_stake_direction": "decreasing"})["trigger_type"] == "capital_raise"
+    assert fundamentals_l3_triggers.evaluate_capital_raise_trigger({}, None)["trigger_type"] == "capital_raise"
+
+
+def test_capital_raise_is_in_supported_filing_types_and_evaluators():
+    assert "capital_raise" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+    assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["capital_raise"] is fundamentals_l3_triggers.evaluate_capital_raise_trigger
 
 
 def test_load_candidate_events_queries_expected_filters(monkeypatch):
@@ -11843,8 +11877,9 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 13
+    assert len(fundamentals_run_pipeline.STEPS) == 14
     assert fundamentals_run_pipeline.STEPS[-1] == "fundamentals.screens.notifications"
+    assert "fundamentals.screens.investor_classification" in fundamentals_run_pipeline.STEPS
 
 
 def test_main_exits_zero_when_not_all_steps_failed(monkeypatch, capsys):
@@ -12068,3 +12103,172 @@ def test_send_daily_digest_records_failure_without_raising(monkeypatch):
 
     assert result == {"sent": 0, "skipped_disabled": 0, "failed": 1}
     assert any(a and a[0] == "watchlist_digest_email_send_failed" for a, k in fallback_events)
+
+
+def test_normalize_investor_key_collapses_whitespace_and_case():
+    assert fundamentals_investor_classification.normalize_investor_key("  ABC   Fund  LP  ") == "abc fund lp"
+    assert fundamentals_investor_classification.normalize_investor_key(None) == ""
+
+
+def test_effective_tier_prefers_override():
+    assert fundamentals_investor_classification.effective_tier({"llm_tier": "unknown", "override_tier": "marquee"}) == "marquee"
+    assert fundamentals_investor_classification.effective_tier({"llm_tier": "recognized", "override_tier": None}) == "recognized"
+    assert fundamentals_investor_classification.effective_tier({"llm_tier": None, "override_tier": None}) is None
+
+
+def test_load_unclassified_investor_names_dedupes_within_batch_and_against_known(monkeypatch):
+    events_df = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": "n1", "structured_extraction_json": json.dumps({"investor_names": ["Acme Fund", "already known fund"]})},
+            {"source": "bse", "news_id": "n2", "structured_extraction_json": json.dumps({"investor_names": ["acme fund", "Beta Ventures"]})},
+        ]
+    )
+    known_df = pd.DataFrame([{"investor_key": "already known fund"}])
+    calls = iter([events_df, known_df])
+    monkeypatch.setattr(fundamentals_investor_classification, "sql_to_df", lambda q: next(calls))
+
+    result = fundamentals_investor_classification.load_unclassified_investor_names()
+
+    keys = [c["investor_key"] for c in result]
+    assert keys == ["acme fund", "beta ventures"]  # "Acme Fund"/"acme fund" collapse to one; the known one is excluded
+    assert result[0]["source"] == "bse" and result[0]["news_id"] == "n1"
+
+
+def test_load_unclassified_investor_names_empty_events_returns_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_investor_classification, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_investor_classification.load_unclassified_investor_names() == []
+
+
+def test_load_unclassified_investor_names_skips_unparseable_json(monkeypatch):
+    events_df = pd.DataFrame([{"source": "bse", "news_id": "n1", "structured_extraction_json": "not json"}])
+    calls = iter([events_df, pd.DataFrame()])
+    monkeypatch.setattr(fundamentals_investor_classification, "sql_to_df", lambda q: next(calls))
+    assert fundamentals_investor_classification.load_unclassified_investor_names() == []
+
+
+def test_run_investor_classification_returns_early_on_no_candidates(monkeypatch):
+    monkeypatch.setattr(fundamentals_investor_classification, "_ensure_investor_classification_table", lambda: None)
+    monkeypatch.setattr(fundamentals_investor_classification, "load_unclassified_investor_names", lambda limit=None: [])
+
+    result = fundamentals_investor_classification.run_investor_classification()
+
+    assert result == {"classified": 0, "failed": 0, "blocked": False}
+
+
+def test_run_investor_classification_writes_classified_rows(monkeypatch):
+    monkeypatch.setattr(fundamentals_investor_classification, "_ensure_investor_classification_table", lambda: None)
+    candidates = [{"investor_key": "acme fund", "investor_name_display": "Acme Fund", "source": "bse", "news_id": "n1"}]
+    monkeypatch.setattr(fundamentals_investor_classification, "load_unclassified_investor_names", lambda limit=None: candidates)
+    monkeypatch.setattr(
+        fundamentals_investor_classification, "classify_investor", lambda name, **k: {"tier": "unknown", "reasoning": "not a recognized name"}
+    )
+    upserts = []
+    monkeypatch.setattr(fundamentals_investor_classification, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_investor_classification.run_investor_classification(model="test-model")
+
+    assert result == {"classified": 1, "failed": 0, "blocked": False}
+    assert len(upserts) == 1
+    row = upserts[0][0].iloc[0]
+    assert row["investor_key"] == "acme fund"
+    assert row["llm_tier"] == "unknown"
+    assert row["override_tier"] is None
+    assert row["llm_model"] == "test-model"
+    assert upserts[0][2]["unique_keys"] == ["investor_key"]
+
+
+def test_run_investor_classification_trips_circuit_breaker(monkeypatch):
+    monkeypatch.setattr(fundamentals_investor_classification, "_ensure_investor_classification_table", lambda: None)
+    candidates = [{"investor_key": f"fund{i}", "investor_name_display": f"Fund {i}", "source": "bse", "news_id": f"n{i}"} for i in range(5)]
+    monkeypatch.setattr(fundamentals_investor_classification, "load_unclassified_investor_names", lambda limit=None: candidates)
+
+    def always_fails(name, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_investor_classification, "classify_investor", always_fails)
+    monkeypatch.setattr(fundamentals_investor_classification, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_investor_classification, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_investor_classification.run_investor_classification()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_investor_classification.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "investor_classification_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_set_investor_override_rejects_invalid_tier():
+    with pytest.raises(ValueError):
+        fundamentals_investor_classification.set_investor_override("acme fund", tier="bogus")
+
+
+def test_set_investor_override_writes_via_db_session(monkeypatch):
+    calls = []
+
+    class FakeCursor:
+        def execute(self, query, params):
+            calls.append((query, params))
+
+    class FakeCtx:
+        def __enter__(self):
+            return (None, FakeCursor())
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(fundamentals_investor_classification, "db_session", lambda: FakeCtx())
+    monkeypatch.setattr(fundamentals_investor_classification, "execute_db_operation", lambda fn, **k: fn())
+
+    fundamentals_investor_classification.set_investor_override("acme fund", tier="marquee", notes="well known")
+
+    assert len(calls) == 1
+    assert calls[0][1][0] == "marquee"
+    assert calls[0][1][1] == "well known"
+    assert calls[0][1][3] == "acme fund"
+
+
+def test_get_investor_classifications_returns_clean_records(monkeypatch):
+    df = pd.DataFrame(
+        [{"investor_key": "acme fund", "investor_name_display": "Acme Fund", "llm_tier": "unknown", "override_tier": None, "llm_classified_at": pd.Timestamp("2026-08-12", tz="UTC")}]
+    )
+    monkeypatch.setattr(fundamentals_api_queries, "get_all_investor_classifications", lambda: df)
+
+    result = fundamentals_api_queries.get_investor_classifications()
+
+    assert result[0]["investor_key"] == "acme fund"
+    assert result[0]["override_tier"] is None
+
+
+def test_set_investor_classification_override_delegates(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "set_investor_override", lambda key, **kwargs: calls.append((key, kwargs)))
+
+    fundamentals_api_queries.set_investor_classification_override("acme fund", {"tier": "marquee", "notes": "well known"})
+
+    assert calls == [("acme fund", {"tier": "marquee", "notes": "well known"})]
+
+
+def test_api_investors_route_returns_queries_result(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_investor_classifications", lambda: [{"investor_key": "acme fund"}])
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/investors")
+    assert r.status_code == 200
+    assert r.json() == [{"investor_key": "acme fund"}]
+
+
+def test_api_override_investor_rejects_invalid_tier():
+    client = TestClient(fundamentals_api_app)
+    r = client.post("/api/investors/acme%20fund/override", json={"tier": "bogus"})
+    assert r.status_code == 400
+
+
+def test_api_override_investor_success(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "set_investor_classification_override", lambda key, payload: calls.append((key, payload)))
+    client = TestClient(fundamentals_api_app)
+
+    r = client.post("/api/investors/acme%20fund/override", json={"tier": "marquee", "notes": "well known"})
+
+    assert r.status_code == 200
+    assert r.json() == {"status": "updated", "investor_key": "acme fund"}
+    assert calls == [("acme fund", {"tier": "marquee", "notes": "well known"})]

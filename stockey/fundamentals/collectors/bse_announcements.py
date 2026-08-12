@@ -29,7 +29,9 @@ detectable-here trigger types (pit_sast, rating_action, results) are stored; eve
 else (AGM notices, routine compliance filings, etc.) is discarded, not archived --
 "OCR only the specific filing types tied to the four L3 triggers... removes most of
 what made the old announcement pipeline expensive" (docs/FUNDAMENTAL_SCREENER_PRD.md
-sec 2).
+sec 2). capital_raise (2026-08-12) is a fifth type, added beyond the source PRD's
+original four at the user's own request ("company getting money through any means is
+an important signal") -- same discard-if-uninteresting discipline applies.
 
 Every row is detection only -- enrichment_status stays "pending" here always. Actual
 content extraction (OCR + structured fields) is step 6, wired in separately per
@@ -101,6 +103,36 @@ RATING_AGENCY_KEYWORDS = (
     "infomerics",
 )
 
+# "Company getting money through any means is an important signal" (user, 2026-08-12)
+# -- preferential allotment / QIP / rights issue / warrant conversion / FCCB. Checked
+# against subcategory AND headline together (not subcategory-first-then-headline-
+# fallback like PIT_SAST/rating_action above) because confirmed live 2026-08-12: a
+# real warrant-conversion allotment ("Allotment of Equity Shares Pursuant to
+# Conversion of Warrants") was filed under BSE's generic 'Outcome without intimation'
+# subcategory -- SUBCATNAME alone would have missed it entirely, only the headline
+# carried the signal.
+CAPITAL_RAISE_KEYWORDS = (
+    "preferential issue",
+    "preferential allotment",
+    "preferential basis",
+    "qualified institutions placement",
+    "qip",
+    "rights issue",
+    "conversion of warrant",
+    "allotment of warrant",
+    "allotment of equity share",
+    "further issue of capital",
+)
+
+# Confirmed live 2026-08-12: a real "Allotment of NCDs to <lender>" headline was
+# filed under BSE's 'Allotment of Equity Shares' subcategory despite being a debt
+# instrument (non-convertible debenture), not equity -- CAPITAL_RAISE_KEYWORDS'
+# subcategory match alone would have misclassified a lending event as the
+# equity-investor-entry signal this trigger is for (the user's own framing was "high
+# quality investor INVESTING", not a lender). Excluded via headline check regardless
+# of which subcategory the row landed in.
+DEBT_INSTRUMENT_EXCLUSION_KEYWORDS = ("ncd", "non-convertible debenture", "debenture")
+
 
 def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
     record_local_fallback_event(
@@ -157,6 +189,13 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
     contains "financial results" without being one; results has its own dedicated
     calendar endpoint (fetch_result_calendar) as a backstop, so it doesn't need a
     headline fallback and shouldn't inherit that false-positive risk.
+
+    capital_raise checks subcategory and headline together, not subcategory-first --
+    confirmed live 2026-08-12 that BSE's subcategory for this type is unreliable (a
+    real warrant-conversion allotment landed under a generic 'Outcome without
+    intimation' bucket) -- and excludes debt-instrument headlines (NCD/debenture)
+    even on a subcategory match, see CAPITAL_RAISE_KEYWORDS/
+    DEBT_INSTRUMENT_EXCLUSION_KEYWORDS.
     """
     subcategory_text = (subcategory or "").lower()
     headline_text = (headline or "").lower()
@@ -169,6 +208,11 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
         keyword in subcategory_text for keyword in RATING_AGENCY_KEYWORDS
     ):
         return "rating_action"
+    if any(keyword in subcategory_text for keyword in CAPITAL_RAISE_KEYWORDS) or any(
+        keyword in headline_text for keyword in CAPITAL_RAISE_KEYWORDS
+    ):
+        if not any(keyword in headline_text for keyword in DEBT_INSTRUMENT_EXCLUSION_KEYWORDS):
+            return "capital_raise"
 
     if any(keyword in headline_text for keyword in PIT_SAST_KEYWORDS):
         return "pit_sast"

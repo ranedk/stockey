@@ -166,11 +166,38 @@ PIT_SAST_SCHEMA = {
     "additionalProperties": False,
 }
 
+# "Company getting money through any means" (user, 2026-08-12) -- preferential
+# allotment, QIP, rights issue, warrant conversion, FCCB. investor_names is an array,
+# not a single field: a preferential allotment/QIP routinely allots to several
+# entities in one filing, and each named investor feeds
+# fundamentals/screens/investor_classification.py independently. Numeric/named-entity
+# fields here (amount, price, share count, names) are the reliable case per this
+# module's own docstring -- no boolean-plus-quote hedging needed, unlike audit_opinion.
+CAPITAL_RAISE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company_name": {"type": ["string", "null"]},
+        "instrument_type": {"type": ["string", "null"], "description": "preferential_allotment / qip / rights_issue / warrants / fccb / other"},
+        "total_amount_rs_cr": {"type": ["number", "null"]},
+        "price_per_share_rs": {"type": ["number", "null"]},
+        "number_of_shares": {"type": ["number", "null"]},
+        "investor_names": {"type": "array", "items": {"type": "string"}, "description": "every named allottee/investor actually stated in the text -- empty array if none named, never invented"},
+        "purpose_summary": {"type": ["string", "null"], "description": "stated use of proceeds, if disclosed"},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": [
+        "company_name", "instrument_type", "total_amount_rs_cr", "price_per_share_rs",
+        "number_of_shares", "investor_names", "purpose_summary", "confidence_notes",
+    ],
+    "additionalProperties": False,
+}
+
 SCHEMAS_BY_FILING_TYPE = {
     "results": ("results_extraction", RESULTS_SCHEMA),
     "results_calendar": ("results_extraction", RESULTS_SCHEMA),
     "rating_action": ("rating_action_extraction", RATING_ACTION_SCHEMA),
     "pit_sast": ("pit_sast_extraction", PIT_SAST_SCHEMA),
+    "capital_raise": ("capital_raise_extraction", CAPITAL_RAISE_SCHEMA),
 }
 
 EXTRACTION_COLUMN_TYPES = {

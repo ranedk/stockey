@@ -26,6 +26,7 @@ import json
 
 import pandas as pd
 
+from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
 from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
 from fundamentals.screens.watch_summary import (
@@ -195,3 +196,16 @@ def create_portfolio_entry(payload: dict) -> dict:
 
 def resolve_portfolio_entry(thesis_id: str, payload: dict) -> None:
     resolve_thesis(thesis_id=thesis_id, **payload)
+
+
+def get_investor_classifications() -> list[dict]:
+    """Every classified investor -- override_tier included as-is so the frontend can
+    show both the LLM's original suggestion and any human correction, not just the
+    effective one."""
+    return _clean_records(get_all_investor_classifications())
+
+
+def set_investor_classification_override(investor_key: str, payload: dict) -> None:
+    """Thin wrapper over investor_classification.set_investor_override -- ValueError
+    (bad tier) propagates to the caller (app.py translates it to a 400)."""
+    set_investor_override(investor_key, **payload)

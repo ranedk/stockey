@@ -12,10 +12,14 @@ trail, so there's nothing else to translate here.
 
 Steps run in dependency order (docs/FUNDAMENTAL_SCREENER_PRD.md sec 8's numbered
 steps): sector reference -> L1 universe -> L2 state -> event collectors -> OCR ->
-structured extraction -> sector capital-cycle -> L3 rule triggers -> L3 LLM triage ->
-descriptive technicals -> watchlist/narrative/email pipeline. The last step
-(notifications.run_watchlist_notification_pipeline) MUST run last: it depends on L3
-alerts, L2 state, technicals, and sector context all being current for that run.
+structured extraction -> investor classification -> sector capital-cycle -> L3 rule
+triggers -> L3 LLM triage -> descriptive technicals -> watchlist/narrative/email
+pipeline. investor_classification runs right after structured_extraction (needs its
+investor_names output); l3_triggers can run before OR after it since the
+capital_raise trigger fires unconditionally, independent of classification status.
+The last step (notifications.run_watchlist_notification_pipeline) MUST run last: it
+depends on L3 alerts, L2 state, technicals, and sector context all being current for
+that run.
 
 One step failing does not abort the run: every fundamentals module already isolates
 its own external-source failures via fallback_telemetry and (for the two LLM-calling
@@ -44,6 +48,7 @@ STEPS: list[str] = [
     "fundamentals.collectors.rating_agencies",
     "fundamentals.collectors.ocr_pipeline",
     "fundamentals.collectors.structured_extraction",
+    "fundamentals.screens.investor_classification",  # needs structured_extraction's investor_names, runs right after it
     "fundamentals.screens.sector_cycle",
     "fundamentals.screens.l3_triggers",
     "fundamentals.screens.llm_triage",
