@@ -71,6 +71,16 @@ export interface SectorInfo {
   watched_companies: SectorWatchedCompany[]
 }
 
+export interface PortfolioScoring {
+  as_of_date: string
+  total_theses: number
+  open: number
+  resolved: number
+  hit_rate: number | null
+  failure_attribution_breakdown: Record<string, number>
+  time_to_confirmation_days: { median_days?: number; mean_days?: number; count?: number }
+}
+
 export interface UniverseCompany {
   ticker: string
   company_name: string
