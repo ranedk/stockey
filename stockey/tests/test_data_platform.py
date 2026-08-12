@@ -11504,7 +11504,7 @@ def test_send_email_returns_none_when_disabled(monkeypatch):
     assert fundamentals_notifications.send_email("subject", "body") is None
 
 
-def test_run_watchlist_notification_pipeline_chains_all_three_steps(monkeypatch):
+def test_run_watchlist_notification_pipeline_chains_all_four_steps(monkeypatch):
     monkeypatch.setattr(
         fundamentals_notifications, "sync_watchlist_from_alerts", lambda: {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0}
     )
@@ -11514,6 +11514,12 @@ def test_run_watchlist_notification_pipeline_chains_all_three_steps(monkeypatch)
     )
     notify_calls = []
     monkeypatch.setattr(fundamentals_notifications, "notify_watchlist_events", lambda events: notify_calls.append(events) or {"sent": 1, "skipped_disabled": 0, "failed": 0})
+    digest_calls = []
+    # NOTE: send_daily_digest must always be mocked in tests that exercise the full
+    # pipeline -- it reads the real WATCHLIST_ALERT_EMAIL_* config and would attempt
+    # a real SES send against the real watchlist otherwise (this config is enabled
+    # in production .env, not just a test fixture).
+    monkeypatch.setattr(fundamentals_notifications, "send_daily_digest", lambda: digest_calls.append(1) or {"sent": 1, "skipped_disabled": 0, "failed": 0})
 
     result = fundamentals_notifications.run_watchlist_notification_pipeline()
 
@@ -11521,7 +11527,9 @@ def test_run_watchlist_notification_pipeline_chains_all_three_steps(monkeypatch)
     assert result["new_candidates"] == 2
     assert result["narratives_generated"] == 1
     assert result["emails_sent"] == 1
+    assert result["digest_sent"] == 1
     assert notify_calls == [narrative_events]
+    assert digest_calls == [1]
 
 
 def test_clean_records_converts_nan_to_none_and_timestamp_to_iso():
@@ -11908,3 +11916,112 @@ def test_api_portfolio_scoring_route_returns_queries_result(monkeypatch):
 
     assert r.status_code == 200
     assert r.json() == canned
+
+
+def test_parse_recipients_splits_on_whitespace():
+    assert fundamentals_notifications._parse_recipients("a@x.com b@y.com   c@z.com") == ["a@x.com", "b@y.com", "c@z.com"]
+
+
+def test_parse_recipients_single_address_with_surrounding_whitespace():
+    assert fundamentals_notifications._parse_recipients("  single@x.com  ") == ["single@x.com"]
+
+
+def test_parse_recipients_empty_or_none_returns_empty_list():
+    assert fundamentals_notifications._parse_recipients("") == []
+    assert fundamentals_notifications._parse_recipients(None) == []
+
+
+def test_send_email_passes_full_recipient_list_to_ses(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "a@x.com b@y.com")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "from@x.com")
+    calls = []
+
+    class FakeSesClient:
+        def send_email(self, **kwargs):
+            calls.append(kwargs)
+            return {"MessageId": "1"}
+
+    monkeypatch.setattr(fundamentals_notifications, "_get_ses_client", lambda: FakeSesClient())
+
+    fundamentals_notifications.send_email("subject", "body")
+
+    assert calls[0]["Destination"] == {"ToAddresses": ["a@x.com", "b@y.com"]}
+
+
+def test_load_full_watchlist_empty_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_notifications.load_full_watchlist() == []
+
+
+def test_build_daily_digest_content_empty_watchlist():
+    subject, body = fundamentals_notifications.build_daily_digest_content([])
+    assert "nothing on the watchlist" in subject.lower()
+    assert "No companies" in body
+
+
+def test_build_daily_digest_content_lists_every_company():
+    rows = [
+        {"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "alert_count": 2, "narrative_text": "foo narrative", "suggested_watch_until": "2026-11-01"},
+        {"company_master_id": "nse:BAR", "company_name": "Bar Co", "first_seen_at": "2026-08-02", "first_seen_price": 50.0, "alert_count": 1, "narrative_text": None, "suggested_watch_until": None},
+    ]
+
+    subject, body = fundamentals_notifications.build_daily_digest_content(rows)
+
+    assert subject == "[Watchlist] Daily digest -- 2 companies"
+    assert "FOO" in body and "Foo Co" in body and "foo narrative" in body
+    assert "BAR" in body and "narrative not generated yet" in body
+    assert "not a trade recommendation" in body
+
+
+def test_send_daily_digest_skips_when_disabled(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", False)
+    result = fundamentals_notifications.send_daily_digest()
+    assert result == {"sent": 0, "skipped_disabled": 1, "failed": 0}
+
+
+def test_send_daily_digest_flags_missing_config(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "")
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_notifications, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_notifications.send_daily_digest()
+
+    assert result == {"sent": 0, "skipped_disabled": 0, "failed": 1}
+    assert any(a and a[0] == "watchlist_digest_email_misconfigured" for a, k in fallback_events)
+
+
+def test_send_daily_digest_sends_successfully(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "from@x.com")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "a@x.com b@y.com")
+    monkeypatch.setattr(fundamentals_notifications, "load_full_watchlist", lambda: [{"company_master_id": "nse:FOO", "company_name": "Foo", "first_seen_at": "2026-08-01", "first_seen_price": 1, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}])
+    sent_calls = []
+    monkeypatch.setattr(fundamentals_notifications, "send_email", lambda subject, body: sent_calls.append((subject, body)))
+
+    result = fundamentals_notifications.send_daily_digest()
+
+    assert result == {"sent": 1, "skipped_disabled": 0, "failed": 0}
+    assert len(sent_calls) == 1
+    assert "1 companies" in sent_calls[0][0]
+
+
+def test_send_daily_digest_records_failure_without_raising(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_FROM", "from@x.com")
+    monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_TO", "a@x.com")
+    monkeypatch.setattr(fundamentals_notifications, "load_full_watchlist", lambda: [])
+
+    def raise_error(subject, body):
+        raise RuntimeError("ses down")
+
+    monkeypatch.setattr(fundamentals_notifications, "send_email", raise_error)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_notifications, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_notifications.send_daily_digest()
+
+    assert result == {"sent": 0, "skipped_disabled": 0, "failed": 1}
+    assert any(a and a[0] == "watchlist_digest_email_send_failed" for a, k in fallback_events)
