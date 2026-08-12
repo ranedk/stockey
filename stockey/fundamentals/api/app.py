@@ -102,6 +102,11 @@ def portfolio() -> list[dict]:
     return queries.get_portfolio()
 
 
+@app.get("/api/portfolio/scoring")
+def portfolio_scoring() -> dict:
+    return queries.get_portfolio_scoring()
+
+
 @app.post("/api/portfolio")
 def create_portfolio(payload: PortfolioCreateRequest) -> dict:
     if payload.origin_tag not in ORIGIN_TAGS:

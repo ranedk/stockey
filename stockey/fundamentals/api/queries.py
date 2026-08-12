@@ -27,7 +27,7 @@ import json
 import pandas as pd
 
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
-from fundamentals.screens.l4_thesis import create_thesis, resolve_thesis
+from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
 from fundamentals.screens.watch_summary import (
     load_latest_l2_state_for_company,
     load_latest_technicals_for_company,
@@ -176,6 +176,14 @@ def get_sectors() -> list[dict]:
 def get_portfolio() -> list[dict]:
     df = sql_to_df("SELECT * FROM fundamentals_l4_thesis ORDER BY created_date DESC")
     return _clean_records(df)
+
+
+def get_portfolio_scoring() -> dict:
+    """Thin wrapper over l4_thesis.compute_quarterly_scoring -- fundamental_basic_
+    goal.md sec 5's actual outcome measure (forecast hit rate, failure-attribution
+    breakdown, time-to-confirmation), not returns. Read-only, computed fresh from
+    whatever's resolved so far -- nothing here is cached or precomputed."""
+    return compute_quarterly_scoring()
 
 
 def create_portfolio_entry(payload: dict) -> dict:

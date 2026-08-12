@@ -11888,3 +11888,23 @@ def test_api_health_route():
     r = client.get("/api/health")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
+
+
+def test_get_portfolio_scoring_delegates_to_compute_quarterly_scoring(monkeypatch):
+    canned = {"as_of_date": "2026-08-12", "total_theses": 3, "open": 1, "resolved": 2, "hit_rate": 50.0, "failure_attribution_breakdown": {"thesis_wrong": 1}, "time_to_confirmation_days": {"median_days": 90.0}}
+    monkeypatch.setattr(fundamentals_api_queries, "compute_quarterly_scoring", lambda: canned)
+
+    result = fundamentals_api_queries.get_portfolio_scoring()
+
+    assert result == canned
+
+
+def test_api_portfolio_scoring_route_returns_queries_result(monkeypatch):
+    canned = {"as_of_date": "2026-08-12", "total_theses": 0, "open": 0, "resolved": 0, "hit_rate": None, "failure_attribution_breakdown": {}, "time_to_confirmation_days": {}}
+    monkeypatch.setattr(fundamentals_api_queries, "get_portfolio_scoring", lambda: canned)
+    client = TestClient(fundamentals_api_app)
+
+    r = client.get("/api/portfolio/scoring")
+
+    assert r.status_code == 200
+    assert r.json() == canned
