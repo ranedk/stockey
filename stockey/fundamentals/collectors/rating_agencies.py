@@ -434,12 +434,19 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
         for _, row in unsupported_rows.iterrows():
             _set_enrichment_status(source=row["source"], news_id=row["news_id"], status="unsupported_agency")
         counts["unsupported_agency"] = int(len(unsupported_rows))
+        # Per-agency breakdown, not just a count -- this is the actual prioritization
+        # signal for "which agency plugin to build next" (2026-08-13): read from
+        # fallback_telemetry after enough real runs accumulate, rather than guessing
+        # from general reputation. "unnamed" covers rows where classify_announcement
+        # matched the generic "credit rating"/"rating action" phrase with no specific
+        # agency name in the text at all.
+        agency_counts = unsupported_rows["_agency"].fillna("unnamed").value_counts().to_dict()
         _record_fallback(
             "rating_enrichment_unsupported_agency",
             reason="Some detected rating_action rows name an agency (or no agency at all) with no enrichment plugin yet.",
             error="no plugin for this agency",
             severity="warn",
-            metadata={"count": int(len(unsupported_rows))},
+            metadata={"count": int(len(unsupported_rows)), "agency_counts": {str(k): int(v) for k, v in agency_counts.items()}},
         )
 
     for agency_name, plugin in AGENCY_PLUGINS.items():

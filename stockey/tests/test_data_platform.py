@@ -9974,6 +9974,7 @@ def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkey
     assert result["unsupported_agency"] == 1
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "unsupported_agency"}]
     assert len(fallback_events) == 1
+    assert fallback_events[0][1]["metadata"]["agency_counts"] == {"care": 1}
 
 
 def test_run_rating_agency_enrichment_matches_icra_row(monkeypatch):
