@@ -24,11 +24,17 @@ way. Two are not:
 "party", "transactions", "related" -- screener.in does not carry either as structured,
 queryable data (footnote-level annual-report disclosure, not tabulated). Per
 docs/FUNDAMENTAL_SCREENER_PRD.md sec 8 step 3's own anticipation ("two filters need
-checking... if not, those two stay a smaller post-hoc pass over the query's output"):
-confirmed unavailable, and no alternate structured source is wired in yet either (a
-company's screener.in detail page doesn't carry these any more than the query engine
-does). These two checks are DEFERRED, not silently skipped -- every run emits a
-fallback_telemetry event recording that, and the run summary carries `checks_deferred`.
+checking... if not, those two stay a smaller post-hoc pass over the query's output"),
+that's exactly what run_l1_universe_refresh does as of 2026-08-13: screener.in has
+neither, but BSE announcement filings do (confirmed live -- both are real, exchange-
+filed disclosures, see fundamentals/collectors/bse_announcements.py's AUDITOR_CHANGE_
+KEYWORDS/RELATED_PARTY_TRANSACTION_KEYWORDS and structured_extraction.py's
+AUDITOR_CHANGE_SCHEMA/RPT_SCHEMA). apply_post_hoc_exclusions() runs this pass over
+screener.in's own candidate list after the query above, using events already
+collected+extracted by the daily fundamentals pipeline -- not a live fetch here.
+DEFERRED_CHECKS is now empty; see its own docstring for the exclusion policy
+(missing/unbackfilled event history never excludes, only a positively-confirmed
+violation does).
 
 Three filters use a documented approximation because screener.in's data granularity
 doesn't match the source spec exactly:
@@ -80,34 +86,152 @@ L1_QUERY = (
     "Contingent liabilities / Net worth < 0.25"
 )
 
-# Not silently skipped -- see module docstring. Every run logs a fallback event naming
-# these, and the run summary/STOCKEY_RUN_STATE carries checks_deferred.
-DEFERRED_CHECKS = ("auditor_change_last_3_years", "related_party_transactions_pct_revenue")
+# Empty as of 2026-08-13 -- both checks below are built. Kept as a named constant
+# (not deleted) so a future genuinely-unsourceable check has somewhere to go, and so
+# checks_deferred stays a meaningful field on the run summary rather than
+# disappearing silently.
+DEFERRED_CHECKS: tuple[str, ...] = ()
 
 
 def _record_deferred_checks_fallback() -> None:
+    """Only called when DEFERRED_CHECKS is non-empty (see run_l1_universe_refresh) --
+    kept general (not auditor/RPT-specific wording) since those two are now built."""
     record_local_fallback_event(
         module=SYNC_SOURCE_NAME,
         source="screenerin",
         fallback_type="l1_checks_not_sourced",
         severity="warn",
-        reason=(
-            "L1 universe filter ran without auditor-change and related-party-transaction "
-            "checks -- confirmed live 2026-08-10 that screener.in exposes neither as "
-            "queryable/structured data, and no alternate source is wired in yet."
-        ),
+        reason=f"L1 universe filter ran without: {', '.join(DEFERRED_CHECKS)} -- no source available yet.",
         error="no source available",
         metadata={"deferred_checks": list(DEFERRED_CHECKS)},
     )
 
+# Auditor-change / RPT post-hoc exclusion (2026-08-13, built): screener.in has neither
+# as structured/queryable data (confirmed live 2026-08-10), but BSE announcements do
+# (confirmed live 2026-08-13 against 40 real companies' 3yr history) -- see
+# fundamentals/collectors/bse_announcements.py's AUDITOR_CHANGE_KEYWORDS/RELATED_
+# PARTY_TRANSACTION_KEYWORDS and structured_extraction.py's AUDITOR_CHANGE_SCHEMA/
+# RPT_SCHEMA. L1 is therefore a two-stage filter: screener.in's arithmetic query
+# first, then this post-hoc pass over its own candidates. Missing data (no
+# auditor_change/RPT event on file for a company at all) NEVER excludes -- absence
+# isn't evidence of a violation, same "null is correct far more often than a guessed
+# value" rule the rest of this pipeline applies everywhere. This does mean a company
+# whose 3yr BSE history hasn't been backfilled yet (fundamentals/collectors/
+# bse_announcements.py's daily crawl only looks back 7 days -- see its own
+# one-time-backfill mechanism) passes by default, not "confirmed clean" -- run_state's
+# own excluded_* lists only ever show POSITIVE exclusions, never a coverage claim.
+AUDITOR_CHANGE_LOOKBACK_YEARS = 3
+# SEBI LODR Regulation 23's own materiality threshold for RPTs requiring shareholder
+# approval (10% of annual consolidated turnover, or Rs 1000cr, whichever lower) --
+# reused here rather than inventing a new number, since fundamental_basic_goal.md's
+# own L1 table doesn't specify one.
+RPT_PCT_OF_REVENUE_THRESHOLD = 10.0
+
+
+def load_auditor_rpt_events_for_companies(company_master_ids: list[str]) -> pd.DataFrame:
+    """Every structured-extracted auditor_change/related_party_transaction event for
+    the given companies -- unfiltered by date/threshold here (that's
+    apply_post_hoc_exclusions' job below), just the raw candidate rows."""
+    if not company_master_ids:
+        return pd.DataFrame()
+    return sql_to_df(
+        """
+        SELECT company_master_id, filing_type, disclosure_date, structured_extraction_json
+        FROM fundamentals_events
+        WHERE company_master_id = ANY(%s) AND filing_type IN ('auditor_change', 'related_party_transaction')
+          AND structured_extraction_status = 'done' AND structured_extraction_json IS NOT NULL
+        """,
+        params=(company_master_ids,),
+    )
+
+
+def _auditor_change_excludes(events: list[dict], *, as_of: pd.Timestamp) -> bool:
+    cutoff = as_of - pd.DateOffset(years=AUDITOR_CHANGE_LOOKBACK_YEARS)
+    for event in events:
+        try:
+            extracted = json.loads(event["structured_extraction_json"])
+        except (TypeError, ValueError):
+            continue
+        # Only a CONFIRMED change excludes -- a proposed_change_agenda, incidental_
+        # mention, or other never does. See AUDITOR_CHANGE_SCHEMA's own docstring for
+        # why the classifier deliberately over-matches and this field is the real gate.
+        if extracted.get("disclosure_type") != "confirmed_change":
+            continue
+        # utc=True: disclosure_date is a plain "YYYY-MM-DD" text column (no offset of
+        # its own) -- without this, to_datetime returns a tz-naive Timestamp that
+        # can't be compared against `cutoff` (tz-aware, from `as_of`), which is a real
+        # bug this module's own tests caught live, not a hypothetical.
+        disclosure_date = pd.to_datetime(event.get("disclosure_date"), errors="coerce", utc=True)
+        if pd.notna(disclosure_date) and disclosure_date >= cutoff:
+            return True
+    return False
+
+
+def _rpt_excludes(events: list[dict]) -> bool:
+    for event in events:
+        try:
+            extracted = json.loads(event["structured_extraction_json"])
+        except (TypeError, ValueError):
+            continue
+        if not extracted.get("is_applicable"):
+            continue  # non-applicability declaration -- the common real case, never excludes
+        pct = extracted.get("pct_of_revenue")
+        if isinstance(pct, (int, float)) and pct >= RPT_PCT_OF_REVENUE_THRESHOLD:
+            return True
+    return False
+
+
+def apply_post_hoc_exclusions(companies: list[dict]) -> tuple[list[dict], dict[str, list[str]]]:
+    """Filters screener.in's own candidate list against real auditor-change/RPT
+    events -- see module-level comment above for the exclusion policy. company_master_
+    id is built as 'nse:'+ticker directly (no lookup query needed), the same identity
+    convention fundamentals/screens/l2_state.py's synthetic events and fundamentals/
+    screens/l3_triggers.py's L2-state join both already rely on."""
+    company_master_ids = [f"nse:{c['ticker']}" for c in companies if c.get("ticker")]
+    events_df = load_auditor_rpt_events_for_companies(company_master_ids)
+
+    events_by_company: dict[str, list[dict]] = {}
+    if not events_df.empty:
+        for row in events_df.to_dict("records"):
+            events_by_company.setdefault(row["company_master_id"], []).append(row)
+
+    as_of = pd.Timestamp.now(tz="UTC")
+    excluded_auditor_change: list[str] = []
+    excluded_related_party_transaction: list[str] = []
+    survivors: list[dict] = []
+    for company in companies:
+        ticker = company.get("ticker")
+        events = events_by_company.get(f"nse:{ticker}", []) if ticker else []
+        auditor_events = [e for e in events if e["filing_type"] == "auditor_change"]
+        rpt_events = [e for e in events if e["filing_type"] == "related_party_transaction"]
+
+        if _auditor_change_excludes(auditor_events, as_of=as_of):
+            excluded_auditor_change.append(company["name"])
+            continue
+        if _rpt_excludes(rpt_events):
+            excluded_related_party_transaction.append(company["name"])
+            continue
+        survivors.append(company)
+
+    return survivors, {
+        "excluded_auditor_change": excluded_auditor_change,
+        "excluded_related_party_transaction": excluded_related_party_transaction,
+    }
+
 
 def run_l1_universe_refresh(session=None) -> dict[str, object]:
-    """Run L1_QUERY and upsert into RESULTS_TABLE, keyed by (query_name, query_version,
+    """Run L1_QUERY, then apply_post_hoc_exclusions over its own candidates, and
+    upsert survivors into RESULTS_TABLE, keyed by (query_name, query_version,
     run_date, company_id) -- append-only across quarterly refreshes (docs/
     FUNDAMENTAL_SCREENER_PRD.md sec 2: append-only, versioned state, always; a query
-    text change bumps L1_QUERY_VERSION rather than silently reinterpreting old rows)."""
+    text change bumps L1_QUERY_VERSION rather than silently reinterpreting old rows).
+    Excluded companies are logged (excluded_auditor_change/excluded_related_party_
+    transaction) but not written anywhere -- same "flags are exclusions, not scores"
+    treatment the rest of L1 already applies, nothing downstream needs to know why a
+    company isn't there."""
     session = session or build_authenticated_session()
-    screener_url, companies = run_query(session, L1_QUERY)
+    screener_url, screened_companies = run_query(session, L1_QUERY)
+    companies, exclusions = apply_post_hoc_exclusions(screened_companies)
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     rows = [
@@ -132,12 +256,15 @@ def run_l1_universe_refresh(session=None) -> dict[str, object]:
             RESULTS_TABLE,
             unique_keys=["query_name", "query_version", "run_date", "company_id"],
         )
-    _record_deferred_checks_fallback()
+    if DEFERRED_CHECKS:
+        _record_deferred_checks_fallback()
     return {
         "query_name": L1_QUERY_NAME,
         "query_version": L1_QUERY_VERSION,
         "rows": len(rows),
         "checks_deferred": list(DEFERRED_CHECKS),
+        "excluded_auditor_change": exclusions["excluded_auditor_change"],
+        "excluded_related_party_transaction": exclusions["excluded_related_party_transaction"],
         "companies": [c["name"] for c in companies][:20],
     }
 
@@ -168,7 +295,18 @@ def main() -> int:
         "query_name": result["query_name"],
         "query_version": result["query_version"],
         "checks_deferred": result["checks_deferred"],
-        "fallback_used": True,  # deferred checks are a standing, visible fallback
+        # 2026-08-13 gap fixes (audit finding): these were computed by
+        # run_l1_universe_refresh already but never forwarded here, so a company's
+        # exclusion reason was invisible past the return dict, not even logged.
+        # Real exclusions are the filter working as intended, not a degradation --
+        # kept as their own fields, NOT folded into fallback_used below.
+        "excluded_auditor_change": result["excluded_auditor_change"],
+        "excluded_related_party_transaction": result["excluded_related_party_transaction"],
+        # Was hardcoded True with a comment claiming "deferred checks are a standing
+        # fallback" -- stale the moment DEFERRED_CHECKS became empty this session
+        # (both checks it referred to are now built), so this was permanently wrong
+        # (always signaling "something needs attention" on every clean run).
+        "fallback_used": bool(result["checks_deferred"]),
         "state_advanced": result["rows"] > 0,
     }
     print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)

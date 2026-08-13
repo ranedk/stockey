@@ -63,7 +63,16 @@ SYNC_SOURCE_NAME = "fundamentals.collectors.structured_extraction"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 DEFAULT_MODEL = env("STRUCTURED_EXTRACTION_MODEL", "gpt-5.4-mini")
-SCHEMA_VERSION = 1
+# Bumped 1 -> 2 (2026-08-13): RESULTS_SCHEMA's shape changed (qoq/yoy split,
+# finance_costs/depreciation_amortisation added, period_type broadened past Q1-Q4)
+# -- see RESULTS_SCHEMA's own docstring. This is a single global version across
+# every filing_type's extraction (not per-schema, matching this module's existing
+# design), so it also bumps rating_action/pit_sast/capital_raise/auditor_change/rpt
+# rows going forward even though only results actually changed -- per the PRD's own
+# "version every signal definition" rule, a later re-read of an old row needs to
+# know which schema shape produced it, and a coarser global version is what this
+# module already committed to rather than something introduced here.
+SCHEMA_VERSION = 2
 CIRCUIT_BREAKER_THRESHOLD = 3
 DEFAULT_BATCH_LIMIT = 50
 
@@ -78,19 +87,51 @@ BASE_SYSTEM_PROMPT = (
     "explicitly in confidence_notes rather than silently picking one interpretation."
 )
 
+# 2026-08-13 (L3 results trigger build, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md):
+# reshaped after a live audit of 43 real already-collected results filings.
+#
+# revenue/pat split into explicit _qoq/_yoy fields (was a single generic
+# "_comparison" field + a freeform "_comparison_period_label" describing which
+# baseline it was) -- confirmed live that a single slot forces an inconsistent
+# choice across companies (the old label field's own values kept saying things
+# like "the table headers are somewhat inconsistent/ambiguous... best matched to
+# ..."). Explicit qoq/yoy fields let the LLM populate whichever the filing actually
+# shows and leave the other null, instead of being forced to pick one; genuine
+# ambiguity goes in confidence_notes (already the catch-all for exactly this) rather
+# than a dedicated label field. "qoq"/"yoy" here mean "immediately preceding
+# reporting period" / "same reporting period one year back" -- cadence-relative, not
+# literally quarter-vs-quarter, since NOT every company reports quarterly (see
+# period_type below).
+#
+# finance_costs/depreciation_amortisation added: confirmed live (a real Ambika
+# Cotton Mills filing) that Indian quarterly results under Ind AS do NOT disclose an
+# EBITDA/operating-profit line item at all -- these two lines are what
+# fundamentals/screens/l3_triggers.py derives operating margin from (Revenue -
+# Expenses excl. these two), not something extracted as a stated figure. Current
+# period only for this first cut, not qoq/yoy -- margin TREND is a later increment,
+# not blocking the initial trigger.
+#
+# period_type broadened past Q1-Q4 to include H1/H2/9M: confirmed live that
+# SME-platform companies file half-yearly, not quarterly (real headlines: "quarter
+# and half year ended..."). Don't assume every company is on a quarterly cadence --
+# fundamentals/screens/l3_triggers.py infers each company's own reporting cadence
+# from its own period_type history rather than a fixed assumption.
 RESULTS_SCHEMA = {
     "type": "object",
     "properties": {
         "company_name": {"type": ["string", "null"]},
         "period_ended": {"type": ["string", "null"]},
-        "period_type": {"type": ["string", "null"], "description": "Q1/Q2/Q3/Q4/Annual, inferred from the period label"},
+        "period_type": {"type": ["string", "null"], "description": "Q1/Q2/Q3/Q4/H1/H2/9M/Annual, inferred from the period label -- H1/H2 for a half-yearly (SME-platform) filer, not every company reports quarterly"},
         "consolidated_or_standalone": {"type": ["string", "null"]},
         "revenue_current_rs_lakh": {"type": ["number", "null"]},
-        "revenue_comparison_rs_lakh": {"type": ["number", "null"], "description": "revenue for whichever OTHER period column is present for comparison"},
-        "revenue_comparison_period_label": {"type": ["string", "null"], "description": "what that comparison period actually is, e.g. 'preceding quarter' or 'same quarter prior year' -- flag ambiguity here rather than guessing silently"},
+        "revenue_qoq_rs_lakh": {"type": ["number", "null"], "description": "revenue for the immediately preceding reporting period (preceding quarter, or preceding half-year for an H1/H2 filer) -- null if that column isn't shown"},
+        "revenue_yoy_rs_lakh": {"type": ["number", "null"], "description": "revenue for the same reporting period one year earlier -- null if that column isn't shown"},
         "pat_current_rs_lakh": {"type": ["number", "null"]},
-        "pat_comparison_rs_lakh": {"type": ["number", "null"]},
+        "pat_qoq_rs_lakh": {"type": ["number", "null"]},
+        "pat_yoy_rs_lakh": {"type": ["number", "null"]},
         "eps_basic_current": {"type": ["number", "null"]},
+        "finance_costs_current_rs_lakh": {"type": ["number", "null"], "description": "the 'Finance Costs' P&L line item for the current period, if shown -- used to derive operating margin (no EBITDA/operating-profit line is disclosed directly)"},
+        "depreciation_amortisation_current_rs_lakh": {"type": ["number", "null"], "description": "the 'Depreciation and amortisation expense' P&L line item for the current period, if shown -- same purpose as finance_costs_current_rs_lakh"},
         "exceptional_items_rs_lakh": {"type": ["number", "null"], "description": "0 if explicitly stated as zero/nil, null if not disclosed at all -- these are different things"},
         "audit_opinion_present": {"type": "boolean", "description": "true only if the auditor's/reviewer's opinion paragraph literally appears in the text"},
         "audit_opinion_summary": {"type": ["string", "null"], "description": "short, grounded paraphrase of the opinion actually stated -- null if audit_opinion_present is false"},
@@ -100,8 +141,9 @@ RESULTS_SCHEMA = {
     },
     "required": [
         "company_name", "period_ended", "period_type", "consolidated_or_standalone",
-        "revenue_current_rs_lakh", "revenue_comparison_rs_lakh", "revenue_comparison_period_label",
-        "pat_current_rs_lakh", "pat_comparison_rs_lakh", "eps_basic_current",
+        "revenue_current_rs_lakh", "revenue_qoq_rs_lakh", "revenue_yoy_rs_lakh",
+        "pat_current_rs_lakh", "pat_qoq_rs_lakh", "pat_yoy_rs_lakh", "eps_basic_current",
+        "finance_costs_current_rs_lakh", "depreciation_amortisation_current_rs_lakh",
         "exceptional_items_rs_lakh", "audit_opinion_present", "audit_opinion_summary",
         "promoter_pledge_status", "promoter_holding_pct", "confidence_notes",
     ],
@@ -192,12 +234,73 @@ CAPITAL_RAISE_SCHEMA = {
     "additionalProperties": False,
 }
 
+# L1 universe filter's auditor-change check (2026-08-13, fundamentals/screens/
+# l1_universe.py's own DEFERRED_CHECKS) -- disclosure_type is the load-bearing field
+# here, same "classify broadly, let extraction judge precisely" split PIT_SAST_
+# SCHEMA's disclosure_type already established: bse_announcements.py's classifier
+# deliberately over-matches "statutory auditor" (confirmed live: catches genuine
+# appointment/resignation filings AND routine results filings that merely mention the
+# incumbent auditor's report, e.g. under a generic "Outcome of Board Meeting"
+# subcategory where SUBCATNAME gives no signal) -- this field is what keeps an
+# incidental mention from becoming a false L1 exclusion, not the classifier.
+AUDITOR_CHANGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company_name": {"type": ["string", "null"]},
+        "disclosure_type": {
+            "type": "string",
+            "description": (
+                "confirmed_change: the filing states an auditor was actually appointed or resigned/removed. "
+                "proposed_change_agenda: an EGM/AGM notice proposing a change not yet approved. "
+                "incidental_mention: the auditor is named only in passing (e.g. citing their report on results), "
+                "no change stated. other: none of the above."
+            ),
+        },
+        "change_direction": {"type": ["string", "null"], "description": "appointment / resignation / null if disclosure_type is not confirmed_change"},
+        "previous_auditor": {"type": ["string", "null"]},
+        "new_auditor": {"type": ["string", "null"]},
+        "effective_date": {"type": ["string", "null"], "description": "ISO date if stated, else null -- never inferred from the filing date"},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": [
+        "company_name", "disclosure_type", "change_direction", "previous_auditor",
+        "new_auditor", "effective_date", "confidence_notes",
+    ],
+    "additionalProperties": False,
+}
+
+# L1 universe filter's related-party-transaction check (2026-08-13, same
+# DEFERRED_CHECKS entry) -- is_applicable mirrors RESULTS_SCHEMA's audit_opinion_
+# present boolean-hedge pattern: both real matches found live were "non-applicability"
+# declarations under SEBI LODR Regulation 23(9), stating RPT does NOT apply to the
+# company at all, not an amount disclosure -- l1_universe.py's post-hoc exclusion
+# reads pct_of_revenue only, so a non-applicability filing correctly contributes
+# nothing to exclude on (is_applicable=false, pct_of_revenue=null), not a guessed 0%.
+RPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company_name": {"type": ["string", "null"]},
+        "is_applicable": {"type": "boolean", "description": "true only if the filing discloses an actual related-party transaction, false for a non-applicability/below-threshold declaration"},
+        "rpt_amount_rs_cr": {"type": ["number", "null"], "description": "null if is_applicable is false or no amount is stated"},
+        "pct_of_revenue": {"type": ["number", "null"], "description": "only if the filing itself states this percentage -- never computed/inferred here"},
+        "related_party_name": {"type": ["string", "null"]},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": [
+        "company_name", "is_applicable", "rpt_amount_rs_cr", "pct_of_revenue",
+        "related_party_name", "confidence_notes",
+    ],
+    "additionalProperties": False,
+}
+
 SCHEMAS_BY_FILING_TYPE = {
     "results": ("results_extraction", RESULTS_SCHEMA),
     "results_calendar": ("results_extraction", RESULTS_SCHEMA),
     "rating_action": ("rating_action_extraction", RATING_ACTION_SCHEMA),
     "pit_sast": ("pit_sast_extraction", PIT_SAST_SCHEMA),
     "capital_raise": ("capital_raise_extraction", CAPITAL_RAISE_SCHEMA),
+    "auditor_change": ("auditor_change_extraction", AUDITOR_CHANGE_SCHEMA),
+    "related_party_transaction": ("rpt_extraction", RPT_SCHEMA),
 }
 
 EXTRACTION_COLUMN_TYPES = {

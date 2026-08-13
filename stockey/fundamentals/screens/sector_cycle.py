@@ -86,6 +86,19 @@ PHASE_THRESHOLD_POINTS = 5.0
 # -- see module docstring's "small-N sectors" caveat, found live 2026-08-11.
 MIN_COMPANIES_FOR_CONFIDENCE = 5
 
+# Growth-classification thresholds (2026-08-13, user request: "sectoral health...
+# should create a classification (High Growth sector, Low Growth Sector, Medium
+# Growth, No pattern etc.)"). Deliberately a SEPARATE axis from `phase` above:
+# phase reads capacity_growth_pct vs demand_growth_pct (cyclical positioning --
+# is the sector over/under-building relative to its own demand), while this reads
+# demand_growth_pct alone (is underlying demand actually growing fast). A sector can
+# be "capacity_discipline" (phase) and "high_growth" (this) at once -- that
+# combination is the textbook bullish setup, which is exactly why they're kept
+# independent rather than collapsed into one field. Same first-cut, fixed-threshold
+# treatment phase got -- easy to tune once reviewed against real sector outcomes.
+GROWTH_HIGH_THRESHOLD_PCT = 15.0
+GROWTH_MEDIUM_THRESHOLD_PCT = 5.0
+
 
 def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
     record_local_fallback_event(
@@ -147,6 +160,21 @@ def classify_phase(capacity_growth_pct: float | None, demand_growth_pct: float |
     return "balanced"
 
 
+def classify_growth(demand_growth_pct: float | None, sample_size_confidence: str) -> str | None:
+    """"No pattern" whenever the read isn't trustworthy -- no demand data at all, OR
+    the sector's sample is too thin (sample_size_confidence == 'low', same
+    MIN_COMPANIES_FOR_CONFIDENCE gate `phase`'s own caveat documents) -- a 1-company
+    median is not a sector growth rate, same reasoning that gates `phase` from being
+    over-read on small-N sectors."""
+    if demand_growth_pct is None or sample_size_confidence == "low":
+        return "no_pattern"
+    if demand_growth_pct >= GROWTH_HIGH_THRESHOLD_PCT:
+        return "high_growth"
+    if demand_growth_pct >= GROWTH_MEDIUM_THRESHOLD_PCT:
+        return "medium_growth"
+    return "low_growth"
+
+
 def compute_sector_aggregates(l1_with_sector: pd.DataFrame, gross_block_data: dict[int, dict[str, float]]) -> pd.DataFrame:
     if l1_with_sector.empty:
         return pd.DataFrame()
@@ -165,6 +193,7 @@ def compute_sector_aggregates(l1_with_sector: pd.DataFrame, gross_block_data: di
 
         demand_values = group["qtr_sales_var_pct"].dropna()
         demand_growth_pct = round(float(demand_values.median()), 2) if not demand_values.empty else None
+        sample_size_confidence = "adequate" if len(capacity_rows) >= MIN_COMPANIES_FOR_CONFIDENCE else "low"
 
         rows.append(
             {
@@ -175,7 +204,8 @@ def compute_sector_aggregates(l1_with_sector: pd.DataFrame, gross_block_data: di
                 "capacity_growth_pct": capacity_growth_pct,
                 "demand_growth_pct": demand_growth_pct,
                 "phase": classify_phase(capacity_growth_pct, demand_growth_pct),
-                "sample_size_confidence": "adequate" if len(capacity_rows) >= MIN_COMPANIES_FOR_CONFIDENCE else "low",
+                "growth_classification": classify_growth(demand_growth_pct, sample_size_confidence),
+                "sample_size_confidence": sample_size_confidence,
                 "run_date": pd.Timestamp.now(tz="UTC").normalize(),
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }

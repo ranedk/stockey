@@ -86,8 +86,12 @@ def universe() -> dict:
 
 
 @app.get("/api/watchlist")
-def watchlist() -> list[dict]:
-    return queries.get_watchlist()
+def watchlist(status: str = "active") -> list[dict]:
+    # status="all" is the sentinel for "every row regardless of status" -- a bare
+    # empty/missing query param is awkward to express unambiguously in a URL, "all"
+    # reads clearly. Everything else (active/stale/invalidated/price_flagged) passes
+    # straight through to queries.get_watchlist's own filter.
+    return queries.get_watchlist(status=None if status == "all" else status)
 
 
 @app.get("/api/watchlist/{company_master_id}")
@@ -158,3 +162,16 @@ def override_investor(investor_key: str, payload: InvestorOverrideRequest) -> di
 @app.get("/api/todos")
 def todos() -> dict:
     return queries.get_todos()
+
+
+@app.get("/api/strategies")
+def strategies() -> list[dict]:
+    return queries.get_strategies()
+
+
+@app.get("/api/strategies/{trigger_type}")
+def strategy_detail(trigger_type: str) -> dict:
+    result = queries.get_strategy_detail(trigger_type)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"{trigger_type} has never alerted")
+    return result

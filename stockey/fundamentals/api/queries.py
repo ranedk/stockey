@@ -30,6 +30,7 @@ from fundamentals.collectors.rating_agencies import get_unsupported_rating_agenc
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
 from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
+from fundamentals.screens.signal_pointers import get_stock_signal_pointers, load_satisfied_strategies_by_company
 from fundamentals.screens.watch_summary import (
     load_latest_l2_state_for_company,
     load_latest_technicals_for_company,
@@ -79,12 +80,24 @@ def get_universe() -> dict:
     }
 
 
-def get_watchlist() -> list[dict]:
+def get_watchlist(status: str | None = "active") -> list[dict]:
+    """status='active' by default (2026-08-13, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md
+    watchlist-exit build) -- this is the default "current watchlist" view, which is
+    exactly where the "crowding" complaint that feature fixes was actually about.
+    Nothing is ever deleted: pass status=None for every row regardless of status, or
+    a specific status ('stale'/'invalidated'/'price_flagged') to see just that
+    bucket -- fundamentals/screens/watchlist_exit.py's own status/status_reason
+    columns are the source of truth, not re-derived here."""
+    params: tuple = ()
+    where_clause = ""
+    if status is not None:
+        where_clause = "WHERE w.status = %s"
+        params = (status,)
     df = sql_to_df(
-        """
+        f"""
         SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
                w.alert_count, w.narrative_text, w.suggested_watch_until, w.narrative_generated_at,
-               l1.company_name, tech.close AS current_price
+               w.status, w.status_reason, l1.company_name, tech.close AS current_price
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
@@ -96,10 +109,21 @@ def get_watchlist() -> list[dict]:
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
+        {where_clause}
         ORDER BY w.last_alert_at DESC NULLS LAST
-        """
+        """,  # noqa: S608 -- where_clause is a fixed internal string, params are parameterized
+        params=params,
     )
-    return _clean_records(df)
+    watchlist = _clean_records(df)
+    if not watchlist:
+        return []
+
+    # 2026-08-13: strategy badges per row -- was previously just a bare alert_count,
+    # the same gap fixed on the digest email (notifications.py's load_full_watchlist).
+    strategies_by_company = load_satisfied_strategies_by_company()
+    for row in watchlist:
+        row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
+    return watchlist
 
 
 def get_watchlist_detail(company_master_id: str) -> dict | None:
@@ -134,6 +158,11 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
         "technicals": load_latest_technicals_for_company(company_master_id),
         "sector_context": load_sector_context_for_company(company_master_id),
         "portfolio": _clean_records(thesis_df),
+        # 2026-08-13: structured pointers (fundamentals/screens/signal_pointers.py),
+        # same aggregator watch_summary.py's narrative LLM sees -- so a human viewing
+        # this detail page gets the same agency-name/investor-tier/sector-growth
+        # context, not a thinner read of the same facts.
+        "signal_pointers": get_stock_signal_pointers(company_master_id),
     }
 
 
@@ -141,7 +170,8 @@ def get_sectors() -> list[dict]:
     sector_df = sql_to_df(
         """
         SELECT sc.sector_code, sc.capacity_growth_pct, sc.demand_growth_pct, sc.phase,
-               sc.sample_size_confidence, sc.n_companies_in_l1, sr.description AS sector_name
+               sc.growth_classification, sc.sample_size_confidence, sc.n_companies_in_l1,
+               sr.description AS sector_name
         FROM fundamentals_sector_cycle sc
         LEFT JOIN LATERAL (
             SELECT description FROM fundamentals_sector_reference
@@ -210,6 +240,55 @@ def set_investor_classification_override(investor_key: str, payload: dict) -> No
     """Thin wrapper over investor_classification.set_investor_override -- ValueError
     (bad tier) propagates to the caller (app.py translates it to a 400)."""
     set_investor_override(investor_key, **payload)
+
+
+def get_strategies() -> list[dict]:
+    """Top-level strategy registry (2026-08-13, user request: "the web app can start
+    with the list of strategies and inside each one the list which is being watched
+    under it"). No new backend concept needed -- trigger_type in fundamentals_l3_
+    alerts already IS the strategy dimension, already many-rows-per-company (a
+    company can satisfy several trigger_types at once). This just groups the
+    existing table by that column instead of adding a registry table."""
+    df = sql_to_df(
+        """
+        SELECT trigger_type, COUNT(DISTINCT company_master_id) AS company_count, MAX(alert_date) AS last_alert_date
+        FROM fundamentals_l3_alerts
+        WHERE company_master_id IS NOT NULL
+        GROUP BY trigger_type
+        ORDER BY trigger_type
+        """
+    )
+    return _clean_records(df)
+
+
+def get_strategy_detail(trigger_type: str) -> dict | None:
+    """Every company currently alerted under one trigger_type, most recent alert per
+    company. None (-> app.py 404) when this trigger_type has never fired, same
+    not-found convention get_watchlist_detail already uses."""
+    df = sql_to_df(
+        """
+        SELECT DISTINCT ON (a.company_master_id)
+               a.company_master_id, a.alert_date, a.reasoning, a.origin,
+               l1.company_name, tech.close AS current_price
+        FROM fundamentals_l3_alerts a
+        LEFT JOIN LATERAL (
+            SELECT company_name FROM fundamentals_l1_universe
+            WHERE ticker = REPLACE(a.company_master_id, 'nse:', '')
+            ORDER BY run_date DESC LIMIT 1
+        ) l1 ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT close FROM fundamentals_technicals
+            WHERE company_master_id = a.company_master_id
+            ORDER BY run_date DESC LIMIT 1
+        ) tech ON TRUE
+        WHERE a.trigger_type = %s AND a.company_master_id IS NOT NULL
+        ORDER BY a.company_master_id, a.alert_date DESC NULLS LAST
+        """,
+        params=(trigger_type,),
+    )
+    if df.empty:
+        return None
+    return {"trigger_type": trigger_type, "companies": _clean_records(df)}
 
 
 def get_todos() -> dict:

@@ -15,8 +15,14 @@ steps): sector reference -> L1 universe -> L2 state -> event collectors -> OCR -
 structured extraction -> investor classification -> sector capital-cycle -> L3 rule
 triggers -> L3 LLM triage -> descriptive technicals -> watchlist/narrative/email
 pipeline. investor_classification runs right after structured_extraction (needs its
-investor_names output); l3_triggers can run before OR after it since the
-capital_raise trigger fires unconditionally, independent of classification status.
+investor_names output). l3_triggers's capital_raise trigger still fires
+unconditionally regardless of classification status (a raise is alert-worthy either
+way -- see evaluate_capital_raise_trigger), but as of 2026-08-13 its REASONING now
+also names the investor tier when known (fundamentals_investor_classification),
+which is why investor_classification staying before l3_triggers in this list is a
+soft ordering preference, not just incidental -- running l3_triggers first would
+still work, just with tiers_by_key empty for that pass (evaluated again, richer, on
+the next run once investor_classification catches up).
 L2 state MUST stay before l3_triggers (already true) for a second reason as of
 2026-08-13, not just its original "state used to corroborate events" one: L2's own
 refresh now writes synthetic institutional_first_entry events straight into
@@ -25,6 +31,12 @@ fundamentals/screens/l2_state.py's own docstring), which l3_triggers then has to
 pick up in the SAME run. The last step
 (notifications.run_watchlist_notification_pipeline) MUST run last: it depends on L3
 alerts, L2 state, technicals, and sector context all being current for that run.
+That step internally chains watchlist sync -> narrative regen -> fundamentals.
+screens.watchlist_exit's status evaluation (2026-08-13, docs/
+FUNDAMENTAL_SCREENER_RESULTS_ARC.md -- the "we will crowd the watchlist" fix) ->
+notify -> daily digest; watchlist_exit is NOT its own STEPS entry, it's called from
+inside notifications.py so it always runs against a freshly-regenerated narrative
+and before the digest's own default active-only filter reads it.
 
 One step failing does not abort the run: every fundamentals module already isolates
 its own external-source failures via fallback_telemetry and (for the two LLM-calling

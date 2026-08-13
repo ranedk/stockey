@@ -29,9 +29,13 @@ detectable-here trigger types (pit_sast, rating_action, results) are stored; eve
 else (AGM notices, routine compliance filings, etc.) is discarded, not archived --
 "OCR only the specific filing types tied to the four L3 triggers... removes most of
 what made the old announcement pipeline expensive" (docs/FUNDAMENTAL_SCREENER_PRD.md
-sec 2). capital_raise (2026-08-12) is a fifth type, added beyond the source PRD's
-original four at the user's own request ("company getting money through any means is
-an important signal") -- same discard-if-uninteresting discipline applies.
+sec 2). Beyond the source PRD's original four, three more types were added the same
+discard-if-uninteresting way: capital_raise (2026-08-12, user request: "company
+getting money through any means is an important signal"), and auditor_change/
+related_party_transaction (2026-08-13, closing L1 universe filter's two
+DEFERRED_CHECKS -- screener.in has neither as structured data, but BSE announcements
+do, confirmed live; see fundamentals/screens/l1_universe.py's own docstring for why
+these two were deferred in the first place).
 
 Every row is detection only -- enrichment_status stays "pending" here always. Actual
 content extraction (OCR + structured fields) is step 6, wired in separately per
@@ -64,8 +68,9 @@ from environs import Env
 from fundamentals.collectors.events_store import RESULTS_TABLE, resolve_isin, upsert_events_with_dedup
 from fundamentals.collectors.security_master import BSE_HEADERS
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
+from fundamentals.screens.l2_state import pull_crawl_forward
 from utils.company_master import map_company_master_ids
-from utils.db import sql_to_df
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -133,6 +138,30 @@ CAPITAL_RAISE_KEYWORDS = (
 # of which subcategory the row landed in.
 DEBT_INSTRUMENT_EXCLUSION_KEYWORDS = ("ncd", "non-convertible debenture", "debenture")
 
+# L1 universe filter's two DEFERRED_CHECKS (auditor change, RPT) -- 2026-08-13, built
+# once fundamentals/screens/l1_universe.py's own docstring turned out to be checking
+# the wrong source (screener.in has neither; BSE announcements have both). Confirmed
+# live against 25 real companies' 3yr BSE history.
+#
+# Auditor: "statutory auditor" alone catches every real shape seen (appointment,
+# resignation, and a combined appointment-of-statutory-and-secretarial-auditor
+# filing) -- BSE's SUBCATNAME is inconsistent about which of the two happened
+# (appointment vs resignation), so change_type is left to structured_extraction.py's
+# AUDITOR_CHANGE_SCHEMA, not this classifier.
+AUDITOR_CHANGE_KEYWORDS = ("statutory auditor",)
+
+# RPT: SEBI LODR Regulation 23 is exclusively "Related Party Transactions" (unlike
+# Regulation 29 above, which the pit_sast lesson found covers multiple unrelated
+# topics) -- both real matches found live cited "regulation 23" without the phrase
+# "related party transaction" anywhere in the headline (both were non-applicability
+# declarations: "non applicability of regulation 23(9) of SEBI LODR"), so the bare
+# regulation-number match is kept here, not dropped the way the pit_sast lesson
+# dropped Regulation 29. Lower stakes than that case anyway: a false-positive here
+# only costs one wasted OCR+extraction call, not a spurious alert (l1_universe.py's
+# exclusion only fires on a real extracted pct_of_revenue over threshold, not on
+# filing_type alone).
+RELATED_PARTY_TRANSACTION_KEYWORDS = ("related party transaction", "regulation 23")
+
 
 def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
     record_local_fallback_event(
@@ -183,12 +212,27 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
     confirmed against the reference sample response, see module docstring).
 
     Falls back to matching the same keywords against HEADLINE only for pit_sast/
-    rating_action (subcategory is sometimes missing/generic for these two), NOT for
-    results -- confirmed live 2026-08-10 that a routine "Newspaper Publication"
-    filing's headline ("Newspaper Publication of the Unaudited Financial Results")
-    contains "financial results" without being one; results has its own dedicated
-    calendar endpoint (fetch_result_calendar) as a backstop, so it doesn't need a
-    headline fallback and shouldn't inherit that false-positive risk.
+    rating_action (subcategory is sometimes missing/generic for these two).
+
+    results DOES now have one narrow headline fallback (2026-08-13, added after a
+    live audit of 30 companies' real BSE history found real results outcomes being
+    silently dropped): BSE very commonly subcategorizes the actual results outcome
+    as "Outcome of Board Meeting", not "Financial Results" -- not rare, the majority
+    shape in that audit. Distinguished from a "Newspaper Publication" re-publication
+    filing (subcategory "Newspaper Publication" of the same content, still excluded
+    -- the original 2026-08-10 false-positive concern: its headline also contains
+    "financial results" without being the source filing) and from a forward-looking
+    notice (BSE uses the distinct subcategory "Board Meeting", without "Outcome of",
+    for "meeting is scheduled on...to consider..." -- nothing to extract yet) by
+    requiring subcategory to be EXACTLY the "outcome of" variant, not a bare
+    headline match. This check runs before auditor_change/related_party_transaction
+    below on purpose: a real row was found live matching both ("Approval of
+    Standalone Audited Financial Results along with Statutory Auditor's Report...")
+    and silently landing on auditor_change, dropping that quarter's numbers entirely
+    -- results must win that overlap. Known smaller residual gap, not solved here:
+    a "Revision of outcome" subcategory (re-submitted/corrected results) was seen
+    once in the same audit -- much lower volume, not worth broadening this keyword
+    set for on a single observation.
 
     capital_raise checks subcategory and headline together, not subcategory-first --
     confirmed live 2026-08-12 that BSE's subcategory for this type is unreliable (a
@@ -203,6 +247,8 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
     if any(keyword in subcategory_text for keyword in PIT_SAST_KEYWORDS):
         return "pit_sast"
     if "financial result" in subcategory_text:
+        return "results"
+    if "outcome of board meeting" in subcategory_text and "financial result" in headline_text:
         return "results"
     if "credit rating" in subcategory_text or "rating action" in subcategory_text or any(
         keyword in subcategory_text for keyword in RATING_AGENCY_KEYWORDS
@@ -220,6 +266,33 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
         keyword in headline_text for keyword in RATING_AGENCY_KEYWORDS
     ):
         return "rating_action"
+
+    # auditor_change / related_party_transaction (2026-08-13, L1 universe filter's
+    # two DEFERRED_CHECKS -- see AUDITOR_CHANGE_KEYWORDS/RELATED_PARTY_TRANSACTION_
+    # KEYWORDS docstrings). Checked against subcategory AND headline together, same
+    # shape as capital_raise above -- "statutory auditor" appears in real filings
+    # under SUBCATNAME values as specific as "Resignation of Statutory Auditors" and
+    # as generic as "Change in Management"/"EGM", so subcategory alone would miss
+    # real cases. Deliberately broad (not narrowed to "appointment of statutory
+    # auditor"-style compound phrases): a real appointment headline was found live
+    # phrased as "...approved the appointment of M/s. Borkar & Muzumdar...as the
+    # Statutory Auditor" -- "appointment" and "statutory auditor" are not adjacent,
+    # so a compound-phrase match would have missed it. The two confirmed-live
+    # incidental-mention shapes (subcategory literally "Financial Results", and
+    # "Outcome of Board Meeting" + a results-shaped headline) are now caught by the
+    # results checks above this one and never reach here at all (2026-08-13 fix --
+    # see this function's own docstring). Any OTHER incidental mention this
+    # classifier still lets through (e.g. a "General"-subcategory row citing
+    # "statutory auditor" with no results-shaped headline) is deliberately still
+    # pushed to structured_extraction.py's AUDITOR_CHANGE_SCHEMA disclosure_type
+    # field rather than solved here -- same "classify broadly, let extraction judge
+    # precisely" split PIT_SAST_SCHEMA's own disclosure_type already uses.
+    if any(keyword in subcategory_text for keyword in AUDITOR_CHANGE_KEYWORDS) or any(
+        keyword in headline_text for keyword in AUDITOR_CHANGE_KEYWORDS
+    ):
+        return "auditor_change"
+    if any(keyword in headline_text for keyword in RELATED_PARTY_TRANSACTION_KEYWORDS):
+        return "related_party_transaction"
     return "other"
 
 
@@ -455,6 +528,24 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
     all_rows = rows + result_calendar_rows
     upsert_result = upsert_events_with_dedup(all_rows)
 
+    # 2026-08-13 (docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md): the moment a fresh
+    # results filing (not results_calendar -- that's a forward prediction, not an
+    # actual filing) is detected for a company, pull its L2 screener.in crawl
+    # forward so L2 re-checks soon instead of waiting out its normal ~75-day
+    # interval -- this is what ties stream B (fast, OCR'd) to scheduling stream A
+    # (authoritative, slower). Best-effort: a failure here must not fail the whole
+    # detection run, since the crawl just falls back to its normal cadence.
+    results_company_master_ids = [row["company_master_id"] for row in rows if row.get("filing_type") == "results"]
+    if results_company_master_ids:
+        try:
+            pull_crawl_forward(results_company_master_ids)
+        except Exception as exc:  # noqa: BLE001 -- best-effort scheduling nudge only
+            _record_fallback(
+                "l3_bse_pull_crawl_forward_failed",
+                reason="Pulling L2's screener.in crawl forward for freshly-detected results failed; L2 falls back to its normal cadence for these companies, not silently stuck forever.",
+                error=exc,
+            )
+
     return {
         "rows": len(all_rows),
         "announcement_rows": len(rows),
@@ -462,6 +553,139 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
         "merged_rows": upsert_result["merged"],
         "companies_scanned": companies_scanned,
         "companies_total": int(len(universe)),
+        "failed_companies": failed_companies,
+        "blocked": blocked,
+    }
+
+
+# One-time 3yr auditor/RPT backfill (2026-08-13) -- see run_auditor_rpt_backfill's own
+# docstring for why this is separate from run_bse_l3_detection above (same crawl
+# machinery, different lookback and different "which companies" selection). NOT part
+# of fundamentals/run_pipeline.py's STEPS -- invoked via `python -m fundamentals.
+# collectors.bse_announcements --backfill` (see this module's __main__ guard), not
+# main(), specifically so main() stays argparse-free: run_pipeline.py calls main()
+# as a direct Python function call (importlib.import_module + module.main()), not a
+# subprocess, so adding argparse there would parse run_pipeline.py's OWN argv (e.g.
+# its --steps flag) and crash on an unrecognized option.
+BACKFILL_PROGRESS_TABLE = "fundamentals_bse_backfill_progress"
+# ~3 years, matches fundamentals/screens/l1_universe.py's AUDITOR_CHANGE_LOOKBACK_YEARS.
+BACKFILL_LOOKBACK_DAYS = 1095
+
+_BACKFILL_PROGRESS_TABLE_STATEMENT = """
+    CREATE TABLE IF NOT EXISTS fundamentals_bse_backfill_progress (
+        company_master_id TEXT PRIMARY KEY,
+        backfilled_at TIMESTAMPTZ NOT NULL
+    )
+"""
+
+
+def _ensure_backfill_progress_table() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(_BACKFILL_PROGRESS_TABLE_STATEMENT)
+
+    execute_db_operation(_op, operation_name="fundamentals_bse_backfill_progress:ensure_table")
+
+
+def load_companies_needing_backfill(limit: int | None = None) -> pd.DataFrame:
+    """L1 companies (with a resolved BSE scrip code) not yet in
+    fundamentals_bse_backfill_progress -- each invocation processes a bounded SLICE OF
+    WHAT'S REMAINING, not the same head-of-list every time the way run_bse_l3_
+    detection's own `limit` does (fine there, since its 7-day incremental crawl scans
+    the whole universe every run regardless; would never converge here)."""
+    _ensure_backfill_progress_table()
+    universe = load_l1_universe_tickers()
+    if universe.empty:
+        return universe
+    universe = universe.join(resolve_company_identity(universe["ticker"]))
+    universe = universe.dropna(subset=["bse_scrip_code"])
+    done_df = sql_to_df(f"SELECT company_master_id FROM {BACKFILL_PROGRESS_TABLE}")  # noqa: S608 -- constant, not user input
+    done = set(done_df["company_master_id"]) if not done_df.empty else set()
+    remaining = universe[~universe["company_master_id"].isin(done)]
+    if limit:
+        remaining = remaining.head(limit)
+    return remaining
+
+
+def _mark_backfilled(company_master_ids: list[str]) -> None:
+    if not company_master_ids:
+        return
+    upsert_to_db(
+        pd.DataFrame({"company_master_id": company_master_ids, "backfilled_at": pd.Timestamp.now(tz="UTC")}),
+        BACKFILL_PROGRESS_TABLE,
+        unique_keys=["company_master_id"],
+    )
+
+
+def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = BACKFILL_LOOKBACK_DAYS) -> dict[str, object]:
+    """Bounded, resumable-across-invocations 3yr historical backfill -- fundamentals/
+    screens/l1_universe.py's post-hoc auditor-change/RPT exclusion needs 3 years of
+    BSE history, but the regular daily crawl (run_bse_l3_detection, LOOKBACK_DAYS=7)
+    only ever sees the last week. Same "bounded per-run, picks up where it left off
+    next run" shape fundamentals/collectors/security_master.py's own --bse-limit
+    already established for a structurally identical problem (a multi-hour full
+    backfill that must fit inside a normal cron slot) -- reuses that module's own
+    fetch_company_announcements/build_announcement_row/upsert_events_with_dedup/
+    circuit-breaker machinery, differing only in WHICH companies get scanned
+    (not-yet-backfilled, tracked here) and HOW FAR BACK (3yr, not 7 days). A company
+    is marked backfilled only after a SUCCESSFUL fetch -- a failed/circuit-broken
+    company stays eligible for retry next invocation, never silently marked done."""
+    universe = load_companies_needing_backfill(limit)
+    if universe.empty:
+        return {"rows": 0, "companies_scanned": 0, "companies_remaining": 0, "failed_companies": [], "blocked": False}
+
+    to_date = datetime.now(timezone.utc)
+    from_date = to_date - timedelta(days=lookback_days)
+
+    rows: list[dict] = []
+    failed_companies: list[str] = []
+    newly_backfilled: list[str] = []
+    consecutive_failures = 0
+    blocked = False
+    companies_scanned = 0
+
+    for _, company in universe.iterrows():
+        scrip_code = str(int(company["bse_scrip_code"]))
+        company_master_id = company["company_master_id"]
+        isin = company["isin"] if pd.notna(company.get("isin")) else None
+        try:
+            raw_rows = fetch_company_announcements(scrip_code, from_date=from_date, to_date=to_date)
+        except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
+            consecutive_failures += 1
+            failed_companies.append(company["ticker"])
+            _record_fallback(
+                "backfill_bse_announcement_fetch_failed",
+                reason="3yr auditor/RPT backfill fetch failed for this company; it stays eligible for retry next invocation (not marked backfilled).",
+                error=exc,
+                metadata={"ticker": company["ticker"], "scrip_code": scrip_code},
+            )
+            if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+                blocked = True
+                _record_fallback(
+                    "backfill_bse_circuit_breaker_tripped",
+                    reason=f"{consecutive_failures} consecutive backfill requests failed -- stopping this invocation immediately, same as run_bse_l3_detection's own breaker.",
+                    error="circuit breaker",
+                    severity="error",
+                )
+                break
+            continue
+
+        consecutive_failures = 0
+        companies_scanned += 1
+        newly_backfilled.append(company_master_id)
+        for raw in raw_rows:
+            row = build_announcement_row(scrip_code, company_master_id, isin, raw)
+            if row is not None:
+                rows.append(row)
+
+    if rows:
+        upsert_events_with_dedup(rows)
+    _mark_backfilled(newly_backfilled)
+
+    return {
+        "rows": len(rows),
+        "companies_scanned": companies_scanned,
+        "companies_remaining": len(load_companies_needing_backfill(None)),
         "failed_companies": failed_companies,
         "blocked": blocked,
     }
@@ -490,4 +714,22 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import argparse
+    import sys
+
+    # Argparse lives ONLY inside this __main__ guard, deliberately not in main()
+    # itself -- see run_auditor_rpt_backfill's own comment on why (run_pipeline.py
+    # calls main() as a direct Python function call, not a subprocess, so main()
+    # having its own argparse would choke on run_pipeline.py's actual argv).
+    parser = argparse.ArgumentParser(description="BSE announcements crawler (daily) / one-time auditor-RPT backfill (--backfill).")
+    parser.add_argument("--backfill", action="store_true", help="Run the one-time 3yr auditor/RPT backfill instead of the daily 7-day crawl.")
+    parser.add_argument("--limit", type=int, default=20, help="Companies to backfill this invocation (bounded, resumable next invocation). 0 = unbounded.")
+    parser.add_argument("--lookback-days", type=int, default=BACKFILL_LOOKBACK_DAYS)
+    args = parser.parse_args()
+
+    if args.backfill:
+        backfill_result = run_auditor_rpt_backfill(limit=args.limit or None, lookback_days=args.lookback_days)
+        print(json.dumps({"source": f"{SYNC_SOURCE_NAME}:backfill", **backfill_result}, ensure_ascii=False, default=str), flush=True)
+        sys.exit(0)
+
     raise SystemExit(main())

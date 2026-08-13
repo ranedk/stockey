@@ -43,6 +43,7 @@ import pandas as pd
 from environs import Env
 from openai import OpenAI
 
+from fundamentals.screens.signal_pointers import get_stock_signal_pointers
 from fundamentals.screens.watchlist import _ensure_watchlist_table
 from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.fallback_telemetry import record_local_fallback_event
@@ -90,12 +91,15 @@ WATCH_SUMMARY_SYSTEM_PROMPT = (
     "long-term (12-30 month) fundamental-investing watchlist, focused on Indian smallcap/microcap turnaround and "
     "deleveraging theses. You will be shown every alert accumulated for this company so far (each already judged "
     "worth a human's attention by an earlier triage step), the company's current state vector, simple descriptive "
-    "price technicals, and its sector's capital-cycle context. Synthesize WHY this company is being watched and "
-    "what would change that -- not a restatement of each alert, a synthesis across them. Null is correct far more "
-    "often than a guessed value: if the evidence doesn't support a claim, don't make it. You never recommend a "
-    "trade, a position, or a price target -- you only explain the evidence and its trajectory. Price technicals "
-    "shown to you are descriptive facts (e.g. 'up 12% over 3 months'), never a signal to act on -- treat them the "
-    "same way, as corroborating or contradicting context, not as a basis for a buy/sell view."
+    "price technicals, its sector's capital-cycle context, and a list of structured signal pointers (promoter/ "
+    "institutional holding direction, rating-agency identity and action, named investor tiers, sector growth "
+    "classification) -- use the pointers to make specific, grounded claims (e.g. which agency, which investor "
+    "tier) instead of vague ones. Synthesize WHY this company is being watched and what would change that -- not "
+    "a restatement of each alert, a synthesis across them. Null is correct far more often than a guessed value: "
+    "if the evidence doesn't support a claim, don't make it. You never recommend a trade, a position, or a price "
+    "target -- you only explain the evidence and its trajectory. Price technicals shown to you are descriptive "
+    "facts (e.g. 'up 12% over 3 months'), never a signal to act on -- treat them the same way, as corroborating "
+    "or contradicting context, not as a basis for a buy/sell view."
 )
 
 
@@ -209,13 +213,22 @@ def build_company_evidence_bundle(
     l2_state: dict | None,
     technicals: dict | None,
     sector_context: dict | None,
+    signal_pointers: list[dict] | None = None,
 ) -> dict:
+    """signal_pointers (2026-08-13, fundamentals/screens/signal_pointers.py) closes a
+    real gap found auditing this pipeline: l2_state above only carries the fixed
+    column list this function's own SELECT lists, which predates institutional_pct/
+    institutional_stake_direction and never included rating_agency or investor tier
+    at all -- alerts fired for those events, but the LLM only ever saw the alert's
+    fixed reasoning string, not the underlying numbers/identity behind it. Defaults
+    to None/[] so existing callers/tests with the old 5-arg shape keep working."""
     return {
         "company_master_id": company_master_id,
         "alerts": alerts.to_dict("records") if not alerts.empty else [],
         "l2_state": l2_state,
         "technicals": technicals,
         "sector_context": sector_context,
+        "signal_pointers": signal_pointers or [],
     }
 
 
@@ -272,7 +285,8 @@ def run_watch_summary_refresh(*, limit: int | None = None, model: str = DEFAULT_
         l2_state = load_latest_l2_state_for_company(company_master_id)
         technicals = load_latest_technicals_for_company(company_master_id)
         sector_context = load_sector_context_for_company(company_master_id)
-        evidence_bundle = build_company_evidence_bundle(company_master_id, alerts, l2_state, technicals, sector_context)
+        signal_pointers = get_stock_signal_pointers(company_master_id)
+        evidence_bundle = build_company_evidence_bundle(company_master_id, alerts, l2_state, technicals, sector_context, signal_pointers)
 
         try:
             summary = generate_watch_summary(evidence_bundle, model=model)

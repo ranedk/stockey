@@ -58,12 +58,14 @@ from fundamentals.collectors import sector_data as fundamentals_sector_data
 from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
 from fundamentals.screens import technicals as fundamentals_technicals
 from fundamentals.screens import watchlist as fundamentals_watchlist
+from fundamentals.screens import watchlist_exit as fundamentals_watchlist_exit
 from fundamentals.screens import watch_summary as fundamentals_watch_summary
 from fundamentals.screens import notifications as fundamentals_notifications
 from fundamentals.api import queries as fundamentals_api_queries
 from fundamentals.api.app import app as fundamentals_api_app
 from fundamentals import run_pipeline as fundamentals_run_pipeline
 from fundamentals.screens import investor_classification as fundamentals_investor_classification
+from fundamentals.screens import signal_pointers as fundamentals_signal_pointers
 from utils import codex_cli
 from utils import db as db_utils
 from utils import http as http_utils
@@ -8682,6 +8684,13 @@ def test_run_l1_universe_refresh_upserts_and_summarizes(monkeypatch):
         {"company_id": 2, "name": "Coral India Fin.", "ticker": "CORALFINAC", "url": "/company/CORALFINAC/", "metrics": {"mar_cap_rscr": 137.9}},
     ]
     monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", companies))
+    # apply_post_hoc_exclusions itself has its own dedicated tests below -- here it's
+    # a pass-through so this test stays focused on the upsert/summary shape.
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "apply_post_hoc_exclusions",
+        lambda cs: (cs, {"excluded_auditor_change": [], "excluded_related_party_transaction": []}),
+    )
 
     upserts = []
     monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
@@ -8700,6 +8709,8 @@ def test_run_l1_universe_refresh_upserts_and_summarizes(monkeypatch):
         "query_version": 1,
         "rows": 2,
         "checks_deferred": list(fundamentals_l1_universe.DEFERRED_CHECKS),
+        "excluded_auditor_change": [],
+        "excluded_related_party_transaction": [],
         "companies": ["Menon Pistons", "Coral India Fin."],
     }
     assert len(upserts) == 1
@@ -8709,14 +8720,13 @@ def test_run_l1_universe_refresh_upserts_and_summarizes(monkeypatch):
     assert set(df["company_id"]) == {1, 2}
     assert json.loads(df.iloc[0]["metrics_json"]) == companies[0]["metrics"]
 
-    # Deferred auditor/RPT checks must be visibly logged on every run, not silent.
-    assert len(fallback_events) == 1
-    assert fallback_events[0]["fallback_type"] == "l1_checks_not_sourced"
-    assert set(fallback_events[0]["metadata"]["deferred_checks"]) == set(fundamentals_l1_universe.DEFERRED_CHECKS)
+    # DEFERRED_CHECKS is empty (both built 2026-08-13) -- no fallback logged for it.
+    assert fallback_events == []
 
 
-def test_run_l1_universe_refresh_skips_upsert_when_no_results_but_still_logs_deferred(monkeypatch):
+def test_run_l1_universe_refresh_skips_upsert_when_no_results(monkeypatch):
     monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", []))
+    monkeypatch.setattr(fundamentals_l1_universe, "apply_post_hoc_exclusions", lambda cs: (cs, {"excluded_auditor_change": [], "excluded_related_party_transaction": []}))
     upserts = []
     monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
     fallback_events = []
@@ -8731,7 +8741,25 @@ def test_run_l1_universe_refresh_skips_upsert_when_no_results_but_still_logs_def
     assert result["rows"] == 0
     assert result["companies"] == []
     assert upserts == []
-    assert len(fallback_events) == 1
+    assert fallback_events == []
+
+
+def test_run_l1_universe_refresh_reports_exclusions_from_post_hoc_pass(monkeypatch):
+    companies = [{"company_id": 1, "name": "Menon Pistons", "ticker": "MENNPIS", "url": "/company/MENNPIS/", "metrics": {}}]
+    monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", companies))
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "apply_post_hoc_exclusions",
+        lambda cs: ([], {"excluded_auditor_change": ["Menon Pistons"], "excluded_related_party_transaction": []}),
+    )
+    monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_l1_universe, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_l1_universe.run_l1_universe_refresh(session=object())
+
+    assert result["rows"] == 0  # excluded, not written
+    assert result["excluded_auditor_change"] == ["Menon Pistons"]
+    assert result["excluded_related_party_transaction"] == []
 
 
 def test_run_l1_universe_refresh_builds_a_session_when_none_given(monkeypatch):
@@ -8749,6 +8777,102 @@ def test_run_l1_universe_refresh_builds_a_session_when_none_given(monkeypatch):
     fundamentals_l1_universe.run_l1_universe_refresh()
 
     assert seen_sessions == ["the-session"]
+
+
+def test_load_auditor_rpt_events_for_companies_empty_input_skips_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_l1_universe, "sql_to_df", lambda q, params=None: calls.append(1) or pd.DataFrame())
+    assert fundamentals_l1_universe.load_auditor_rpt_events_for_companies([]).empty
+    assert calls == []
+
+
+def test_auditor_change_excludes_only_on_confirmed_change_within_lookback():
+    as_of = pd.Timestamp("2026-08-13", tz="UTC")
+    confirmed_recent = {"structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change"}), "disclosure_date": "2026-01-01"}
+    confirmed_old = {"structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change"}), "disclosure_date": "2020-01-01"}
+    proposed = {"structured_extraction_json": json.dumps({"disclosure_type": "proposed_change_agenda"}), "disclosure_date": "2026-01-01"}
+    incidental = {"structured_extraction_json": json.dumps({"disclosure_type": "incidental_mention"}), "disclosure_date": "2026-01-01"}
+
+    assert fundamentals_l1_universe._auditor_change_excludes([confirmed_recent], as_of=as_of) is True
+    assert fundamentals_l1_universe._auditor_change_excludes([confirmed_old], as_of=as_of) is False  # older than 3yr lookback
+    assert fundamentals_l1_universe._auditor_change_excludes([proposed], as_of=as_of) is False
+    assert fundamentals_l1_universe._auditor_change_excludes([incidental], as_of=as_of) is False
+    assert fundamentals_l1_universe._auditor_change_excludes([], as_of=as_of) is False
+
+
+def test_auditor_change_excludes_skips_unparseable_json():
+    as_of = pd.Timestamp("2026-08-13", tz="UTC")
+    event = {"structured_extraction_json": "not json", "disclosure_date": "2026-01-01"}
+    assert fundamentals_l1_universe._auditor_change_excludes([event], as_of=as_of) is False
+
+
+def test_rpt_excludes_only_when_applicable_and_over_threshold():
+    non_applicable = {"structured_extraction_json": json.dumps({"is_applicable": False, "pct_of_revenue": None})}
+    applicable_under = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 5.0})}
+    applicable_over = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 15.0})}
+    applicable_no_pct = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None})}
+
+    assert fundamentals_l1_universe._rpt_excludes([non_applicable]) is False
+    assert fundamentals_l1_universe._rpt_excludes([applicable_under]) is False
+    assert fundamentals_l1_universe._rpt_excludes([applicable_over]) is True
+    assert fundamentals_l1_universe._rpt_excludes([applicable_no_pct]) is False  # no guessed 0%/100%
+    assert fundamentals_l1_universe._rpt_excludes([]) is False
+
+
+def test_apply_post_hoc_exclusions_missing_data_never_excludes(monkeypatch):
+    companies = [{"company_id": 1, "name": "No History Co", "ticker": "NOHIST", "url": "", "metrics": {}}]
+    monkeypatch.setattr(fundamentals_l1_universe, "load_auditor_rpt_events_for_companies", lambda cmids: pd.DataFrame())
+
+    survivors, exclusions = fundamentals_l1_universe.apply_post_hoc_exclusions(companies)
+
+    assert survivors == companies
+    assert exclusions == {"excluded_auditor_change": [], "excluded_related_party_transaction": []}
+
+
+def test_apply_post_hoc_exclusions_excludes_on_confirmed_auditor_change(monkeypatch):
+    companies = [
+        {"company_id": 1, "name": "Changed Auditor Co", "ticker": "CHANGED", "url": "", "metrics": {}},
+        {"company_id": 2, "name": "Clean Co", "ticker": "CLEAN", "url": "", "metrics": {}},
+    ]
+    events_df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:CHANGED", "filing_type": "auditor_change", "disclosure_date": "2026-01-01",
+                "structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change"}),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l1_universe, "load_auditor_rpt_events_for_companies", lambda cmids: events_df)
+
+    survivors, exclusions = fundamentals_l1_universe.apply_post_hoc_exclusions(companies)
+
+    assert [c["name"] for c in survivors] == ["Clean Co"]
+    assert exclusions["excluded_auditor_change"] == ["Changed Auditor Co"]
+
+
+def test_apply_post_hoc_exclusions_excludes_on_material_rpt(monkeypatch):
+    companies = [{"company_id": 1, "name": "Big RPT Co", "ticker": "BIGRPT", "url": "", "metrics": {}}]
+    events_df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:BIGRPT", "filing_type": "related_party_transaction", "disclosure_date": "2026-01-01",
+                "structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 25.0}),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l1_universe, "load_auditor_rpt_events_for_companies", lambda cmids: events_df)
+
+    survivors, exclusions = fundamentals_l1_universe.apply_post_hoc_exclusions(companies)
+
+    assert survivors == []
+    assert exclusions["excluded_related_party_transaction"] == ["Big RPT Co"]
+
+
+def test_apply_post_hoc_exclusions_empty_companies_list(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "load_auditor_rpt_events_for_companies", lambda cmids: pd.DataFrame())
+    survivors, exclusions = fundamentals_l1_universe.apply_post_hoc_exclusions([])
+    assert survivors == []
+    assert exclusions == {"excluded_auditor_change": [], "excluded_related_party_transaction": []}
 
 
 # fundamentals/screens/l2_state.py -- L2 watch-state store (step 4).
@@ -8945,6 +9069,7 @@ def test_build_institutional_entry_event_row_shape():
     assert event["quantity"] == 2.1
     assert event["disclosure_date"] == date(2026, 8, 13)
     assert "2.1" in event["headline"]
+    assert "re-entry" in event["headline"]  # 2026-08-13: caveat the ~3yr lookback window, not "first ever"
 
 
 def test_fetch_pledge_levels_builds_dict_keyed_by_company_id(monkeypatch):
@@ -8959,6 +9084,138 @@ def test_fetch_pledge_levels_builds_dict_keyed_by_company_id(monkeypatch):
     assert levels == {3163: 96.64}
 
 
+def test_filter_universe_to_due_no_state_row_is_due(monkeypatch):
+    universe = pd.DataFrame([{"company_id": 1, "ticker": "A"}, {"company_id": 2, "ticker": "B"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_crawl_state", lambda: pd.DataFrame())
+    result = fundamentals_l2_state.filter_universe_to_due(universe)
+    assert set(result["company_id"]) == {1, 2}  # no crawl-state row at all -- both due
+
+
+def test_filter_universe_to_due_filters_past_and_future(monkeypatch):
+    universe = pd.DataFrame([{"company_id": 1, "ticker": "A"}, {"company_id": 2, "ticker": "B"}, {"company_id": 3, "ticker": "C"}])
+    now = pd.Timestamp.now(tz="UTC")
+    state = pd.DataFrame(
+        [
+            {"company_id": 1, "next_due_at": now - pd.Timedelta(days=1)},  # past -- due
+            {"company_id": 2, "next_due_at": now + pd.Timedelta(days=30)},  # future -- not due
+            # company 3 has no state row -- due
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l2_state, "load_crawl_state", lambda: state)
+    result = fundamentals_l2_state.filter_universe_to_due(universe)
+    assert set(result["company_id"]) == {1, 3}
+
+
+def test_filter_universe_to_due_empty_universe_skips_state_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "load_crawl_state", lambda: calls.append(1) or pd.DataFrame())
+    assert fundamentals_l2_state.filter_universe_to_due(pd.DataFrame()).empty
+    assert calls == []
+
+
+def test_mark_crawled_upserts_with_future_due_date(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+    fundamentals_l2_state._mark_crawled(1, "AAREYDRUGS")
+    df, table, kwargs = calls[0]
+    assert table == fundamentals_l2_state.CRAWL_STATE_TABLE
+    assert kwargs["unique_keys"] == ["company_id"]
+    assert df.iloc[0]["company_id"] == 1
+    assert df.iloc[0]["next_due_at"] > pd.Timestamp.now(tz="UTC")
+
+
+def test_pull_crawl_forward_empty_input_skips_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", lambda q, params=None: calls.append(1) or pd.DataFrame())
+    assert fundamentals_l2_state.pull_crawl_forward([]) == {"pulled_forward": 0}
+    assert calls == []
+
+
+def test_pull_crawl_forward_sets_next_due_at_to_now(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "_ensure_crawl_state_table", lambda: None)
+    universe_df = pd.DataFrame([{"company_id": 1, "ticker": "AAREYDRUGS"}])
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", lambda q, params=None: universe_df)
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+
+    result = fundamentals_l2_state.pull_crawl_forward(["nse:AAREYDRUGS"])
+
+    assert result == {"pulled_forward": 1}
+    df, table, kwargs = calls[0]
+    assert table == fundamentals_l2_state.CRAWL_STATE_TABLE
+    assert (pd.Timestamp.now(tz="UTC") - df.iloc[0]["next_due_at"]).total_seconds() < 5  # ~now, not the full interval
+
+
+def test_pull_crawl_forward_no_matching_l1_company_skips_upsert(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "_ensure_crawl_state_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda *a, **k: calls.append(1))
+    assert fundamentals_l2_state.pull_crawl_forward(["nse:NOTINUNIVERSE"]) == {"pulled_forward": 0}
+    assert calls == []
+
+
+def test_fetch_valuation_levels_builds_dict_keyed_by_company_id(monkeypatch):
+    companies = [
+        {"company_id": 19, "metrics": {"p_e": 5.59, "5yrs_pe": 24.33}},  # confirmed live shape
+        {"company_id": 2, "metrics": {"p_e": -3.0, "5yrs_pe": 10.0}},  # negative PE -- excluded
+        {"company_id": 3, "metrics": {"p_e": 8.0, "5yrs_pe": 0}},  # zero historical median -- excluded
+        {"company_id": 4, "metrics": {"p_e": 8.0}},  # no historical median at all -- excluded
+    ]
+    monkeypatch.setattr(fundamentals_l2_state, "run_query", lambda session, query_text: ("url", companies))
+
+    levels = fundamentals_l2_state.fetch_valuation_levels(object())
+
+    assert levels == {19: {"pe": 5.59, "historical_pe_5y": 24.33}}
+
+
+def test_load_sector_codes_for_tickers_strips_nse_prefix(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:AAREYDRUGS", "sector_code": "IN01"}])
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["params"] = params
+        return df
+
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_l2_state.load_sector_codes_for_tickers(["AAREYDRUGS"])
+
+    assert result == {"AAREYDRUGS": "IN01"}
+    assert captured["params"] == (["nse:AAREYDRUGS"],)
+
+
+def test_load_sector_codes_for_tickers_empty_input_skips_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", lambda q, params=None: calls.append(1) or pd.DataFrame())
+    assert fundamentals_l2_state.load_sector_codes_for_tickers([]) == {}
+    assert calls == []
+
+
+def test_compute_valuation_sector_percentiles_ranks_within_sector():
+    rows = [
+        {"company_id": 1, "ticker": "A", "pe": 5.0},
+        {"company_id": 2, "ticker": "B", "pe": 15.0},
+        {"company_id": 3, "ticker": "C", "pe": 10.0},  # different sector -- ranked alone
+    ]
+    sector_codes = {"A": "IN01", "B": "IN01", "C": "IN02"}
+
+    result = fundamentals_l2_state.compute_valuation_sector_percentiles(rows, sector_codes)
+
+    assert result[1] == 50.0  # cheaper of two in IN01
+    assert result[2] == 100.0  # pricier of two in IN01
+    assert result[3] == 100.0  # only company in IN02
+
+
+def test_compute_valuation_sector_percentiles_skips_missing_sector_or_pe():
+    rows = [
+        {"company_id": 1, "ticker": "A", "pe": 5.0},  # no sector_code resolved
+        {"company_id": 2, "ticker": "B", "pe": None},  # no pe
+    ]
+    sector_codes = {"B": "IN01"}
+    assert fundamentals_l2_state.compute_valuation_sector_percentiles(rows, sector_codes) == {}
+
+
 def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     universe = pd.DataFrame(
         [
@@ -8968,6 +9225,10 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     )
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {1: 5.0})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {1: {"pe": 10.0, "historical_pe_5y": 20.0}})
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {"AAREYDRUGS": "IN01", "TCC": "IN01"})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
     detail = {
         "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
         "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
@@ -8997,7 +9258,15 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     row2 = df[df["company_id"] == 2].iloc[0]
     assert row2["pledge_pct"] == 0.0  # not in pledge_levels -> defaults to unpledged
     assert row1["sector_cycle_phase"] is None
-    assert row1["valuation_percentile"] is None
+    # company 1 has a valuation_levels entry -> both derived fields populated
+    assert row1["pe"] == 10.0
+    assert row1["valuation_vs_own_history_ratio"] == 0.5  # 10.0 / 20.0
+    assert row1["valuation_sector_percentile"] == 100.0  # only PE-eligible company in its sector this run
+    # company 2 has no valuation_levels entry -> never a guessed value (None ->
+    # NaN once mixed into a float64 DataFrame column alongside company 1's real value)
+    assert pd.isna(row2["pe"])
+    assert pd.isna(row2["valuation_vs_own_history_ratio"])
+    assert pd.isna(row2["valuation_sector_percentile"])
     assert any(e["fallback_type"] == "l2_fields_not_sourced" for e in fallback_events)
 
 
@@ -9005,6 +9274,10 @@ def test_run_l2_state_refresh_writes_synthetic_event_on_institutional_first_entr
     universe = pd.DataFrame([{"company_id": 1, "company_name": "Entry Co", "ticker": "ENTRYCO"}])
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
     detail = {
         "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
         "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
@@ -9038,6 +9311,10 @@ def test_run_l2_state_refresh_no_synthetic_event_when_no_first_entry(monkeypatch
     universe = pd.DataFrame([{"company_id": 1, "company_name": "No Entry Co", "ticker": "NOENTRY"}])
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
     detail = {
         "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
         "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
@@ -9063,6 +9340,10 @@ def test_run_l2_state_refresh_skips_a_company_whose_detail_fetch_fails(monkeypat
     )
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
     detail = {
         "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
         "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
@@ -9101,7 +9382,7 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
 
     result = fundamentals_l2_state.run_l2_state_refresh(session=object())
 
-    assert result == {"rows": 0, "failed_companies": [], "checks_deferred": list(fundamentals_l2_state.DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0}
+    assert result == {"rows": 0, "failed_companies": [], "checks_deferred": list(fundamentals_l2_state.DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0, "companies_due": 0}
     assert upserts == []
     assert any(e["fallback_type"] == "l2_no_l1_universe" for e in fallback_events)
 
@@ -9153,6 +9434,40 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
         (None, "Allotment of shares on preferential basis to ABC Fund LP", "capital_raise"),
         (None, "Allotment pursuant to Qualified Institutions Placement", "capital_raise"),
         ("General", "Rights Issue - Allotment of Equity Shares", "capital_raise"),
+        # Real (subcategory, headline) pairs, captured live 2026-08-13 against 40 real
+        # companies' 3yr BSE history -- see AUDITOR_CHANGE_KEYWORDS' comment.
+        ("Appointment of Statutory Auditor/s", "Resignation of Statutory Auditor.", "auditor_change"),
+        ("Change in Management", "Appointment of Statutory auditor in place of retiring statutory auditor", "auditor_change"),
+        (None, "The Board of Directors...approved the appointment of M/s. Borkar & Muzumdar, Chartered Accountants, as the Statutory Auditor", "auditor_change"),
+        ("General", "Appointment of Joint Statutory Auditors of CSB Bank Limited for the financial year 2026-27", "auditor_change"),
+        # Real pair, captured live: a routine results filing's headline mentions the
+        # incumbent auditor's report -- not a change. SUBCATNAME "Financial Results"
+        # routes it to "results" before reaching the auditor_change check at all.
+        ("Financial Results", "Considered and Approved the Audited Financial Results along with the Auditor's Report issued by the Statutory Auditors", "results"),
+        # Same real pair, but under "Outcome of Board Meeting" -- 2026-08-13 fix: this
+        # used to fall through to "auditor_change" (a real bug: dropped the quarter's
+        # numbers entirely). Now caught by the "outcome of board meeting" + results-
+        # headline branch, which runs before auditor_change -- results wins the overlap.
+        ("Outcome of Board Meeting", "Considered and Approved the Audited Financial Results along with the Auditor's Report issued by the Statutory Auditors", "results"),
+        # Real (subcategory, headline) pairs for RPT -- see RELATED_PARTY_TRANSACTION_
+        # KEYWORDS' comment. Both real matches found live were non-applicability
+        # declarations, not amount disclosures -- structured_extraction.py's
+        # RPT_SCHEMA is what distinguishes the two, not this classifier.
+        ("General", "Disclosure of the Related Party transactions under Regulation 23(9) of SEBI (LODR) Regulation, 2015 is not applicable to our company.", "related_party_transaction"),
+        ("General", "In reference to Regulation 23 (9) of SEBI (LODR) Regulation, 2015, wherein a Company is required to submit to the stock exchange a disclosure of related party transactions", "related_party_transaction"),
+        # Real (subcategory, headline) pairs captured live 2026-08-13 (30-company BSE
+        # history audit) -- "Outcome of Board Meeting" results outcomes that were
+        # previously silently dropped as "other".
+        ("Outcome of Board Meeting", "The Board of Directors of the Company in their Meeting held on Wednesday, 12th August, 2026 has duly approved the Unaudited Financial Results along with...", "results"),
+        ("Outcome of Board Meeting", "Considered and approve the Unaudited Financial Results of the Company for the quarter ended 30th June, 2026;", "results"),
+        ("Outcome of Board Meeting", "Board considered and approved the Un-audited financial result for the quarter and half year ended 30/09/2025", "results"),
+        # Real pair: a forward-looking notice, distinct SUBCATNAME ("Board Meeting",
+        # no "Outcome of") -- nothing filed yet, must stay "other".
+        ("Board Meeting", "BWL Ltd has informed BSE that the meeting of the Board of Directors of the Company is scheduled on 04/08/2026, inter alia, to consider and approve Quarterly Financial Results", "other"),
+        # Real pair: a redundant newspaper re-publication of the same results --
+        # different SUBCATNAME than the source filing, must stay excluded (the
+        # original 2026-08-10 false-positive concern this whole design avoids).
+        ("Newspaper Publication", "Intimation of Publication of the Unaudited Financial Results for the Quarter ended 30th June, 2026.", "other"),
     ],
 )
 def test_classify_announcement(subcategory, headline, expected):
@@ -9400,6 +9715,177 @@ def test_run_bse_l3_detection_returns_early_on_empty_universe(monkeypatch):
 
     assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
     assert any(e["fallback_type"] == "l3_bse_no_l1_universe" for e in fallback_events)
+
+
+def test_run_bse_l3_detection_pulls_crawl_forward_for_fresh_results(monkeypatch):
+    universe = _bse_universe_df(1)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "resolve_company_identity", lambda tickers: _bse_identity_df(tickers, ["111111"])
+    )
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "fetch_company_announcements",
+        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Financial Results", "HEADLINE": "Q1 results"}],
+    )
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+    pull_calls = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "pull_crawl_forward", lambda cmids: pull_calls.append(cmids))
+
+    fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert pull_calls == [["nse:TICK1"]]
+
+
+def test_run_bse_l3_detection_no_results_rows_skips_pull_crawl_forward(monkeypatch):
+    universe = _bse_universe_df(1)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "resolve_company_identity", lambda tickers: _bse_identity_df(tickers, ["111111"])
+    )
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "fetch_company_announcements",
+        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}],
+    )
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+    pull_calls = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "pull_crawl_forward", lambda cmids: pull_calls.append(cmids))
+
+    fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert pull_calls == []
+
+
+def test_run_bse_l3_detection_pull_crawl_forward_failure_is_non_fatal(monkeypatch):
+    universe = _bse_universe_df(1)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "resolve_company_identity", lambda tickers: _bse_identity_df(tickers, ["111111"])
+    )
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "fetch_company_announcements",
+        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Financial Results", "HEADLINE": "Q1 results"}],
+    )
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    def failing_pull(cmids):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "pull_crawl_forward", failing_pull)
+
+    result = fundamentals_bse_announcements.run_bse_l3_detection()
+
+    assert result["rows"] == 1  # the run itself still succeeds
+    assert any(e["fallback_type"] == "l3_bse_pull_crawl_forward_failed" for e in fallback_events)
+
+
+def test_load_companies_needing_backfill_excludes_already_done(monkeypatch):
+    universe = _bse_universe_df(3)
+    monkeypatch.setattr(fundamentals_bse_announcements, "_ensure_backfill_progress_table", lambda: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_company_identity",
+        lambda tickers: _bse_identity_df(tickers, ["1", "2", "3"]),
+    )
+    monkeypatch.setattr(
+        fundamentals_bse_announcements, "sql_to_df", lambda q, params=None: pd.DataFrame({"company_master_id": ["nse:TICK1"]})
+    )
+
+    result = fundamentals_bse_announcements.load_companies_needing_backfill()
+
+    assert set(result["company_master_id"]) == {"nse:TICK2", "nse:TICK3"}
+
+
+def test_load_companies_needing_backfill_respects_limit(monkeypatch):
+    universe = _bse_universe_df(3)
+    monkeypatch.setattr(fundamentals_bse_announcements, "_ensure_backfill_progress_table", lambda: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "resolve_company_identity",
+        lambda tickers: _bse_identity_df(tickers, ["1", "2", "3"]),
+    )
+    monkeypatch.setattr(fundamentals_bse_announcements, "sql_to_df", lambda q, params=None: pd.DataFrame())
+
+    result = fundamentals_bse_announcements.load_companies_needing_backfill(limit=1)
+
+    assert len(result) == 1
+
+
+def test_mark_backfilled_empty_list_skips_upsert(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda *a, **k: calls.append(1))
+    fundamentals_bse_announcements._mark_backfilled([])
+    assert calls == []
+
+
+def test_mark_backfilled_upserts_progress_rows(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+    fundamentals_bse_announcements._mark_backfilled(["nse:X", "nse:Y"])
+    df, table, kwargs = calls[0]
+    assert table == fundamentals_bse_announcements.BACKFILL_PROGRESS_TABLE
+    assert kwargs["unique_keys"] == ["company_master_id"]
+    assert set(df["company_master_id"]) == {"nse:X", "nse:Y"}
+
+
+def test_run_auditor_rpt_backfill_returns_early_when_nothing_remaining(monkeypatch):
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_companies_needing_backfill", lambda limit=None: pd.DataFrame())
+    result = fundamentals_bse_announcements.run_auditor_rpt_backfill()
+    assert result == {"rows": 0, "companies_scanned": 0, "companies_remaining": 0, "failed_companies": [], "blocked": False}
+
+
+def test_run_auditor_rpt_backfill_marks_only_successful_companies(monkeypatch):
+    universe = _bse_universe_df(2)
+    identity = _bse_identity_df(universe["ticker"], ["111111", "222222"])
+    combined = universe.join(identity)
+
+    call_order = iter([combined, pd.DataFrame()])  # first call: work batch; second (companies_remaining recompute): none left
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_companies_needing_backfill", lambda limit=None: next(call_order))
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "x"}])
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+    marked = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "_mark_backfilled", lambda cmids: marked.append(cmids))
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_bse_announcements.run_auditor_rpt_backfill(limit=2)
+
+    assert result["companies_scanned"] == 2
+    assert result["companies_remaining"] == 0
+    assert result["blocked"] is False
+    assert set(marked[0]) == {"nse:TICK1", "nse:TICK2"}
+
+
+def test_run_auditor_rpt_backfill_does_not_mark_failed_companies(monkeypatch):
+    universe = _bse_universe_df(1)
+    identity = _bse_identity_df(universe["ticker"], ["111111"])
+    combined = universe.join(identity)
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_companies_needing_backfill", lambda limit=None: combined)
+
+    def always_fails(scrip, **k):
+        raise fundamentals_bse_announcements.BseBlockedError("HTTP 403")
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", always_fails)
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": 0, "merged": 0})
+    marked = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "_mark_backfilled", lambda cmids: marked.append(cmids))
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_bse_announcements.run_auditor_rpt_backfill()
+
+    assert result["companies_scanned"] == 0
+    assert result["failed_companies"] == ["TICK1"]
+    assert marked == [[]]  # called, but with nothing to mark -- the failed company stays eligible for retry
 
 
 # fundamentals/collectors/events_store.py -- shared fundamentals_events dedup/merge.
@@ -10701,7 +11187,7 @@ def test_extract_structured_fields_routes_to_the_right_schema(monkeypatch):
     assert captured["response_format"]["json_schema"]["schema"] == fundamentals_structured_extraction.RATING_ACTION_SCHEMA
 
 
-@pytest.mark.parametrize("filing_type", ["results", "results_calendar", "rating_action", "pit_sast", "capital_raise"])
+@pytest.mark.parametrize("filing_type", ["results", "results_calendar", "rating_action", "pit_sast", "capital_raise", "auditor_change", "related_party_transaction"])
 def test_every_supported_filing_type_has_a_schema(filing_type):
     assert filing_type in fundamentals_structured_extraction.SCHEMAS_BY_FILING_TYPE
 
@@ -10710,6 +11196,61 @@ def test_capital_raise_schema_requires_investor_names_array():
     schema = fundamentals_structured_extraction.CAPITAL_RAISE_SCHEMA
     assert "investor_names" in schema["required"]
     assert schema["properties"]["investor_names"]["type"] == "array"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        fundamentals_structured_extraction.AUDITOR_CHANGE_SCHEMA,
+        fundamentals_structured_extraction.RPT_SCHEMA,
+    ],
+)
+def test_new_schemas_are_strict_mode_consistent(schema):
+    # OpenAI strict json_schema mode requires every property listed in "required" and
+    # additionalProperties=False -- same shape every other schema in this module uses.
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"].keys())
+
+
+def test_auditor_change_schema_disclosure_type_is_the_load_bearing_field():
+    schema = fundamentals_structured_extraction.AUDITOR_CHANGE_SCHEMA
+    assert "disclosure_type" in schema["required"]
+    assert schema["properties"]["disclosure_type"]["type"] == "string"
+
+
+def test_rpt_schema_is_applicable_is_boolean_hedge():
+    schema = fundamentals_structured_extraction.RPT_SCHEMA
+    assert schema["properties"]["is_applicable"]["type"] == "boolean"
+    assert schema["properties"]["pct_of_revenue"]["type"] == ["number", "null"]
+
+
+def test_results_schema_is_strict_mode_consistent():
+    schema = fundamentals_structured_extraction.RESULTS_SCHEMA
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"].keys())
+
+
+def test_results_schema_splits_qoq_yoy_not_generic_comparison():
+    schema = fundamentals_structured_extraction.RESULTS_SCHEMA
+    for field in ("revenue_qoq_rs_lakh", "revenue_yoy_rs_lakh", "pat_qoq_rs_lakh", "pat_yoy_rs_lakh"):
+        assert field in schema["properties"]
+        assert schema["properties"][field]["type"] == ["number", "null"]
+    # the old generic single-slot fields are gone, not just renamed
+    assert "revenue_comparison_rs_lakh" not in schema["properties"]
+    assert "revenue_comparison_period_label" not in schema["properties"]
+    assert "pat_comparison_rs_lakh" not in schema["properties"]
+
+
+def test_results_schema_has_margin_derivation_inputs():
+    schema = fundamentals_structured_extraction.RESULTS_SCHEMA
+    assert schema["properties"]["finance_costs_current_rs_lakh"]["type"] == ["number", "null"]
+    assert schema["properties"]["depreciation_amortisation_current_rs_lakh"]["type"] == ["number", "null"]
+
+
+def test_results_schema_period_type_mentions_half_yearly():
+    schema = fundamentals_structured_extraction.RESULTS_SCHEMA
+    desc = schema["properties"]["period_type"]["description"]
+    assert "H1" in desc and "H2" in desc
 
 
 def test_load_pending_extraction_targets_queries_expected_filters(monkeypatch):
@@ -10868,6 +11409,188 @@ def test_evaluate_capital_raise_trigger_always_alerts_regardless_of_l2_state():
     assert fundamentals_l3_triggers.evaluate_capital_raise_trigger({}, None)["trigger_type"] == "capital_raise"
 
 
+def test_summarize_investor_tiers_none_when_no_investors():
+    assert fundamentals_l3_triggers._summarize_investor_tiers([]) is None
+    assert fundamentals_l3_triggers._summarize_investor_tiers(None) is None
+
+
+def test_summarize_investor_tiers_prefers_marquee_over_recognized():
+    tiers = [{"name": "Beta LLC", "tier": "recognized"}, {"name": "Acme Fund", "tier": "marquee"}]
+    assert fundamentals_l3_triggers._summarize_investor_tiers(tiers) == "Named investor Acme Fund classified as marquee."
+
+
+def test_summarize_investor_tiers_unclassified_still_gets_a_sentence():
+    tiers = [{"name": "Mystery Capital", "tier": None}]
+    result = fundamentals_l3_triggers._summarize_investor_tiers(tiers)
+    assert "not yet classified" in result
+    assert "Mystery Capital" in result
+
+
+def test_compute_growth_pct_positive():
+    assert fundamentals_l3_triggers.compute_growth_pct(120.0, 100.0) == 20.0
+
+
+def test_compute_growth_pct_negative():
+    assert fundamentals_l3_triggers.compute_growth_pct(80.0, 100.0) == -20.0
+
+
+def test_compute_growth_pct_loss_to_profit_swing_reads_positive():
+    # real shape found live (Diamines and Chemicals): pat swung from a loss to a
+    # profit -- must read as a large POSITIVE change, not negative.
+    result = fundamentals_l3_triggers.compute_growth_pct(27.32, -209.4)
+    assert result > 0
+
+
+def test_compute_growth_pct_profit_to_loss_swing_reads_negative():
+    result = fundamentals_l3_triggers.compute_growth_pct(-50.0, 100.0)
+    assert result < 0
+
+
+def test_compute_growth_pct_none_when_baseline_zero():
+    assert fundamentals_l3_triggers.compute_growth_pct(100.0, 0) is None
+
+
+def test_compute_growth_pct_none_when_either_input_missing():
+    assert fundamentals_l3_triggers.compute_growth_pct(None, 100.0) is None
+    assert fundamentals_l3_triggers.compute_growth_pct(100.0, None) is None
+
+
+def test_compute_approx_operating_margin_pct_real_shape():
+    # real values from a live-verified extraction (Ambika Cotton Mills Q1 FY27).
+    result = fundamentals_l3_triggers.compute_approx_operating_margin_pct(
+        revenue=25792.0, pat=2570.0, finance_costs=295.0, depreciation_amortisation=524.0
+    )
+    assert result == round((2570.0 + 295.0 + 524.0) / 25792.0 * 100, 2)
+
+
+def test_compute_approx_operating_margin_pct_none_when_revenue_zero():
+    assert fundamentals_l3_triggers.compute_approx_operating_margin_pct(revenue=0, pat=10, finance_costs=1, depreciation_amortisation=1) is None
+
+
+def test_compute_approx_operating_margin_pct_none_when_any_input_missing():
+    assert fundamentals_l3_triggers.compute_approx_operating_margin_pct(revenue=100, pat=None, finance_costs=1, depreciation_amortisation=1) is None
+
+
+def test_infer_reporting_cadence_quarterly_when_any_quarter_seen():
+    assert fundamentals_l3_triggers.infer_reporting_cadence(["Q1", "Q2"]) == "quarterly"
+    assert fundamentals_l3_triggers.infer_reporting_cadence(["H1", "Q3"]) == "quarterly"  # quarterly wins if ever seen
+
+
+def test_infer_reporting_cadence_half_yearly_when_only_h1_h2():
+    assert fundamentals_l3_triggers.infer_reporting_cadence(["H1", "H2"]) == "half_yearly"
+
+
+def test_infer_reporting_cadence_unknown_when_no_history():
+    assert fundamentals_l3_triggers.infer_reporting_cadence([]) == "unknown"
+    assert fundamentals_l3_triggers.infer_reporting_cadence([None, None]) == "unknown"
+
+
+def test_load_results_period_type_history_extracts_period_types(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"structured_extraction_json": json.dumps({"period_type": "Q1"})},
+            {"structured_extraction_json": json.dumps({"period_type": "H1"})},
+            {"structured_extraction_json": "not json"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_l3_triggers.load_results_period_type_history("nse:ABC")
+    assert result == ["Q1", "H1"]
+
+
+def test_load_results_period_type_history_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_l3_triggers.load_results_period_type_history("nse:ABC") == []
+
+
+def test_load_prior_same_period_results_event_matches_period_type(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"disclosure_date": "2025-11-10", "structured_extraction_json": json.dumps({"period_type": "Q2"})},
+            {"disclosure_date": "2025-08-05", "structured_extraction_json": json.dumps({"period_type": "Q1"})},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_l3_triggers.load_prior_same_period_results_event("nse:ABC", period_type="Q1", before_disclosure_date="2026-08-01")
+    assert result == {"disclosure_date": "2025-08-05"}
+
+
+def test_load_prior_same_period_results_event_none_when_period_type_unknown():
+    assert fundamentals_l3_triggers.load_prior_same_period_results_event("nse:ABC", period_type=None, before_disclosure_date="2026-08-01") is None
+
+
+def test_load_prior_same_period_results_event_none_when_no_match(monkeypatch):
+    df = pd.DataFrame([{"disclosure_date": "2025-11-10", "structured_extraction_json": json.dumps({"period_type": "Q2"})}])
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: df)
+    assert fundamentals_l3_triggers.load_prior_same_period_results_event("nse:ABC", period_type="Q1", before_disclosure_date="2026-08-01") is None
+
+
+def test_load_latest_results_calendar_event_returns_row(monkeypatch):
+    df = pd.DataFrame([{"disclosure_date": "2026-08-10"}])
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: df)
+    assert fundamentals_l3_triggers.load_latest_results_calendar_event("nse:ABC") == {"disclosure_date": "2026-08-10"}
+
+
+def test_load_latest_results_calendar_event_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_l3_triggers.load_latest_results_calendar_event("nse:ABC") is None
+
+
+def test_compute_timing_delay_days_both_baselines_present():
+    result = fundamentals_l3_triggers.compute_timing_delay_days(
+        "2026-08-20", prior_same_period_disclosure_date="2025-08-05", calendar_expected_date="2026-08-10"
+    )
+    # own-history: last year 2025-08-05 + 365 days = 2026-08-05; actual 2026-08-20 -> 15 days late
+    assert result["vs_own_history_days"] == 15
+    # calendar: expected 2026-08-10; actual 2026-08-20 -> 10 days late
+    assert result["vs_calendar_days"] == 10
+
+
+def test_compute_timing_delay_days_early_reads_negative():
+    result = fundamentals_l3_triggers.compute_timing_delay_days("2026-08-01", prior_same_period_disclosure_date="2025-08-05", calendar_expected_date=None)
+    assert result["vs_own_history_days"] < 0
+
+
+def test_compute_timing_delay_days_none_baselines_stay_none():
+    result = fundamentals_l3_triggers.compute_timing_delay_days("2026-08-20")
+    assert result == {"vs_own_history_days": None, "vs_calendar_days": None}
+
+
+def test_compute_timing_delay_days_unparseable_disclosure_date_returns_all_none():
+    result = fundamentals_l3_triggers.compute_timing_delay_days("not a date", prior_same_period_disclosure_date="2025-08-05", calendar_expected_date="2026-08-10")
+    assert result == {"vs_own_history_days": None, "vs_calendar_days": None}
+
+
+def test_evaluate_capital_raise_trigger_reasoning_includes_investor_tier():
+    event = {"investor_tiers": [{"name": "Acme Fund", "tier": "marquee"}]}
+    result = fundamentals_l3_triggers.evaluate_capital_raise_trigger(event, None)
+    assert "Acme Fund" in result["reasoning"] and "marquee" in result["reasoning"]
+
+
+def test_evaluate_capital_raise_trigger_reasoning_unchanged_when_no_investor_tiers():
+    result = fundamentals_l3_triggers.evaluate_capital_raise_trigger({}, None)
+    assert "Named investor" not in result["reasoning"]
+
+
+def test_resolve_investor_tiers_for_event_resolves_known_and_unknown():
+    event = {"structured_extraction_json": json.dumps({"investor_names": ["Acme Fund", "Mystery Capital"]})}
+    tiers_by_key = {"acme fund": {"llm_tier": "recognized", "override_tier": "marquee"}}
+
+    result = fundamentals_l3_triggers._resolve_investor_tiers_for_event(event, tiers_by_key)
+
+    by_name = {r["name"]: r["tier"] for r in result}
+    assert by_name["Acme Fund"] == "marquee"  # override wins
+    assert by_name["Mystery Capital"] is None
+
+
+def test_resolve_investor_tiers_for_event_no_json_returns_empty():
+    assert fundamentals_l3_triggers._resolve_investor_tiers_for_event({}, {}) == []
+
+
+def test_resolve_investor_tiers_for_event_unparseable_json_returns_empty():
+    assert fundamentals_l3_triggers._resolve_investor_tiers_for_event({"structured_extraction_json": "not json"}, {}) == []
+
+
 def test_capital_raise_is_in_supported_filing_types_and_evaluators():
     assert "capital_raise" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
     assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["capital_raise"] is fundamentals_l3_triggers.evaluate_capital_raise_trigger
@@ -10886,6 +11609,195 @@ def test_evaluate_institutional_entry_trigger_uses_event_headline_as_reasoning()
 def test_institutional_entry_is_in_supported_filing_types_and_evaluators():
     assert "institutional_entry" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
     assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["institutional_entry"] is fundamentals_l3_triggers.evaluate_institutional_entry_trigger
+
+
+def _results_event(**overrides):
+    extracted = {
+        "period_type": "Q1",
+        "revenue_current_rs_lakh": 100.0,
+        "revenue_yoy_rs_lakh": 100.0,
+        "pat_current_rs_lakh": 10.0,
+        "pat_yoy_rs_lakh": 10.0,
+        "finance_costs_current_rs_lakh": 2.0,
+        "depreciation_amortisation_current_rs_lakh": 3.0,
+    }
+    extracted.update(overrides)
+    return {
+        "company_master_id": "nse:ABC",
+        "disclosure_date": "2026-08-01",
+        "structured_extraction_json": json.dumps(extracted),
+    }
+
+
+def _no_timing_signal(monkeypatch):
+    # most tests aren't about the timing branch -- neutralize it so decline/confirm
+    # branches can be tested in isolation.
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_prior_same_period_results_event", lambda cmid, **k: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_results_calendar_event", lambda cmid: None)
+
+
+def test_evaluate_results_trigger_none_when_no_extraction():
+    assert fundamentals_l3_triggers.evaluate_results_trigger({}, None) is None
+
+
+def test_evaluate_results_trigger_none_when_unparseable_json():
+    assert fundamentals_l3_triggers.evaluate_results_trigger({"structured_extraction_json": "not json"}, None) is None
+
+
+def test_evaluate_results_trigger_delayed_wins_regardless_of_growth(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_prior_same_period_results_event", lambda cmid, **k: {"disclosure_date": "2025-07-01"})
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_results_calendar_event", lambda cmid: None)
+    # 2025-07-01 + 365 days = 2026-07-01; actual 2026-08-01 -> 31 days late (> threshold)
+    event = _results_event(disclosure_date="2026-08-01")
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
+    assert result["trigger_type"] == "results_delayed"
+    assert "31 days" in result["reasoning"]
+
+
+def test_evaluate_results_trigger_decline_always_alerts(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(revenue_current_rs_lakh=80.0, revenue_yoy_rs_lakh=100.0)  # -20% YoY
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
+    assert result["trigger_type"] == "results_decline"
+    assert "Revenue declined -20.0% YoY" in result["reasoning"]
+
+
+def test_exceptional_items_caveat_only_applies_to_pat():
+    extracted = {"exceptional_items_rs_lakh": 50.0}
+    assert fundamentals_l3_triggers._exceptional_items_caveat(extracted, "Revenue") == ""
+    assert "exceptional item" in fundamentals_l3_triggers._exceptional_items_caveat(extracted, "PAT")
+
+
+def test_exceptional_items_caveat_empty_when_zero_or_none():
+    assert fundamentals_l3_triggers._exceptional_items_caveat({"exceptional_items_rs_lakh": 0}, "PAT") == ""
+    assert fundamentals_l3_triggers._exceptional_items_caveat({"exceptional_items_rs_lakh": None}, "PAT") == ""
+    assert fundamentals_l3_triggers._exceptional_items_caveat({}, "PAT") == ""
+
+
+def test_evaluate_results_trigger_decline_pat_driven_includes_exceptional_items_caveat(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(pat_current_rs_lakh=5.0, pat_yoy_rs_lakh=20.0, exceptional_items_rs_lakh=8.0)  # -75% YoY PAT
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
+    assert result["trigger_type"] == "results_decline"
+    assert "exceptional item" in result["reasoning"]
+
+
+def test_evaluate_results_trigger_decline_revenue_driven_omits_exceptional_items_caveat(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(revenue_current_rs_lakh=80.0, revenue_yoy_rs_lakh=100.0, exceptional_items_rs_lakh=8.0)  # revenue-driven, not PAT
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
+    assert "exceptional item" not in result["reasoning"]
+
+
+def test_evaluate_results_trigger_confirm_turnaround_includes_exceptional_items_caveat(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(pat_current_rs_lakh=120.0, pat_yoy_rs_lakh=100.0, exceptional_items_rs_lakh=15.0)  # +20% YoY PAT
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, {"net_debt_yoy_delta_rscr": -50})
+    assert result["trigger_type"] == "results_confirm_turnaround"
+    assert "exceptional item" in result["reasoning"]
+
+
+def test_evaluate_results_trigger_decline_alerts_even_without_l2_state(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(pat_current_rs_lakh=5.0, pat_yoy_rs_lakh=20.0)  # -75% YoY PAT
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
+    assert result["trigger_type"] == "results_decline"
+
+
+def test_evaluate_results_trigger_growth_with_l2_confirmation_alerts(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(revenue_current_rs_lakh=120.0, revenue_yoy_rs_lakh=100.0)  # +20% YoY
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, {"net_debt_yoy_delta_rscr": -50})
+    assert result["trigger_type"] == "results_confirm_turnaround"
+    assert "Revenue grew 20.0% YoY" in result["reasoning"]
+    assert "Approx operating margin" in result["reasoning"]
+
+
+def test_evaluate_results_trigger_growth_without_l2_confirmation_does_not_alert(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(revenue_current_rs_lakh=120.0, revenue_yoy_rs_lakh=100.0)  # +20% YoY
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, {"net_debt_yoy_delta_rscr": 50})  # worsening, not confirming
+    assert result is None
+
+
+def test_evaluate_results_trigger_growth_without_l2_state_does_not_alert(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(revenue_current_rs_lakh=120.0, revenue_yoy_rs_lakh=100.0)
+    assert fundamentals_l3_triggers.evaluate_results_trigger(event, None) is None
+
+
+def test_evaluate_results_trigger_flat_growth_no_signal(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event()  # revenue/pat unchanged YoY
+    assert fundamentals_l3_triggers.evaluate_results_trigger(event, {"net_debt_yoy_delta_rscr": -50}) is None
+
+
+def test_evaluate_results_trigger_no_growth_data_returns_none(monkeypatch):
+    _no_timing_signal(monkeypatch)
+    event = _results_event(revenue_yoy_rs_lakh=None, pat_yoy_rs_lakh=None)
+    assert fundamentals_l3_triggers.evaluate_results_trigger(event, None) is None
+
+
+def test_results_is_in_supported_filing_types_and_evaluators():
+    assert "results" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+    assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["results"] is fundamentals_l3_triggers.evaluate_results_trigger
+
+
+def test_evaluate_auditor_change_trigger_alerts_on_confirmed_change():
+    event = {"structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change", "change_direction": "resignation", "previous_auditor": "ABC & Co", "new_auditor": None})}
+    result = fundamentals_l3_triggers.evaluate_auditor_change_trigger(event, None)
+    assert result["trigger_type"] == "auditor_change"
+    assert "resignation" in result["reasoning"]
+    assert "ABC & Co" in result["reasoning"]
+
+
+def test_evaluate_auditor_change_trigger_alerts_even_without_l2_state():
+    event = {"structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change", "change_direction": "appointment"})}
+    assert fundamentals_l3_triggers.evaluate_auditor_change_trigger(event, None)["trigger_type"] == "auditor_change"
+
+
+@pytest.mark.parametrize("disclosure_type", ["proposed_change_agenda", "incidental_mention", "other", None])
+def test_evaluate_auditor_change_trigger_none_when_not_confirmed(disclosure_type):
+    event = {"structured_extraction_json": json.dumps({"disclosure_type": disclosure_type})}
+    assert fundamentals_l3_triggers.evaluate_auditor_change_trigger(event, None) is None
+
+
+def test_evaluate_auditor_change_trigger_none_when_no_extraction():
+    assert fundamentals_l3_triggers.evaluate_auditor_change_trigger({}, None) is None
+    assert fundamentals_l3_triggers.evaluate_auditor_change_trigger({"structured_extraction_json": "not json"}, None) is None
+
+
+def test_auditor_change_is_in_supported_filing_types_and_evaluators():
+    assert "auditor_change" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+    assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["auditor_change"] is fundamentals_l3_triggers.evaluate_auditor_change_trigger
+
+
+def test_evaluate_related_party_transaction_trigger_alerts_over_threshold():
+    event = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 25.0, "related_party_name": "Promoter Group Ltd", "rpt_amount_rs_cr": 50.0})}
+    result = fundamentals_l3_triggers.evaluate_related_party_transaction_trigger(event, None)
+    assert result["trigger_type"] == "related_party_transaction"
+    assert "Promoter Group Ltd" in result["reasoning"]
+    assert "25.0%" in result["reasoning"]
+
+
+def test_evaluate_related_party_transaction_trigger_none_when_not_applicable():
+    event = {"structured_extraction_json": json.dumps({"is_applicable": False, "pct_of_revenue": None})}
+    assert fundamentals_l3_triggers.evaluate_related_party_transaction_trigger(event, None) is None
+
+
+def test_evaluate_related_party_transaction_trigger_none_when_under_threshold():
+    event = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 5.0})}
+    assert fundamentals_l3_triggers.evaluate_related_party_transaction_trigger(event, None) is None
+
+
+def test_evaluate_related_party_transaction_trigger_none_when_pct_missing():
+    event = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None})}
+    assert fundamentals_l3_triggers.evaluate_related_party_transaction_trigger(event, None) is None
+
+
+def test_related_party_transaction_is_in_supported_filing_types_and_evaluators():
+    assert "related_party_transaction" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+    assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["related_party_transaction"] is fundamentals_l3_triggers.evaluate_related_party_transaction_trigger
 
 
 def test_load_candidate_events_queries_expected_filters(monkeypatch):
@@ -10929,6 +11841,16 @@ def test_resolve_rating_action_type_handles_unparseable_json():
     assert fundamentals_l3_triggers._resolve_rating_action_type(event) is None
 
 
+def test_evaluate_rating_action_trigger_reasoning_names_agency_when_known():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger({"rating_action_type": "downgraded", "rating_agency": "CRISIL"}, None)
+    assert "CRISIL" in result["reasoning"]
+
+
+def test_evaluate_rating_action_trigger_reasoning_omits_agency_when_unknown():
+    result = fundamentals_l3_triggers.evaluate_rating_action_trigger({"rating_action_type": "downgraded"}, None)
+    assert "(" not in result["reasoning"]
+
+
 def test_evaluate_rating_action_trigger_uses_structured_extraction_fallback():
     # real end-to-end shape: a non-ICRA rating action with no rating_action_type
     # column populated, only structured_extraction_json (from the generic BSE-PDF
@@ -10964,6 +11886,7 @@ def test_run_l3_rule_triggers_writes_an_alert_for_a_downgrade(monkeypatch):
     monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
     l2_state = pd.DataFrame([{"ticker": "X", "company_name": "X Ltd", "net_debt_yoy_delta_rscr": 3, "run_date": date(2026, 7, 1)}])
     monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: l2_state)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_investor_tiers", lambda: pd.DataFrame())
 
     upserts = []
     monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
@@ -10983,6 +11906,34 @@ def test_run_l3_rule_triggers_writes_an_alert_for_a_downgrade(monkeypatch):
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "alerted"}]
 
 
+def test_run_l3_rule_triggers_attaches_investor_tiers_to_capital_raise_reasoning(monkeypatch):
+    monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "capital_raise",
+                "headline": "preferential allotment", "rating_action_type": None, "transaction_type": None,
+                "insider_name": None, "quantity": None, "disclosure_date": date(2026, 8, 1),
+                "structured_extraction_json": json.dumps({"investor_names": ["Acme Fund"]}),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: pd.DataFrame(columns=["ticker"]))
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_investor_tiers", lambda: pd.DataFrame([{"investor_key": "acme fund", "llm_tier": "recognized", "override_tier": "marquee"}]))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_l3_triggers, "_set_rule_trigger_status", lambda **kwargs: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_record_fallback", lambda *a, **k: None)
+
+    fundamentals_l3_triggers.run_l3_rule_triggers()
+
+    df, _, _ = upserts[0]
+    assert "Acme Fund" in df.iloc[0]["reasoning"]
+    assert "marquee" in df.iloc[0]["reasoning"]
+
+
 def test_run_l3_rule_triggers_marks_not_alert_worthy_and_skips_upsert(monkeypatch):
     monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
     monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
@@ -10997,6 +11948,7 @@ def test_run_l3_rule_triggers_marks_not_alert_worthy_and_skips_upsert(monkeypatc
     )
     monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
     monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: pd.DataFrame(columns=["ticker"]))
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_investor_tiers", lambda: pd.DataFrame())
     upserts = []
     monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
     status_calls = []
@@ -11514,6 +12466,31 @@ def test_classify_phase_none_when_either_input_missing():
     assert fundamentals_sector_cycle.classify_phase(10.0, None) is None
 
 
+def test_classify_growth_high_at_or_above_threshold():
+    assert fundamentals_sector_cycle.classify_growth(15.0, "adequate") == "high_growth"
+    assert fundamentals_sector_cycle.classify_growth(30.0, "adequate") == "high_growth"
+
+
+def test_classify_growth_medium_between_thresholds():
+    assert fundamentals_sector_cycle.classify_growth(5.0, "adequate") == "medium_growth"
+    assert fundamentals_sector_cycle.classify_growth(14.9, "adequate") == "medium_growth"
+
+
+def test_classify_growth_low_below_medium_threshold():
+    assert fundamentals_sector_cycle.classify_growth(4.9, "adequate") == "low_growth"
+    assert fundamentals_sector_cycle.classify_growth(-20.0, "adequate") == "low_growth"
+
+
+def test_classify_growth_no_pattern_when_demand_missing():
+    assert fundamentals_sector_cycle.classify_growth(None, "adequate") == "no_pattern"
+
+
+def test_classify_growth_no_pattern_when_sample_size_low():
+    # a real, non-missing 20% median demand growth off a single company is still not
+    # a trustworthy sector read -- same gate `sample_size_confidence` applies to phase.
+    assert fundamentals_sector_cycle.classify_growth(20.0, "low") == "no_pattern"
+
+
 def test_fetch_gross_block_data_filters_incomplete_rows(monkeypatch):
     companies = [
         {"company_id": 1, "metrics": {"gross_block_rscr": 120, "gross_block_py_rscr": 100}},
@@ -11550,10 +12527,19 @@ def test_compute_sector_aggregates_computes_capacity_and_demand_growth():
     assert ch["capacity_growth_pct"] == 10.0
     assert ch["demand_growth_pct"] == 15.0  # median(10, 20)
 
+    # n_companies_with_gross_block=2 < MIN_COMPANIES_FOR_CONFIDENCE -> "no_pattern"
+    # despite a real demand_growth_pct=15.0, same low-sample gate as IN0201 below.
+    assert ch["sample_size_confidence"] == "low"
+    assert ch["growth_classification"] == "no_pattern"
+
     auto = result[result["sector_code"] == "IN0201"].iloc[0]
     assert auto["n_companies_with_gross_block"] == 0
     assert pd.isna(auto["capacity_growth_pct"])  # None -> NaN once mixed into a float64 DataFrame column
     assert auto["demand_growth_pct"] == 5.0
+    # n_companies_with_gross_block=0 < MIN_COMPANIES_FOR_CONFIDENCE -> sample_size_confidence
+    # is "low" here, so growth_classification is "no_pattern" despite a real demand_growth_pct.
+    assert auto["sample_size_confidence"] == "low"
+    assert auto["growth_classification"] == "no_pattern"
 
 
 def test_compute_sector_aggregates_flags_low_sample_size_confidence():
@@ -11577,7 +12563,9 @@ def test_compute_sector_aggregates_flags_adequate_sample_size_confidence():
     )
     gross_block = {i: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100} for i in range(1, 6)}  # 5 of 6
     result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
-    assert result.iloc[0]["sample_size_confidence"] == "adequate"
+    row = result.iloc[0]
+    assert row["sample_size_confidence"] == "adequate"
+    assert row["growth_classification"] == "medium_growth"  # demand_growth_pct=10.0, adequate sample
 
 
 def test_compute_sector_aggregates_excludes_companies_without_sector_code():
@@ -11814,18 +12802,21 @@ def test_sync_watchlist_from_alerts_flags_missing_price_without_failing(monkeypa
 
 def test_build_company_evidence_bundle_shapes_output():
     alerts = pd.DataFrame([{"trigger_type": "rating_downgrade", "origin": "rule", "alert_date": date(2026, 8, 1), "reasoning": "r"}])
-    bundle = fundamentals_watch_summary.build_company_evidence_bundle("nse:X", alerts, {"ticker": "X"}, {"close": 100}, {"sector_code": "IN01"})
+    pointers = [{"signal_type": "rating_action", "value": "downgraded"}]
+    bundle = fundamentals_watch_summary.build_company_evidence_bundle("nse:X", alerts, {"ticker": "X"}, {"close": 100}, {"sector_code": "IN01"}, pointers)
     assert bundle["company_master_id"] == "nse:X"
     assert bundle["alerts"] == [{"trigger_type": "rating_downgrade", "origin": "rule", "alert_date": date(2026, 8, 1), "reasoning": "r"}]
     assert bundle["l2_state"] == {"ticker": "X"}
     assert bundle["technicals"] == {"close": 100}
     assert bundle["sector_context"] == {"sector_code": "IN01"}
+    assert bundle["signal_pointers"] == pointers
 
 
 def test_build_company_evidence_bundle_empty_alerts():
     bundle = fundamentals_watch_summary.build_company_evidence_bundle("nse:X", pd.DataFrame(), None, None, None)
     assert bundle["alerts"] == []
     assert bundle["l2_state"] is None
+    assert bundle["signal_pointers"] == []  # defaults to [] when the caller omits it (old 5-arg call shape)
 
 
 def test_run_watch_summary_refresh_returns_early_when_no_candidates(monkeypatch):
@@ -11842,6 +12833,7 @@ def _patch_watch_summary_evidence_loaders(monkeypatch):
     monkeypatch.setattr(fundamentals_watch_summary, "load_latest_l2_state_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_watch_summary, "load_latest_technicals_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_watch_summary, "load_sector_context_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_watch_summary, "get_stock_signal_pointers", lambda cmid: [])
 
 
 def test_run_watch_summary_refresh_new_candidate_marks_narrative_changed(monkeypatch):
@@ -11868,6 +12860,28 @@ def test_run_watch_summary_refresh_new_candidate_marks_narrative_changed(monkeyp
     assert len(updates) == 1
     assert updates[0]["company_master_id"] == "nse:X"
     assert updates[0]["model"] == "test-model"
+
+
+def test_run_watch_summary_refresh_passes_signal_pointers_into_evidence_bundle(monkeypatch):
+    # closes the gap found auditing this pipeline (2026-08-13): agency name,
+    # institutional numbers, and investor tier used to never reach the narrative LLM.
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame([{"company_master_id": "nse:X", "last_alert_at": date(2026, 8, 1), "narrative_generated_at": None, "narrative_text": None}])
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+    pointers = [{"signal_type": "rating_action", "label": "Rating downgraded (CRISIL)", "value": "downgraded", "direction": "down", "as_of_date": "2026-08-01", "source": "CRISIL"}]
+    monkeypatch.setattr(fundamentals_watch_summary, "get_stock_signal_pointers", lambda cmid: pointers)
+    captured = {}
+    monkeypatch.setattr(
+        fundamentals_watch_summary,
+        "generate_watch_summary",
+        lambda bundle, **k: (captured.update(bundle=bundle), {"narrative": "n", "suggested_watch_duration_days": 30, "confidence": "high"})[1],
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: None)
+
+    fundamentals_watch_summary.run_watch_summary_refresh()
+
+    assert captured["bundle"]["signal_pointers"] == pointers
 
 
 def test_run_watch_summary_refresh_existing_candidate_detects_text_change(monkeypatch):
@@ -12020,13 +13034,19 @@ def test_send_email_returns_none_when_disabled(monkeypatch):
     assert fundamentals_notifications.send_email("subject", "body") is None
 
 
-def test_run_watchlist_notification_pipeline_chains_all_four_steps(monkeypatch):
+def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
     monkeypatch.setattr(
         fundamentals_notifications, "sync_watchlist_from_alerts", lambda: {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0}
     )
     narrative_events = [{"company_master_id": "nse:A", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
     monkeypatch.setattr(
         fundamentals_notifications, "run_watch_summary_refresh", lambda: {"generated": 1, "failed": 0, "blocked": False, "narrative_events": narrative_events}
+    )
+    exit_calls = []
+    monkeypatch.setattr(
+        fundamentals_notifications,
+        "run_watchlist_exit_evaluation",
+        lambda: exit_calls.append(1) or {"companies": 5, "active": 4, "invalidated": 1, "price_flagged": 0, "stale": 0},
     )
     notify_calls = []
     monkeypatch.setattr(fundamentals_notifications, "notify_watchlist_events", lambda events: notify_calls.append(events) or {"sent": 1, "skipped_disabled": 0, "failed": 0})
@@ -12042,10 +13062,13 @@ def test_run_watchlist_notification_pipeline_chains_all_four_steps(monkeypatch):
     assert result["watchlist_companies"] == 5
     assert result["new_candidates"] == 2
     assert result["narratives_generated"] == 1
+    assert result["watchlist_active"] == 4
+    assert result["watchlist_invalidated"] == 1
     assert result["emails_sent"] == 1
     assert result["digest_sent"] == 1
     assert notify_calls == [narrative_events]
     assert digest_calls == [1]
+    assert exit_calls == [1]
 
 
 def test_clean_records_converts_nan_to_none_and_timestamp_to_iso():
@@ -12079,6 +13102,35 @@ def test_get_universe_empty_returns_empty_companies(monkeypatch):
     assert result["run_date"] is None
 
 
+def test_get_watchlist_attaches_strategies_per_company(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: df)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise", "rating_downgrade"]})
+
+    result = fundamentals_api_queries.get_watchlist()
+
+    assert result[0]["strategies"] == ["capital_raise", "rating_downgrade"]
+
+
+def test_get_watchlist_empty_watchlist_skips_strategies_query(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: calls.append(1) or {})
+
+    assert fundamentals_api_queries.get_watchlist() == []
+    assert calls == []  # no point querying strategies for an empty watchlist
+
+
+def test_get_watchlist_company_with_no_strategies_gets_empty_list(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 0}])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: df)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist()
+
+    assert result[0]["strategies"] == []
+
+
 def test_get_watchlist_detail_returns_none_when_not_found(monkeypatch):
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
     assert fundamentals_api_queries.get_watchlist_detail("nse:MISSING") is None
@@ -12097,6 +13149,7 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: {"ticker": "FOO"})
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: {"close": 100})
     monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: {"sector_code": "IN01"})
+    monkeypatch.setattr(fundamentals_api_queries, "get_stock_signal_pointers", lambda cmid: [{"signal_type": "rating_action", "value": "downgraded"}])
 
     result = fundamentals_api_queries.get_watchlist_detail("nse:FOO")
 
@@ -12107,10 +13160,11 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
     assert result["technicals"] == {"close": 100}
     assert result["sector_context"] == {"sector_code": "IN01"}
     assert result["portfolio"] == []
+    assert result["signal_pointers"] == [{"signal_type": "rating_action", "value": "downgraded"}]
 
 
 def test_get_sectors_groups_watched_companies_by_sector(monkeypatch):
-    sector_df = pd.DataFrame([{"sector_code": "IN01", "capacity_growth_pct": 5.0, "demand_growth_pct": 3.0, "phase": "capacity_expansion", "sample_size_confidence": "adequate", "n_companies_in_l1": 10, "sector_name": "Chemicals"}])
+    sector_df = pd.DataFrame([{"sector_code": "IN01", "capacity_growth_pct": 5.0, "demand_growth_pct": 3.0, "phase": "capacity_expansion", "growth_classification": "low_growth", "sample_size_confidence": "adequate", "n_companies_in_l1": 10, "sector_name": "Chemicals"}])
     watched_df = pd.DataFrame([{"sector_code": "IN01", "company_master_id": "nse:FOO", "alert_count": 2, "narrative_text": "x" * 300}])
     call_order = iter([sector_df, watched_df])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: next(call_order))
@@ -12122,6 +13176,59 @@ def test_get_sectors_groups_watched_companies_by_sector(monkeypatch):
     assert len(watched) == 1
     assert watched[0]["company_master_id"] == "nse:FOO"
     assert len(watched[0]["narrative_snippet"]) == 200
+    assert result[0]["growth_classification"] == "low_growth"
+
+
+def test_get_strategies_returns_grouped_counts(monkeypatch):
+    df = pd.DataFrame([{"trigger_type": "capital_raise", "company_count": 3, "last_alert_date": date(2026, 8, 1)}])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_api_queries.get_strategies()
+    assert result[0]["trigger_type"] == "capital_raise"
+    assert result[0]["company_count"] == 3
+
+
+def test_get_strategy_detail_returns_none_when_never_fired(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_api_queries.get_strategy_detail("no_such_trigger") is None
+
+
+def test_get_strategy_detail_returns_companies(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:FOO", "alert_date": date(2026, 8, 1), "reasoning": "r", "origin": "rule", "company_name": "Foo Ltd", "current_price": 100.0}])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: df)
+
+    result = fundamentals_api_queries.get_strategy_detail("capital_raise")
+
+    assert result["trigger_type"] == "capital_raise"
+    assert result["companies"][0]["company_master_id"] == "nse:FOO"
+
+
+def test_api_strategies_route_returns_queries_result(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_strategies", lambda: [{"trigger_type": "capital_raise", "company_count": 3}])
+    client = TestClient(fundamentals_api_app)
+
+    r = client.get("/api/strategies")
+
+    assert r.status_code == 200
+    assert r.json() == [{"trigger_type": "capital_raise", "company_count": 3}]
+
+
+def test_api_strategy_detail_route_404_when_none(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_strategy_detail", lambda trigger_type: None)
+    client = TestClient(fundamentals_api_app)
+
+    r = client.get("/api/strategies/no_such_trigger")
+
+    assert r.status_code == 404
+
+
+def test_api_strategy_detail_route_returns_queries_result(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_strategy_detail", lambda trigger_type: {"trigger_type": trigger_type, "companies": []})
+    client = TestClient(fundamentals_api_app)
+
+    r = client.get("/api/strategies/capital_raise")
+
+    assert r.status_code == 200
+    assert r.json() == {"trigger_type": "capital_raise", "companies": []}
 
 
 def test_get_sectors_empty_returns_empty_list(monkeypatch):
@@ -12162,6 +13269,69 @@ def test_api_universe_route_returns_queries_result(monkeypatch):
     r = client.get("/api/universe")
     assert r.status_code == 200
     assert r.json()["query_version"] == 1
+
+
+def _capturing_get_watchlist(captured):
+    def _fn(status="active"):
+        captured["status"] = status
+        return []
+
+    return _fn
+
+
+def test_api_watchlist_route_defaults_to_active_status(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist", _capturing_get_watchlist(captured))
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist")
+    assert r.status_code == 200
+    assert captured["status"] == "active"
+
+
+def test_api_watchlist_route_status_all_passes_none(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist", _capturing_get_watchlist(captured))
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist?status=all")
+    assert r.status_code == 200
+    assert captured["status"] is None
+
+
+def test_api_watchlist_route_status_stale_passes_through(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist", _capturing_get_watchlist(captured))
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist?status=stale")
+    assert r.status_code == 200
+    assert captured["status"] == "stale"
+
+
+def test_get_watchlist_status_none_omits_where_clause(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["query"] = q
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    fundamentals_api_queries.get_watchlist(status=None)
+    assert "WHERE w.status" not in captured["query"]
+    assert captured["params"] == ()
+
+
+def test_get_watchlist_status_filters_by_value(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["query"] = q
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    fundamentals_api_queries.get_watchlist(status="stale")
+    assert "WHERE w.status = %s" in captured["query"]
+    assert captured["params"] == ("stale",)
 
 
 def test_api_watchlist_detail_route_404_when_not_found(monkeypatch):
@@ -12493,6 +13663,16 @@ def test_load_full_watchlist_empty_returns_empty_list(monkeypatch):
     assert fundamentals_notifications.load_full_watchlist() == []
 
 
+def test_load_full_watchlist_attaches_strategies_per_company(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
+    monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
+    monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise"]})
+
+    result = fundamentals_notifications.load_full_watchlist()
+
+    assert result[0]["strategies"] == ["capital_raise"]
+
+
 def test_build_daily_digest_content_empty_watchlist():
     subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content([])
     assert "nothing on the watchlist" in subject.lower()
@@ -12517,6 +13697,39 @@ def test_build_daily_digest_content_lists_every_company_in_both_parts():
     assert "<html" in html_body and "<table>" in html_body
     assert 'class="pos"' in html_body  # FOO: 100 -> 110 is a gain
     assert "n/a" in html_body  # BAR's NaN current_price rendered honestly, not as "nan%"
+
+
+def test_build_daily_digest_content_renders_strategy_badges():
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 2, "narrative_text": "n",
+            "suggested_watch_until": None, "strategies": ["capital_raise", "rating_downgrade"],
+        }
+    ]
+
+    subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+
+    assert "Strategies: Capital raise, Rating downgrade" in text_body
+    assert 'class="strategy-badge"' in html_body
+    assert "Capital raise" in html_body and "Rating downgrade" in html_body
+
+
+@pytest.mark.parametrize(
+    "trigger_type",
+    ["results_decline", "results_confirm_turnaround", "results_delayed", "auditor_change", "related_party_transaction"],
+)
+def test_strategy_labels_covers_new_trigger_types(trigger_type):
+    assert trigger_type in fundamentals_notifications.STRATEGY_LABELS
+    assert fundamentals_notifications._strategy_label(trigger_type) != trigger_type  # a real label, not the raw fallback
+
+
+def test_build_daily_digest_content_no_strategies_key_renders_fine():
+    # backward-compat: a row without a "strategies" key (old shape) must not crash.
+    rows = [{"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}]
+    subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "Strategies:" not in text_body
+    assert 'class="strategy-badge"' not in html_body
 
 
 def test_build_daily_digest_content_negative_change_gets_neg_class():
@@ -12779,3 +13992,503 @@ def test_api_todos_route_returns_queries_result(monkeypatch):
 
     assert r.status_code == 200
     assert r.json() == {"rating_agencies": [{"agency_name": "acuite"}]}
+
+
+# --- signal_pointers.py -----------------------------------------------------------
+
+
+def test_resolve_rating_action_prefers_column_over_json():
+    event = {"rating_action_type": "downgraded", "structured_extraction_json": json.dumps({"rating_action": "upgraded"})}
+    assert fundamentals_signal_pointers._resolve_rating_action(event) == "downgraded"
+
+
+def test_resolve_rating_action_falls_back_to_json():
+    event = {"rating_action_type": None, "structured_extraction_json": json.dumps({"rating_action": "upgraded"})}
+    assert fundamentals_signal_pointers._resolve_rating_action(event) == "upgraded"
+
+
+def test_resolve_rating_action_none_when_neither_present():
+    assert fundamentals_signal_pointers._resolve_rating_action({"rating_action_type": None, "structured_extraction_json": None}) is None
+
+
+def test_load_l2_signals_for_company_strips_nse_prefix_and_returns_row(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["params"] = params
+        return pd.DataFrame([{"promoter_pct": 55.0, "promoter_stake_direction": "increasing", "institutional_pct": 3.0, "institutional_stake_direction": "increasing", "institutional_first_entry": False, "run_date": date(2026, 8, 1)}])
+
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", fake_sql_to_df)
+    result = fundamentals_signal_pointers.load_l2_signals_for_company("nse:ABC")
+
+    assert captured["params"] == ("ABC",)
+    assert result["promoter_pct"] == 55.0
+
+
+def test_load_l2_signals_for_company_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_l2_signals_for_company("nse:ABC") is None
+
+
+def test_load_latest_rating_event_for_company_returns_row(monkeypatch):
+    df = pd.DataFrame([{"rating_agency": "CRISIL", "rating_action_type": "downgraded", "structured_extraction_json": None, "disclosure_date": "2026-08-01", "load_ts": pd.Timestamp("2026-08-01", tz="UTC")}])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_signal_pointers.load_latest_rating_event_for_company("nse:ABC")
+    assert result["rating_agency"] == "CRISIL"
+
+
+def test_load_latest_rating_event_for_company_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_latest_rating_event_for_company("nse:ABC") is None
+
+
+def test_load_latest_insider_transaction_for_company_returns_row(monkeypatch):
+    df = pd.DataFrame([{"insider_name": "John Doe", "quantity": 10000.0, "transaction_type": "Buy", "disclosure_date": "2026-08-01", "load_ts": pd.Timestamp("2026-08-01", tz="UTC")}])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_signal_pointers.load_latest_insider_transaction_for_company("nse:ABC")
+    assert result["insider_name"] == "John Doe"
+
+
+def test_load_latest_insider_transaction_for_company_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_latest_insider_transaction_for_company("nse:ABC") is None
+
+
+def test_load_latest_confirmed_auditor_change_for_company_finds_confirmed_row(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"disclosure_date": "2026-08-01", "structured_extraction_json": json.dumps({"disclosure_type": "incidental_mention"})},
+            {"disclosure_date": "2026-07-01", "structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change", "change_direction": "resignation", "previous_auditor": "ABC & Co"})},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_signal_pointers.load_latest_confirmed_auditor_change_for_company("nse:ABC")
+    assert result["change_direction"] == "resignation"
+    assert result["disclosure_date"] == "2026-07-01"
+
+
+def test_load_latest_confirmed_auditor_change_for_company_none_when_no_confirmed_row(monkeypatch):
+    df = pd.DataFrame([{"disclosure_date": "2026-08-01", "structured_extraction_json": json.dumps({"disclosure_type": "incidental_mention"})}])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    assert fundamentals_signal_pointers.load_latest_confirmed_auditor_change_for_company("nse:ABC") is None
+
+
+def test_load_latest_confirmed_auditor_change_for_company_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_latest_confirmed_auditor_change_for_company("nse:ABC") is None
+
+
+def test_load_latest_material_rpt_for_company_finds_material_row(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"disclosure_date": "2026-08-01", "structured_extraction_json": json.dumps({"is_applicable": False, "pct_of_revenue": None})},
+            {"disclosure_date": "2026-07-01", "structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 25.0, "related_party_name": "Promoter Group"})},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_signal_pointers.load_latest_material_rpt_for_company("nse:ABC")
+    assert result["pct_of_revenue"] == 25.0
+    assert result["related_party_name"] == "Promoter Group"
+
+
+def test_load_latest_material_rpt_for_company_none_when_under_threshold(monkeypatch):
+    df = pd.DataFrame([{"disclosure_date": "2026-08-01", "structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 5.0})}])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    assert fundamentals_signal_pointers.load_latest_material_rpt_for_company("nse:ABC") is None
+
+
+def test_load_latest_material_rpt_for_company_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_latest_material_rpt_for_company("nse:ABC") is None
+
+
+def test_get_stock_signal_pointers_auditor_change(monkeypatch):
+    auditor_change = {"disclosure_date": "2026-08-01", "change_direction": "resignation", "previous_auditor": "ABC & Co", "new_auditor": None}
+    _patch_signal_pointer_loaders(monkeypatch, auditor_change=auditor_change)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 1
+    assert pointers[0]["signal_type"] == "auditor_change"
+    assert "resignation" in pointers[0]["label"]
+    assert "ABC & Co" in pointers[0]["label"]
+
+
+def test_get_stock_signal_pointers_rpt(monkeypatch):
+    rpt = {"disclosure_date": "2026-08-01", "pct_of_revenue": 25.0, "related_party_name": "Promoter Group"}
+    _patch_signal_pointer_loaders(monkeypatch, rpt=rpt)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 1
+    assert pointers[0]["signal_type"] == "related_party_transaction"
+    assert pointers[0]["value"] == 25.0
+    assert "Promoter Group" in pointers[0]["label"]
+
+
+def test_load_capital_raise_investor_signals_dedupes_and_resolves_tier(monkeypatch):
+    events_df = pd.DataFrame(
+        [
+            {"structured_extraction_json": json.dumps({"investor_names": ["Acme Fund", "Unknown Guy"]}), "disclosure_date": "2026-08-01"},
+            {"structured_extraction_json": json.dumps({"investor_names": ["acme fund"]}), "disclosure_date": "2026-08-05"},  # dup, same key -> first occurrence wins
+        ]
+    )
+    tiers_df = pd.DataFrame([{"investor_key": "acme fund", "llm_tier": "recognized", "override_tier": "marquee"}])
+    calls = iter([events_df, tiers_df])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: next(calls))
+
+    result = fundamentals_signal_pointers.load_capital_raise_investor_signals_for_company("nse:ABC")
+
+    by_name = {r["investor_name"]: r for r in result}
+    assert by_name["Acme Fund"]["tier"] == "marquee"  # override wins over llm_tier
+    assert by_name["Acme Fund"]["as_of_date"] == "2026-08-01"  # first occurrence's date, not the dup's
+    assert by_name["Unknown Guy"]["tier"] is None  # not yet classified -- surfaced, not dropped
+    assert len(result) == 2  # "acme fund" dedup collapsed to one
+
+
+def test_load_capital_raise_investor_signals_empty_events_returns_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_capital_raise_investor_signals_for_company("nse:ABC") == []
+
+
+def test_load_capital_raise_investor_signals_skips_unparseable_json(monkeypatch):
+    events_df = pd.DataFrame([{"structured_extraction_json": "not json", "disclosure_date": "2026-08-01"}])
+    calls = iter([events_df, pd.DataFrame()])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: next(calls))
+    assert fundamentals_signal_pointers.load_capital_raise_investor_signals_for_company("nse:ABC") == []
+
+
+def test_load_sector_growth_for_company_returns_row(monkeypatch):
+    df = pd.DataFrame([{"sector_code": "IN01", "sector_name": "Chemicals", "phase": "balanced", "demand_growth_pct": 20.0, "sample_size_confidence": "adequate", "run_date": date(2026, 8, 1)}])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_signal_pointers.load_sector_growth_for_company("nse:ABC")
+    assert result["sector_name"] == "Chemicals"
+
+
+def test_load_sector_growth_for_company_none_when_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_sector_growth_for_company("nse:ABC") is None
+
+
+def test_load_satisfied_strategies_for_company_returns_rows(monkeypatch):
+    df = pd.DataFrame([{"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1), "reasoning": "r"}])
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_signal_pointers.load_satisfied_strategies_for_company("nse:ABC")
+    assert result == [{"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1), "reasoning": "r"}]
+
+
+def test_load_satisfied_strategies_for_company_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_satisfied_strategies_for_company("nse:ABC") == []
+
+
+def test_load_satisfied_strategies_by_company_groups_and_sorts(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:FOO", "trigger_type": "rating_downgrade"},
+            {"company_master_id": "nse:FOO", "trigger_type": "capital_raise"},
+            {"company_master_id": "nse:BAR", "trigger_type": "insider_buy"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: df)
+
+    result = fundamentals_signal_pointers.load_satisfied_strategies_by_company()
+
+    assert result == {"nse:FOO": ["capital_raise", "rating_downgrade"], "nse:BAR": ["insider_buy"]}
+
+
+def test_load_satisfied_strategies_by_company_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_signal_pointers.load_satisfied_strategies_by_company() == {}
+
+
+def _patch_signal_pointer_loaders(monkeypatch, *, l2=None, rating=None, investors=None, sector=None, strategies=None, insider=None, auditor_change=None, rpt=None):
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_l2_signals_for_company", lambda cmid: l2)
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_latest_rating_event_for_company", lambda cmid: rating)
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_capital_raise_investor_signals_for_company", lambda cmid: investors or [])
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_sector_growth_for_company", lambda cmid: sector)
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_satisfied_strategies_for_company", lambda cmid: strategies or [])
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_latest_insider_transaction_for_company", lambda cmid: insider)
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_latest_confirmed_auditor_change_for_company", lambda cmid: auditor_change)
+    monkeypatch.setattr(fundamentals_signal_pointers, "load_latest_material_rpt_for_company", lambda cmid: rpt)
+
+
+def test_get_stock_signal_pointers_all_sources_empty_returns_empty(monkeypatch):
+    _patch_signal_pointer_loaders(monkeypatch)
+    assert fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC") == []
+
+
+def test_get_stock_signal_pointers_promoter_and_institutional_holding(monkeypatch):
+    l2 = {"promoter_pct": 55.0, "promoter_stake_direction": "decreasing", "institutional_pct": 4.0, "institutional_stake_direction": "increasing", "institutional_first_entry": False, "run_date": date(2026, 8, 1)}
+    _patch_signal_pointer_loaders(monkeypatch, l2=l2)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+    by_type = {p["signal_type"]: p for p in pointers}
+
+    assert by_type["promoter_holding"]["value"] == 55.0
+    assert by_type["promoter_holding"]["direction"] == "decreasing"
+    assert by_type["institutional_holding"]["value"] == 4.0
+    assert by_type["institutional_holding"]["direction"] == "increasing"
+    assert "institutional_first_entry" not in by_type  # flag is False -- no pointer emitted
+
+
+def test_get_stock_signal_pointers_institutional_first_entry_emitted_when_true(monkeypatch):
+    l2 = {"promoter_pct": None, "promoter_stake_direction": None, "institutional_pct": None, "institutional_stake_direction": None, "institutional_first_entry": True, "run_date": date(2026, 8, 1)}
+    _patch_signal_pointer_loaders(monkeypatch, l2=l2)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 1
+    assert pointers[0]["signal_type"] == "institutional_first_entry"
+    assert pointers[0]["direction"] == "new"
+    assert "~3yr" in pointers[0]["label"]  # 2026-08-13: caveat the lookback window, not "first ever"
+
+
+def test_get_stock_signal_pointers_rating_action_includes_agency_in_label(monkeypatch):
+    rating = {"rating_agency": "CRISIL", "rating_action_type": "downgraded", "structured_extraction_json": None, "disclosure_date": "2026-08-01"}
+    _patch_signal_pointer_loaders(monkeypatch, rating=rating)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 1
+    assert pointers[0]["signal_type"] == "rating_action"
+    assert pointers[0]["value"] == "downgraded"
+    assert pointers[0]["direction"] == "down"
+    assert "CRISIL" in pointers[0]["label"]
+    assert pointers[0]["source"] == "CRISIL"
+
+
+def test_get_stock_signal_pointers_rating_action_omitted_when_unresolvable(monkeypatch):
+    rating = {"rating_agency": "CRISIL", "rating_action_type": None, "structured_extraction_json": None, "disclosure_date": "2026-08-01"}
+    _patch_signal_pointer_loaders(monkeypatch, rating=rating)
+    assert fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC") == []
+
+
+def test_get_stock_signal_pointers_investor_entries(monkeypatch):
+    investors = [{"investor_name": "Acme Fund", "tier": "marquee", "as_of_date": "2026-08-01"}, {"investor_name": "Unknown Guy", "tier": None, "as_of_date": "2026-08-01"}]
+    _patch_signal_pointer_loaders(monkeypatch, investors=investors)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 2
+    assert all(p["signal_type"] == "investor_entry" for p in pointers)
+    assert {p["value"] for p in pointers} == {"marquee", None}
+
+
+def test_get_stock_signal_pointers_sector_growth_uses_classify_growth(monkeypatch):
+    sector = {"sector_code": "IN01", "sector_name": "Chemicals", "phase": "balanced", "demand_growth_pct": 20.0, "sample_size_confidence": "adequate", "run_date": date(2026, 8, 1)}
+    _patch_signal_pointer_loaders(monkeypatch, sector=sector)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 1
+    assert pointers[0]["signal_type"] == "sector_growth"
+    assert pointers[0]["value"] == "high_growth"  # classify_growth(20.0, "adequate")
+    assert "Chemicals" in pointers[0]["label"]
+
+
+def test_get_stock_signal_pointers_sector_growth_omitted_when_demand_missing(monkeypatch):
+    sector = {"sector_code": "IN01", "sector_name": "Chemicals", "phase": "balanced", "demand_growth_pct": None, "sample_size_confidence": "adequate", "run_date": date(2026, 8, 1)}
+    _patch_signal_pointer_loaders(monkeypatch, sector=sector)
+    assert fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC") == []
+
+
+def test_get_stock_signal_pointers_strategy_satisfied(monkeypatch):
+    strategies = [{"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1), "reasoning": "r"}, {"trigger_type": "rating_downgrade", "alert_date": date(2026, 8, 2), "reasoning": "r2"}]
+    _patch_signal_pointer_loaders(monkeypatch, strategies=strategies)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 2
+    assert {p["value"] for p in pointers} == {"capital_raise", "rating_downgrade"}
+    assert all(p["signal_type"] == "strategy_satisfied" for p in pointers)
+
+
+def test_get_stock_signal_pointers_insider_buy(monkeypatch):
+    insider = {"insider_name": "John Doe", "quantity": 10000.0, "transaction_type": "Buy", "disclosure_date": "2026-08-01"}
+    _patch_signal_pointer_loaders(monkeypatch, insider=insider)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert len(pointers) == 1
+    assert pointers[0]["signal_type"] == "insider_transaction"
+    assert pointers[0]["direction"] == "buy"
+    assert "John Doe" in pointers[0]["label"]
+    assert "10,000" in pointers[0]["label"]
+
+
+def test_get_stock_signal_pointers_insider_sell_no_quantity(monkeypatch):
+    insider = {"insider_name": "Jane Roe", "quantity": None, "transaction_type": "Sell", "disclosure_date": "2026-08-01"}
+    _patch_signal_pointer_loaders(monkeypatch, insider=insider)
+
+    pointers = fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC")
+
+    assert pointers[0]["direction"] == "sell"
+    assert "Jane Roe" in pointers[0]["label"]
+    assert "(" not in pointers[0]["label"]  # no quantity known -- omitted, not guessed
+
+
+def test_get_stock_signal_pointers_insider_transaction_omitted_when_no_name_recognized_direction(monkeypatch):
+    # a pit_sast row can have a transaction_type that's neither buy nor sell-shaped
+    # (e.g. a pledge-related notice) -- must not silently invent a direction.
+    insider = {"insider_name": "John Doe", "quantity": 100.0, "transaction_type": "Pledge Revoke", "disclosure_date": "2026-08-01"}
+    _patch_signal_pointer_loaders(monkeypatch, insider=insider)
+    assert fundamentals_signal_pointers.get_stock_signal_pointers("nse:ABC") == []
+
+
+# fundamentals/screens/watchlist_exit.py -- watchlist exit signals (step 10.5).
+
+
+def test_check_invalidated_finds_contradicting_later_trigger():
+    history = [
+        {"trigger_type": "rating_confirms_deleveraging", "alert_date": date(2026, 8, 1)},
+        {"trigger_type": "rating_downgrade", "alert_date": date(2026, 9, 1)},
+    ]
+    reason = fundamentals_watchlist_exit._check_invalidated(history)
+    assert reason is not None
+    assert "rating_downgrade" in reason and "rating_confirms_deleveraging" in reason
+
+
+def test_check_invalidated_none_when_no_contradiction():
+    history = [{"trigger_type": "rating_confirms_deleveraging", "alert_date": date(2026, 8, 1)}, {"trigger_type": "capital_raise", "alert_date": date(2026, 9, 1)}]
+    assert fundamentals_watchlist_exit._check_invalidated(history) is None
+
+
+def test_check_invalidated_none_when_opposing_trigger_came_first():
+    # the contradiction must come AFTER the original -- an earlier downgrade before
+    # a later confirms-deleveraging isn't invalidation, it's an outdated data point.
+    history = [{"trigger_type": "rating_downgrade", "alert_date": date(2026, 7, 1)}, {"trigger_type": "rating_confirms_deleveraging", "alert_date": date(2026, 8, 1)}]
+    assert fundamentals_watchlist_exit._check_invalidated(history) is None
+
+
+def test_check_invalidated_none_for_trigger_type_with_no_mapped_opposite():
+    history = [{"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1)}, {"trigger_type": "institutional_first_entry", "alert_date": date(2026, 9, 1)}]
+    assert fundamentals_watchlist_exit._check_invalidated(history) is None
+
+
+def test_check_invalidated_empty_history():
+    assert fundamentals_watchlist_exit._check_invalidated([]) is None
+
+
+def test_check_price_flagged_rally():
+    reason = fundamentals_watchlist_exit._check_price_flagged(100.0, 160.0)  # +60%
+    assert reason is not None
+    assert "up 60.0%" in reason
+
+
+def test_check_price_flagged_decline():
+    reason = fundamentals_watchlist_exit._check_price_flagged(100.0, 60.0)  # -40%
+    assert reason is not None
+    assert "down 40.0%" in reason
+
+
+def test_check_price_flagged_none_within_band():
+    assert fundamentals_watchlist_exit._check_price_flagged(100.0, 110.0) is None  # +10%, within band
+
+
+def test_check_price_flagged_none_when_price_missing():
+    assert fundamentals_watchlist_exit._check_price_flagged(None, 110.0) is None
+    assert fundamentals_watchlist_exit._check_price_flagged(100.0, None) is None
+    assert fundamentals_watchlist_exit._check_price_flagged(0, 110.0) is None
+
+
+def test_check_stale_true_when_watch_until_passed_and_nothing_new():
+    reason = fundamentals_watchlist_exit._check_stale(
+        date(2026, 8, 1), pd.Timestamp("2026-07-01", tz="UTC"), pd.Timestamp("2026-07-15", tz="UTC"), today=date(2026, 8, 13)
+    )
+    assert reason is not None
+    assert "2026-08-01" in reason
+
+
+def test_check_stale_none_when_watch_until_not_yet_passed():
+    assert fundamentals_watchlist_exit._check_stale(date(2026, 12, 1), None, pd.Timestamp("2026-07-15", tz="UTC"), today=date(2026, 8, 13)) is None
+
+
+def test_check_stale_none_when_fresher_alert_exists_than_narrative():
+    # last_alert_at is AFTER narrative_generated_at -- a fresh alert exists that
+    # hasn't been synthesized into a new narrative yet, not actually stale.
+    reason = fundamentals_watchlist_exit._check_stale(
+        date(2026, 8, 1), pd.Timestamp("2026-08-10", tz="UTC"), pd.Timestamp("2026-07-15", tz="UTC"), today=date(2026, 8, 13)
+    )
+    assert reason is None
+
+
+def test_check_stale_none_when_no_suggested_watch_until():
+    assert fundamentals_watchlist_exit._check_stale(None, None, None, today=date(2026, 8, 13)) is None
+
+
+def test_evaluate_exit_status_priority_invalidated_over_price_and_stale():
+    row = {"first_seen_price": 100.0, "current_price": 160.0, "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
+    history = [{"trigger_type": "rating_confirms_deleveraging", "alert_date": date(2026, 7, 1)}, {"trigger_type": "rating_downgrade", "alert_date": date(2026, 8, 1)}]
+    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, history, today=date(2026, 8, 13))
+    assert status == "invalidated"
+
+
+def test_evaluate_exit_status_priority_price_over_stale():
+    row = {"first_seen_price": 100.0, "current_price": 160.0, "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
+    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    assert status == "price_flagged"
+
+
+def test_evaluate_exit_status_falls_through_to_stale():
+    row = {"first_seen_price": 100.0, "current_price": 110.0, "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
+    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    assert status == "stale"
+
+
+def test_evaluate_exit_status_active_when_nothing_fires():
+    row = {"first_seen_price": 100.0, "current_price": 110.0, "suggested_watch_until": date(2026, 12, 1), "last_alert_at": None, "narrative_generated_at": None}
+    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    assert status == "active"
+    assert reason is None
+
+
+def test_load_trigger_type_history_by_company_groups_by_company(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:FOO", "trigger_type": "capital_raise", "alert_date": date(2026, 8, 1)},
+            {"company_master_id": "nse:FOO", "trigger_type": "rating_downgrade", "alert_date": date(2026, 8, 2)},
+            {"company_master_id": "nse:BAR", "trigger_type": "insider_buy", "alert_date": date(2026, 8, 1)},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watchlist_exit, "sql_to_df", lambda q: df)
+    result = fundamentals_watchlist_exit.load_trigger_type_history_by_company()
+    assert len(result["nse:FOO"]) == 2
+    assert len(result["nse:BAR"]) == 1
+
+
+def test_load_trigger_type_history_by_company_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist_exit, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_watchlist_exit.load_trigger_type_history_by_company() == {}
+
+
+def test_run_watchlist_exit_evaluation_empty_watchlist(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: pd.DataFrame())
+    result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
+    assert result == {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0}
+
+
+def test_run_watchlist_exit_evaluation_upserts_status_per_company(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    watchlist = pd.DataFrame(
+        [
+            {"company_master_id": "nse:FOO", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 110.0},
+            {"company_master_id": "nse:BAR", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 200.0},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: watchlist)
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_trigger_type_history_by_company", lambda: {})
+    calls = []
+    monkeypatch.setattr(fundamentals_watchlist_exit, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+
+    result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
+
+    assert result["companies"] == 2
+    assert result["active"] == 1
+    assert result["price_flagged"] == 1
+    df, table, kwargs = calls[0]
+    assert table == "fundamentals_watchlist"
+    assert kwargs["unique_keys"] == ["company_master_id"]
+    statuses = dict(zip(df["company_master_id"], df["status"]))
+    assert statuses == {"nse:FOO": "active", "nse:BAR": "price_flagged"}
