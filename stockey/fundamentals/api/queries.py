@@ -26,6 +26,7 @@ import json
 
 import pandas as pd
 
+from fundamentals.collectors.rating_agencies import get_unsupported_rating_agencies
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
 from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
@@ -209,3 +210,14 @@ def set_investor_classification_override(investor_key: str, payload: dict) -> No
     """Thin wrapper over investor_classification.set_investor_override -- ValueError
     (bad tier) propagates to the caller (app.py translates it to a 400)."""
     set_investor_override(investor_key, **payload)
+
+
+def get_todos() -> dict:
+    """Development todo board (2026-08-13, user-requested) -- currently one
+    category: rating agencies detected in real data with no enrichment plugin yet,
+    ranked by how often they've actually shown up. Self-clearing: an agency drops
+    off the moment its plugin ships (fundamentals/collectors/rating_agencies.py's
+    get_unsupported_rating_agencies() filters against the live AGENCY_PLUGINS
+    registry, not a stored "done" flag). A dict, not a list, so more todo
+    categories can be added later without changing this endpoint's shape."""
+    return {"rating_agencies": _clean_records(get_unsupported_rating_agencies())}

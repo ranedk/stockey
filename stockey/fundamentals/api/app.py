@@ -153,3 +153,8 @@ def override_investor(investor_key: str, payload: InvestorOverrideRequest) -> di
         raise HTTPException(status_code=400, detail=f"tier must be one of {INVESTOR_TIERS}")
     queries.set_investor_classification_override(investor_key, payload.model_dump())
     return {"status": "updated", "investor_key": investor_key}
+
+
+@app.get("/api/todos")
+def todos() -> dict:
+    return queries.get_todos()

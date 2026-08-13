@@ -105,6 +105,16 @@ instruction 2026-08-10) -- a consecutive-failure circuit breaker stops that agen
 remaining rows this run rather than retrying into a block, even though none of these
 three sites have a known WAF history the way NSE/BSE do. Per-agency, not whole-run --
 see the plugin-shape note above.
+
+Development todo tracking (2026-08-13, user-requested): every unsupported-agency row
+is also tallied into fundamentals_unsupported_rating_agencies (agency_name,
+occurrence_count, first/last_seen_at, one example) -- track_unsupported_agencies().
+This is the durable, queryable version of the agency_counts fallback_telemetry above;
+fundamentals/api/queries.py's get_rating_agency_todos() exposes it to the frontend's
+Todos page. Self-clearing, not a manual "done" flag: get_unsupported_rating_agencies()
+filters against the LIVE AGENCY_PLUGINS registry at read time, so an agency drops off
+the todo list the moment its plugin ships, even though its historical row (and the
+count it accumulated before that) stays in the table.
 """
 
 from __future__ import annotations
@@ -121,7 +131,7 @@ from psycopg2 import sql as psycopg2_sql
 from fundamentals.collectors.bse_announcements import RATING_AGENCY_KEYWORDS
 from fundamentals.collectors.events_store import RESULTS_TABLE, _ensure_events_schema
 from fundamentals.collectors.security_master import UA
-from utils.db import db_session, execute_db_operation, sql_to_df
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -513,6 +523,7 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
             severity="warn",
             metadata={"count": int(len(unsupported_rows)), "agency_counts": {str(k): int(v) for k, v in agency_counts.items()}},
         )
+        track_unsupported_agencies(unsupported_rows)
 
     for agency_name, plugin in AGENCY_PLUGINS.items():
         agency_rows = pending[pending["_agency"] == agency_name]
@@ -606,6 +617,75 @@ def _bootstrap_rating_columns() -> None:
                 )
 
     execute_db_operation(_op, operation_name="fundamentals_events:ensure_rating_columns")
+
+
+UNSUPPORTED_AGENCIES_TABLE = "fundamentals_unsupported_rating_agencies"
+
+_UNSUPPORTED_AGENCIES_TABLE_STATEMENT = """
+    CREATE TABLE IF NOT EXISTS fundamentals_unsupported_rating_agencies (
+        agency_name TEXT PRIMARY KEY,
+        occurrence_count INTEGER NOT NULL,
+        first_seen_at TIMESTAMPTZ NOT NULL,
+        last_seen_at TIMESTAMPTZ NOT NULL,
+        example_headline TEXT,
+        example_company_master_id TEXT,
+        load_ts TIMESTAMPTZ
+    )
+"""
+
+
+def _ensure_unsupported_agencies_table() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(_UNSUPPORTED_AGENCIES_TABLE_STATEMENT)
+
+    execute_db_operation(_op, operation_name="fundamentals_unsupported_rating_agencies:ensure_table")
+
+
+def track_unsupported_agencies(unsupported_rows: pd.DataFrame) -> None:
+    """Durable, queryable "development todo" record -- see module docstring.
+    occurrence_count accumulates across every run (never reset); first_seen_at is
+    set once and never overwritten, matching fundamentals/screens/watchlist.py's own
+    "increment count, keep first_seen stable" pattern."""
+    if unsupported_rows.empty:
+        return
+    _ensure_unsupported_agencies_table()
+
+    grouped = unsupported_rows.copy()
+    grouped["_agency"] = grouped["_agency"].fillna("unnamed")
+    now = pd.Timestamp.now(tz="UTC")
+
+    existing_df = sql_to_df("SELECT agency_name, occurrence_count, first_seen_at FROM fundamentals_unsupported_rating_agencies")
+    existing = {row["agency_name"]: row for row in existing_df.to_dict("records")} if not existing_df.empty else {}
+
+    rows = []
+    for agency_name, group in grouped.groupby("_agency"):
+        prior = existing.get(agency_name)
+        example = group.iloc[-1]
+        rows.append(
+            {
+                "agency_name": agency_name,
+                "occurrence_count": int((prior["occurrence_count"] if prior else 0) + len(group)),
+                "first_seen_at": prior["first_seen_at"] if prior else now,
+                "last_seen_at": now,
+                "example_headline": example.get("headline"),
+                "example_company_master_id": example.get("company_master_id"),
+                "load_ts": now,
+            }
+        )
+    upsert_to_db(pd.DataFrame(rows), UNSUPPORTED_AGENCIES_TABLE, unique_keys=["agency_name"])
+
+
+def get_unsupported_rating_agencies() -> pd.DataFrame:
+    """Every tracked not-yet-supported agency, EXCLUDING whatever's currently in
+    AGENCY_PLUGINS -- self-clearing, see module docstring. Read fresh each call, no
+    caching, so a just-shipped plugin drops its agency off the list immediately."""
+    _ensure_unsupported_agencies_table()
+    df = sql_to_df(f"SELECT * FROM {UNSUPPORTED_AGENCIES_TABLE} ORDER BY occurrence_count DESC")  # noqa: S608 -- table name is our own fixed constant, never user input
+    if df.empty:
+        return df
+    supported = set(AGENCY_PLUGINS.keys())
+    return df[~df["agency_name"].isin(supported)].reset_index(drop=True)
 
 
 def _resolve_issuer_name(company_master_id: str | None) -> str | None:

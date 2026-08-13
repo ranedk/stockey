@@ -9969,6 +9969,11 @@ def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkey
     )
     fallback_events = []
     monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+    # track_unsupported_agencies does real DB work (table DDL + upsert) -- must be
+    # mocked here or every test run would write "acuite" rows into the real
+    # fundamentals_unsupported_rating_agencies table.
+    tracked = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "track_unsupported_agencies", lambda rows: tracked.append(rows))
 
     result = fundamentals_rating_agencies.run_rating_agency_enrichment()
 
@@ -9976,6 +9981,7 @@ def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkey
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "unsupported_agency"}]
     assert len(fallback_events) == 1
     assert fallback_events[0][1]["metadata"]["agency_counts"] == {"acuite": 1}
+    assert len(tracked) == 1 and len(tracked[0]) == 1  # the unsupported row was handed to the tracker
 
 
 def test_run_rating_agency_enrichment_matches_icra_row(monkeypatch):
@@ -10228,6 +10234,71 @@ def test_run_rating_agency_enrichment_care_match_leaves_rating_action_type_unset
     assert fields["rating_agency"] == "care"
     assert fields["rating_action_type"] is None
     assert fields["rationale_pdf_url"] == "https://www.careratings.com/upload/CompanyFiles/PR/f.pdf"
+
+
+def test_track_unsupported_agencies_empty_is_a_noop(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_unsupported_agencies_table", lambda: calls.append(1))
+    fundamentals_rating_agencies.track_unsupported_agencies(pd.DataFrame())
+    assert calls == []
+
+
+def test_track_unsupported_agencies_accumulates_count_and_keeps_first_seen(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_unsupported_agencies_table", lambda: None)
+    existing = pd.DataFrame([{"agency_name": "acuite", "occurrence_count": 3, "first_seen_at": pd.Timestamp("2026-08-01", tz="UTC")}])
+    monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", lambda q: existing)
+    upserts = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    rows = pd.DataFrame([{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "h", "_agency": "acuite"}])
+    fundamentals_rating_agencies.track_unsupported_agencies(rows)
+
+    written = upserts[0][0].iloc[0]
+    assert written["agency_name"] == "acuite"
+    assert written["occurrence_count"] == 4  # 3 prior + 1 new
+    assert written["first_seen_at"] == pd.Timestamp("2026-08-01", tz="UTC")  # unchanged
+    assert upserts[0][2]["unique_keys"] == ["agency_name"]
+
+
+def test_track_unsupported_agencies_new_agency_starts_at_count_of_rows(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_unsupported_agencies_table", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", lambda q: pd.DataFrame())
+    upserts = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    rows = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "h1", "_agency": None},
+            {"source": "bse", "news_id": "n2", "company_master_id": "nse:Y", "headline": "h2", "_agency": None},
+        ]
+    )
+    fundamentals_rating_agencies.track_unsupported_agencies(rows)
+
+    written = upserts[0][0].iloc[0]
+    assert written["agency_name"] == "unnamed"  # None agency collapses to "unnamed"
+    assert written["occurrence_count"] == 2
+
+
+def test_get_unsupported_rating_agencies_excludes_agencies_with_a_plugin(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_unsupported_agencies_table", lambda: None)
+    df = pd.DataFrame(
+        [
+            {"agency_name": "acuite", "occurrence_count": 5},
+            {"agency_name": "care", "occurrence_count": 100},  # has a plugin now -- must be excluded
+            {"agency_name": "icra", "occurrence_count": 1},  # has a plugin -- excluded
+        ]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", lambda q: df)
+
+    result = fundamentals_rating_agencies.get_unsupported_rating_agencies()
+
+    assert list(result["agency_name"]) == ["acuite"]
+
+
+def test_get_unsupported_rating_agencies_empty_table_returns_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_unsupported_agencies_table", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_rating_agencies.get_unsupported_rating_agencies().empty
 
 
 def test_run_rating_agency_enrichment_handles_multiple_agencies_in_one_run(monkeypatch):
@@ -12541,3 +12612,28 @@ def test_api_override_investor_success(monkeypatch):
     assert r.status_code == 200
     assert r.json() == {"status": "updated", "investor_key": "acme fund"}
     assert calls == [("acme fund", {"tier": "marquee", "notes": "well known"})]
+
+
+def test_get_todos_wraps_unsupported_rating_agencies(monkeypatch):
+    df = pd.DataFrame([{"agency_name": "acuite", "occurrence_count": 5, "first_seen_at": pd.Timestamp("2026-08-01", tz="UTC"), "last_seen_at": pd.Timestamp("2026-08-13", tz="UTC")}])
+    monkeypatch.setattr(fundamentals_api_queries, "get_unsupported_rating_agencies", lambda: df)
+
+    result = fundamentals_api_queries.get_todos()
+
+    assert result["rating_agencies"][0]["agency_name"] == "acuite"
+    assert result["rating_agencies"][0]["occurrence_count"] == 5
+
+
+def test_get_todos_empty_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_unsupported_rating_agencies", lambda: pd.DataFrame())
+    assert fundamentals_api_queries.get_todos() == {"rating_agencies": []}
+
+
+def test_api_todos_route_returns_queries_result(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_todos", lambda: {"rating_agencies": [{"agency_name": "acuite"}]})
+    client = TestClient(fundamentals_api_app)
+
+    r = client.get("/api/todos")
+
+    assert r.status_code == 200
+    assert r.json() == {"rating_agencies": [{"agency_name": "acuite"}]}
