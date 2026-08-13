@@ -1,6 +1,5 @@
 SHELL=/bin/bash
 PATH=/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/{{STOCKEY_USER}}/.local/bin
-CRON_TZ=Asia/Kolkata
 MAILTO=""
 
 STOCKEY_DIR={{STOCKEY_DIR}}
@@ -23,6 +22,20 @@ LOG_DIR={{LOG_DIR}}
 # (screener/watchlist/narrative/portfolio), not technicals/trading. Two more jobs below:
 # the batch pipeline (fundamentals/run_pipeline.py) and its API server
 # (fundamentals/api/app.py), which serves the screener/ Nuxt frontend.
+#
+# TIMEZONE (2026-08-13, confirmed empirically via logs/cron/*.log real firing
+# timestamps): this go-crond build (webdevops/go-crond 23.12.0) does NOT honor a
+# CRON_TZ line -- there used to be one here and jobs fired at its literal UTC
+# numbers instead of IST-shifted ones. The server's system clock is UTC
+# (timedatectl: Etc/UTC) with no sudo to change it, and go-crond has no
+# --timezone flag and no documented CRON_TZ/TZ support. Every schedule below is
+# therefore written in UTC directly, with the intended IST wall-clock time noted
+# in each comment -- IST = UTC + 5:30, so UTC = IST - 5:30. All of today's IST
+# times are >= 06:50 IST, comfortably clear of the 05:30 IST / 00:00 UTC
+# boundary, so none of these conversions cross a UTC calendar day and the
+# weekday ("1-5") fields are unaffected. If a future job is intended for early
+# IST morning (before ~05:30 IST), remember it lands on the PREVIOUS UTC date
+# and its weekday field needs shifting too.
 
 # ---------------------------------------------------------------------------
 # Recurring cron-managed jobs.
@@ -31,52 +44,62 @@ LOG_DIR={{LOG_DIR}}
 # Late-night data catch-up: Dhan publishes EOD bars staggered (only a fraction of the
 # universe has them at the 18:45 reconcile), and a bad morning bhavcopy fetch must not
 # survive the night. Checks bhavcopy/Dhan/benchmark coverage and runs bounded fixes.
-30 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
+# 17:00 UTC = 22:30 IST
+00 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
 
 # Daily coverage/staleness report across every KEEP table (docs/DATA_COVERAGE.md).
 # Non-fatal visibility layer, not a gate: writes to data_coverage_report (queryable
 # trend history) and the log below. Runs after data_readiness so its own freshness
 # reflects that pass's fixes.
-40 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
+# 17:10 UTC = 22:40 IST
+10 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
 
 # Daily log rotation before the morning jobs: archive sizable logs as
 # logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running
 # processes keep their handles) and prune archives past LOG_ROTATE_KEEP_DAYS.
-50 06 * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
+# 01:20 UTC = 06:50 IST
+20 01 * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
 
 # Daily broad raw download + parse safety net before market open on weekdays.
 # A second end-of-day complete_data.sh run below repairs anything intraday jobs missed.
-10 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
+# 01:40 UTC = 07:10 IST
+40 01 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
 # Queue single-client downloader work and drain it without parallel NSE/Dhan/Screener sessions.
 # The direct complete_data.sh path remains the broad catch-up/backfill safety net.
 # all_external_workers.sh is NOT optional: all_downloaders_queue.sh routes every
 # data.nseindia.* module plus Dhan scrip_master/ohlcv into the nse/dhan queues instead of
 # running them inline -- this is the only thing that drains those queues (see DATA_INVENTORY.md).
-30 08,12,16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
-35 08,12,16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
+# 03:00,07:00,11:00 UTC = 08:30,12:30,16:30 IST
+00 03,07,11 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
+# 03:05,07:05,11:05 UTC = 08:35,12:35,16:35 IST
+05 03,07,11 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
 
 # End-of-day broad catch-up. This intentionally runs the full download+parse path so any
 # downloader/parser work missed earlier in the day is repaired.
-30 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
+# 12:00 UTC = 17:30 IST
+00 12 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
 
 # Daily OHLCV coverage reconciliation. Backfills any universe symbol whose latest daily bar
 # predates the last completed trading day (e.g. after the scheduler was down during market
 # hours), so systrader never reads silently stale bars.
-45 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
+# 13:15 UTC = 18:45 IST
+15 13 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
 
 # Split/bonus-adjusted price table (price-step derived) -- systrader's PRIMARY equity series
 # (advisory_adjusted_ohlcv_daily), promoted out of advisory/ 2026-07-28. Scheduled right after
 # the OHLCV reconcile now that the downstream advisory/research chain that used to sit between
 # them is gone -- no need to wait until 21:38 anymore.
-50 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+# 13:20 UTC = 18:50 IST
+20 13 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
 
 # Fundamentals screener pipeline: L1/L2 refresh, event collectors, OCR + structured
 # extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive
 # technicals, and the watchlist/narrative/email pipeline (fundamentals/run_pipeline.py,
 # one step failing does not abort the run). Scheduled after price_adjustment
-# (18:50) so the descriptive-technicals step reads a same-day adjusted price series.
-15 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_screener.lock ./all_fundamentals_screener.sh >> "$LOG_DIR/fundamentals_screener.log" 2>&1
+# (18:50 IST) so the descriptive-technicals step reads a same-day adjusted price series.
+# 13:45 UTC = 19:15 IST
+45 13 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_screener.lock ./all_fundamentals_screener.sh >> "$LOG_DIR/fundamentals_screener.log" 2>&1
 
 # Fundamentals screener API (fundamentals/api/app.py), serving the screener/ Nuxt
 # frontend. Long-running service, same respawn-under-lock pattern the old
@@ -84,6 +107,7 @@ LOG_DIR={{LOG_DIR}}
 # minutes, with_lock.sh no-ops while a real instance holds the lock, and the script's
 # own /api/health check no-ops again if something is already serving. No weekday
 # restriction -- this is a local dashboard, not a market-hours job.
+# Every 5 minutes, wall-clock -- not IST-anchored, no conversion needed.
 */5 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_api.lock ./all_fundamentals_api.sh >> "$LOG_DIR/fundamentals_api.log" 2>&1
 
 # ---------------------------------------------------------------------------
@@ -92,5 +116,7 @@ LOG_DIR={{LOG_DIR}}
 # ---------------------------------------------------------------------------
 #
 # Optional split refreshes if you want explicit control instead of complete_data.sh.
-# 05 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
-# 40 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
+# 01:35 UTC = 07:05 IST
+# 35 01 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
+# 02:10 UTC = 07:40 IST
+# 10 02 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
