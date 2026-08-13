@@ -9954,12 +9954,13 @@ def test_run_rating_agency_enrichment_returns_early_when_nothing_pending(monkeyp
 
 
 def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkeypatch):
-    # CARE has no plugin yet (unlike icra/india ratings/crisil, added 2026-08-12) --
-    # a genuinely still-unsupported agency, see module docstring.
+    # Acuite has no plugin yet (unlike icra/india ratings/crisil/care) -- a
+    # genuinely still-unsupported agency, see module docstring (zero observed
+    # volume in the 2026-08-13 S3 archive scan, unlike CARE's real 5).
     monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
     pending = pd.DataFrame(
-        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "CARE Ratings downgrades the rating", "subcategory": None, "disclosure_date": date(2026, 8, 4)}]
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "Acuite Ratings downgrades the rating", "subcategory": None, "disclosure_date": date(2026, 8, 4)}]
     )
     monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
     status_calls = []
@@ -9974,7 +9975,7 @@ def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkey
     assert result["unsupported_agency"] == 1
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "unsupported_agency"}]
     assert len(fallback_events) == 1
-    assert fallback_events[0][1]["metadata"]["agency_counts"] == {"care": 1}
+    assert fallback_events[0][1]["metadata"]["agency_counts"] == {"acuite": 1}
 
 
 def test_run_rating_agency_enrichment_matches_icra_row(monkeypatch):
@@ -10067,8 +10068,8 @@ def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkey
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "failed"}]
 
 
-def test_agency_plugins_registry_covers_icra_india_ratings_crisil():
-    assert set(fundamentals_rating_agencies.AGENCY_PLUGINS.keys()) == {"icra", "india ratings", "crisil"}
+def test_agency_plugins_registry_covers_icra_india_ratings_crisil_care():
+    assert set(fundamentals_rating_agencies.AGENCY_PLUGINS.keys()) == {"icra", "india ratings", "crisil", "care"}
     for plugin in fundamentals_rating_agencies.AGENCY_PLUGINS.values():
         assert callable(plugin["open_session"])
         assert callable(plugin["search"])
@@ -10153,6 +10154,80 @@ def test_search_crisil_rationales_raises_on_non_200(monkeypatch):
     monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
     with pytest.raises(fundamentals_rating_agencies.CrisilBlockedError):
         fundamentals_rating_agencies.search_crisil_rationales("X")
+
+
+def test_search_care_rationales_parses_real_response_shape(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": [
+                    {"CompanyName": "Adani Ports and Special Economic Zone Limited", "FileURL": "202607120701_Adani_Ports_and_Special_Economic_Zone_Limited.pdf", "PublishedDate": "2026-07-03 00:00:00.000"},
+                    {"CompanyName": "No File Co", "FileURL": None, "PublishedDate": "2026-07-03 00:00:00.000"},
+                ]
+            }
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+
+    results = fundamentals_rating_agencies.search_care_rationales("Adani Ports")
+
+    assert len(results) == 1  # the row with no FileURL is skipped
+    assert results[0]["headline"] is None  # CARE's listing has no action-stating text at all
+    assert results[0]["rationale_pdf_url"] == "https://www.careratings.com/upload/CompanyFiles/PR/202607120701_Adani_Ports_and_Special_Economic_Zone_Limited.pdf"
+
+
+def test_search_care_rationales_url_quotes_filename_with_spaces(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"CompanyName": "X", "FileURL": "MUNDRA PORT AND SEZ LIMITED-03092010.pdf", "PublishedDate": "2010-09-03 00:00:00.000"}]}
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+
+    results = fundamentals_rating_agencies.search_care_rationales("Mundra Port")
+
+    assert "%20" in results[0]["rationale_pdf_url"]
+    assert " " not in results[0]["rationale_pdf_url"]
+
+
+def test_search_care_rationales_raises_on_non_200(monkeypatch):
+    class FakeResponse:
+        status_code = 500
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "exchange_request_gate", lambda **k: contextlib.nullcontext())
+    monkeypatch.setattr(fundamentals_rating_agencies.requests, "get", lambda *a, **k: FakeResponse())
+    with pytest.raises(fundamentals_rating_agencies.CareBlockedError):
+        fundamentals_rating_agencies.search_care_rationales("X")
+
+
+def test_run_rating_agency_enrichment_care_match_leaves_rating_action_type_unset(monkeypatch):
+    # the key correctness point: a matched CARE row (no headline) must NOT write
+    # rating_action_type="other" -- that would silently block l3_triggers.py's own
+    # structured_extraction_json fallback (Part 1) for this row.
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X", "headline": "CARE Ratings assigns the rating", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "Some Issuer")
+    monkeypatch.setattr(
+        fundamentals_rating_agencies, "search_care_rationales", lambda issuer: [{"date_text": "04 Aug 2026", "headline": None, "rationale_id": "f.pdf", "rationale_url": None, "rationale_pdf_url": "https://www.careratings.com/upload/CompanyFiles/PR/f.pdf"}]
+    )
+    status_calls = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["matched"] == 1
+    fields = status_calls[0]["fields"]
+    assert fields["rating_agency"] == "care"
+    assert fields["rating_action_type"] is None
+    assert fields["rationale_pdf_url"] == "https://www.careratings.com/upload/CompanyFiles/PR/f.pdf"
 
 
 def test_run_rating_agency_enrichment_handles_multiple_agencies_in_one_run(monkeypatch):

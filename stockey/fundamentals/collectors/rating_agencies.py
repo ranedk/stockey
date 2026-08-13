@@ -71,6 +71,23 @@ returns an EMPTY response body (not `{"docs": []}`) -- confirmed live, handled
 explicitly rather than treated as a parse failure. Same DETAIL-page situation as
 India Ratings: no working rationale endpoint found in the time spent, left None.
 
+CARE, reverse-engineered live 2026-08-13, chosen over Acuité/Brickwork/Infomerics
+based on real evidence, not reputation: scanning ~2500 archived NSE announcements in
+the stockeydata S3 bucket (the old advisory pipeline's own OCR archive, a much larger
+and broader-company sample than this module's own detection has accumulated yet) found
+30 real historical rating-action disclosures with a resolvable agency -- CRISIL 11,
+ICRA 6, CARE 5, India Ratings 5, Acuité/Brickwork/Infomerics 0. CARE was the one
+agency with real observed volume and no plugin. Found via the CDP session: careratings.
+com's "Find Ratings" page search box posts to `GET /rrcompany?companyName=<company>
+&YearID=&fdate=&tdate=` (YearID confirmed live to not actually filter -- same result
+count regardless of value) -- plain JSON, no auth, `{"data": [{"FileURL",
+"PublishedDate", ...}]}`. Genuinely different shape from the other three: CARE's
+listing has NO action-stating headline at all, just press-release PDF filenames + a
+date -- rating_action_type is left unset here and relies entirely on l3_triggers.py's
+own structured_extraction_json fallback (Part 1, 2026-08-12) once the PDF is OCR'd,
+not guessed from nothing. The PDF itself IS directly fetchable, no auth: confirmed
+live at `https://www.careratings.com/upload/CompanyFiles/PR/<FileURL, URL-quoted>`.
+
 enrichment_status values this module can set (fundamentals_events, shared with
 bse_announcements.py/nse_pit.py's "pending" default):
 - "matched" -- found the corresponding agency rationale, structured fields filled in.
@@ -94,6 +111,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -124,6 +142,10 @@ CRISIL_LISTING_URL = (
     "https://www.crisilratings.com/content/crisilratings/en/home/our-business/ratings/"
     "rating-rationale/_jcr_content/wrapper_100_par/ratingresultlisting.results.json"
 )
+
+CARE_HEADERS = {"User-Agent": UA}
+CARE_SEARCH_URL = "https://www.careratings.com/rrcompany"
+CARE_PDF_BASE_URL = "https://www.careratings.com/upload/CompanyFiles/PR/{filename}"
 
 CIRCUIT_BREAKER_THRESHOLD = 3
 # A rationale can be published a day or two either side of the exchange announcement
@@ -345,6 +367,48 @@ def search_crisil_rationales(company_name: str) -> list[dict]:
     return results
 
 
+class CareBlockedError(RuntimeError):
+    """Raised internally when a CARE request looks wrong (non-200 or unparseable
+    JSON) -- counted towards that agency's own circuit breaker."""
+
+
+def search_care_rationales(company_name: str) -> list[dict]:
+    with exchange_request_gate(domain="care"):
+        response = requests.get(
+            CARE_SEARCH_URL,
+            params={"companyName": company_name, "YearID": "", "fdate": "", "tdate": ""},
+            headers=CARE_HEADERS,
+            timeout=30,
+        )
+    if response.status_code != 200:
+        raise CareBlockedError(f"HTTP {response.status_code} searching CARE rating listing")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise CareBlockedError(f"non-JSON response: {exc}") from exc
+    results = []
+    for row in data.get("data") or []:
+        file_url = row.get("FileURL")
+        if not file_url:
+            continue
+        results.append(
+            {
+                "date_text": row.get("PublishedDate"),
+                # CARE's listing has no action-stating headline at all (unlike
+                # ICRA/India Ratings/CRISIL) -- confirmed live 2026-08-13, just
+                # press-release PDF filenames + dates. rating_action_type is left
+                # for l3_triggers.py's own structured_extraction_json fallback
+                # (Part 1, 2026-08-12) to fill in once the PDF is OCR'd, not
+                # guessed here.
+                "headline": None,
+                "rationale_id": file_url,
+                "rationale_url": None,
+                "rationale_pdf_url": CARE_PDF_BASE_URL.format(filename=quote(file_url)),
+            }
+        )
+    return results
+
+
 def match_rationale(results: list[dict], target_date) -> dict | None:
     """Flexible date parsing, not a per-agency strict format -- confirmed live
     2026-08-12 that pandas' own parser handles all three agencies' differing
@@ -382,6 +446,7 @@ AGENCY_PLUGINS = {
     "icra": {"open_session": _open_icra_session_state, "search": _search_icra},
     "india ratings": {"open_session": _open_stateless_session, "search": lambda _session, company: search_india_ratings_rationales(company)},
     "crisil": {"open_session": _open_stateless_session, "search": lambda _session, company: search_crisil_rationales(company)},
+    "care": {"open_session": _open_stateless_session, "search": lambda _session, company: search_care_rationales(company)},
 }
 
 
@@ -497,14 +562,22 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
                 continue
 
             counts["matched"] += 1
+            # Some agencies' listings (CARE, confirmed live 2026-08-13) carry no
+            # action-stating headline at all -- classify_rating_action_type() would
+            # otherwise return "other" for an empty string, which if written to the
+            # rating_action_type COLUMN would block l3_triggers.py's own
+            # structured_extraction_json fallback (Part 1) from ever running for
+            # this row (a non-empty column always wins there). Leave the column
+            # unset (None) instead when there's genuinely nothing to classify.
+            headline = matched.get("headline")
             _set_enrichment_status(
                 source=row["source"],
                 news_id=row["news_id"],
                 status="matched",
                 fields={
                     "rating_agency": agency_name,
-                    "rating_action_type": classify_rating_action_type(matched["headline"]),
-                    "rationale_headline": matched["headline"],
+                    "rating_action_type": classify_rating_action_type(headline) if headline else None,
+                    "rationale_headline": headline,
                     "rationale_id": matched["rationale_id"],
                     "rationale_url": matched.get("rationale_url"),
                     "rationale_pdf_url": matched.get("rationale_pdf_url"),
