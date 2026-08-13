@@ -60,8 +60,9 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 
 # Trigger types this rule pass evaluates -- "results" deliberately not included yet,
 # see module docstring. capital_raise added 2026-08-12 (see evaluate_capital_raise_
-# trigger below).
-SUPPORTED_FILING_TYPES = ("rating_action", "pit_sast", "capital_raise")
+# trigger below). institutional_entry added 2026-08-13 (synthetic events written by
+# fundamentals/screens/l2_state.py, no exchange filing exists for this one).
+SUPPORTED_FILING_TYPES = ("rating_action", "pit_sast", "capital_raise", "institutional_entry")
 
 _ALERTS_TABLE_STATEMENT = """
     CREATE TABLE IF NOT EXISTS fundamentals_l3_alerts (
@@ -222,10 +223,25 @@ def evaluate_capital_raise_trigger(event: dict, l2_row: dict | None) -> dict | N
     }
 
 
+def evaluate_institutional_entry_trigger(event: dict, l2_row: dict | None) -> dict | None:
+    """Always alert-worthy, unconditional on L2 state -- the original
+    fundamental_basic_goal.md L3 trigger #3 ("first institutional entry"), built
+    2026-08-13. Not corroborated against l2_row on purpose: this event's own source
+    IS L2's own shareholding table (fundamentals/screens/l2_state.py's
+    compute_institutional_stake), so checking l2_row here would be circular, not
+    independent confirmation -- same reasoning insider buys and capital_raise use for
+    skipping corroboration."""
+    return {
+        "trigger_type": "institutional_first_entry",
+        "reasoning": event.get("headline") or "First institutional (FII+DII) stake detected in screener.in's quarterly shareholding pattern -- alert-worthy regardless of prior L2 state.",
+    }
+
+
 TRIGGER_EVALUATORS = {
     "rating_action": evaluate_rating_action_trigger,
     "pit_sast": evaluate_pit_sast_trigger,
     "capital_raise": evaluate_capital_raise_trigger,
+    "institutional_entry": evaluate_institutional_entry_trigger,
 }
 
 

@@ -58,6 +58,34 @@ Approximations, documented like L1's:
 
 Live 2026-08-10: validated against the current 188-company L1 universe (docs/
 FUNDAMENTAL_SCREENER_PRD.md sec 8 step 3).
+
+Institutional first-entry (2026-08-13, the original fundamental_basic_goal.md L3
+trigger #3 -- "quarterly shareholding pattern deltas, first institutional entry" --
+left open when capital_raise (announcement-based, a different signal) was built
+instead on 2026-08-12). Same shareholding table already fetched for promoter_stake,
+confirmed live 2026-08-13 against a real company (HALDYNGL): screener.in carries
+`FIIs` and `DIIs` as separate rows, summed here to match L1_QUERY's own "FII holding +
+DII holding" convention. compute_institutional_stake() mirrors compute_promoter_stake
+exactly, plus one more field: institutional_first_entry, true only when every prior
+quarter in the visible window was explicitly 0 (not merely missing/None -- a gap in
+the data is not proof of a zero, so it does NOT count as "prior zero") and the latest
+quarter is the first nonzero. Caveat, documented not hidden: screener.in's
+shareholding table only shows a trailing ~12-quarter (3-year) window, so this is
+"first entry visible in ~3 years of history", not a claim about the company's entire
+listed lifetime.
+
+There is no exchange filing for this -- the "event" is L2's own quarterly refresh
+observing the transition. To flow through the same fundamentals_l3_alerts pipeline as
+every other trigger (fundamentals/screens/l3_triggers.py's institutional_entry
+evaluator) rather than inventing a second, parallel alert mechanism, a detected
+first-entry writes a SYNTHETIC row into fundamentals_events (source="l2_state",
+filing_type="institutional_entry") -- see _build_institutional_entry_event_row().
+news_id is keyed on the shareholding table's own latest PERIOD LABEL (e.g. "Jun
+2026"), deliberately NOT run_date: L2 can refresh daily while the underlying
+quarterly data is unchanged, and keying on run_date would re-fire the "first entry"
+alert every single day until the next quarter actually posts. Keying on the period
+label makes this idempotent across same-quarter re-runs and fire exactly once, for
+the quarter the transition actually happened.
 """
 
 from __future__ import annotations
@@ -68,6 +96,8 @@ import re
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from fundamentals.collectors.events_store import RESULTS_TABLE as EVENTS_TABLE
+from fundamentals.collectors.events_store import _ensure_events_schema
 from fundamentals.collectors.screenerin import build_authenticated_session, clean_text, run_query
 from fundamentals.collectors.screenerin import to_number as _screenerin_to_number
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
@@ -234,6 +264,47 @@ def compute_promoter_stake(shareholding: dict[str, object]) -> dict[str, object]
     return {"promoter_pct": latest, "promoter_stake_direction": direction}
 
 
+def compute_institutional_stake(shareholding: dict[str, object]) -> dict[str, object]:
+    """FII + DII combined, matching L1_QUERY's own "FII holding + DII holding"
+    convention -- see module docstring for the first-entry definition and its
+    trailing-~12-quarter-window caveat."""
+    fii_raw = shareholding.get("rows", {}).get("FIIs") or []
+    dii_raw = shareholding.get("rows", {}).get("DIIs") or []
+    combined: list[float | None] = []
+    for fii, dii in zip(fii_raw, dii_raw):
+        if isinstance(fii, (int, float)) and isinstance(dii, (int, float)):
+            combined.append(fii + dii)
+        else:
+            combined.append(None)
+
+    numeric = [v for v in combined if isinstance(v, (int, float))]
+    latest = numeric[-1] if numeric else None
+
+    direction = None
+    if len(numeric) >= 4:
+        window = numeric[-4:]
+        delta = window[-1] - window[0]
+        if delta > 0.01:
+            direction = "increasing"
+        elif delta < -0.01:
+            direction = "decreasing"
+        else:
+            direction = "flat"
+
+    first_entry = False
+    if len(combined) >= 2:
+        prior = combined[:-1]
+        # Every prior quarter must be an EXPLICIT 0, not merely missing/None -- a gap
+        # in the data is not proof of a zero, so it must never produce a false
+        # "first entry" claim.
+        prior_all_zero = bool(prior) and all(isinstance(v, (int, float)) and v == 0 for v in prior)
+        latest_val = combined[-1]
+        if prior_all_zero and isinstance(latest_val, (int, float)) and latest_val > 0:
+            first_entry = True
+
+    return {"institutional_pct": latest, "institutional_stake_direction": direction, "institutional_first_entry": first_entry}
+
+
 def fetch_pledge_levels(session) -> dict[int, float]:
     """Companies with any promoter pledge, market-wide -- anyone not in this dict is
     treated as 0.0 (unpledged), the overwhelmingly common case. See module docstring
@@ -274,8 +345,41 @@ def build_l2_state_row(company: dict[str, object], pledge_levels: dict[int, floa
         **compute_cwip_ratio(detail["balance_sheet"]),
         "pledge_pct": pledge_levels.get(company["company_id"], 0.0),
         **compute_promoter_stake(detail["shareholding"]),
+        **compute_institutional_stake(detail["shareholding"]),
         "sector_cycle_phase": None,
         "valuation_percentile": None,
+    }
+
+
+def _build_institutional_entry_event_row(row: dict[str, object], *, latest_period: str, load_ts) -> dict[str, object]:
+    """One synthetic fundamentals_events row for a detected institutional first
+    entry -- see module docstring for why this is a synthetic event (no exchange
+    filing exists) and why news_id is keyed on latest_period, not run_date."""
+    ticker = row["ticker"]
+    return {
+        "source": "l2_state",
+        "news_id": f"institutional_entry:{ticker}:{latest_period}",
+        "company_master_id": f"nse:{ticker}",
+        "isin": None,
+        "filing_type": "institutional_entry",
+        "headline": f"First institutional (FII+DII) stake detected: {row.get('institutional_pct')}% as of {latest_period}",
+        "subcategory": None,
+        "disclosure_date": row["run_date"].date() if hasattr(row["run_date"], "date") else row["run_date"],
+        "announcement_timestamp": load_ts,
+        "quantity": row.get("institutional_pct"),
+        "insider_name": None,
+        "transaction_type": None,
+        "attachment_name": None,
+        "detail_url": None,
+        "detection_source": "l2_state_shareholding_pattern",
+        # No document exists for this filing_type -- nothing to OCR/extract, so this
+        # is never "pending" in the sense rating_action/results are (and the OCR/
+        # structured-extraction queues already exclude it naturally: no
+        # attachment_name or rationale_pdf_url).
+        "enrichment_status": "not_applicable",
+        "sources": "l2_state",
+        "raw_json": json.dumps({"institutional_pct": row.get("institutional_pct"), "period": latest_period, "ticker": ticker}, ensure_ascii=False, default=str),
+        "load_ts": load_ts,
     }
 
 
@@ -288,7 +392,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         universe = universe.head(limit)
     if universe.empty:
         _record_no_universe_fallback()
-        return {"rows": 0, "failed_companies": [], "checks_deferred": list(DEFERRED_FIELDS), "companies": []}
+        return {"rows": 0, "failed_companies": [], "checks_deferred": list(DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0}
 
     session = session or build_authenticated_session()
     pledge_levels = fetch_pledge_levels(session)
@@ -297,6 +401,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     load_ts = pd.Timestamp.now(tz="UTC")
     rows: list[dict[str, object]] = []
     failed_companies: list[str] = []
+    institutional_entry_events: list[dict[str, object]] = []
     for _, company in universe.iterrows():
         ticker = company["ticker"]
         if not ticker:
@@ -313,18 +418,27 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         row["load_ts"] = load_ts
         rows.append(row)
 
+        if row.get("institutional_first_entry"):
+            periods = detail.get("shareholding", {}).get("periods") or []
+            latest_period = periods[-1] if periods else str(run_date.date())
+            institutional_entry_events.append(_build_institutional_entry_event_row(row, latest_period=latest_period, load_ts=load_ts))
+
     if rows:
         upsert_to_db(
             pd.DataFrame(rows),
             RESULTS_TABLE,
             unique_keys=["company_id", "run_date", "state_vector_version"],
         )
+    if institutional_entry_events:
+        _ensure_events_schema()
+        upsert_to_db(pd.DataFrame(institutional_entry_events), EVENTS_TABLE, unique_keys=["source", "news_id"])
     _record_deferred_fields_fallback()
     return {
         "rows": len(rows),
         "failed_companies": failed_companies,
         "checks_deferred": list(DEFERRED_FIELDS),
         "companies": [row["company_name"] for row in rows][:20],
+        "institutional_first_entries": len(institutional_entry_events),
     }
 
 
@@ -338,6 +452,7 @@ def main() -> int:
         "state_vector_version": STATE_VECTOR_VERSION,
         "checks_deferred": result["checks_deferred"],
         "failed_companies": result["failed_companies"],
+        "institutional_first_entries": result.get("institutional_first_entries", 0),
         "fallback_used": True,  # deferred fields + any per-company fetch failures are a standing, visible fallback
         "state_advanced": result["rows"] > 0,
     }

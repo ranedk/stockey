@@ -8873,6 +8873,80 @@ def test_compute_promoter_stake_direction_is_none_with_fewer_than_4_quarters():
     assert result["promoter_stake_direction"] is None
 
 
+@pytest.mark.parametrize(
+    "fiis,diis,expected_direction",
+    [
+        ([0.5, 0.5, 0.5, 0.5], [1.0, 1.0, 1.0, 1.0], "flat"),
+        ([0.0, 0.5, 1.0, 1.5], [0.0, 0.0, 0.0, 0.0], "increasing"),
+        ([2.0, 1.5, 1.0, 0.5], [0.0, 0.0, 0.0, 0.0], "decreasing"),
+    ],
+)
+def test_compute_institutional_stake_direction_over_last_4_quarters(fiis, diis, expected_direction):
+    shareholding = {"rows": {"FIIs": fiis, "DIIs": diis}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_pct"] == fiis[-1] + diis[-1]
+    assert result["institutional_stake_direction"] == expected_direction
+
+
+def test_compute_institutional_stake_sums_fii_and_dii():
+    # real shape confirmed live 2026-08-13 (HALDYNGL): screener.in carries FIIs and
+    # DIIs as separate rows, summed here to match L1_QUERY's own convention.
+    shareholding = {"rows": {"FIIs": [0.0, 0.0, 0.0], "DIIs": [0.0, 1.17, 1.53]}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_pct"] == 1.53
+
+
+def test_compute_institutional_stake_first_entry_true_when_all_prior_explicitly_zero():
+    shareholding = {"rows": {"FIIs": [0.0, 0.0, 0.0], "DIIs": [0.0, 0.0, 2.1]}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_first_entry"] is True
+
+
+def test_compute_institutional_stake_first_entry_false_when_already_held_before():
+    # real shape confirmed live 2026-08-13 (HALDYNGL): DIIs already nonzero one
+    # quarter back -- this is growth, not entry.
+    shareholding = {"rows": {"FIIs": [0.0, 0.0], "DIIs": [1.17, 2.03]}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_first_entry"] is False
+
+
+def test_compute_institutional_stake_first_entry_false_when_latest_is_zero():
+    shareholding = {"rows": {"FIIs": [0.0, 0.0], "DIIs": [0.0, 0.0]}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_first_entry"] is False
+
+
+def test_compute_institutional_stake_first_entry_false_with_only_one_quarter():
+    shareholding = {"rows": {"FIIs": [1.0], "DIIs": [0.0]}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_first_entry"] is False
+
+
+def test_compute_institutional_stake_first_entry_false_when_prior_quarter_missing_not_zero():
+    # a gap in the data (None) is not proof of a zero -- must not produce a false
+    # "first entry" claim just because a value is missing.
+    shareholding = {"rows": {"FIIs": [None, 0.0], "DIIs": [0.0, 3.0]}}
+    result = fundamentals_l2_state.compute_institutional_stake(shareholding)
+    assert result["institutional_first_entry"] is False
+
+
+def test_compute_institutional_stake_empty_shareholding_returns_none_and_false():
+    result = fundamentals_l2_state.compute_institutional_stake({"rows": {}})
+    assert result == {"institutional_pct": None, "institutional_stake_direction": None, "institutional_first_entry": False}
+
+
+def test_build_institutional_entry_event_row_shape():
+    row = {"ticker": "TESTCO", "institutional_pct": 2.1, "run_date": date(2026, 8, 13)}
+    event = fundamentals_l2_state._build_institutional_entry_event_row(row, latest_period="Jun 2026", load_ts=pd.Timestamp("2026-08-13", tz="UTC"))
+    assert event["source"] == "l2_state"
+    assert event["news_id"] == "institutional_entry:TESTCO:Jun 2026"
+    assert event["company_master_id"] == "nse:TESTCO"
+    assert event["filing_type"] == "institutional_entry"
+    assert event["quantity"] == 2.1
+    assert event["disclosure_date"] == date(2026, 8, 13)
+    assert "2.1" in event["headline"]
+
+
 def test_fetch_pledge_levels_builds_dict_keyed_by_company_id(monkeypatch):
     companies = [
         {"company_id": 3163, "metrics": {"pledged_pct": 96.64}},
@@ -8927,6 +9001,59 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     assert any(e["fallback_type"] == "l2_fields_not_sourced" for e in fallback_events)
 
 
+def test_run_l2_state_refresh_writes_synthetic_event_on_institutional_first_entry(monkeypatch):
+    universe = pd.DataFrame([{"company_id": 1, "company_name": "Entry Co", "ticker": "ENTRYCO"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {
+            "periods": ["Mar 2026", "Jun 2026"],
+            "rows": {"Promoters": [74.37, 74.37, 74.37, 74.37], "FIIs": [0.0, 0.0], "DIIs": [0.0, 3.2]},
+        },
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+    monkeypatch.setattr(fundamentals_l2_state, "_ensure_events_schema", lambda: None)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(
+        fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: None
+    )
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["institutional_first_entries"] == 1
+    assert len(upserts) == 2  # L2 state rows, then the synthetic event row
+    event_df, event_table, event_kwargs = upserts[1]
+    assert event_table == fundamentals_l2_state.EVENTS_TABLE
+    assert event_kwargs["unique_keys"] == ["source", "news_id"]
+    event_row = event_df.iloc[0]
+    assert event_row["news_id"] == "institutional_entry:ENTRYCO:Jun 2026"
+    assert event_row["filing_type"] == "institutional_entry"
+    assert event_row["quantity"] == 3.2
+
+
+def test_run_l2_state_refresh_no_synthetic_event_when_no_first_entry(monkeypatch):
+    universe = pd.DataFrame([{"company_id": 1, "company_name": "No Entry Co", "ticker": "NOENTRY"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"periods": ["Mar 2026", "Jun 2026"], "rows": {"Promoters": [74.37] * 4, "FIIs": [0.0, 0.0], "DIIs": [0.0, 0.0]}},
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["institutional_first_entries"] == 0
+    assert len(upserts) == 1  # only the L2 state upsert, no synthetic event
+
+
 def test_run_l2_state_refresh_skips_a_company_whose_detail_fetch_fails(monkeypatch):
     universe = pd.DataFrame(
         [
@@ -8974,7 +9101,7 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
 
     result = fundamentals_l2_state.run_l2_state_refresh(session=object())
 
-    assert result == {"rows": 0, "failed_companies": [], "checks_deferred": list(fundamentals_l2_state.DEFERRED_FIELDS), "companies": []}
+    assert result == {"rows": 0, "failed_companies": [], "checks_deferred": list(fundamentals_l2_state.DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0}
     assert upserts == []
     assert any(e["fallback_type"] == "l2_no_l1_universe" for e in fallback_events)
 
@@ -10744,6 +10871,21 @@ def test_evaluate_capital_raise_trigger_always_alerts_regardless_of_l2_state():
 def test_capital_raise_is_in_supported_filing_types_and_evaluators():
     assert "capital_raise" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
     assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["capital_raise"] is fundamentals_l3_triggers.evaluate_capital_raise_trigger
+
+
+def test_evaluate_institutional_entry_trigger_always_alerts_regardless_of_l2_state():
+    assert fundamentals_l3_triggers.evaluate_institutional_entry_trigger({}, {"promoter_stake_direction": "decreasing"})["trigger_type"] == "institutional_first_entry"
+    assert fundamentals_l3_triggers.evaluate_institutional_entry_trigger({}, None)["trigger_type"] == "institutional_first_entry"
+
+
+def test_evaluate_institutional_entry_trigger_uses_event_headline_as_reasoning():
+    result = fundamentals_l3_triggers.evaluate_institutional_entry_trigger({"headline": "First institutional (FII+DII) stake detected: 3.2% as of Jun 2026"}, None)
+    assert "3.2%" in result["reasoning"]
+
+
+def test_institutional_entry_is_in_supported_filing_types_and_evaluators():
+    assert "institutional_entry" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+    assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["institutional_entry"] is fundamentals_l3_triggers.evaluate_institutional_entry_trigger
 
 
 def test_load_candidate_events_queries_expected_filters(monkeypatch):

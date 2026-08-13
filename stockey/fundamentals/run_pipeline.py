@@ -17,9 +17,14 @@ triggers -> L3 LLM triage -> descriptive technicals -> watchlist/narrative/email
 pipeline. investor_classification runs right after structured_extraction (needs its
 investor_names output); l3_triggers can run before OR after it since the
 capital_raise trigger fires unconditionally, independent of classification status.
-The last step (notifications.run_watchlist_notification_pipeline) MUST run last: it
-depends on L3 alerts, L2 state, technicals, and sector context all being current for
-that run.
+L2 state MUST stay before l3_triggers (already true) for a second reason as of
+2026-08-13, not just its original "state used to corroborate events" one: L2's own
+refresh now writes synthetic institutional_first_entry events straight into
+fundamentals_events (no exchange filing exists for this trigger -- see
+fundamentals/screens/l2_state.py's own docstring), which l3_triggers then has to
+pick up in the SAME run. The last step
+(notifications.run_watchlist_notification_pipeline) MUST run last: it depends on L3
+alerts, L2 state, technicals, and sector context all being current for that run.
 
 One step failing does not abort the run: every fundamentals module already isolates
 its own external-source failures via fallback_telemetry and (for the two LLM-calling
