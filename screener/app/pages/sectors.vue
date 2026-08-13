@@ -9,6 +9,19 @@ const phaseTone: Record<string, 'good' | 'bad' | 'neutral'> = {
   capacity_expansion: 'bad',
   balanced: 'neutral',
 }
+
+const GROWTH_LABELS: Record<string, string> = {
+  high_growth: 'High growth',
+  medium_growth: 'Medium growth',
+  low_growth: 'Low growth',
+  no_pattern: 'No pattern',
+}
+const growthTone: Record<string, 'good' | 'bad' | 'neutral' | 'warn'> = {
+  high_growth: 'good',
+  medium_growth: 'neutral',
+  low_growth: 'warn',
+  no_pattern: 'neutral',
+}
 </script>
 
 <template>
@@ -18,6 +31,12 @@ const phaseTone: Record<string, 'good' | 'bad' | 'neutral'> = {
       Capacity vs demand growth by sector (capital-cycle phase, L1 universe only), and
       which watchlist companies sit in each one. Descriptive only -- not a ranked
       recommendation.
+    </p>
+    <p class="mt-1 text-xs text-slate-400">
+      Capacity is derived from gross block, a weak-to-meaningless proxy for
+      asset-light sectors (e.g. Financial Services, IT/Services) that aren't
+      constrained by physical fixed assets -- treat phase and growth badges with
+      more skepticism there than in capital-intensive sectors.
     </p>
 
     <div v-if="error" class="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
@@ -30,6 +49,11 @@ const phaseTone: Record<string, 'good' | 'bad' | 'neutral'> = {
           <div class="flex items-center gap-2">
             <h2 class="font-medium">{{ sector.sector_name || sector.sector_code }}</h2>
             <BadgePill v-if="sector.phase" :label="sector.phase" :tone="phaseTone[sector.phase] || 'neutral'" />
+            <BadgePill
+              v-if="sector.growth_classification"
+              :label="GROWTH_LABELS[sector.growth_classification] || sector.growth_classification"
+              :tone="growthTone[sector.growth_classification] || 'neutral'"
+            />
             <BadgePill v-if="sector.sample_size_confidence === 'low'" label="low sample size" tone="warn" />
           </div>
           <div class="text-xs text-slate-500">

@@ -2,6 +2,12 @@
 // hand-written file (no codegen) since the API is small and both sides are owned by
 // the same person -- revisit with an OpenAPI-generated client if the surface grows.
 
+// 'active' is the only status the API returns by default -- pass status=all (or a
+// specific value) to /api/watchlist to see the others. See fundamentals/screens/
+// watchlist_exit.py: nothing is ever deleted, this is a soft-status/visibility
+// filter, not a destructive removal.
+export type WatchlistStatus = 'active' | 'stale' | 'invalidated' | 'price_flagged'
+
 export interface WatchlistItem {
   company_master_id: string
   first_seen_at: string | null
@@ -13,6 +19,11 @@ export interface WatchlistItem {
   narrative_generated_at: string | null
   company_name: string | null
   current_price: number | null
+  // 2026-08-13: distinct trigger_type values this company currently satisfies --
+  // was previously only visible on the detail page's signal_pointers.
+  strategies: string[]
+  status: WatchlistStatus
+  status_reason: string | null
 }
 
 export interface AlertItem {
@@ -44,6 +55,19 @@ export interface PortfolioThesis {
   source_alert_trigger_type: string | null
 }
 
+// Structured, queryable per-stock pointers (2026-08-13) -- fundamentals/screens/
+// signal_pointers.py. Deliberately typed fields, not free-text tags: signal_type is
+// one of promoter_holding / institutional_holding / institutional_first_entry /
+// rating_action / investor_entry / sector_growth / strategy_satisfied.
+export interface SignalPointer {
+  signal_type: string
+  label: string
+  value: string | number | null
+  direction: string | null
+  as_of_date: string | null
+  source: string | null
+}
+
 export interface WatchlistDetail {
   watchlist: WatchlistItem
   alerts: AlertItem[]
@@ -51,6 +75,7 @@ export interface WatchlistDetail {
   technicals: Record<string, unknown> | null
   sector_context: Record<string, unknown> | null
   portfolio: PortfolioThesis[]
+  signal_pointers: SignalPointer[]
 }
 
 export interface SectorWatchedCompany {
@@ -66,6 +91,10 @@ export interface SectorInfo {
   capacity_growth_pct: number | null
   demand_growth_pct: number | null
   phase: string | null
+  // High/medium/low growth or no_pattern (2026-08-13) -- a separate axis from phase:
+  // phase reads capacity vs demand (cyclical positioning), this reads demand alone
+  // (is underlying demand actually growing fast). See sector_cycle.py's classify_growth.
+  growth_classification: 'high_growth' | 'medium_growth' | 'low_growth' | 'no_pattern' | null
   sample_size_confidence: string | null
   n_companies_in_l1: number
   watched_companies: SectorWatchedCompany[]
@@ -142,4 +171,26 @@ export interface UnsupportedRatingAgency {
 
 export interface Todos {
   rating_agencies: UnsupportedRatingAgency[]
+}
+
+// Strategy registry (2026-08-13) -- trigger_type in fundamentals_l3_alerts grouped
+// as "strategies". No new backend concept: a company can satisfy several at once.
+export interface Strategy {
+  trigger_type: string
+  company_count: number
+  last_alert_date: string | null
+}
+
+export interface StrategyCompany {
+  company_master_id: string
+  alert_date: string | null
+  reasoning: string | null
+  origin: string
+  company_name: string | null
+  current_price: number | null
+}
+
+export interface StrategyDetail {
+  trigger_type: string
+  companies: StrategyCompany[]
 }

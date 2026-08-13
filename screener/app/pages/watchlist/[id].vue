@@ -33,6 +33,24 @@ const phaseTone: Record<string, 'good' | 'bad' | 'neutral'> = {
   balanced: 'neutral',
 }
 
+const satisfiedStrategies = computed(() =>
+  (data.value?.signal_pointers ?? []).filter((p) => p.signal_type === 'strategy_satisfied'),
+)
+const otherSignalPointers = computed(() =>
+  (data.value?.signal_pointers ?? []).filter((p) => p.signal_type !== 'strategy_satisfied'),
+)
+
+const DIRECTION_TONE: Record<string, 'good' | 'bad' | 'neutral'> = {
+  increasing: 'good',
+  decreasing: 'bad',
+  new: 'good',
+  up: 'good',
+  down: 'bad',
+}
+function directionTone(direction: string | null): 'good' | 'bad' | 'neutral' {
+  return direction ? DIRECTION_TONE[direction] || 'neutral' : 'neutral'
+}
+
 async function onCreated() {
   showAddForm.value = false
   await refresh()
@@ -55,8 +73,25 @@ async function onResolved() {
 
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold">{{ data.watchlist.company_master_id.replace('nse:', '') }}</h1>
+        <div class="flex items-center gap-2">
+          <h1 class="text-2xl font-semibold">{{ data.watchlist.company_master_id.replace('nse:', '') }}</h1>
+          <BadgePill
+            v-if="data.watchlist.status !== 'active'"
+            :label="WATCHLIST_STATUS_LABELS[data.watchlist.status]"
+            :tone="WATCHLIST_STATUS_TONE[data.watchlist.status]"
+          />
+        </div>
         <p class="text-slate-600">{{ data.watchlist.company_name }}</p>
+        <p v-if="data.watchlist.status_reason" class="mt-1 text-sm text-slate-500">{{ data.watchlist.status_reason }}</p>
+        <div v-if="satisfiedStrategies.length" class="mt-2 flex flex-wrap gap-1.5">
+          <NuxtLink
+            v-for="p in satisfiedStrategies"
+            :key="p.value as string"
+            :to="`/strategies/${encodeURIComponent(p.value as string)}`"
+          >
+            <BadgePill :label="strategyLabel(p.value as string)" tone="neutral" />
+          </NuxtLink>
+        </div>
       </div>
       <div class="text-right">
         <div class="flex items-center justify-end gap-2">
@@ -151,6 +186,24 @@ async function onResolved() {
       <p class="mt-1 text-xs text-slate-500">
         capacity growth {{ formatPct(data.sector_context.capacity_growth_pct as any) }} · demand growth {{ formatPct(data.sector_context.demand_growth_pct as any) }}
       </p>
+      <p v-if="data.sector_context.phase" class="mt-1 text-[11px] text-slate-400">
+        Capacity is gross-block-derived -- weak proxy for asset-light sectors (e.g. Financial Services, IT/Services).
+      </p>
+    </section>
+
+    <!-- Structured pointers (2026-08-13): typed facts, not free-text tags -- promoter/
+         institutional direction, rating agency+action, investor tier, sector growth. -->
+    <section v-if="otherSignalPointers.length" class="rounded-lg border border-slate-200 bg-white p-4">
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Signals</h2>
+      <ul class="mt-3 space-y-2">
+        <li v-for="p in otherSignalPointers" :key="`${p.signal_type}-${p.value}`" class="flex items-center justify-between gap-3 text-sm">
+          <span class="text-slate-700">{{ p.label }}</span>
+          <div class="flex items-center gap-2">
+            <BadgePill v-if="p.direction" :label="p.direction" :tone="directionTone(p.direction)" />
+            <span class="text-xs text-slate-400">{{ formatDate(p.as_of_date) }}</span>
+          </div>
+        </li>
+      </ul>
     </section>
 
     <!-- The path: every piece of evidence that led here -->
