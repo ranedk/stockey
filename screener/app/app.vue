@@ -11,6 +11,7 @@
           <NuxtLink to="/sectors" class="hover:text-slate-900" active-class="text-slate-900">Sectors</NuxtLink>
           <NuxtLink to="/portfolio" class="hover:text-slate-900" active-class="text-slate-900">Portfolio</NuxtLink>
           <NuxtLink to="/investors" class="hover:text-slate-900" active-class="text-slate-900">Investors</NuxtLink>
+          <NuxtLink to="/todos" class="hover:text-slate-900" active-class="text-slate-900">Todos</NuxtLink>
         </div>
       </nav>
     </header>

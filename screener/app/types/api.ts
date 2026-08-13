@@ -130,3 +130,16 @@ export interface InvestorClassification {
   first_seen_source: string | null
   first_seen_news_id: string | null
 }
+
+export interface UnsupportedRatingAgency {
+  agency_name: string
+  occurrence_count: number
+  first_seen_at: string
+  last_seen_at: string
+  example_headline: string | null
+  example_company_master_id: string | null
+}
+
+export interface Todos {
+  rating_agencies: UnsupportedRatingAgency[]
+}
