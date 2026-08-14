@@ -112,7 +112,6 @@ in `stockey_schema_migrations`.
 - Prefer `python -m ...` from the repo root so relative config/`.env` loading
   behaves consistently.
 - Symbol-specific loaders take `--symbols` or `STOCKEY_SYMBOLS` explicitly --
-  no static registry-file fallback (removed 2026-08-14; `config/watchlist_symbols.txt`
-  never existed despite once being documented here). A collector that needs "the
-  current tradeable NSE universe" calls `utils/universe.py`'s `get_equity_universe()`
+  no static registry-file fallback. A collector that needs "the current
+  tradeable NSE universe" calls `utils/universe.py`'s `get_equity_universe()`
   instead.

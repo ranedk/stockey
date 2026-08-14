@@ -50,12 +50,12 @@ class Finding:
         }
 
 
-# Stockey is a pure data platform for Indian-equity price/reference data (operator
-# decision 2026-07-27, docs/PURE_TA_MIGRATION_PLAN.md). All research/signal/LLM
-# authority moved to systrader. These checks assert that framing stays documented
-# and that removed-scope terminology (advisory decision system, Nuxt frontend,
-# fundamentals/announcements/news pipelines) doesn't creep back into operational
-# docs without an explicit historical/removed-scope note.
+# Stockey is a pure data platform for Indian-equity price/reference data. All
+# research/signal/LLM authority lives in systrader. These checks assert that
+# framing stays documented and that removed-scope terminology (the advisory
+# decision system, LLM-token-consuming fundamentals/announcements/news
+# pipelines) doesn't creep back into operational docs without an explicit
+# historical/removed-scope note.
 REQUIRED_COVERAGE = {
     "README.md": [
         ("pure data platform framing", re.compile(r"pure data platform", re.IGNORECASE)),
@@ -86,7 +86,6 @@ STALE_WARNING_PATTERNS = [
     ("legacy_advisory_module_reference", re.compile(r"\badvisory\.[a-zA-Z_][a-zA-Z0-9_]*\b")),
     ("legacy_features_module_reference", re.compile(r"\bfeatures\.[a-zA-Z_][a-zA-Z0-9_]*\b")),
     ("legacy_removed_scope_module_reference", re.compile(r"\bdata\.(screenerin|fred|mospi|eaindustry|nsdl|announcements|economictimes)\.")),
-    ("legacy_nuxt_operator_frontend", re.compile(r"\bNuxt\b")),
     ("legacy_removed_cron_script", re.compile(
         r"\ball_(advisory|ml|watchers|frontend|llm_decisions|research_evidence|hypothesis_scan|"
         r"event_policy_evaluator|technical_threshold_calibration|operator_health|api_latency_probe|"
@@ -114,7 +113,6 @@ WARNING_ALLOWLIST = {
     "legacy_advisory_module_reference": _REMOVED_SCOPE_ALLOWLIST,
     "legacy_features_module_reference": _REMOVED_SCOPE_ALLOWLIST,
     "legacy_removed_scope_module_reference": _REMOVED_SCOPE_ALLOWLIST,
-    "legacy_nuxt_operator_frontend": _REMOVED_SCOPE_ALLOWLIST,
     "legacy_removed_cron_script": _REMOVED_SCOPE_ALLOWLIST,
 }
 

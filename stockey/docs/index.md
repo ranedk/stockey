@@ -64,12 +64,11 @@ Expected prefixes:
 
 ## Data loaders
 
-Symbol-specific loaders take `--symbols` or the `STOCKEY_SYMBOLS` env var explicitly
--- no static registry-file fallback (`config/tracked_symbols.txt` removed 2026-08-14;
-it had silently become production's actual symbol scope for one collector for ~5
-months). A collector that needs "the current tradeable NSE universe" calls
-`utils/universe.py`'s `get_equity_universe()`, which derives it live from the daily
-bhavcopy -- not a file anyone has to remember to keep in sync.
+Symbol-specific loaders take `--symbols` or the `STOCKEY_SYMBOLS` env var
+explicitly -- no static registry-file fallback. A collector that needs "the
+current tradeable NSE universe" calls `utils/universe.py`'s
+`get_equity_universe()`, which derives it live from the daily bhavcopy -- not
+a file anyone has to remember to keep in sync.
 
 The full daily pipeline is `./complete_data.sh` — see `README.md` for the
 cron list and `docs/scripts.md` for the exact `data.download_runner` step
@@ -95,11 +94,9 @@ See `README.md` for Chrome CDP / auto-login setup.
 python -m data.sharpelydata.scrip_master
 ```
 
-Fundamentals/shareholding extraction was removed in the pure-TA cut
-(`docs/DATA_INVENTORY.md`); the mcap slice (`sharpely_data.py` → `historical_mcap`)
-was removed 2026-08-14 (redundant with `nseindia_mcap`, zero downstream consumers).
-`scrip_master.py` stays — it feeds `company_master`'s `sharpely_id` identity
-fallback and `fundamentals/collectors/sector_data.py`'s sector mapping.
+`scrip_master.py` feeds `company_master`'s `sharpely_id` identity fallback and
+`fundamentals/collectors/sector_data.py`'s sector mapping — see
+`docs/DATA_INVENTORY.md` for the full collector/table inventory.
 
 ### RBI / FBIL
 
@@ -135,9 +132,9 @@ scripts/start_chrome_cdp.sh
 python -m utils.db_schema_dump --schemas public
 ```
 
-There is no longer a maintained static schema dump doc — `docs/DATA_INVENTORY.md`
-is the authoritative table inventory; run `db_schema_dump` directly for live
-column-level detail.
+`docs/DATA_INVENTORY.md` is the table inventory; run `db_schema_dump` directly
+for live column-level detail — there's no separate static schema dump doc to
+keep in sync.
 
 ## Agent-facing tool surface
 

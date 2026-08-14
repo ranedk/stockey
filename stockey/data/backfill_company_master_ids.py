@@ -18,9 +18,6 @@ class BackfillSpec:
 
 
 SPECS: tuple[BackfillSpec, ...] = (
-    # 2026-08-14 cloud-DB cleanup (Phase 5 of PURE_TA_MIGRATION_PLAN.md, finally executed):
-    # dropped announcement_pipeline_documents/reports, stmt_income/balancesheet/cashflow,
-    # shareholding_category/top_holders, nseindia_insider_deals -- specs removed with them.
     BackfillSpec("historical_mcap", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_events", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_corporate_actions", "symbol", exchange="NSE"),

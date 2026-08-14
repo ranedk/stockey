@@ -2,14 +2,16 @@
 
 This file is the operating guide for AI coding agents working on Stockey.
 
-Stockey is a **pure data platform** for Indian-equity price/reference data (operator
-decision 2026-07-27). It collects, adjusts, and identity-maps bhavcopy, corporate
-actions, indices, calendar, Dhan broker, and RBI/FBIL rate data, then writes it to
-the cloud Postgres for `systrader` to consume. It does **no** research, signal
-generation, backtesting, sizing, execution, fundamental analysis, news/announcement
-processing, or LLM-token consumption — all of that moved to `systrader`
-(`~/code/trading/systrader`, Go). See `docs/DATA_INVENTORY.md` for the authoritative
-keep/remove inventory and `docs/PURE_TA_MIGRATION_PLAN.md` for how the cut happened.
+Stockey is a **pure data platform** for Indian-equity price/reference data. It
+collects, adjusts, and identity-maps bhavcopy, corporate actions, indices,
+calendar, Dhan broker, and RBI/FBIL rate data, then writes it to the cloud
+Postgres for `systrader` to consume. It does **no** research, signal
+generation, backtesting, sizing, execution, fundamental analysis, news/
+announcement processing, or LLM-token consumption — all of that lives in
+`systrader` (Go; checked out locally as `~/code/trading/systrader` or
+`~/code/trading/systrade` depending on the machine — check `ls ~/code/trading/`
+if unsure). See `docs/DATA_INVENTORY.md` for the authoritative collector/table
+inventory.
 
 Treat this as data-collection infrastructure, not a research app: correctness,
 point-in-time discipline, and visible failure matter more than features. Do not
@@ -35,22 +37,35 @@ reintroduce research/signal/LLM logic here — it belongs in systrader.
 - systrader owns all research, signals, and trading decisions. If a task looks
   like it needs a trading rule, a backtest, a scoring model, or an LLM call over
   market data, it belongs in systrader, not here.
+- No static symbol/company registry file for a collector to fall back to. A
+  collector that needs "the current tradeable NSE universe" calls
+  `utils/universe.py`'s `get_equity_universe()` (derives it live from the daily
+  bhavcopy). A collector that deliberately needs only a small sample (e.g. a
+  connectivity/auth smoke test) derives it dynamically too — see
+  `data/download_runner.py`'s `_dhan_precheck_symbols()`. No hardcoded ticker
+  names anywhere in this pipeline outside tests.
+- Do not call `page.goto()` (or `requests.get()`) against nseindia.com /
+  nsearchives.nseindia.com directly from a new collector — NSE's Akamai WAF
+  blocks fast on request rate and effectively requires a real browser. Route
+  every navigation through `utils/nse_rate_limiter.py`'s `nse_goto(page, url)`
+  (or `nse_request_gate()` for plain `requests` calls); it enforces a
+  cross-process floor and serializes so no two processes ever have an NSE
+  request in flight at once — bypassing it for "just this one call" defeats the
+  point, since the WAF scores the domain's total request rate, not per-script.
 
 ## Current Architecture
 
-The core pure-TA pipeline is 6 cron jobs (`config/stockey.crontab.template`). Times
-below are the intended IST wall-clock schedule; the template's `CRON_TZ` line was
-removed 2026-08-13 because go-crond (webdevops/go-crond 23.12.0, no `--timezone`
-flag, no documented `CRON_TZ`/`TZ` support) does not honor it -- confirmed
-empirically via `logs/cron/*.log` firing at literal UTC numbers instead of
-IST-shifted ones. The crontab file itself is written in UTC (IST - 5:30); see the
-per-job comments in the template for each line's UTC/IST pair:
+The core pure-TA pipeline is 6 cron jobs (`config/stockey.crontab.template`).
+Times below are the intended IST wall-clock schedule; go-crond
+(webdevops/go-crond) has no `CRON_TZ`/`TZ` support, so the crontab file itself
+is written in UTC (IST − 5:30) — see the per-job comments in the template for
+each line's UTC/IST pair:
 
 1. `complete_data.sh` (07:10 + 17:30) — runs `data.download_runner --phase all`:
    downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
-   scrip master + OHLCV, RBI/FBIL rates, and normalizes
-   corporate actions. See `data/download_runner.py`'s `DOWNLOADER_STEPS` /
-   `PARSER_STEPS` for the exact registry.
+   scrip master + OHLCV, RBI/FBIL rates, and normalizes corporate actions. See
+   `data/download_runner.py`'s `DOWNLOADER_STEPS` / `PARSER_STEPS` for the
+   exact registry.
 2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30 and
    +5 min) — queues single-client NSE/Dhan work (`data/download_queue.py`) and
    drains it (`utils/external_task_queue.py`) so parallel NSE/Dhan sessions don't
@@ -70,22 +85,22 @@ BORDERLINE (LLM-free, useful for FnO event-vol research later per
 `docs/DATA_INVENTORY.md`) — the files stay but are deliberately **not** scheduled
 (frozen, not deleted).
 
-Plus two more jobs (2026-08-11) for the fundamentals screener, a deliberate,
-separate carve-out from the pure-TA boundary above (long-term fundamental
-screening — screener/watchlist/narrative/portfolio — not technicals/trading;
+Plus two more jobs for the fundamentals screener, a deliberate, separate
+carve-out from the pure-TA boundary above (long-term fundamental screening —
+screener/watchlist/narrative/portfolio — not technicals/trading;
 `docs/FUNDAMENTAL_SCREENER_PRD.md`):
 
 7. `all_fundamentals_screener.sh` (19:15, weekdays) — runs
-   `fundamentals.run_pipeline`: L1/L2 refresh, event collectors, OCR + structured
-   extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive
-   technicals, and the watchlist/narrative/email pipeline, in dependency order.
-   One step failing does not abort the run.
+   `fundamentals.run_pipeline`: sector reference, L1/L2 refresh, event
+   collectors, OCR + structured extraction, sector capital-cycle, L3 alerts
+   (rule + LLM triage), descriptive technicals, and the watchlist/narrative/
+   email pipeline, in dependency order. One step failing does not abort the
+   run.
 8. `all_fundamentals_api.sh` (every 5 min, no weekday restriction) — long-running
    FastAPI service (`fundamentals/api/app.py`) serving the `screener/` Nuxt
-   frontend. Same respawn-under-lock pattern the old `all_frontend.sh` used: cron
-   retries every 5 minutes, `with_lock.sh` no-ops while a real instance holds the
-   lock, and the script's own `/api/health` check no-ops again if something is
-   already serving.
+   frontend. Cron retries every 5 minutes; `with_lock.sh` no-ops while a real
+   instance holds the lock, and the script's own `/api/health` check no-ops
+   again if something is already serving.
 
 ## Key Commands
 
@@ -124,24 +139,21 @@ exists because concurrent logins triggered Dhan's "too many attempts" block.
 
 ## Files To Inspect First
 
-- `docs/DATA_INVENTORY.md` — the authoritative keep/remove table inventory and
+- `docs/DATA_INVENTORY.md` — the authoritative collector/table inventory and
   cron list; check here before assuming a table or collector is in scope.
-- `docs/PURE_TA_MIGRATION_PLAN.md` — the phased history of how stockey became
-  pure-TA; useful for "why does X work this way" questions.
 - `DATA_CONTRACT.md` (repo root; canonical copy in systrader) — the table API
-  systrader depends on, the cloud-DB load rule, Dhan auth handoff, the
-  TimescaleDB-hypertable correction (several KEEP tables are still
-  hypertables — use `hypertable_size()` for capacity work, plain
-  `pg_total_relation_size()` dramatically undercounts them; also `pg_dump -t`/
-  `\copy tablename` silently copy zero rows for a hypertable — the
-  `\copy (SELECT * FROM ...)` form is required).
+  systrader depends on, the cloud-DB load rule, Dhan auth handoff, and the
+  TimescaleDB-hypertable notes (several tables are hypertables — use
+  `hypertable_size()` for capacity work, plain `pg_total_relation_size()`
+  dramatically undercounts them; `pg_dump -t`/`\copy tablename` silently copy
+  zero rows for a hypertable — the `\copy (SELECT * FROM ...)` form is
+  required).
 - `data/download_runner.py` for the downloader/parser registry (what actually
   runs and in what order).
 - `data/data_readiness.py` for the freshness checks and bounded repairs.
-- `docs/operators_manual.md` — **stale**, still describes the pre-2026-07-27
-  advisory system; useful for historical context only, not current behavior.
-  `docs/scripts.md` is current/maintained despite living in the same era —
-  don't assume everything from that period is stale without checking.
+- `docs/operators_manual.md` — day-to-day runbook: interpreter resolution,
+  Chrome CDP setup, scheduled runs, main operating modes, DB/Redis robustness
+  knobs, inspection commands.
 
 ## Coding Rules
 
@@ -152,9 +164,8 @@ exists because concurrent logins triggered Dhan's "too many attempts" block.
 - Prefer bounded, focused fixes over large refactors.
 - Keep new comments rare and useful.
 - Default to ASCII in new files.
-- When touching a collector, check `docs/DATA_INVENTORY.md` first — if the table
-  it writes isn't in the KEEP list, the fix probably belongs in the archive
-  branch (`advisory-archive-2026-07`), not here.
+- When touching a collector, check `docs/DATA_INVENTORY.md` first to confirm
+  the table it writes is actually in scope.
 
 ## Validation Checklist
 
@@ -188,58 +199,29 @@ python scripts/docs_state_audit.py --strict
 - Do not point backtests, scans, or any read-heavy work at the cloud DB — it's
   small by design; heavy reads happen against systrader's local `systrade`
   mirror (see `DATA_CONTRACT.md`'s load rule).
-- Do not add a static symbol/company registry file for a collector to fall back
-  to. `config/tracked_symbols.txt` was exactly this — a 2-symbol placeholder
-  file multiple collectors silently fell back to (one ran full browser
-  automation against it daily for ~5 months with zero value) — removed
-  2026-08-14. `utils/sync.py`'s `load_tracked_symbols()` now only honors an
-  explicit `--symbols` arg or `STOCKEY_SYMBOLS` env var (no file fallback); a
-  collector that needs "the current tradeable NSE universe" calls
-  `utils/universe.py`'s `get_equity_universe()` (derives it live from the daily
-  bhavcopy) instead of maintaining its own list. A collector that deliberately
-  needs only a small sample (e.g. a connectivity/auth smoke test) should derive
-  it dynamically at execution time too — see `data/download_runner.py`'s
-  `_dhan_precheck_symbols()`/`dhan_ohlcv_precheck` step, which samples
-  `get_equity_universe()` rather than naming fixed tickers. No hardcoded ticker
-  names anywhere in this pipeline outside tests (2026-08-14 rule, after finding
-  SHAKTIPUMP/HDFCBANK hardcoded in three different places over time). Do not
-  widen a per-symbol scraper's scope casually either way without checking the
-  cost (thousands of daily calls add up fast).
-- Do not call `page.goto()` (or `requests.get()`) against nseindia.com /
-  nsearchives.nseindia.com directly from a new collector. NSE's Akamai WAF blocks
-  fast on request rate (2026-08-09/10 incident) and now effectively requires a
-  real browser — route every navigation through `utils/nse_rate_limiter.py`'s
-  `nse_goto(page, url)` (or `nse_request_gate()` for plain `requests` calls). It
-  enforces a cross-process floor (`NSE_MIN_REQUEST_INTERVAL_SECONDS`, default
-  10s) and serializes so no two processes ever have an NSE request in flight at
-  once — bypassing it for "just this one call" defeats the whole point, since
-  the WAF scores the domain's total request rate, not per-script.
+- Do not add a static symbol/company registry file for a collector to fall
+  back to — see Project Principles above.
+- Do not widen a per-symbol scraper's scope casually without checking the
+  cost — a slow per-symbol scraper run against a wide universe can mean
+  thousands of daily calls.
 
-## Boundary with systrader (2026-07-27, migration completed 2026-08-05)
+## Boundary with systrader
 
 Stockey is a pure DATA PLATFORM; all research/TA/selection authority lives in
-`systrader` (`~/code/trading/systrader`, Go, Carver-framework). Read before any
-structural work:
+`systrader` (Go, Carver framework). Read before any structural work:
 
 - `DATA_CONTRACT.md` (repo root; canonical copy in systrader) — table API,
   load rule (cloud DB is small: never point heavy reads at it), auth, and the
-  TimescaleDB correction.
-- `docs/DATA_INVENTORY.md` — the full keep/remove inventory and cron list.
-- `docs/PURE_TA_MIGRATION_PLAN.md` — phase-by-phase migration history,
-  including two registry-level scope leaks and a stale-data bug found and
-  fixed during the cut.
+  TimescaleDB notes.
+- `docs/DATA_INVENTORY.md` — the full collector/table inventory and cron list.
 
-Both projects now share one Claude Code session and one memory directory
-(`~/.claude/projects/-Users-rane-code-trading/memory/`) — decisions affecting
-the other project still belong in these repo docs (the inter-session API), not
-only in session memory, since memory doesn't survive a fresh conversation the
-way a committed doc does.
+Both projects can share one Claude Code session and one memory directory —
+decisions affecting the other project still belong in these repo docs (the
+inter-session API), not only in session memory, since memory doesn't survive
+a fresh conversation the way a committed doc does.
 
-Research boundary: ideas graduate from stockey's historical experiments to
-systrader by **re-implementation as storied rules through `research/LEDGER.md`**
-— never by copying code. Any research findings here that touch shared NSE data
-must be exportable as trial counts (systrader's multiple-testing bar depends on
-knowing every experiment the data has been asked) — this was done for the
-2026-06/07 stockey-session experiments plus 4 more batches found during the
-2026-08-05 Phase 3 evidence export (`systrader/research/imports/`); LEDGER rows
-1-9 are current as of that export.
+Research boundary: ideas graduate from stockey's experiments to systrader by
+**re-implementation as storied rules through `research/LEDGER.md`** — never by
+copying code. Any research findings here that touch shared NSE data must be
+exportable as trial counts (systrader's multiple-testing bar depends on
+knowing every experiment the data has been asked).

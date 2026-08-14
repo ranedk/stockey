@@ -1,16 +1,15 @@
 # Data Coverage & Completeness
 
-Point-in-time snapshot from the 2026-08-05 completeness sweep, plus the
-mechanism that keeps it current going forward. See `docs/DATA_INVENTORY.md`
-for the authoritative table-ownership list this document assumes.
+See `docs/DATA_INVENTORY.md` for the authoritative table-ownership list this
+document assumes.
 
 ## Live tool
 
-`scripts/data_coverage_report.py` runs the same checks below automatically —
-row counts, symbol/entity coverage, date range, and a staleness verdict for
-tables expected to advance every trading day. It writes one row per table per
-day to `data_coverage_report` (so trends are queryable over time) and prints a
-text/JSON summary for cron logs.
+`scripts/data_coverage_report.py` is the source of truth for current
+coverage — row counts, symbol/entity coverage, date range, and a staleness
+verdict for tables expected to advance every trading day. It writes one row
+per table per day to `data_coverage_report` (so trends are queryable over
+time) and prints a text/JSON summary for cron logs.
 
 ```sh
 python -m scripts.data_coverage_report                 # text, persists to the DB
@@ -19,121 +18,82 @@ python -m scripts.data_coverage_report --no-persist     # dry run
 python -m scripts.data_coverage_report --require        # exit 1 if any table is in "error"
 ```
 
-Scheduled nightly at 22:40 (`all_data_coverage_report.sh`, right after
-`all_data_readiness.sh`) — see `config/stockey.crontab.template`.
-
-**This document is a snapshot, not a substitute for running the tool.** Treat
-every number below as "true as of 2026-08-05" — check `data_coverage_report`
-or re-run the script for current state.
+Scheduled nightly (`all_data_coverage_report.sh`, right after
+`all_data_readiness.sh`) — see `config/stockey.crontab.template`. This
+document explains what each table category is and its known, permanent
+quirks; run the tool for current numbers.
 
 ## Table categories and what's inside them
 
 ### NSE bhavcopy (daily price/turnover/circuit data)
-`nseindia_ohlcv` (OHLC + volume, the base equity series, 2013+, ~7,150
-symbols), `nseindia_mcap`, `nseindia_mto` (delivery volume), `nseindia_52wk`
-(52-week hi/lo), `nseindia_cmvolt` (realized volatility), `nseindia_circuit_hit`,
+`nseindia_ohlcv` (OHLC + volume, the base equity series, 2013+), `nseindia_mcap`,
+`nseindia_mto` (delivery volume), `nseindia_52wk` (52-week hi/lo),
+`nseindia_cmvolt` (realized volatility), `nseindia_circuit_hit`,
 `nseindia_cat_turnover` (FII/DII category turnover, parsed from a separate NSE
 Excel workbook), `nseindia_catg` (impact cost by category), `nseindia_var1`
 (VaR margin — spans equity/bonds/SME/govt-securities/MF, not equity-only,
-hence its much larger symbol count), `nseindia_short_selling` (NSE only
-started publishing this in mid-2025).
+hence its much larger symbol count than the equity tables), `nseindia_short_selling`,
+`nseindia_block_deals`, `nseindia_bulk_deals`.
 
-**Gap:** `nseindia_mcap` only starts 2024-02-01 and `nseindia_52wk` only
-starts 2019-10-17 — both well short of the 2013 bhavcopy baseline. Not fixed
-here; flagged for a decision on whether backfill is worth pursuing.
+`nseindia_mcap` starts 2024-02-01 and `nseindia_52wk` starts 2019-10-17 —
+both well short of the 2013 bhavcopy baseline; `historical_mcap` (a frozen
+archive) covers pre-2024 market cap where `nseindia_mcap` doesn't.
 
 ### NSE corporate actions
-`nseindia_corporate_actions_bc_raw` (the real, comprehensive source — parsed
-from the bhavcopy CA feed, ~5,700 symbols) and `nseindia_corporate_actions_normalized`
-(derived from it via `data/nseindia/adjusted_prices.py`,
-detects split/bonus/etc. and feeds `data/dhanlive/ohlcv.py`'s
-recent-adjustment check). `events_dividend` / `events_capital_change` cover
-dividends and capital changes separately (~19% of `events_dividend` rows lack
-`dividend_amount` — handle nulls in any TR math).
-
-**Fixed 2026-08-05:** `nseindia_corporate_actions_normalized` was silently
-1+ year stale because nothing ever scheduled its writer — only ever run
-manually. Now runs daily in `download_runner.PARSER_STEPS`.
-
-**Also removed:** the plain `nseindia_corporate_actions` table/collector was
-dropped from the KEEP set — it ran full NSE browser automation daily but only
-ever covered 2 placeholder symbols in `config/tracked_symbols.txt`, entirely
-superseded by `_bc_raw`.
+`nseindia_corporate_actions_bc_raw` (the comprehensive source — parsed from
+the bhavcopy CA feed) and `nseindia_corporate_actions_normalized` (derived
+from it via `data/nseindia/adjusted_prices.py`, detects split/bonus/etc. and
+feeds `data/dhanlive/ohlcv.py`'s recent-adjustment check). `events_dividend`
+/ `events_capital_change` cover dividends and capital changes separately — a
+minority of `events_dividend` rows lack `dividend_amount`, handle nulls in
+any TR math.
 
 ### Price adjustment (systrader's PRIMARY series)
-`advisory_adjusted_ohlcv_daily` is a view over raw `nseindia_ohlcv` joined with
-`nseindia_adjustment_factors` (`data/nseindia/price_adjustment.py`) — split/bonus
-factor derived purely from price steps, corroborated by declared NSE corporate
-actions where available; total-return factor derived from `events_dividend`.
-2013+, ~3,970 symbols, current — always in sync with `nseindia_ohlcv` since
-nothing is separately written for the adjusted series itself.
+`advisory_adjusted_ohlcv_daily` is a view over raw `nseindia_ohlcv` joined
+with `nseindia_adjustment_factors` (`data/nseindia/price_adjustment.py`) —
+split/bonus factor derived purely from price steps, corroborated by declared
+NSE corporate actions where available; total-return factor derived from
+`events_dividend`. Always in sync with `nseindia_ohlcv` since nothing is
+separately written for the adjusted series itself.
 
 ### NSE indices / calendar
-`nseindia_indices` (2014+, 226 index names, current). `nseindia_holidays` /
-`dim_trading_days` are forward-looking reference data by design — a "stale"
-max date here is normal, not a bug (they cover the calendar year ahead).
+`nseindia_indices`. `nseindia_holidays` / `dim_trading_days` are
+forward-looking reference data by design — a "stale" max date here is
+normal, not a bug (they cover the calendar year ahead).
 
 ### Dhan broker
-`master_dhan_instruments` (the full instrument master — 757K rows, ~400K
-distinct `symbol_name` because it includes every F&O strike/expiry
-combination, not just equities), `dhan_ohlcv_daily` (2015+, fallback series),
-`dhan_ohlcv_intraday` (1-min bars, live since 2025-09-22, 22M+ rows — see
-`DATA_CONTRACT.md`'s correction: this landed in the cloud DB, not the local-only
-landing zone originally proposed, and systrader doesn't currently sync it).
+`master_dhan_instruments` (the full instrument master — includes every F&O
+strike/expiry combination, not just equities, so its distinct-symbol count is
+much larger than the equity universe), `dhan_ohlcv_daily` (fallback series),
+`dhan_ohlcv_intraday` (1-min bars — lives in the cloud DB, not currently
+synced to systrader; see `DATA_CONTRACT.md`'s open item).
 
 ### RBI/FBIL
-`rbi_bank_rates` (a rate-*change* log back to 1935, not a daily series — sparse
-gaps between entries are correct, RBI just hasn't moved the repo/bank rate),
-`rbi_currency_rates`, `fbil_gsec_par`, `fbil_gsec_quote`.
-
-**Fixed 2026-08-05:** `rbi_currency_rates` was 12 days stale because
-`data/rbi/download_currency_rates.py` had **never** been registered in
-`download_runner.DOWNLOADER_STEPS` in this file's entire git history — only
-ever run manually. Now scheduled daily.
+`rbi_bank_rates` (a rate-*change* log back to 1935, not a daily series —
+sparse gaps between entries are correct, RBI just hasn't moved the repo/bank
+rate), `rbi_currency_rates`, `fbil_gsec_par`, `fbil_gsec_quote`.
 
 ### Identity
-`company_master`, `dim_security` (identity mapping; `effective_from` tops out
-2026-02-09 — worth checking whether anything listed since then is missing an
-identity record).
-
-### Sharpely mcap slice — removed 2026-08-14
-`data/sharpelydata/sharpely_data.py` and the `mcap` DOWNLOADER_STEPS entry are
-gone. It had regressed to reading its symbol list from `config/tracked_symbols.txt`
-(a 2-symbol placeholder, unnoticed for ~5 months) with zero downstream consumers;
-`nseindia_mcap` (bhavcopy parser, free byproduct of the daily download) covers the
-same point-in-time universe for 2024-02+. `historical_mcap` (2012+, 973 symbols,
-narrower than `nseindia_mcap`'s ~3,300) held real pre-2024 history not available
-anywhere else — kept as a frozen archive (2026-08-14 decision), no longer written.
+`company_master`, `dim_security` (identity mapping).
 
 ## Known, understood, not-a-bug gaps
 
-- `rbi_bank_rates` "staleness" — see above, it's a change log.
+- `rbi_bank_rates` "staleness" — it's a change log, see above.
 - `nseindia_holidays`/`dim_trading_days` "staleness" — forward-looking by
   design.
-- `nseindia_short_selling` starting mid-2025 — reflects when NSE began
-  publishing the disclosure.
+- `nseindia_short_selling` only starting mid-2025 — reflects when NSE began
+  publishing that disclosure.
 - `nseindia_var1`'s large symbol count — legitimate breadth (equity + bonds +
-  SME + govt securities + MF units), verified via series-code breakdown.
-- `nseindia_cat_turnover` gaps — **corrected 2026-08-10.** Not "occasionally
-  corrupt" — NSE simply doesn't include `cat_turnover_*.xls` (and
-  `Margintrdg_*.zip`, always the same pair) in the bhavcopy archive every
-  trading day. Confirmed by diffing the actual zip contents of two ordinary
-  2026-07 trading days: one had 22 files (no cat_turnover), the other 24
-  (with it) — no error, no corruption, the file just wasn't generated that
-  day. Coverage also genuinely dropped: ~95-100% through 2025, ~30% from
-  2026-04 onward (real shift in NSE's publishing cadence, not a parser
-  regression). `data_coverage_report.py` reclassified it "informational"
-  (like `nseindia_short_selling`) instead of "daily" — it was alerting on a
-  source that was never actually daily.
+  SME + govt securities + MF units).
+- `nseindia_cat_turnover` gaps — NSE doesn't include
+  `cat_turnover_*.xls`/`Margintrdg_*.zip` in the bhavcopy archive every
+  trading day; coverage genuinely varies by period, not a parser bug.
+  `data_coverage_report.py` classifies it "informational" rather than
+  "daily" for this reason.
 
-## Still open (not resolved by this pass)
+## Still open
 
 - `nseindia_mcap` / `nseindia_52wk` history gaps (2024/2019 starts vs. 2013
   baseline) — decide whether backfilling is worth it.
 - `dhan_ohlcv_intraday` living in the cloud DB rather than locally, and not
   synced to systrader at all — see `DATA_CONTRACT.md`'s open item.
-- `dim_security` identity-mapping freshness for anything listed since
-  2026-02-09.
-- Broader `docs/` cleanup — several files (`advisory_manual.md`,
-  `llm_decision_authority.md`, `hypothesis_*.md`, `operator_*.md`, and
-  similar) still describe the pre-2026-07-27 advisory system.

@@ -35,10 +35,6 @@ class RetentionTable:
     description: str
 
 
-# 2026-08-14 cloud-DB cleanup (Phase 5 of PURE_TA_MIGRATION_PLAN.md, finally executed):
-# dropped advisory_intraday_features_daily/decision_traces/decision_trace_steps/
-# event_processing_runs/action_conflicts/trace_summaries -- their code was already gone
-# (Phase 4), this script had stayed retention-aware of tables nothing wrote anymore.
 RETENTION_TABLES: dict[str, RetentionTable] = {
     "dhan_ohlcv_intraday": RetentionTable(
         table_name="dhan_ohlcv_intraday",

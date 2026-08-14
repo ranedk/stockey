@@ -6,12 +6,11 @@ calendar, Dhan broker, and RBI/FBIL rate data, then writes it to the cloud
 Postgres for `systrader` (the sibling research/trading repo) to consume. It
 does no research, signal generation, backtesting, sizing, execution,
 fundamental analysis, news/announcement processing, or LLM-token consumption
-— all of that lives in `systrader` now (operator decision 2026-07-27).
+— all of that lives in `systrader`.
 
 See `CLAUDE.md` for the full operating guide, `docs/DATA_INVENTORY.md` for the
-authoritative keep/remove table+module inventory, `docs/DATA_COVERAGE.md` for
-what's inside each kept table and its coverage, and `docs/PURE_TA_MIGRATION_PLAN.md`
-for how the cut happened. `DATA_CONTRACT.md` is the boundary contract with
+collector/table inventory, and `docs/DATA_COVERAGE.md` for what's inside each
+table and its coverage. `DATA_CONTRACT.md` is the boundary contract with
 systrader (table API, cloud-DB load rule, Dhan auth handoff).
 
 ## Pipeline

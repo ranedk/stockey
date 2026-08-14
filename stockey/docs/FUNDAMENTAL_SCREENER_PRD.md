@@ -41,13 +41,12 @@ Two products, two standards of evidence:
   returns, and keeps a human at L4 committing to a falsifiable thesis before
   any capital moves.
 
-The prior attempt at this (deleted in the 2026-07-27 pure-TA migration,
-`docs/PURE_TA_MIGRATION_PLAN.md`) failed by conflating four different
-epistemic categories into one automated pipeline: raw collection,
-fundamental state, backtested technical signals, and LLM-assisted judgment,
-all feeding one execution engine. `docs/DATA_INVENTORY.md`'s postmortem:
-*"no robust cross-regime selection alpha... news/announcement pipelines burn
-LLM tokens with no backtestable output."*
+A prior attempt at this failed by conflating four different epistemic
+categories into one automated pipeline: raw collection, fundamental state,
+backtested technical signals, and LLM-assisted judgment, all feeding one
+execution engine — no robust cross-regime selection alpha, and LLM-driven
+news/announcement pipelines burned tokens with no backtestable output. This
+PRD keeps those categories separate on purpose.
 
 **The one rule that matters more than any other in this document: this
 screener and systrader's systematic engine never merge into one decision
