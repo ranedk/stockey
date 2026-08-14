@@ -1,11 +1,13 @@
-"""Price-data sanity audit -- institutionalizes the price/adjustment bug hunt (2026-07-13).
+"""Price-data sanity audit -- institutionalizes the price/adjustment bug hunt.
 
-Every backtest depends on nseindia_ohlcv. This session found five silent data issues that quietly
-distorted results: corporate-action splits on UNADJUSTED prices counted as real -90% losses; EQ->BE
-(Trade-to-Trade) migrations dropped by EQ-only queries; cross-source (nseindia vs dhan) adjustment
-mismatches; an unpopulated adjusted-price table; and benchmark-calendar gaps that misalign excess
-windows. This audit surfaces all five on the raw data, so any consumer knows the hazards BEFORE it
-computes returns -- rather than each backtest rediscovering them by hand.
+Every backtest depends on nseindia_ohlcv. This surfaces silent data issues that can quietly distort
+returns: corporate-action splits on UNADJUSTED prices counted as real -90% losses; EQ->BE (Trade-to-
+Trade) migrations dropped by EQ-only queries; cross-source (nseindia vs dhan) adjustment mismatches; an
+unpopulated adjusted-price table; detected split/bonus events that don't independently corroborate
+against Dhan's own raw data (a real misclassification risk -- a demerger/rights issue/scheme of
+arrangement can produce a price step that coincidentally looks like a split); and benchmark-calendar
+gaps that misalign excess windows. This audit surfaces all of these on the raw data, so any consumer
+knows the hazards BEFORE it computes returns -- rather than each backtest rediscovering them by hand.
 
 Read-only. Model: scripts/funnel_invariants.py (Finding / build_report / format_text_report / main).
 Run: `python scripts/price_data_sanity.py --format text`. DB checks are best-effort (a clean skip if
@@ -24,6 +26,7 @@ CA_STEP_HIGH = 1.5
 LOOKBACK_DAYS = 250
 CROSS_SOURCE_MISMATCH_PCT = 0.10
 ADJUSTED_TABLE_MIN_SYMBOLS = 100  # below this, advisory_adjusted_ohlcv_daily is unusable for adjustment
+SPLIT_CROSSCHECK_TOLERANCE = 0.05  # allowed drift between our detected split ratio and Dhan's own raw step
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,57 @@ def build_report(*, lookback_days: int = LOOKBACK_DAYS) -> dict[str, object]:
     except Exception as exc:
         findings.append(Finding("warning", "adjusted_table_check_failed", str(exc)[:150]))
 
-    # 5. benchmark-calendar gaps: EQ trading days with no NIFTY bar in EITHER source (nseindia_indices or
+    # 5. detected split/bonus events cross-checked against Dhan's independent raw data. Dhan is NOT a
+    # simple "always raw" source to diff day-over-day: confirmed live, Dhan often pre-adjusts a symbol's
+    # history a few days early/late relative to NSE's official ex-date once it becomes aware of a split
+    # (via its own re-fetch cadence), so a strict single-day step comparison flags ordinary trading noise
+    # as a false mismatch. Using a +/-3-day median window instead absorbs that misalignment. A genuine
+    # mismatch is one where Dhan's window ratio matches NEITHER our detected nse_ratio (Dhan agrees on the
+    # step, just not yet applied) NOR ~1.0 (Dhan already smoothly adjusted) -- confirmed live: this exact
+    # check caught VIVIMEDLAB 2025-12-18's nse_ratio of 28.0 as bogus (a previous_close of Rs 1.00 against
+    # a ~Rs 27 stock -- a bad source row that happened to snap to a round ratio, no declared CA either),
+    # while correctly clearing dozens of real splits Dhan had already smoothed over.
+    try:
+        r = _one(f"""
+            WITH events AS (
+                SELECT symbol, date FROM nseindia_adjustment_factors
+                WHERE ca_flag IN ('split_bonus', 'split_bonus_ca') AND date >= {since}
+            ),
+            nse_ratios AS (
+                SELECT symbol, date, open / NULLIF(previous_close, 0) AS nse_ratio
+                FROM nseindia_ohlcv WHERE series IN ('EQ', 'BE') AND symbol IN (SELECT symbol FROM events)
+            ),
+            dhan_window AS (
+                SELECT e.symbol, e.date,
+                       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.close)
+                         FILTER (WHERE d.date < e.date) AS pre_median,
+                       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.close)
+                         FILTER (WHERE d.date >= e.date) AS post_median
+                FROM events e
+                JOIN dhan_ohlcv_daily d ON d.ticker = e.symbol
+                    AND d.date BETWEEN e.date - INTERVAL '3 days' AND e.date + INTERVAL '3 days'
+                GROUP BY e.symbol, e.date
+            )
+            SELECT COUNT(*) mismatches, COUNT(*) FILTER (WHERE w.symbol IS NULL) no_dhan_coverage
+            FROM events e
+            JOIN nse_ratios n ON n.symbol = e.symbol AND n.date = e.date
+            LEFT JOIN dhan_window w ON w.symbol = e.symbol AND w.date = e.date
+            WHERE w.symbol IS NULL
+               OR (
+                    ABS(w.post_median / NULLIF(w.pre_median, 0) - n.nse_ratio) > {SPLIT_CROSSCHECK_TOLERANCE} * GREATEST(n.nse_ratio, 1)
+                    AND ABS(w.post_median / NULLIF(w.pre_median, 0) - 1.0) > {SPLIT_CROSSCHECK_TOLERANCE}
+                  )""")
+        mismatches, no_dhan = int(r.iloc[0]["mismatches"]), int(r.iloc[0]["no_dhan_coverage"])
+        if mismatches:
+            findings.append(Finding("warning", "split_dhan_crosscheck_mismatch",
+                f"{mismatches} recent detected split/bonus events don't independently corroborate against "
+                f"Dhan's raw data ({no_dhan} of those have no Dhan coverage in the window at all) -- "
+                "re-verify these against the declared CA feed and raw prices before trusting "
+                "nseindia_adjustment_factors for them."))
+    except Exception as exc:
+        findings.append(Finding("warning", "split_dhan_crosscheck_failed", str(exc)[:150]))
+
+    # 6. benchmark-calendar gaps: EQ trading days with no NIFTY bar in EITHER source (nseindia_indices or
     # dhan's NIFTY INDEX, which _load_benchmark now gap-fills from). A residual gap is a genuine data hole.  [ERROR]
     try:
         r = _one(f"""

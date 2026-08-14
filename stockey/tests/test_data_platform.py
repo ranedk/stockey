@@ -1088,7 +1088,52 @@ def test_company_master_preserves_index_for_non_contiguous_series(monkeypatch):
     df = pd.DataFrame({"symbol": tickers})
     df["company_master_id"] = out
     assert df.loc[14, "company_master_id"] == "nse:AARNAV"
-    assert df.loc[22, "company_master_id"] == "nse:AASTHA"
+
+
+def test_map_company_master_ids_nse_or_bse_falls_back_and_flags_residual(monkeypatch):
+    # 2026-08-14 bug found live: ~25% of the fundamentals L1 universe (screener.in,
+    # exchange-ambiguous tickers) failed a plain exchange="NSE" match with zero
+    # visibility -- most turned out to have a real company_master row all along, just
+    # keyed under bse_ticker (screener.in reports a company's BSE scrip code even when
+    # it's genuinely NSE-listed). NSE resolves first; only what's STILL missing after
+    # the BSE fallback gets a fallback_telemetry event (the true residual gap, not the
+    # common recoverable case).
+    def fake_map(tickers, *, exchange):
+        table = {
+            "NSE": {"CAPRIHANS": "nse:CAPRIHANS"},          # NSE-listed, resolves directly
+            "BSE": {"509486": "nse:CAPRIHANS", "531977": "nse:CHLOGIST"},  # BSE-code-reported cases
+        }[exchange]
+        return pd.Series([table.get(t, pd.NA) for t in tickers], index=tickers.index, dtype="string")
+
+    monkeypatch.setattr(company_master_utils, "map_company_master_ids", fake_map)
+    events = []
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    tickers = pd.Series(["CAPRIHANS", "509486", "531977", "TRULYUNKNOWN"], index=[0, 1, 2, 3])
+    out = company_master_utils.map_company_master_ids_nse_or_bse(tickers)
+
+    assert out.loc[0] == "nse:CAPRIHANS"   # resolved directly via NSE
+    assert out.loc[1] == "nse:CAPRIHANS"   # BSE-code-for-an-NSE-company, recovered via fallback
+    assert out.loc[2] == "nse:CHLOGIST"    # same
+    assert pd.isna(out.loc[3])             # genuinely unknown either way
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "identity_unresolved_nse_and_bse"
+    assert events[0]["metadata"]["tickers"] == ["TRULYUNKNOWN"]
+
+
+def test_map_company_master_ids_nse_or_bse_no_telemetry_when_all_resolve(monkeypatch):
+    monkeypatch.setattr(
+        company_master_utils, "map_company_master_ids",
+        lambda tickers, *, exchange: pd.Series(["nse:X"] * len(tickers), index=tickers.index, dtype="string"),
+    )
+    events = []
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    out = company_master_utils.map_company_master_ids_nse_or_bse(pd.Series(["X"], index=[0]))
+
+    assert out.loc[0] == "nse:X"
+    assert events == []
 
 
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
@@ -6315,6 +6360,62 @@ def test_price_adjustment_declared_ca_fixes_missed_split():
     assert (a2["cum_adj_factor"] == 1.0).all() and (a2["ca_flag"] == "").all()
 
 
+def test_price_adjustment_declared_non_split_ca_blocks_price_snap():
+    # 2026-08-14 bug found live: a demerger, rights issue, or scheme of arrangement can produce a price
+    # step that coincidentally snaps to a round ratio -- confirmed live for TATAMOTORS/SIEMENS/RAYMOND/IDFC
+    # (demergers), CALSOFT/RSWM/IDEA (rights issues), and 11 more (schemes of arrangement), all wrongly
+    # classified 'split_bonus' by the price-snap heuristic alone. TRIVENI's actual 2026-07-22 demerger:
+    # 471.50 -> 289.95 open, ratio 0.6149 snaps cleanly to 3/5 -- a real round ratio, but NOT a split.
+    import datetime as _dt
+    from data.nseindia import price_adjustment as pa
+
+    df = pd.DataFrame({
+        "symbol": ["TRIVENI", "TRIVENI"],
+        "date": pd.to_datetime(["2026-07-21", "2026-07-22"], utc=True),
+        "open": [469.65, 289.95], "close": [471.50, 275.50],
+    })
+    # without the guard, this round-ratio step would be misread as a split (matches _snap_event_ratio's
+    # own logic -- confirm the un-guarded baseline actually would have misclassified it)
+    unguarded = pa.adjust_frame(df.copy())
+    assert unguarded.sort_values("date").iloc[1]["ca_flag"] == "split_bonus"
+
+    non_split = {("TRIVENI", _dt.date(2026, 7, 22))}
+    guarded = pa.adjust_frame(df.copy(), declared_non_split_dates=non_split).sort_values("date").reset_index(drop=True)
+    assert guarded.loc[1, "ca_flag"] == "declared_non_split_ca"
+    assert (guarded["cum_adj_factor"] == 1.0).all()  # NOT adjusted -- the demerger's real value change stays visible
+
+    # a declared split/bonus ratio still wins over a non-split date for the SAME key (shouldn't co-occur in
+    # practice -- load_declared_ca_ratios() puts every date in exactly one bucket -- but declared_ratios must
+    # take priority if it ever does)
+    both = pa.adjust_frame(
+        df.copy(),
+        declared_ratios={("TRIVENI", _dt.date(2026, 7, 22)): 0.6},
+        declared_non_split_dates=non_split,
+    ).sort_values("date").reset_index(drop=True)
+    assert both.loc[1, "ca_flag"] == "split_bonus_ca"
+
+
+def test_load_declared_ca_ratios_separates_split_bonus_from_other_declared_actions(monkeypatch):
+    from data.nseindia import price_adjustment as pa
+    import datetime as _dt
+
+    rows = pd.DataFrame({
+        "symbol": ["A", "B", "C", "D"],
+        "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"], utc=True),
+        "subject": ["BONUS 1:1", "DEMERGER", "RIGHTS 1:1 @ PRM RS 10", "SCHEME OF ARRANGEMENT"],
+    })
+    monkeypatch.setattr("utils.db.sql_to_df", lambda query: rows)
+
+    ratios, non_split_dates = pa.load_declared_ca_ratios()
+
+    assert ratios == {("A", _dt.date(2026, 1, 1)): 0.5}
+    assert non_split_dates == {
+        ("B", _dt.date(2026, 1, 2)),
+        ("C", _dt.date(2026, 1, 3)),
+        ("D", _dt.date(2026, 1, 4)),
+    }
+
+
 def test_compute_total_return_factor_back_adjusts_pre_dividend_history():
     # 2026-08-14 redesign: TR factor derived from events_dividend, not re-parsed CA text. A Rs 5 dividend
     # on 2026-01-03 (prev_close 100) -> daily factor 0.95; pre-ex-date history is back-adjusted by it,
@@ -6384,7 +6485,7 @@ def test_build_adjustment_factors_writes_compact_table(monkeypatch):
     import utils.db as db_module
     monkeypatch.setattr(db_module, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(db_module, "upsert_to_db", fake_upsert)
-    monkeypatch.setattr(pa, "load_declared_ca_ratios", lambda: {})
+    monkeypatch.setattr(pa, "load_declared_ca_ratios", lambda: ({}, set()))
     monkeypatch.setattr(pa, "ensure_factors_table", lambda: None)
     view_calls = []
     monkeypatch.setattr(pa, "ensure_view", lambda: view_calls.append(True))
@@ -6458,6 +6559,10 @@ def test_price_data_sanity_report_contract():
     assert "status: error" in text and "unadjusted_corporate_actions" in text and "benchmark_calendar_gaps" in text
     # thresholds are the shared circuit-band convention (a split is a >35% single-day step)
     assert pds.CA_STEP_LOW < 0.7 and pds.CA_STEP_HIGH > 1.3
+    # split/bonus events must independently corroborate against Dhan within a sane tolerance -- not so
+    # tight it flags ordinary trading noise (Dhan often pre/post-adjusts a symbol a few days off NSE's
+    # official ex-date), not so loose it misses a real mismatch
+    assert 0.02 <= pds.SPLIT_CROSSCHECK_TOLERANCE <= 0.10
 
 
 
@@ -9543,7 +9648,7 @@ def test_resolve_company_identity_joins_on_ticker_and_preserves_index(monkeypatc
     tickers = pd.Series(["AAREYDRUGS", "UNKNOWNTICKER"], index=[5, 9])
     monkeypatch.setattr(
         fundamentals_bse_announcements,
-        "map_company_master_ids",
+        "map_company_master_ids_nse_or_bse",
         lambda series, **k: pd.Series(["nse:AAREYDRUGS", pd.NA], index=series.index, dtype="string"),
     )
     monkeypatch.setattr(
@@ -10202,7 +10307,7 @@ def test_build_pit_row_matches_a_real_captured_disclosure():
 def test_resolve_company_identity_uses_events_store_helpers(monkeypatch):
     tickers = pd.Series(["AAREYDRUGS"], index=[0])
     monkeypatch.setattr(
-        fundamentals_nse_pit, "map_company_master_ids", lambda series, **k: pd.Series(["nse:AAREYDRUGS"], index=series.index, dtype="string")
+        fundamentals_nse_pit, "map_company_master_ids_nse_or_bse", lambda series, **k: pd.Series(["nse:AAREYDRUGS"], index=series.index, dtype="string")
     )
     monkeypatch.setattr(fundamentals_nse_pit, "resolve_isin", lambda cmids: pd.Series(["INE198H01019"], index=cmids.index))
     monkeypatch.setattr(fundamentals_nse_pit, "resolve_issuer_names", lambda cmids: pd.Series(["Aarey Drugs & Pharmaceuticals"], index=cmids.index))

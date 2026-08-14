@@ -60,16 +60,25 @@ def _factor_for_events(events: set[tuple[str, int, int]]) -> float | None:
     return factor
 
 
-def load_declared_ca_ratios() -> dict[tuple[str, Any], float]:
-    """Map (symbol, ex-date) -> declared split/bonus price factor from nseindia_corporate_actions_bc_raw.
-    Duplicate declarations (same event listed per series) dedupe; genuinely distinct same-day events
-    (a bonus AND a split) multiply. Only ratios that move the price >2% are kept (a real CA)."""
+def load_declared_ca_ratios() -> tuple[dict[tuple[str, Any], float], set[tuple[str, Any]]]:
+    """Map (symbol, ex-date) -> declared split/bonus price factor from nseindia_corporate_actions_bc_raw,
+    plus the set of (symbol, ex-date) that had a declared corporate action but NOT a split/bonus one
+    (demerger, rights issue, scheme of arrangement, ...). Duplicate declarations (same event listed per
+    series) dedupe; genuinely distinct same-day events (a bonus AND a split) multiply. Only ratios that
+    move the price >2% are kept (a real CA).
+
+    The second set exists because a demerger, rights issue, or scheme of arrangement can ALSO produce a
+    price step that happens to snap to a round ratio by coincidence (confirmed live: TATAMOTORS, SIEMENS,
+    RAYMOND, IDFC and 17 more demergers, 9 rights issues, 11 schemes of arrangement were all found
+    misclassified as split_bonus by the price-snap heuristic alone, in the PRIMARY series). A declared
+    non-split reason for a circuit-breaching date is stronger evidence than a coincidental round ratio --
+    adjust_frame() must not let the price-snap fallback override it."""
     from utils.db import sql_to_df
     df = sql_to_df(
         "SELECT symbol, date, subject FROM nseindia_corporate_actions_bc_raw WHERE subject IS NOT NULL"
     )
     if df.empty:
-        return {}
+        return {}, set()
     dates = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.date
     events_by_key: dict[tuple[str, Any], set[tuple[str, int, int]]] = {}
     for sym, dt, subj in zip(df["symbol"], dates, df["subject"]):
@@ -77,11 +86,14 @@ def load_declared_ca_ratios() -> dict[tuple[str, Any], float]:
             continue
         events_by_key.setdefault((sym, dt), set()).update(_events_from_subject(subj))
     ratios: dict[tuple[str, Any], float] = {}
+    non_split_dates: set[tuple[str, Any]] = set()
     for key, events in events_by_key.items():
         f = _factor_for_events(events)
         if f is not None and f > 0 and abs(f - 1.0) > 0.02:
             ratios[key] = f
-    return ratios
+        else:
+            non_split_dates.add(key)  # a subject WAS declared for this date, just not a split/bonus one
+    return ratios, non_split_dates
 
 # a single-day close step beyond the widest Indian circuit band (~20%) is a CA or data artifact
 CIRCUIT_STEP_LOW = 0.65
@@ -108,7 +120,8 @@ def _snap_event_ratio(price_ratio: float) -> float | None:
 
 def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str = "date",
                  close_col: str = "close", open_col: str = "open",
-                 declared_ratios: dict[tuple[str, Any], float] | None = None) -> pd.DataFrame:
+                 declared_ratios: dict[tuple[str, Any], float] | None = None,
+                 declared_non_split_dates: set[tuple[str, Any]] | None = None) -> pd.DataFrame:
     """Return df with `cum_adj_factor`, `adj_close`, and `ca_flag` per row.
 
     CA detection uses the ex-date OVERNIGHT gap `open[t] / close[t-1]` -- the PURE split/bonus factor, since
@@ -121,8 +134,19 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
     circuit-breaching step whose date matches a declared split/bonus uses that EXACT ratio -- fixing the
     cases the price-only snap misses (a 1:1 bonus that also moved a few %, or ratios absent from the round
     set). Only breaching rows consult it, so a declared CA with no price step is never applied (no
-    double-adjust). `ca_flag`: 'split_bonus_ca' (declared-confirmed), 'split_bonus' (price-snapped),
-    'ambiguous' (breach, neither -> possible data error, NOT adjusted), else ''.
+    double-adjust).
+
+    `declared_non_split_dates` (also from the Bc feed) is the opposite guard: a circuit-breaching step whose
+    date has a declared corporate action that is NOT a split/bonus (demerger, rights issue, scheme of
+    arrangement, ...) must not be guessed at by the round-ratio snap just because the ratio happens to look
+    clean -- confirmed live: TATAMOTORS/SIEMENS/RAYMOND/IDFC and 17 more demergers, 9 rights issues, and 11
+    schemes of arrangement were all being misclassified as split_bonus this way. Checked AFTER
+    `declared_ratios` (a declared split/bonus always wins) and BEFORE the price-snap fallback.
+
+    `ca_flag`: 'split_bonus_ca' (declared-confirmed split/bonus), 'split_bonus' (price-snapped, no
+    declared CA either way), 'declared_non_split_ca' (breach, but NSE declared a different, non-split
+    reason -- NOT adjusted), 'ambiguous' (breach, no declared CA and no round-ratio match -> possible data
+    error, NOT adjusted), else ''.
     """
     if df.empty:
         return df.assign(cum_adj_factor=[], adj_close=[], ca_flag=[])
@@ -137,12 +161,11 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
         price_ratio = close_ratio
     breach = (price_ratio < CIRCUIT_STEP_LOW) | (price_ratio > CIRCUIT_STEP_HIGH)
 
+    row_keys = list(zip(out[symbol_col].to_numpy(), pd.to_datetime(out[date_col], utc=True).dt.date.to_numpy()))
+
     # per-row declared-CA ratio, aligned to `out` (NaN where none) -- vectorized left-merge preserves order
     if declared_ratios:
-        keys = pd.DataFrame({
-            "__sym": out[symbol_col].to_numpy(),
-            "__dt": pd.to_datetime(out[date_col], utc=True).dt.date.to_numpy(),
-        })
+        keys = pd.DataFrame({"__sym": [k[0] for k in row_keys], "__dt": [k[1] for k in row_keys]})
         dr = pd.DataFrame([(s, d, f) for (s, d), f in declared_ratios.items()],
                           columns=["__sym", "__dt", "__declared"])
         declared_col = keys.merge(dr, on=["__sym", "__dt"], how="left", sort=False)["__declared"].to_numpy()
@@ -157,6 +180,9 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
         if np.isfinite(declared) and declared > 0:
             event_ratio[i] = declared            # NSE-declared split/bonus -> exact, ground-truth ratio
             ca_flag[i] = "split_bonus_ca"
+            continue
+        if declared_non_split_dates and row_keys[i] in declared_non_split_dates:
+            ca_flag[i] = "declared_non_split_ca"  # NSE declared a non-split reason -- do not guess "split"
             continue
         snapped = _snap_event_ratio(float(price_ratio[i]))
         if snapped is None:
@@ -312,8 +338,10 @@ def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
     if raw.empty:
         return {"rows": 0}
     raw["date"] = pd.to_datetime(raw["date"], utc=True, errors="coerce")
-    declared_ratios = load_declared_ca_ratios()  # NSE Bc feed confirms/supplies ratios the price snap misses
-    adj = adjust_frame(raw, declared_ratios=declared_ratios)  # price-step + declared-CA back-adjustment
+    # NSE Bc feed confirms/supplies ratios the price snap misses, AND vetoes the price snap where it would
+    # otherwise misclassify a demerger/rights issue/scheme of arrangement as a split (see adjust_frame's docstring)
+    declared_ratios, declared_non_split_dates = load_declared_ca_ratios()
+    adj = adjust_frame(raw, declared_ratios=declared_ratios, declared_non_split_dates=declared_non_split_dates)
 
     dividends = sql_to_df("SELECT symbol, ex_date, dividend_amount FROM events_dividend")
     adj["cum_total_return_factor"] = compute_total_return_factor(adj, dividends).to_numpy()
@@ -327,9 +355,11 @@ def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
         "rows": int(len(out)),
         "symbols": int(out["symbol"].nunique()),
         "declared_ca_ratios_loaded": int(len(declared_ratios)),
+        "declared_non_split_dates_loaded": int(len(declared_non_split_dates)),
         "dividend_events_loaded": int(len(dividends)),
         "split_bonus_events": int((adj["ca_flag"] == "split_bonus").sum()),
         "ca_confirmed_events": int((adj["ca_flag"] == "split_bonus_ca").sum()),
+        "declared_non_split_events": int((adj["ca_flag"] == "declared_non_split_ca").sum()),
         "ambiguous_flags": int((adj["ca_flag"] == "ambiguous").sum()),
         "price_adjusted_rows": int((out["cum_price_adjustment_factor"] != 1.0).sum()),
         "total_return_adjusted_rows": int((out["cum_total_return_factor"] != 1.0).sum()),

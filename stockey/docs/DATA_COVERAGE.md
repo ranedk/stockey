@@ -68,6 +68,15 @@ much larger than the equity universe), `dhan_ohlcv_daily` (fallback series),
 `dhan_ohlcv_intraday` (1-min bars — lives in the cloud DB, not currently
 synced to systrader; see `DATA_CONTRACT.md`'s open item).
 
+`dhan_ohlcv_daily` is neither purely raw nor continuously adjusted — Dhan
+applies its own split/bonus adjustment to a symbol's history whenever it
+re-syncs that symbol (triggered here by `has_recent_adjustment()`), but the
+timing can differ from NSE's official ex-date by a few days either way, and
+older history only reflects whatever was known as of Dhan's last re-fetch (a
+symbol with two splits may show only the more recent one applied to its
+oldest rows). `scripts/price_data_sanity.py`'s Dhan cross-check accounts for
+this with a multi-day window rather than a strict same-day comparison.
+
 ### RBI/FBIL
 `rbi_bank_rates` (a rate-*change* log back to 1935, not a daily series —
 sparse gaps between entries are correct, RBI just hasn't moved the repo/bank

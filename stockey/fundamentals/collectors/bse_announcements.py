@@ -69,7 +69,7 @@ from fundamentals.collectors.events_store import RESULTS_TABLE, resolve_isin, up
 from fundamentals.collectors.security_master import BSE_HEADERS
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
 from fundamentals.screens.l2_state import pull_crawl_forward
-from utils.company_master import map_company_master_ids
+from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
@@ -297,13 +297,17 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
 
 
 def resolve_company_identity(tickers: pd.Series) -> pd.DataFrame:
-    """NSE ticker (as stored in fundamentals_l1_universe) -> (company_master_id,
-    bse_scrip_code, isin), via company_master/dim_security -- reuses the step-0
-    backfill (fundamentals/collectors/security_master.py) rather than looking scrip
-    codes up again here, and fundamentals.collectors.events_store.resolve_isin for the
-    cross-source dedup key. Returns a DataFrame indexed like `tickers`, so callers can
-    `.join()` it straight onto their own frame."""
-    company_master_ids = map_company_master_ids(tickers, exchange="NSE")
+    """L1-universe ticker -> (company_master_id, bse_scrip_code, isin), via
+    company_master/dim_security -- reuses the step-0 backfill (fundamentals/
+    collectors/security_master.py) rather than looking scrip codes up again here, and
+    fundamentals.collectors.events_store.resolve_isin for the cross-source dedup key.
+    NSE first, BSE-ticker fallback (map_company_master_ids_nse_or_bse) since
+    screener.in can report a company's BSE scrip code even when it's genuinely
+    NSE-listed, and this module's whole job is BSE announcement crawling -- silently
+    dropping the identity here means the company never gets crawled at all. Returns a
+    DataFrame indexed like `tickers`, so callers can `.join()` it straight onto their
+    own frame."""
+    company_master_ids = map_company_master_ids_nse_or_bse(tickers)
     lookup_df = sql_to_df("SELECT company_master_id, bse_scrip_code FROM company_master WHERE bse_scrip_code IS NOT NULL")
     scrip_by_company_master_id = dict(zip(lookup_df["company_master_id"], lookup_df["bse_scrip_code"]))
     return pd.DataFrame(

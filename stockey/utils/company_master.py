@@ -193,6 +193,47 @@ def map_company_master_ids(tickers: Iterable[object], *, exchange: str) -> pd.Se
     return cleaned.map(mapping).astype("string")
 
 
+def map_company_master_ids_nse_or_bse(tickers: Iterable[object]) -> pd.Series:
+    """Resolve tickers that may be either an NSE symbol or a BSE numeric scrip code --
+    a cross-exchange source (screener.in and others) can return either for the same
+    company, and this repo's identity is keyed primarily by nse_ticker. Tries NSE
+    first, then falls back to bse_ticker for whatever's still unresolved.
+
+    Confirmed live 2026-08-14: ~25% of the fundamentals screener's L1 universe (52 of
+    191 tickers in one run) failed a plain exchange="NSE" match, with zero visibility
+    that it had happened -- map_company_master_ids() returns NA silently, no
+    fallback_telemetry event, no error. In a sample of 30, 24 actually had a real
+    company_master row all along, just keyed under bse_ticker (screener.in reports
+    the BSE code for some NSE-listed companies too, not only genuinely BSE-only
+    ones). Use this instead of a bare exchange="NSE" call for any ticker whose
+    source doesn't guarantee "this is definitely an NSE symbol" (EQUITY_L.csv-derived
+    tickers, e.g. in fundamentals/collectors/security_master.py, are NSE-guaranteed
+    and should keep using map_company_master_ids(..., exchange="NSE") directly)."""
+    original_index = tickers.index if isinstance(tickers, pd.Series) else None
+    ticker_series = pd.Series(list(tickers), dtype="string", index=original_index)
+    resolved = map_company_master_ids(ticker_series, exchange="NSE")
+    missing_mask = resolved.isna()
+    if missing_mask.any():
+        bse_resolved = map_company_master_ids(ticker_series[missing_mask], exchange="BSE")
+        resolved.loc[missing_mask] = bse_resolved
+
+    unresolved_tickers = sorted(ticker_series[resolved.isna()].dropna().unique().tolist())
+    if unresolved_tickers:
+        # genuinely unknown to company_master under EITHER exchange -- not a silent drop: the caller's
+        # row still gets NA and (per each caller's own handling) is typically excluded downstream, but
+        # this makes that exclusion visible instead of vanishing with zero trace.
+        record_local_fallback_event(
+            module="utils.company_master",
+            source="map_company_master_ids_nse_or_bse",
+            fallback_type="identity_unresolved_nse_and_bse",
+            severity="warn",
+            reason=f"{len(unresolved_tickers)} ticker(s) matched neither nse_ticker nor bse_ticker in company_master",
+            error="no company_master match",
+            metadata={"tickers": unresolved_tickers[:50]},
+        )
+    return resolved
+
+
 def load_company_master_records(ticker: str, exchanges: Optional[Sequence[str]] = None) -> pd.DataFrame:
     clean_ticker = _clean_scalar(ticker)
     if clean_ticker is None:

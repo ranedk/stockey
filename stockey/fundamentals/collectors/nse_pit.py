@@ -43,7 +43,7 @@ from playwright.sync_api import sync_playwright
 from fundamentals.collectors.events_store import resolve_isin, resolve_issuer_names, upsert_events_with_dedup
 from fundamentals.collectors.screenerin import to_number
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
-from utils.company_master import map_company_master_ids
+from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.nse_rate_limiter import nse_goto, nse_request_gate
 
@@ -76,10 +76,12 @@ def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = 
 
 
 def resolve_company_identity(tickers: pd.Series) -> pd.DataFrame:
-    """NSE ticker -> (company_master_id, isin, issuer) -- issuer is NSE's own
+    """L1-universe ticker -> (company_master_id, isin, issuer) -- issuer is NSE's own
     registered-company-name param for corporates-pit, isin is the cross-source dedup
-    key (fundamentals/collectors/events_store.py)."""
-    company_master_ids = map_company_master_ids(tickers, exchange="NSE")
+    key (fundamentals/collectors/events_store.py). NSE first, BSE-ticker fallback
+    (map_company_master_ids_nse_or_bse) since screener.in can report a company's BSE
+    scrip code even when it's genuinely NSE-listed -- see that function's docstring."""
+    company_master_ids = map_company_master_ids_nse_or_bse(tickers)
     return pd.DataFrame(
         {
             "company_master_id": company_master_ids,
