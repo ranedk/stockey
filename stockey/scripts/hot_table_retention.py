@@ -35,6 +35,10 @@ class RetentionTable:
     description: str
 
 
+# 2026-08-14 cloud-DB cleanup (Phase 5 of PURE_TA_MIGRATION_PLAN.md, finally executed):
+# dropped advisory_intraday_features_daily/decision_traces/decision_trace_steps/
+# event_processing_runs/action_conflicts/trace_summaries -- their code was already gone
+# (Phase 4), this script had stayed retention-aware of tables nothing wrote anymore.
 RETENTION_TABLES: dict[str, RetentionTable] = {
     "dhan_ohlcv_intraday": RetentionTable(
         table_name="dhan_ohlcv_intraday",
@@ -42,48 +46,6 @@ RETENTION_TABLES: dict[str, RetentionTable] = {
         group="intraday",
         default_retention_days=DEFAULT_INTRADAY_RETENTION_DAYS,
         description="Raw Dhan intraday candles used by watchers, execution price checks, and intraday feature rebuilds.",
-    ),
-    "advisory_intraday_features_daily": RetentionTable(
-        table_name="advisory_intraday_features_daily",
-        date_column="asof_date",
-        group="intraday",
-        default_retention_days=DEFAULT_INTRADAY_RETENTION_DAYS,
-        description="Daily derived intraday participation features.",
-    ),
-    "advisory_decision_traces": RetentionTable(
-        table_name="advisory_decision_traces",
-        date_column="updated_at",
-        group="trace",
-        default_retention_days=DEFAULT_TRACE_RETENTION_DAYS,
-        description="Raw decision trace headers.",
-    ),
-    "advisory_decision_trace_steps": RetentionTable(
-        table_name="advisory_decision_trace_steps",
-        date_column="load_ts",
-        group="trace",
-        default_retention_days=DEFAULT_TRACE_RETENTION_DAYS,
-        description="Raw decision trace stage details.",
-    ),
-    "advisory_event_processing_runs": RetentionTable(
-        table_name="advisory_event_processing_runs",
-        date_column="started_at",
-        group="trace",
-        default_retention_days=DEFAULT_TRACE_RETENTION_DAYS,
-        description="Event-processing trace rows and errors.",
-    ),
-    "advisory_action_conflicts": RetentionTable(
-        table_name="advisory_action_conflicts",
-        date_column="load_ts",
-        group="trace",
-        default_retention_days=DEFAULT_TRACE_RETENTION_DAYS,
-        description="Action conflict audit rows.",
-    ),
-    "advisory_trace_summaries": RetentionTable(
-        table_name="advisory_trace_summaries",
-        date_column="generated_at",
-        group="trace",
-        default_retention_days=DEFAULT_TRACE_RETENTION_DAYS,
-        description="Materialized compact trace summary cache rows.",
     ),
 }
 

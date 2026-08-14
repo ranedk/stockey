@@ -1,7 +1,0 @@
-# Default tracked symbols for symbol-specific loaders.
-# Replace or extend this list, or override it with:
-#   python -m <module> --symbols RELIANCE TCS
-#   STOCKEY_SYMBOLS=RELIANCE,TCS
-
-SHAKTIPUMP
-HDFCBANK

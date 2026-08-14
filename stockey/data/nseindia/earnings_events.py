@@ -182,7 +182,7 @@ def main() -> int:
 
     symbols = load_tracked_symbols(args.symbols)
     if not symbols:
-        raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
+        raise SystemExit("No symbols provided. Use --symbols or STOCKEY_SYMBOLS.")
 
     STOCKEY_RUN_STATE = sync_earnings_events(
         symbols=symbols,

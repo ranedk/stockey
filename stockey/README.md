@@ -20,7 +20,7 @@ The whole pipeline is cron jobs defined in `config/stockey.crontab.template`:
 
 1. `complete_data.sh` (07:10 + 17:30) — `data.download_runner --phase all`:
    downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
-   scrip master + OHLCV, RBI/FBIL rates, Sharpely market-cap, and normalizes
+   scrip master + OHLCV, RBI/FBIL rates, and normalizes
    corporate actions.
 2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30
    and +5 min) — queue single-client NSE/Dhan work and drain it, so parallel

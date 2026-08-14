@@ -865,8 +865,8 @@ def parse_catg(path):
 
     # ISIN is not unique, there can be multiple Symbols with the same ISIN because the same underlying
     # can be traded in different series (e.g. Nifty 50 and Nifty 50 Future)
-    # Also, the same symbol and isin can be a part of more than one series e.g. SHAKTIPUMP is traded in
-    # series BE and EQ
+    # Also, the same symbol and isin can be a part of more than one series (e.g. a
+    # single company traded in both series BE and EQ, confirmed live)
     # When company changes its name, symbol also changes but ISIN remains the same
     df = with_company_master(df)
     upsert_to_db(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
@@ -14,8 +13,6 @@ from utils.db import db_session, with_db_retries
 from utils.redis_utils import get_redis_client as get_resilient_redis_client
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SYMBOLS_FILE = REPO_ROOT / "config" / "tracked_symbols.txt"
 DEFAULT_START_DATE = datetime(2014, 1, 1)
 
 
@@ -26,6 +23,12 @@ def parse_datetime_arg(value: str | None) -> datetime | None:
 
 
 def load_tracked_symbols(symbol_args: Iterable[str] | None = None) -> list[str]:
+    """Explicit symbol list for a one-off/small-scope loader: --symbols arg, else
+    STOCKEY_SYMBOLS env var, else empty. No file fallback (removed 2026-08-14 --
+    used to silently fall back to a static config/tracked_symbols.txt placeholder
+    list, which is exactly the footgun this function must not reintroduce). A
+    caller that needs "the current tradeable NSE universe" should call
+    utils.universe.get_equity_universe() instead of expecting this to supply it."""
     values: list[str] = []
 
     if symbol_args:
@@ -37,12 +40,6 @@ def load_tracked_symbols(symbol_args: Iterable[str] | None = None) -> list[str]:
             for part in os.getenv("STOCKEY_SYMBOLS", "").split(",")
             if part.strip()
         )
-    elif DEFAULT_SYMBOLS_FILE.exists():
-        for line in DEFAULT_SYMBOLS_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            values.append(line.upper())
 
     deduped: list[str] = []
     seen = set()

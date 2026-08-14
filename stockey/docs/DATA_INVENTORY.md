@@ -24,8 +24,9 @@ framework) needs only the price/CA/rates/identity core below.
 | Dhan broker | dhanlive/* (incl. auth/web_login) | master_dhan_instruments, dhan_ohlcv_daily, dhan_ohlcv_intraday (future 1-min landing zone) |
 | RBI/FBIL | rbi/* | rbi_bank_rates, rbi_currency_rates, fbil_gsec_par, fbil_gsec_quote |
 | Identity | company_master, nseindia/security_history | company_master, dim_security* |
-| Sharpely (mcap slice ONLY) | sharpelydata/sharpely_data.py | historical_mcap |
+| Sharpely identity/sector mapping (mcap slice removed 2026-08-14, see REMOVE section note) | sharpelydata/scrip_master.py | master_sharpely_equity, master_sharpely_funds — feeds company_master's sharpely_id fallback + fundamentals/collectors/sector_data.py |
 | Download run state | data/download_runner.py (via utils/sync_state.py, promoted from advisory/ 2026-07-28) | advisory_sync_state (load-bearing per Phase 2 audit; NEVER drop) |
+| Promoted utility tables (correction 2026-08-14: the "ALL advisory_\* except adjusted_ohlcv_daily/sync_state" REMOVE wording below technically caught these too, but they're live Phase-2-promoted `utils/*` modules, not advisory research artifacts) | utils/fallback_telemetry.py, utils/external_task_queue.py, utils/identity_issues.py | advisory_fallback_events, advisory_external_task_queue, advisory_identity_issues |
 
 2026-08-05 completeness sweep findings, both fixed:
 - `nseindia_corporate_actions_normalized` was 1+ year stale (last row
@@ -71,43 +72,87 @@ enqueued, never executed) — `complete_data.sh` alone would still cover the
 same modules inline, but only at its 2x/day cadence, losing the
 3x/day (08,12,16) intraday-coverage frequency the queue path exists for.
 
-## REMOVE — LLM-token consumers
+## REMOVED — LLM-token consumers (dropped 2026-08-14)
+
+Code was archived in the 2026-07-27/08-02 pure-TA cut; the tables themselves
+physically stayed until the Phase 5 cleanup below finally ran:
 
 - data/announcements/* (categorize.py/prompts.py classify with LLM calls) →
   announcement_pipeline_documents, announcement_pipeline_reports
 - data/economictimes/rss.py → economictimes_rss_items (fed LLM news themes)
 - Advisory LLM stack (llm_*, event policy, adversarial review, news themes)
 
-## REMOVE — fundamental / non-TA
+## REMOVED — fundamental / non-TA (dropped 2026-08-14 unless noted)
 
 - data/screenerin/* → screenerin_* tables
 - Sharpely fundamentals → sharpely_stock_meta, sharpely_stock_peers,
-  master_sharpely_{equity,funds}, stmt_{balancesheet,cashflow,income},
-  shareholding_*, advisory_fundamentals_daily
-- nseindia/insider_deals + deal-flow tables (nseindia_insider_deals,
-  nseindia_{block,bulk}_deals) — sweep showed IC ≈ 0
+  stmt_{balancesheet,cashflow,income}, shareholding_*, advisory_fundamentals_daily.
+  Correction 2026-08-14: `master_sharpely_{equity,funds}` (written by
+  `sharpelydata/scrip_master.py`) turned out to still be load-bearing —
+  `data/company_master.py` uses `sharpely_id` as an identity-key fallback, and
+  the fundamentals screener's `fundamentals/collectors/sector_data.py` (built
+  2026-08-11, after this list was written) reads it for NSE→BSE sector-code
+  mapping. Moved to KEEP above; `scrip_master.py` stays scheduled; these two
+  tables were NOT part of the 2026-08-14 drop.
+- Sharpely mcap slice (`sharpelydata/sharpely_data.py` → `historical_mcap`)
+  removed 2026-08-14 — collector had regressed to a 2-symbol placeholder list
+  (`config/tracked_symbols.txt`) with zero downstream consumers; `nseindia_mcap`
+  (bhavcopy parser, free byproduct of the daily download) covers the same
+  point-in-time universe for 2024-02+. Pre-2024 history in `historical_mcap`
+  (2012+, 973 symbols) is real and non-trivial to re-collect — table itself
+  kept as a frozen archive (2026-08-14 decision), NOT part of the drop below.
+- nseindia_insider_deals — no live writer, dropped. Correction 2026-08-14:
+  `nseindia_block_deals`/`nseindia_bulk_deals` were misattributed here — both
+  are still written live by `data/nseindia/offmarket_parser.py`, the same
+  scheduled parser that produces the KEEP-listed `nseindia_short_selling`.
+  Moved to KEEP above; NOT part of the drop.
 - nseindia/earnings_events → nseindia_earnings_events (BORDERLINE: LLM-free
-  and useful for FnO event-vol later — freeze the collector rather than
-  delete if cheap)
+  and useful for FnO event-vol later — collector frozen, NOT part of the
+  drop; table stays)
 - nseindia/recent_events → nseindia_events (corrected 2026-08-04: this table
   was previously misattributed to earnings_events.py above; it's actually a
   separate collector for NSE's board-meeting/AGM event calendar. Same
-  BORDERLINE treatment as earnings_events: LLM-free, freeze rather than
-  delete. Registered under `download_runner.DOWNLOADER_STEPS` purpose
-  "events"; currently flaky against NSE's site — TimeoutError waiting for a
-  download event, non-critical purpose so it doesn't block the pipeline)
+  BORDERLINE treatment as earnings_events: collector frozen, NOT part of the
+  drop; table stays. Registered under `download_runner.DOWNLOADER_STEPS`
+  purpose "events"; currently flaky against NSE's site — TimeoutError waiting
+  for a download event, non-critical purpose so it doesn't block the pipeline)
 - Macro: mospi_cpi, eaindustry_wpi, macro_usa*, macro_india_gdp, fii_*
   (data/mospi, data/eaindustry, data/fred, data/nsdl)
 - features_* precomputed tables
-- ALL advisory_* tables except advisory_adjusted_ohlcv_daily and
-  advisory_sync_state (Phase 2 audit 2026-07-28 confirmed
-  data/download_runner.py persists standardized run state to it via
-  utils/sync_state.py — load-bearing, NEVER drop)
+- ALL advisory_* tables except advisory_adjusted_ohlcv_daily,
+  advisory_sync_state, and the three promoted utility tables now in KEEP
+  above (advisory_fallback_events, advisory_external_task_queue,
+  advisory_identity_issues)
 
 ## Execution notes
 
 - Archive code (git branch/attic), drop cron entries in the same commit.
-- Table drops on the cloud DB: take a final dump first; drops free space on
-  the small instance.
+- **Phase 5 (cloud-DB table drops) executed 2026-08-14**, ~3 weeks after Phase
+  4 archived the code — the tables above had stayed physically present the
+  whole time despite `PURE_TA_MIGRATION_PLAN.md`'s "no cloud-DB dump before
+  drops" operator decision, found during a full DB audit. A targeted `pg_dump`
+  of exactly the dropped tables (schema+data, `-Fc`) was taken first anyway as
+  a local safety net (`~/stockey_db_dumps/`), on top of that decision, since
+  it cost nothing and the tables' code had been gone long enough that nobody
+  had eyes on whether any were still quietly worth reading. 152 tables
+  dropped, ~15 GB freed. `data/backfill_company_master_ids.py`'s SPECS and
+  `scripts/hot_table_retention.py`'s RETENTION_TABLES had their entries for
+  dropped tables removed in the same pass so neither errors on next run.
+  Two additional undocumented tables found by the same audit were held back
+  pending a separate decision, then also dropped 2026-08-14 (same-day, second
+  pass, own targeted `pg_dump` first) once resolved:
+  - `nseindia_ohlcv_adjusted` — stale since 2026-02-09, superseded by
+    `advisory_adjusted_ohlcv_daily`. Turned out to be its own small instance of
+    the tracked_symbols.txt placeholder-scope bug: only 2 symbols
+    (HDFCBANK, SHAKTIPUMP) ever populated, out of the full universe
+    `adjusted_prices.py`'s `adjust` stage was meant to cover -- confirmed dead,
+    never in this list either way.
+  - `nseindia_var1_archive_pre_dedup_20260801` -- 209M rows / 52 GB, zero code
+    or doc references anywhere. Its unique index
+    (`for_date, entry_number, series, symbol, isin`) has one extra column vs
+    `nseindia_var1`'s own (`for_date, series, symbol, isin`) -- confirms it's a
+    genuine pre-dedup raw-ingestion snapshot from a 2026-08-01 cleanup, not an
+    unrelated/mystery dataset. Pure VaR/margin technical data either way (not
+    fundamentals), fully superseded by the deduplicated live `nseindia_var1`.
 - systrader's sync list already matches the KEEP set; nothing to change
   downstream except deleting the never-built universe_screen design.

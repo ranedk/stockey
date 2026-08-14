@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  python -m data.dhanlive.ohlcv_pull RELIANCE\n"
             "  python -m data.dhanlive.ohlcv_pull RELIANCE --last-minutes 180\n"
-            "  python -m data.dhanlive.ohlcv_pull HDFCBANK --interval-minutes 1\n"
+            "  python -m data.dhanlive.ohlcv_pull TCS --interval-minutes 1\n"
             "  python -m data.dhanlive.ohlcv_pull NIFTY --asset-type benchmark --mode intraday\n"
             "  python -m data.dhanlive.ohlcv_pull RELIANCE --mode daily --last-days 90\n"
             "  python -m data.dhanlive.ohlcv_pull RELIANCE --source db --format json\n"
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("ticker", help="Ticker or identifier, for example RELIANCE, HDFCBANK, NIFTY")
+    parser.add_argument("ticker", help="Ticker or identifier, for example RELIANCE, TCS, NIFTY")
     parser.add_argument("--exchange", default="NSE", choices=["NSE", "BSE"], help="Exchange. Default: NSE")
     parser.add_argument(
         "--asset-type",

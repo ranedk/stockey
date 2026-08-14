@@ -84,9 +84,9 @@ def check_bhavcopy(expected_day: pd.Timestamp) -> dict[str, Any]:
 
 
 def check_dhan_coverage(expected_day: pd.Timestamp) -> dict[str, Any]:
-    from data.dhanlive.ohlcv_reconcile import load_universe_symbols
+    from utils.universe import get_equity_universe
 
-    universe = load_universe_symbols()
+    universe = get_equity_universe()
     if not universe:
         return {"check": "dhan_daily_coverage", "status": "warn", "reason": "empty reconcile universe"}
     covered = sql_to_df(

@@ -21,11 +21,16 @@ DOWNLOADER_STEPS = [
     {"module": "data.dhanlive.scrip_master", "args": [], "purpose": "dhan_master_precheck"},
     {"module": "data.sharpelydata.scrip_master", "args": [], "purpose": "sharpely_master_precheck"},
     {"module": "data.company_master", "args": [], "purpose": "identity_build"},
+    # No symbols here on purpose -- run_download_module() fills in a small, dynamic
+    # sample from utils/universe.py's get_equity_universe() at execution time (2026-08-14:
+    # no hardcoded ticker names anywhere in this pipeline, not even a "just a smoke test"
+    # pair -- see DHAN_PRECHECK_SAMPLE_SIZE below). Proves the Dhan API/token works
+    # before the rest of the run depends on it; the broad universe is covered by
+    # ohlcv_reconcile.py separately.
     {"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"},
     {"module": "data.rbi.download_fbil_gsec", "args": [], "purpose": "macro"},
     {"module": "data.rbi.download_bank_rates", "args": [], "purpose": "macro"},
     {"module": "data.rbi.download_currency_rates", "args": [], "purpose": "macro"},
-    {"module": "data.sharpelydata.sharpely_data", "args": [], "purpose": "mcap"},
     {"module": "data.nseindia.offmarket", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.bhavcopy_downloader", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.indices_downloader", "args": [], "purpose": "market_wide"},
@@ -51,6 +56,33 @@ PARSER_MODULES = {str(step["module"]) for step in PARSER_STEPS}
 # events, news -- is non-critical: a flaky external source (e.g. the MOSPI CPI API) must NOT abort the
 # run and must NOT skip the market downloaders ordered after it, nor flip the whole run to "failed".
 CRITICAL_PURPOSES = {"market_wide", "benchmark_sync", "dhan_ohlcv_precheck"}
+
+DHAN_PRECHECK_SAMPLE_SIZE = 2
+
+
+def _dhan_precheck_symbols() -> list[str]:
+    """Small, dynamic sample for the dhan_ohlcv_precheck connectivity/auth smoke test --
+    deliberately not a fixed named list (2026-08-14: no hardcoded ticker names anywhere
+    in this pipeline outside tests). Top-by-traded-value on the latest bhavcopy session,
+    not just the first N of utils/universe.py's alphabetically-sorted get_equity_universe()
+    -- a smoke test should hit reliably liquid, well-covered names, not whatever sorts
+    first (e.g. thin small-caps), to avoid spurious failures unrelated to Dhan itself."""
+    from utils.db import sql_to_df
+    from utils.universe import UNIVERSE_SERIES, UNIVERSE_SOURCE_TABLE
+
+    query = (
+        f"SELECT symbol FROM {UNIVERSE_SOURCE_TABLE} "
+        f"WHERE series = ANY(%s) AND date = (SELECT MAX(date) FROM {UNIVERSE_SOURCE_TABLE}) "
+        f"ORDER BY total_value DESC NULLS LAST LIMIT %s"
+    )
+    try:
+        frame = sql_to_df(query, params=(list(UNIVERSE_SERIES), DHAN_PRECHECK_SAMPLE_SIZE))
+    except Exception as exc:
+        print(f"[download_runner] dhan_ohlcv_precheck sample unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+    if frame.empty or "symbol" not in frame.columns:
+        return []
+    return [str(value).strip().upper() for value in frame["symbol"].tolist() if str(value or "").strip()]
 
 
 def _is_critical(step: dict[str, Any]) -> bool:
@@ -501,6 +533,10 @@ def run_download_module(step: dict[str, Any]) -> dict[str, Any]:
     module_name = str(step.get("module") or "")
     module_args = [str(value) for value in (step.get("args") or [])]
     purpose = str(step.get("purpose") or "")
+    if purpose == "dhan_ohlcv_precheck" and not module_args:
+        sample = _dhan_precheck_symbols()
+        if sample:
+            module_args = ["--symbols", *sample]
     _emit_progress(f"[data.download_runner] module={module_name} start purpose={purpose or '-'} args={module_args}")
     try:
         sys.argv = [module_name, *module_args]

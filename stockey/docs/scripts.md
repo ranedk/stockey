@@ -36,7 +36,6 @@ data.dhanlive.ohlcv
 data.rbi.download_fbil_gsec
 data.rbi.download_bank_rates
 data.rbi.download_currency_rates
-data.sharpelydata.sharpely_data          # mcap only — fundamentals slice was removed
 data.nseindia.offmarket
 data.nseindia.bhavcopy_downloader
 data.nseindia.indices_downloader
@@ -111,6 +110,8 @@ in `stockey_schema_migrations`.
 
 - Prefer `python -m ...` from the repo root so relative config/`.env` loading
   behaves consistently.
-- Symbol-specific loaders default to `config/tracked_symbols.txt`; daily
-  derivation jobs use `config/watchlist_symbols.txt`. Override either with
-  `--symbols` or `STOCKEY_SYMBOLS`.
+- Symbol-specific loaders take `--symbols` or `STOCKEY_SYMBOLS` explicitly --
+  no static registry-file fallback (removed 2026-08-14; `config/watchlist_symbols.txt`
+  never existed despite once being documented here). A collector that needs "the
+  current tradeable NSE universe" calls `utils/universe.py`'s `get_equity_universe()`
+  instead.

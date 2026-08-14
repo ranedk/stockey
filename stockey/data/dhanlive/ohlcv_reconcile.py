@@ -1,4 +1,4 @@
-"""Reconcile daily OHLCV coverage for the advisory symbol universe.
+"""Reconcile daily OHLCV coverage for the pure-TA equity universe.
 
 The scheduled Dhan OHLCV module only syncs the small tracked-symbols list, and the
 broad equity universe is kept fresh by the intraday watchers -- so whenever the cron
@@ -11,6 +11,14 @@ symbols through the existing incremental `sync_daily_ohlcv` path.
 Run automatically as the first step of `start_cron.sh` and on the pre-advisory
 schedule; run manually via `./all_ohlcv_reconcile.sh` or
 `python -m data.dhanlive.ohlcv_reconcile --dry-run`.
+
+The universe query itself was promoted to `utils/universe.py`'s `get_equity_universe()`
+2026-08-14 -- this used to be a local `load_universe_symbols()` unioning
+`advisory_screener_constituents`/`advisory_watchlist`/`advisory_operator_holdings`, all
+of which lost their writers in the 2026-07-27 pure-TA cut and had silently frozen at a
+stale 2026-07-21 snapshot ever since. Promoted (not just fixed in place) so any other
+collector that needs "the current tradeable NSE universe" has one shared, always-live
+place to get it instead of growing its own local notion of the universe again.
 """
 from __future__ import annotations
 
@@ -25,21 +33,15 @@ from environs import Env
 from utils.advisory_date import _market_calendar_date, latest_trading_day_on_or_before
 from data.dhanlive.ohlcv import DAILY_TABLE, sync_many_daily
 from utils.db import sql_to_df
+from utils.universe import get_equity_universe
 
 env = Env()
 
 DEFAULT_MAX_SYMBOLS = env.int("OHLCV_RECONCILE_MAX_SYMBOLS", default=400)
-# Union constituents over a snapshot window instead of only the newest snapshot: a
-# partial refresh (one screener updating on a weekend) must not collapse the universe
-# and silently exclude symbols from reconciliation.
-CONSTITUENTS_LOOKBACK_DAYS = env.int("OHLCV_RECONCILE_CONSTITUENTS_LOOKBACK_DAYS", default=7)
 # After this hour (IST) on a trading day, today's EOD bars are expected to exist, so the
 # pre-advisory reconcile (18:45) pulls TODAY's bars instead of stopping at yesterday.
 TODAY_COMPLETE_AFTER_HOUR_IST = env.int("OHLCV_RECONCILE_TODAY_COMPLETE_AFTER_HOUR_IST", default=18)
 MARKET_TIMEZONE = "Asia/Kolkata"
-CONSTITUENTS_TABLE = "advisory_screener_constituents"
-WATCHLIST_TABLE = "advisory_watchlist"
-HOLDINGS_TABLE = "advisory_operator_holdings"
 
 
 def _ist_now(now: Any | None = None) -> pd.Timestamp:
@@ -67,41 +69,6 @@ def expected_complete_trading_day(now: Any | None = None) -> pd.Timestamp:
     return latest
 
 
-def load_universe_symbols() -> list[str]:
-    """Advisory symbol universe: latest screener constituents + active watchlist + open holdings."""
-    symbols: set[str] = set()
-    queries = (
-        (
-            "constituents",
-            f"SELECT DISTINCT ticker AS symbol FROM {CONSTITUENTS_TABLE} "
-            f"WHERE date >= (SELECT MAX(date) FROM {CONSTITUENTS_TABLE}) - interval '{int(CONSTITUENTS_LOOKBACK_DAYS)} days'",
-        ),
-        (
-            "watchlist",
-            f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE} "
-            f"WHERE asof_date = (SELECT MAX(asof_date) FROM {WATCHLIST_TABLE}) "
-            "AND COALESCE(watch_enabled, TRUE) = TRUE",
-        ),
-        (
-            "holdings",
-            f"SELECT DISTINCT symbol FROM {HOLDINGS_TABLE} WHERE COALESCE(status, 'open') = 'open'",
-        ),
-    )
-    for source, query in queries:
-        try:
-            frame = sql_to_df(query)
-        except Exception as exc:
-            print(f"[ohlcv_reconcile] universe source {source} unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
-            continue
-        if frame.empty or "symbol" not in frame.columns:
-            continue
-        for value in frame["symbol"].tolist():
-            text = str(value or "").strip().upper()
-            if text:
-                symbols.add(text)
-    return sorted(symbols)
-
-
 def find_stale_symbols(universe: list[str], expected_date: pd.Timestamp) -> list[str]:
     """Symbols whose latest daily bar predates the expected date (or that have no bars)."""
     if not universe:
@@ -127,7 +94,7 @@ def find_stale_symbols(universe: list[str], expected_date: pd.Timestamp) -> list
 
 def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now: Any | None = None) -> dict[str, Any]:
     expected = expected_complete_trading_day(now)
-    universe = load_universe_symbols()
+    universe = get_equity_universe()
     stale = find_stale_symbols(universe, expected)
     cap = int(DEFAULT_MAX_SYMBOLS if max_symbols is None else max_symbols)
     skipped = 0
@@ -164,7 +131,7 @@ def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Reconcile daily OHLCV coverage for the advisory universe.")
+    parser = argparse.ArgumentParser(description="Reconcile daily OHLCV coverage for the pure-TA equity universe.")
     parser.add_argument("--dry-run", action="store_true", help="Report stale coverage without syncing.")
     parser.add_argument("--max-symbols", type=int, default=None, help=f"Cap synced symbols (default {DEFAULT_MAX_SYMBOLS}).")
     parser.add_argument("--format", choices=["json", "text"], default="text")

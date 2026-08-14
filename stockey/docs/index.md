@@ -64,9 +64,12 @@ Expected prefixes:
 
 ## Data loaders
 
-Symbol-specific loaders default to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt).
-Daily derivation jobs can instead use [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt).
-Override either per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
+Symbol-specific loaders take `--symbols` or the `STOCKEY_SYMBOLS` env var explicitly
+-- no static registry-file fallback (`config/tracked_symbols.txt` removed 2026-08-14;
+it had silently become production's actual symbol scope for one collector for ~5
+months). A collector that needs "the current tradeable NSE universe" calls
+`utils/universe.py`'s `get_equity_universe()`, which derives it live from the daily
+bhavcopy -- not a file anyone has to remember to keep in sync.
 
 The full daily pipeline is `./complete_data.sh` — see `README.md` for the
 cron list and `docs/scripts.md` for the exact `data.download_runner` step
@@ -86,15 +89,17 @@ By default the loader syncs 5 years of daily candles plus the last 1 day of
 1-minute intraday candles. Supported asset types: `stock`, `index`, `benchmark`.
 See `README.md` for Chrome CDP / auto-login setup.
 
-### Sharpely (market-cap slice only)
+### Sharpely (identity/sector mapping only)
 
 ```sh
 python -m data.sharpelydata.scrip_master
-python -m data.sharpelydata.sharpely_data
 ```
 
 Fundamentals/shareholding extraction was removed in the pure-TA cut
-(`docs/DATA_INVENTORY.md`) — `sharpely_data.py` now writes `historical_mcap` only.
+(`docs/DATA_INVENTORY.md`); the mcap slice (`sharpely_data.py` → `historical_mcap`)
+was removed 2026-08-14 (redundant with `nseindia_mcap`, zero downstream consumers).
+`scrip_master.py` stays — it feeds `company_master`'s `sharpely_id` identity
+fallback and `fundamentals/collectors/sector_data.py`'s sector mapping.
 
 ### RBI / FBIL
 

@@ -18,18 +18,13 @@ class BackfillSpec:
 
 
 SPECS: tuple[BackfillSpec, ...] = (
-    BackfillSpec("announcement_pipeline_documents", "ticker", exchange_column="exchange"),
-    BackfillSpec("announcement_pipeline_reports", "ticker", exchange_column="exchange"),
-    BackfillSpec("stmt_income", "symbol", exchange="NSE"),
-    BackfillSpec("stmt_balancesheet", "symbol", exchange="NSE"),
-    BackfillSpec("stmt_cashflow", "symbol", exchange="NSE"),
-    BackfillSpec("shareholding_category", "symbol", exchange="NSE"),
-    BackfillSpec("shareholding_top_holders", "symbol", exchange="NSE"),
+    # 2026-08-14 cloud-DB cleanup (Phase 5 of PURE_TA_MIGRATION_PLAN.md, finally executed):
+    # dropped announcement_pipeline_documents/reports, stmt_income/balancesheet/cashflow,
+    # shareholding_category/top_holders, nseindia_insider_deals -- specs removed with them.
     BackfillSpec("historical_mcap", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_events", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_corporate_actions", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_earnings_events", "symbol", exchange="NSE"),
-    BackfillSpec("nseindia_insider_deals", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_block_deals", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_bulk_deals", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_short_selling", "symbol", exchange="NSE"),

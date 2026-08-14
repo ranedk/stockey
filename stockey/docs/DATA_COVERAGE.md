@@ -93,14 +93,14 @@ ever run manually. Now scheduled daily.
 2026-02-09 — worth checking whether anything listed since then is missing an
 identity record).
 
-### Sharpely (mcap slice only)
-`historical_mcap` — 2012+, but only 973 symbols vs. ~7,150 in the full equity
-universe (narrower than `nseindia_mcap`'s 3,309).
-
-**Fixed 2026-08-05:** the sync silently failed every day *after* its first
-successful run, because Sharpely's API 400s on a same-day (`start_date ==
-end_date`) window — exactly what a normal incremental day produces once
-yesterday is already captured. Now always requests a >=1-day window.
+### Sharpely mcap slice — removed 2026-08-14
+`data/sharpelydata/sharpely_data.py` and the `mcap` DOWNLOADER_STEPS entry are
+gone. It had regressed to reading its symbol list from `config/tracked_symbols.txt`
+(a 2-symbol placeholder, unnoticed for ~5 months) with zero downstream consumers;
+`nseindia_mcap` (bhavcopy parser, free byproduct of the daily download) covers the
+same point-in-time universe for 2024-02+. `historical_mcap` (2012+, 973 symbols,
+narrower than `nseindia_mcap`'s ~3,300) held real pre-2024 history not available
+anywhere else — kept as a frozen archive (2026-08-14 decision), no longer written.
 
 ## Known, understood, not-a-bug gaps
 

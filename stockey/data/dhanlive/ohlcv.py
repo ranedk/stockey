@@ -831,7 +831,7 @@ def main() -> None:
 
     symbols = load_tracked_symbols(args.symbols)
     if not symbols:
-        raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
+        raise SystemExit("No symbols provided. Use --symbols or STOCKEY_SYMBOLS.")
 
     ensure_ohlcv_tables()
     from_date = parse_datetime_arg(args.from_date)

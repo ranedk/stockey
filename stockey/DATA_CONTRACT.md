@@ -76,7 +76,7 @@ detects column drift and recreates); renames/drops must be coordinated —
 | master_dhan_instruments | `data/dhanlive/scrip_master.py` | security ids, lots, expiries |
 | dim_security | `data/nseindia/security_history.py` | identity mapping |
 | nseindia_corporate_actions_bc_raw / nseindia_corporate_actions_normalized | `data/nseindia/bhavcopy_parser.py` / `data/nseindia/adjusted_prices.py --only normalize` | corrected 2026-08-05: the plain `nseindia_corporate_actions` table (previously listed here) is no longer written — its collector only ever covered 2 placeholder symbols and was unscheduled; `_bc_raw` (bhavcopy CA feed, 5,728 symbols) is the comprehensive source, `_normalized` derives from it (now scheduled daily, was 1yr+ stale until fixed) |
-| nseindia_mcap / historical_mcap | bhavcopy parser / sharpely | point-in-time universe |
+| nseindia_mcap | `data/nseindia/bhavcopy_parser.py`'s `parse_mcap` | point-in-time universe, 2024-02+ |
 | nseindia_holidays | `data/nseindia/holidays.py` | |
 | dim_trading_days | producer unidentified — locate before relying on it | |
 | rbi_bank_rates / fbil_gsec_par | `data/rbi/*` | risk-free (repo/T-bill) + G-sec carry |

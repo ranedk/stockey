@@ -45,7 +45,7 @@ per-job comments in the template for each line's UTC/IST pair:
 
 1. `complete_data.sh` (07:10 + 17:30) — runs `data.download_runner --phase all`:
    downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
-   scrip master + OHLCV, RBI/FBIL rates, Sharpely market-cap, and normalizes
+   scrip master + OHLCV, RBI/FBIL rates, and normalizes
    corporate actions. See `data/download_runner.py`'s `DOWNLOADER_STEPS` /
    `PARSER_STEPS` for the exact registry.
 2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30 and
@@ -183,10 +183,23 @@ python scripts/docs_state_audit.py --strict
 - Do not point backtests, scans, or any read-heavy work at the cloud DB — it's
   small by design; heavy reads happen against systrader's local `systrade`
   mirror (see `DATA_CONTRACT.md`'s load rule).
-- Do not widen a collector's symbol scope casually (e.g. `config/tracked_symbols.txt`)
-  without checking the cost — one prior collector ran full browser automation
-  daily against a 2-symbol placeholder list for a year with zero value; a
-  wider scope on a slow per-symbol scraper can mean thousands of daily calls.
+- Do not add a static symbol/company registry file for a collector to fall back
+  to. `config/tracked_symbols.txt` was exactly this — a 2-symbol placeholder
+  file multiple collectors silently fell back to (one ran full browser
+  automation against it daily for ~5 months with zero value) — removed
+  2026-08-14. `utils/sync.py`'s `load_tracked_symbols()` now only honors an
+  explicit `--symbols` arg or `STOCKEY_SYMBOLS` env var (no file fallback); a
+  collector that needs "the current tradeable NSE universe" calls
+  `utils/universe.py`'s `get_equity_universe()` (derives it live from the daily
+  bhavcopy) instead of maintaining its own list. A collector that deliberately
+  needs only a small sample (e.g. a connectivity/auth smoke test) should derive
+  it dynamically at execution time too — see `data/download_runner.py`'s
+  `_dhan_precheck_symbols()`/`dhan_ohlcv_precheck` step, which samples
+  `get_equity_universe()` rather than naming fixed tickers. No hardcoded ticker
+  names anywhere in this pipeline outside tests (2026-08-14 rule, after finding
+  SHAKTIPUMP/HDFCBANK hardcoded in three different places over time). Do not
+  widen a per-symbol scraper's scope casually either way without checking the
+  cost (thousands of daily calls add up fast).
 - Do not call `page.goto()` (or `requests.get()`) against nseindia.com /
   nsearchives.nseindia.com directly from a new collector. NSE's Akamai WAF blocks
   fast on request rate (2026-08-09/10 incident) and now effectively requires a

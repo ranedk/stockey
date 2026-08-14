@@ -38,7 +38,6 @@ from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv, scrip_master as dhan_scrip_master
 from data.nseindia import bhavcopy_downloader, bhavcopy_parser, corporate_actions, earnings_events, indices_downloader, indices_parser, offmarket, recent_events, security_history
-from data.sharpelydata import sharpely_data
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
@@ -311,6 +310,41 @@ def test_ohlcv_reconcile_expected_day_is_trading_day_and_clock_aware(monkeypatch
     assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
 
 
+def test_get_equity_universe_queries_bhavcopy(monkeypatch):
+    # 2026-08-14: promoted out of ohlcv_reconcile.py's local load_universe_symbols(),
+    # which used to union advisory_screener_constituents/advisory_watchlist/
+    # advisory_operator_holdings, all of which lost their writers in the pure-TA cut
+    # and had silently frozen -- now the one shared, always-live universe source.
+    from utils import universe as universe_mod
+
+    captured: dict[str, object] = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame({"symbol": ["reliance", "tcs", "reliance", "", None]})
+
+    monkeypatch.setattr(universe_mod, "sql_to_df", fake_sql_to_df)
+
+    result = universe_mod.get_equity_universe()
+
+    assert result == ["RELIANCE", "TCS"]
+    assert universe_mod.UNIVERSE_SOURCE_TABLE in captured["query"]
+    assert "series = ANY(%s)" in captured["query"]
+    assert captured["params"] == (["EQ", "BE"],)
+
+
+def test_get_equity_universe_empty_on_db_error(monkeypatch):
+    from utils import universe as universe_mod
+
+    def fake_sql_to_df(query, params=None):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(universe_mod, "sql_to_df", fake_sql_to_df)
+
+    assert universe_mod.get_equity_universe() == []
+
+
 def test_ohlcv_reconcile_find_stale_symbols(monkeypatch):
     from data.dhanlive import ohlcv_reconcile as orc
 
@@ -333,7 +367,7 @@ def test_ohlcv_reconcile_run_caps_symbols_and_counts_results(monkeypatch):
     from data.dhanlive import ohlcv_reconcile as orc
 
     monkeypatch.setattr(orc, "expected_complete_trading_day", lambda now=None: pd.Timestamp("2026-07-03", tz="UTC"))
-    monkeypatch.setattr(orc, "load_universe_symbols", lambda: ["A", "B", "C", "D"])
+    monkeypatch.setattr(orc, "get_equity_universe", lambda: ["A", "B", "C", "D"])
     monkeypatch.setattr(orc, "find_stale_symbols", lambda universe, expected: ["A", "B", "C"])
     synced: list[list[str]] = []
 
@@ -1237,6 +1271,22 @@ def test_sync_redis_set_members_records_local_fallback(monkeypatch):
     assert event["severity"] == "warn"
     assert isinstance(event["error"], RuntimeError)
     assert event["metadata"] == {"key": "bhavcopy:parsed", "command": "smembers"}
+
+
+def test_load_tracked_symbols_no_file_fallback(monkeypatch):
+    # 2026-08-14: the config/tracked_symbols.txt file fallback was removed -- this
+    # function must never silently resolve to a static placeholder list again. Only
+    # an explicit --symbols arg or STOCKEY_SYMBOLS env var may produce a result.
+    monkeypatch.delenv("STOCKEY_SYMBOLS", raising=False)
+
+    assert sync_utils.load_tracked_symbols(None) == []
+    assert sync_utils.load_tracked_symbols([]) == []
+
+    monkeypatch.setenv("STOCKEY_SYMBOLS", "reliance, tcs,reliance")
+    assert sync_utils.load_tracked_symbols(None) == ["RELIANCE", "TCS"]
+
+    monkeypatch.delenv("STOCKEY_SYMBOLS", raising=False)
+    assert sync_utils.load_tracked_symbols(["shaktipump,hdfcbank"]) == ["SHAKTIPUMP", "HDFCBANK"]
 
 
 def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
@@ -4573,6 +4623,64 @@ def test_download_runner_records_nonzero_exit_fallback(monkeypatch):
     assert events[0]["metadata"] == {"module": "data.company_master", "purpose": "identity_build", "returncode": 2}
 
 
+def test_dhan_precheck_symbols_samples_by_liquidity(monkeypatch):
+    # 2026-08-14: no hardcoded ticker names anywhere in this pipeline outside tests --
+    # dhan_ohlcv_precheck used to pass a fixed SHAKTIPUMP/HDFCBANK pair; now it samples
+    # the top-traded-value names off the latest bhavcopy session instead.
+    captured: dict[str, object] = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame({"symbol": ["bhartiartl", "astral"]})
+
+    monkeypatch.setattr("utils.db.sql_to_df", fake_sql_to_df)
+
+    result = download_runner._dhan_precheck_symbols()
+
+    assert result == ["BHARTIARTL", "ASTRAL"]
+    assert "ORDER BY total_value DESC" in captured["query"]
+    assert captured["params"] == (["EQ", "BE"], download_runner.DHAN_PRECHECK_SAMPLE_SIZE)
+
+
+def test_dhan_precheck_symbols_empty_on_db_error(monkeypatch):
+    def fake_sql_to_df(query, params=None):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("utils.db.sql_to_df", fake_sql_to_df)
+
+    assert download_runner._dhan_precheck_symbols() == []
+
+
+def test_run_download_module_fills_dhan_precheck_symbols_dynamically(monkeypatch):
+    monkeypatch.setattr(download_runner, "_dhan_precheck_symbols", lambda: ["BHARTIARTL", "ASTRAL"])
+    monkeypatch.setattr(download_runner, "_execute_module_entrypoint", lambda _module_name: (0, {"rows": 2}))
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: None)
+
+    result = download_runner.run_download_module(
+        {"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"}
+    )
+
+    assert result["status"] == "ok"
+    assert result["args"] == ["--symbols", "BHARTIARTL", "ASTRAL"]
+
+
+def test_run_download_module_dhan_precheck_stays_empty_when_universe_unavailable(monkeypatch):
+    # A DB-unavailable universe must not silently fall back to any hardcoded name --
+    # empty args flow through to ohlcv.py's own "No symbols provided" hard failure.
+    monkeypatch.setattr(download_runner, "_dhan_precheck_symbols", lambda: [])
+    monkeypatch.setattr(download_runner, "_execute_module_entrypoint", lambda _module_name: (1, {}))
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: None)
+    monkeypatch.setattr(download_runner, "record_local_fallback_event", lambda **kwargs: kwargs)
+
+    result = download_runner.run_download_module(
+        {"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"}
+    )
+
+    assert result["args"] == []
+    assert result["status"] == "failed"
+
+
 def test_schema_migration_dry_run_and_checksum_skip(monkeypatch):
     from utils import schema_migrations
 
@@ -6078,75 +6186,6 @@ def test_sharpely_scrip_master_main_exports_runner_state(monkeypatch, capsys):
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["instrument_type_count"] == 3
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["fallback_used"] is False
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["state_advanced"] is True
-
-
-def test_sharpely_data_main_returns_nonzero_on_failed_run_state(monkeypatch, capsys):
-    monkeypatch.setattr(sharpely_data, "load_tracked_symbols", lambda symbols: ["AAA", "BAD"])
-    monkeypatch.setattr(sharpely_data, "parse_datetime_arg", lambda value: pd.Timestamp(value).to_pydatetime() if value else None)
-    monkeypatch.setattr(
-        sharpely_data,
-        "sync_sharpely_data",
-        lambda **kwargs: {
-            "source": "sharpely_fundamentals",
-            "symbol_count": len(kwargs["symbols"]),
-            "rows": 5,
-            "rows_read": len(kwargs["symbols"]),
-            "rows_written": 5,
-            "classification": "partial_failed",
-            "status": "failed",
-            "failed_symbol_count": 1,
-            "from_date": "2026-06-01",
-            "to_date": "2026-06-11",
-            "fallback_used": False,
-            "state_advanced": True,
-        },
-    )
-    monkeypatch.setattr(sys, "argv", ["data.sharpelydata.sharpely_data", "--symbols", "AAA", "BAD"])
-
-    assert sharpely_data.main() == 1
-    capsys.readouterr()
-
-    assert sharpely_data.STOCKEY_RUN_STATE["classification"] == "partial_failed"
-    assert sharpely_data.STOCKEY_RUN_STATE["status"] == "failed"
-
-
-def test_sharpely_data_main_exports_runner_state(monkeypatch, capsys):
-    monkeypatch.setattr(sharpely_data, "load_tracked_symbols", lambda symbols: ["AAA", "BBB"])
-    monkeypatch.setattr(sharpely_data, "parse_datetime_arg", lambda value: pd.Timestamp(value).to_pydatetime() if value else None)
-    monkeypatch.setattr(
-        sharpely_data,
-        "sync_sharpely_data",
-        lambda **kwargs: {
-            "source": "sharpely_fundamentals",
-            "symbol_count": len(kwargs["symbols"]),
-            "rows": 5,
-            "rows_read": len(kwargs["symbols"]),
-            "rows_written": 5,
-            "classification": "ok",
-            "status": "ok",
-            "from_date": "2026-06-01",
-            "to_date": "2026-06-11",
-            "fallback_used": False,
-            "state_advanced": True,
-        },
-    )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["data.sharpelydata.sharpely_data", "--symbols", "AAA", "BBB", "--from-date", "2026-06-01", "--to-date", "2026-06-11"],
-    )
-
-    assert sharpely_data.main() == 0
-    capsys.readouterr()
-
-    assert sharpely_data.STOCKEY_RUN_STATE["source"] == "sharpely_fundamentals"
-    assert sharpely_data.STOCKEY_RUN_STATE["symbol_count"] == 2
-    assert sharpely_data.STOCKEY_RUN_STATE["rows"] == 5
-    assert sharpely_data.STOCKEY_RUN_STATE["rows_read"] == 2
-    assert sharpely_data.STOCKEY_RUN_STATE["rows_written"] == 5
-    assert sharpely_data.STOCKEY_RUN_STATE["classification"] == "ok"
-    assert sharpely_data.STOCKEY_RUN_STATE["status"] == "ok"
-    assert sharpely_data.STOCKEY_RUN_STATE["state_advanced"] is True
 
 
 def test_nse_corporate_actions_sync_returns_standard_run_state(monkeypatch):
@@ -7846,8 +7885,17 @@ def test_cleanup_deprecated_tables_uses_retryable_drop(monkeypatch):
     assert executed == [("DROP TABLE IF EXISTS dhan_screeners", None)]
 
 
-def test_hot_table_retention_selects_trace_and_intraday_groups():
+def test_hot_table_retention_selects_trace_and_intraday_groups(monkeypatch):
+    # 2026-08-14: the real "trace" group tables (advisory_decision_traces etc.) were
+    # dropped in the cloud-DB cleanup -- RETENTION_TABLES is intraday-only now, so this
+    # exercises selected_specs()'s group filter against a synthetic trace entry instead.
     from scripts import hot_table_retention
+
+    fake_trace = hot_table_retention.RetentionTable(
+        table_name="fake_trace_table", date_column="load_ts", group="trace",
+        default_retention_days=90, description="test",
+    )
+    monkeypatch.setitem(hot_table_retention.RETENTION_TABLES, "fake_trace_table", fake_trace)
 
     trace_specs = hot_table_retention.selected_specs(group="trace")
     intraday_specs = hot_table_retention.selected_specs(group="intraday")
@@ -7856,7 +7904,7 @@ def test_hot_table_retention_selects_trace_and_intraday_groups():
     assert intraday_specs
     assert {spec.group for spec in trace_specs} == {"trace"}
     assert {spec.group for spec in intraday_specs} == {"intraday"}
-    assert "advisory_decision_traces" in {spec.table_name for spec in trace_specs}
+    assert "fake_trace_table" in {spec.table_name for spec in trace_specs}
     assert "dhan_ohlcv_intraday" in {spec.table_name for spec in intraday_specs}
 
 
