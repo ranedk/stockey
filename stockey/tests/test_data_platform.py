@@ -1980,6 +1980,24 @@ def test_dhan_client_refreshes_token_after_401(monkeypatch):
     assert refresh_calls == ["OLD"]
 
 
+def test_dhan_client_default_construction_reads_auth_attempts_from_env(monkeypatch):
+    # 2026-08-14 regression found live: an earlier same-day dead-code-sweep commit removed this module's
+    # `env = Env()` (it looked unused after deleting DhanTradingClient, the only caller of bare `env(...)`)
+    # but missed that DhanHistoricalClient.__init__ ALSO reads `env.int("DHAN_API_AUTH_ATTEMPTS", ...)` on
+    # its default (no-`auth_attempts`-kwarg) path -- crashing with NameError: name 'env' is not defined.
+    # Every existing test constructed the client with an explicit `auth_attempts=3`, which short-circuits
+    # the `auth_attempts or env.int(...)` expression before it ever touches `env` -- masking the bug
+    # entirely. Production code (data/dhanlive/ohlcv.py's sync_many_daily/sync_many_intraday) constructs
+    # `DhanHistoricalClient()` with NO args, which is exactly the path that crashed -- confirmed live via
+    # the 13:15 UTC ohlcv_reconcile.py cron job traceback. This test exercises that real default path.
+    monkeypatch.setattr(dhan_client, "get_access_token", lambda: "OLD")
+    monkeypatch.setattr(dhan_client.requests, "Session", lambda: type("S", (), {"headers": {}})())
+
+    client = dhan_client.DhanHistoricalClient()  # no auth_attempts kwarg -- the real production call shape
+
+    assert client.auth_attempts == 3  # DHAN_API_AUTH_ATTEMPTS default
+
+
 def test_dhan_client_gives_up_after_auth_refresh_attempts(monkeypatch):
     refresh_calls = []
 
@@ -14613,3 +14631,68 @@ def test_run_watchlist_exit_evaluation_upserts_status_per_company(monkeypatch):
     assert kwargs["unique_keys"] == ["company_master_id"]
     statuses = dict(zip(df["company_master_id"], df["status"]))
     assert statuses == {"nse:FOO": "active", "nse:BAR": "price_flagged"}
+
+
+def test_run_watchlist_exit_evaluation_uses_live_first_seen_price_not_frozen_column(monkeypatch):
+    # 2026-08-14 bug found live: first_seen_price is written ONCE (watchlist-add time) and never
+    # refreshed, while current_price is recomputed daily from the latest cum_adj_factor -- a split/bonus
+    # for a watchlisted symbol AFTER it was first seen changes cum_adj_factor for every date strictly
+    # before the event, so the frozen stored first_seen_price silently drifts out of sync with
+    # current_price's basis. Re-deriving first_seen_price live via load_price_near (keyed on
+    # first_seen_at) keeps both prices on the same adjustment basis. Here the STORED first_seen_price
+    # (40.0) would say +175% (flagged); the LIVE value (95.0, as if a 1:1 bonus since first-seen halved
+    # the historical adjusted price) says the true change is a plain +15.8% (not flagged) -- proving the
+    # live value, not the stale one, drives the decision.
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    watchlist = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:FOO", "first_seen_price": 40.0, "first_seen_at": "2026-01-01",
+                "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None,
+                "current_price": 110.0,
+            },
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: watchlist)
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_trigger_type_history_by_company", lambda: {})
+    price_lookup_calls = []
+
+    def fake_load_price_near(company_master_id, as_of_date):
+        price_lookup_calls.append((company_master_id, as_of_date))
+        return 95.0
+
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_price_near", fake_load_price_near)
+    calls = []
+    monkeypatch.setattr(fundamentals_watchlist_exit, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+
+    result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
+
+    assert price_lookup_calls == [("nse:FOO", "2026-01-01")]
+    assert result["price_flagged"] == 0
+    assert result["active"] == 1
+    df, _table, _kwargs = calls[0]
+    assert df.iloc[0]["status"] == "active"  # not price_flagged -- proves the live 95.0 was used, not 40.0
+
+
+def test_run_watchlist_exit_evaluation_falls_back_to_stored_price_when_live_lookup_empty(monkeypatch):
+    # load_price_near returning None (no price history that early) must fall back to the stored column,
+    # not silently treat the company as having no first_seen_price at all.
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    watchlist = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:FOO", "first_seen_price": 100.0, "first_seen_at": "2026-01-01",
+                "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None,
+                "current_price": 200.0,
+            },
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: watchlist)
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_trigger_type_history_by_company", lambda: {})
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_price_near", lambda *_a, **_k: None)
+    calls = []
+    monkeypatch.setattr(fundamentals_watchlist_exit, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+
+    result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
+
+    assert result["price_flagged"] == 1  # 100 -> 200 is +100%, still flagged using the stored fallback

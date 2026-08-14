@@ -26,9 +26,25 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 
 `historical_mcap` is kept as a frozen archive (2012+, ~970 symbols) — no
 longer written, but holds pre-2024 market-cap history `nseindia_mcap`
-doesn't have. `nseindia_corporate_actions` (~30 rows) is a frozen historical
-leftover, no longer written — `nseindia_corporate_actions_bc_raw`/
-`_normalized` are the live corporate-actions source.
+doesn't have. `nseindia_corporate_actions` (~30 rows) is no longer written,
+but — unlike `historical_mcap` — is NOT just a passive leftover: confirmed
+live 2026-08-14, `data/nseindia/adjusted_prices.py`'s
+`load_corporate_actions_sources()` still reads it and unions it with
+`nseindia_corporate_actions_bc_raw` into every `nseindia_corporate_actions_
+normalized` rebuild, so its frozen ~30 rows are actively folded into a live
+write pipeline on every run, not just sitting inert.
+
+`dim_security_overrides` is a manual-curation table (see `docs/identity.md`)
+— `data/nseindia/security_history.py` reads it (`load_security_overrides()`)
+but nothing writes it; confirmed live 2026-08-14 it's empty (0 rows) and has
+no populating code path anywhere — a human is expected to hand-edit rows
+here, which apparently hasn't happened yet.
+
+`nseindia_ohlcv_adjusted` — an earlier, never-fully-wired adjusted-price
+table superseded by `data/nseindia/price_adjustment.py`'s factor table +
+`advisory_adjusted_ohlcv_daily` view — was confirmed live 2026-08-14 to be
+empty with zero write or read call sites anywhere in either repo, and was
+dropped.
 
 `nseindia_earnings_events` and `nseindia_events` (NSE earnings-date and
 board-meeting/AGM calendars) have collectors that exist but are deliberately

@@ -47,7 +47,7 @@ import json
 
 import pandas as pd
 
-from fundamentals.screens.watchlist import _ensure_watchlist_table
+from fundamentals.screens.watchlist import _ensure_watchlist_table, load_price_near
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 
 SYNC_SOURCE_NAME = "fundamentals.screens.watchlist_exit"
@@ -92,11 +92,23 @@ def load_watchlist_for_exit_evaluation() -> pd.DataFrame:
     """Every current watchlist row plus the two fields evaluate_exit_status needs
     that aren't already on fundamentals_watchlist: current price (fundamentals_
     technicals, same source get_watchlist()'s own query already uses) and
-    first_seen_price/suggested_watch_until/narrative_generated_at/last_alert_at,
-    already columns on the table itself."""
+    first_seen_price/first_seen_at/suggested_watch_until/narrative_generated_at/
+    last_alert_at, already columns on the table itself.
+
+    first_seen_at is included so the caller can re-derive first_seen_price live
+    (see run_watchlist_exit_evaluation) rather than trust the frozen stored value
+    -- confirmed live 2026-08-14: both first_seen_price and current_price are
+    adj_close from advisory_adjusted_ohlcv_daily, but first_seen_price is written
+    ONCE at watchlist-add time and never refreshed, while current_price is
+    recomputed daily from the latest cum_adj_factor. A split/bonus for a
+    watchlisted symbol AFTER it was first seen changes cum_adj_factor for every
+    date strictly before the event -- current_price picks that up immediately,
+    the frozen first_seen_price does not, silently producing a wrong change_pct
+    (and therefore a wrong/missed price_flagged exit) the first time this happens
+    to any watchlisted name."""
     return sql_to_df(
         """
-        SELECT w.company_master_id, w.first_seen_price, w.last_alert_at,
+        SELECT w.company_master_id, w.first_seen_price, w.first_seen_at, w.last_alert_at,
                w.suggested_watch_until, w.narrative_generated_at,
                tech.close AS current_price
         FROM fundamentals_watchlist w
@@ -218,6 +230,13 @@ def run_watchlist_exit_evaluation() -> dict[str, object]:
     for _, row in watchlist.iterrows():
         row_dict = row.to_dict()
         company_master_id = row_dict["company_master_id"]
+        # re-derive first_seen_price live (see load_watchlist_for_exit_evaluation's docstring) instead of
+        # trusting the frozen stored column, so it stays on the SAME cum_adj_factor basis as current_price
+        # even if a split/bonus happened after this company was first seen. Falls back to the stored value
+        # if the live lookup comes back empty (e.g. a gap in the adjusted series) -- never guessed/defaulted.
+        live_first_seen_price = load_price_near(company_master_id, row_dict.get("first_seen_at"))
+        if live_first_seen_price is not None:
+            row_dict["first_seen_price"] = live_first_seen_price
         status, reason = evaluate_exit_status(row_dict, trigger_history_by_company.get(company_master_id, []), today=today)
         counts[status] += 1
         rows.append(

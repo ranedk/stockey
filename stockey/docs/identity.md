@@ -39,11 +39,13 @@ Recommended usage:
 ## Downstream usage
 
 - `nseindia_corporate_actions_normalized` now carries `security_id`
-- `nseindia_ohlcv_adjusted` now carries `security_id`
-- `features_price_daily` groups on `security_id`
 
 This keeps the identity-aware NSE adjusted-price pipeline stable when the
-market identifier changes.
+market identifier changes. (`nseindia_ohlcv_adjusted` and `features_price_daily`
+were an earlier design, both since removed -- confirmed live 2026-08-14 that
+neither table exists; `data/nseindia/price_adjustment.py`'s factor table +
+`advisory_adjusted_ohlcv_daily` view is the current adjusted-price pipeline and
+does not key on `security_id`.)
 
 systrader consumes `dhan_ohlcv_daily` (raw) and `advisory_adjusted_ohlcv_daily`
 (systrader's PRIMARY series, built by `data/nseindia/price_adjustment.py` from

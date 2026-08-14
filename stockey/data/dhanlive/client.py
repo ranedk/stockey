@@ -8,8 +8,13 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
+from environs import Env
+
 from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import force_refresh_access_token, get_access_token
+
+env = Env()
+env.read_env()
 
 
 class DhanAPIError(RuntimeError):
