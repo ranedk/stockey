@@ -1,19 +1,17 @@
 """Watchlist email notifications -- fundamental screener step 12, closing out the
 watchlist pipeline started by fundamentals/screens/watchlist.py (step 10) and
-fundamentals/screens/watch_summary.py (step 11). User-confirmed trigger (conversation
-2026-08-11): "send email on new watchlist candidate as well as when narrative
-changes."
+fundamentals/screens/watch_summary.py (step 11).
 
-Both triggers collapse to one input: watch_summary.py's own narrative_events list
-already carries is_new_candidate and narrative_changed per company, computed by
-comparing the newly generated narrative text against whatever was stored before (see
-that module's docstring). A brand-new candidate's first-ever narrative generation IS
-both events at once -- there is no meaningful "candidate added, no explanation yet"
-email to send separately, so this module sends exactly one email per event, its
-subject line distinguishing "new candidate" from "narrative updated". An event whose
-narrative regenerated but produced byte-identical text (narrative_changed=False, see
-watch_summary.py's own test for that edge case) sends nothing -- no new information,
-no email.
+send_daily_digest() sends exactly one consolidated email per pipeline run, listing
+the ENTIRE active watchlist regardless of whether anything changed today -- a
+standing end-of-day summary, not a per-change alert. (Until 2026-08-14 this module
+also sent a separate email per new-candidate/narrative-change event via
+notify_watchlist_events(); removed at the user's request so a run producing several
+watchlist changes sends one digest, not a burst of individual emails.) Rendered as
+an HTML table + narrative section (2026-08-12, "more like a dashboard than a textual
+email" per the user) -- a plain-text part is always included alongside it as the
+universal fallback every client falls back to when HTML rendering is off, per RFC
+2046's multipart/alternative convention.
 
 SAFETY: sending is OFF by default (WATCHLIST_ALERT_EMAIL_ENABLED, unset/false).
 Turning it on requires WATCHLIST_ALERT_EMAIL_FROM and WATCHLIST_ALERT_EMAIL_TO to be
@@ -25,40 +23,16 @@ this module does not attempt to verify that state itself, it will simply fail lo
 permissions were set up.
 
 WATCHLIST_ALERT_EMAIL_TO holds one or more addresses separated by whitespace (env
-vars can't hold a list, and SES's own SendEmail already accepts multiple
-ToAddresses) -- _parse_recipients() splits it; every send in this module (per-event
-and the daily digest below) goes to the full parsed list.
-
-Two independent things send mail, both gated on the same WATCHLIST_ALERT_EMAIL_*
-config:
-- notify_watchlist_events(): per-event, only on real change (new candidate or
-  narrative text that actually changed) -- see below.
-- send_daily_digest() (2026-08-12): one consolidated email per pipeline run listing
-  the ENTIRE watchlist, regardless of whether anything changed today -- a standing
-  end-of-day summary, not a change alert. Both fire from
-  run_watchlist_notification_pipeline() each time the daily fundamentals pipeline
-  runs (cron: 19:15 weekdays), so "day end" here means "after the pipeline's own
-  daily run", not a separately scheduled job. Rendered as an HTML table + narrative
-  section (2026-08-12, "more like a dashboard than a textual email" per the user) --
-  a plain-text part is always included alongside it as the universal fallback every
-  client falls back to when HTML rendering is off, per RFC 2046's multipart/
-  alternative convention.
-
-Both triggers collapse to one input: watch_summary.py's own narrative_events list
-already carries is_new_candidate and narrative_changed per company, computed by
-comparing the newly generated narrative text against whatever was stored before (see
-that module's docstring). A brand-new candidate's first-ever narrative generation IS
-both events at once -- there is no meaningful "candidate added, no explanation yet"
-email to send separately, so notify_watchlist_events() sends exactly one email per
-event, its subject line distinguishing "new candidate" from "narrative updated". An
-event whose narrative regenerated but produced byte-identical text
-(narrative_changed=False, see watch_summary.py's own test for that edge case) sends
-nothing -- no new information, no email.
+vars can't hold a list, and SES's own SendEmail already accepts multiple recipients)
+-- _parse_recipients() splits it. send_email() puts these addresses in Bcc (not To,
+per the 2026-08-14 privacy fix -- multiple real people are configured here and
+shouldn't see each other's addresses); WATCHLIST_ALERT_EMAIL_FROM is used as both the
+Source and the (self-addressed) To, since a valid message needs a To header.
 
 run_watchlist_notification_pipeline() is the single daily entrypoint chaining all
-four steps (sync watchlist -> regenerate stale narratives -> notify on what changed
--> send the daily digest) so cron/manual invocation is one command, matching how the
-rest of this fundamentals screener is run step-by-step
+four steps (sync watchlist -> regenerate stale narratives -> evaluate exits -> send
+the daily digest) so cron/manual invocation is one command, matching how the rest of
+this fundamentals screener is run step-by-step
 (`python -m fundamentals.screens.<module>`)."""
 
 from __future__ import annotations
@@ -123,36 +97,17 @@ def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = 
     )
 
 
-def build_email_content(event: dict) -> tuple[str, str]:
-    company_master_id = event["company_master_id"]
-    ticker = str(company_master_id).removeprefix("nse:")
-    if event.get("is_new_candidate"):
-        subject = f"[Watchlist] New candidate: {ticker}"
-        intro = "This company was just added to the watchlist based on a new fundamental alert."
-    else:
-        subject = f"[Watchlist] Narrative updated: {ticker}"
-        intro = "The watch narrative for this company changed based on a new fundamental alert."
-
-    body = (
-        f"{intro}\n\n"
-        f"{event.get('narrative_text') or '(no narrative text)'}\n\n"
-        f"Suggested watch until: {event.get('suggested_watch_until') or 'n/a'}\n"
-        f"Confidence: {event.get('confidence') or 'n/a'}\n"
-        "\n"
-        "This is a descriptive screener alert, not a trade recommendation. Review and "
-        "add to portfolio manually if warranted."
-    )
-    return subject, body
-
-
 def send_email(subject: str, text_body: str, html_body: str | None = None) -> dict | None:
-    """Sends via SES to every address in WATCHLIST_ALERT_EMAIL_TO. Always includes a
-    plain-text part (universal fallback); html_body, when given, is attached
-    alongside it as the primary rendering most clients show (multipart/alternative,
-    per RFC 2046 -- a client picks whichever part it can render best, never both).
-    Returns None (not an error) if sending is disabled -- callers that need to
-    distinguish "disabled" from "sent" should check WATCHLIST_ALERT_EMAIL_ENABLED
-    themselves, same as notify_watchlist_events/send_daily_digest do."""
+    """Sends via SES to every address in WATCHLIST_ALERT_EMAIL_TO, as Bcc -- recipients
+    don't see each other's addresses (2026-08-14; multiple real people are configured
+    here). Source doubles as the To: address (a valid RFC 5322 message needs one, and
+    a self-addressed To reads better than an empty one) -- the actual recipients only
+    ever appear in Bcc. Always includes a plain-text part (universal fallback);
+    html_body, when given, is attached alongside it as the primary rendering most
+    clients show (multipart/alternative, per RFC 2046 -- a client picks whichever part
+    it can render best, never both). Returns None (not an error) if sending is
+    disabled -- callers that need to distinguish "disabled" from "sent" should check
+    WATCHLIST_ALERT_EMAIL_ENABLED themselves, same as send_daily_digest does."""
     if not WATCHLIST_ALERT_EMAIL_ENABLED:
         return None
     client = _get_ses_client()
@@ -161,45 +116,12 @@ def send_email(subject: str, text_body: str, html_body: str | None = None) -> di
         body["Html"] = {"Data": html_body, "Charset": "UTF-8"}
     return client.send_email(
         Source=WATCHLIST_ALERT_EMAIL_FROM,
-        Destination={"ToAddresses": _parse_recipients(WATCHLIST_ALERT_EMAIL_TO)},
+        Destination={
+            "ToAddresses": [WATCHLIST_ALERT_EMAIL_FROM],
+            "BccAddresses": _parse_recipients(WATCHLIST_ALERT_EMAIL_TO),
+        },
         Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": body},
     )
-
-
-def notify_watchlist_events(narrative_events: list[dict]) -> dict[str, object]:
-    changed_events = [e for e in narrative_events if e.get("narrative_changed")]
-    if not changed_events:
-        return {"sent": 0, "skipped_disabled": 0, "failed": 0}
-
-    if not WATCHLIST_ALERT_EMAIL_ENABLED:
-        return {"sent": 0, "skipped_disabled": len(changed_events), "failed": 0}
-
-    if not WATCHLIST_ALERT_EMAIL_FROM or not _parse_recipients(WATCHLIST_ALERT_EMAIL_TO):
-        _record_fallback(
-            "watchlist_email_misconfigured",
-            reason="WATCHLIST_ALERT_EMAIL_ENABLED is true but WATCHLIST_ALERT_EMAIL_FROM/TO is unset; no emails sent this run.",
-            error="missing sender/recipient",
-            severity="error",
-        )
-        return {"sent": 0, "skipped_disabled": 0, "failed": len(changed_events)}
-
-    sent = 0
-    failed = 0
-    for event in changed_events:
-        subject, body = build_email_content(event)
-        try:
-            send_email(subject, body)
-            sent += 1
-        except Exception as exc:  # noqa: BLE001 -- one company's SES failure must not block the rest
-            failed += 1
-            _record_fallback(
-                "watchlist_email_send_failed",
-                reason="SES send_email failed for this watchlist event; not retried automatically.",
-                error=exc,
-                metadata={"company_master_id": event.get("company_master_id")},
-            )
-
-    return {"sent": sent, "skipped_disabled": 0, "failed": failed}
 
 
 def load_full_watchlist() -> list[dict]:
@@ -387,8 +309,8 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
 
 def send_daily_digest() -> dict[str, object]:
     """One consolidated email per pipeline run listing the entire watchlist,
-    regardless of whether anything changed today -- distinct from
-    notify_watchlist_events()'s per-change alerts, see module docstring."""
+    regardless of whether anything changed today -- the only email this module
+    sends, see module docstring."""
     if not WATCHLIST_ALERT_EMAIL_ENABLED:
         return {"sent": 0, "skipped_disabled": 1, "failed": 0}
 
@@ -415,20 +337,18 @@ def send_daily_digest() -> dict[str, object]:
 
 
 def run_watchlist_notification_pipeline() -> dict[str, object]:
-    """Chains watchlist sync -> narrative regen -> EXIT STATUS EVALUATION -> notify
-    -> daily digest, in that order. watchlist_exit runs right after narrative regen
+    """Chains watchlist sync -> narrative regen -> EXIT STATUS EVALUATION -> daily
+    digest, in that order. watchlist_exit runs right after narrative regen
     (2026-08-13, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md's "we will crowd the
     watchlist" gap fix) so it evaluates against a freshly-updated suggested_watch_
-    until/narrative_generated_at, and before notify/digest so send_daily_digest's own
-    default active-only filter reflects this run's status, not last run's. notify_
-    watchlist_events is deliberately NOT status-filtered -- a per-event change alert
-    (including one that happens to also be an invalidating event) should still reach
-    a human regardless of the company's resulting status; only the daily digest's
-    "here's your current watchlist" view filters to active by default."""
+    until/narrative_generated_at, and before the digest so send_daily_digest's own
+    default active-only filter reflects this run's status, not last run's. (Until
+    2026-08-14 this also ran notify_watchlist_events between exit evaluation and the
+    digest, sending one email per changed company; removed so a run with several
+    changes sends only the one consolidated digest -- see module docstring.)"""
     sync_result = sync_watchlist_from_alerts()
     summary_result = run_watch_summary_refresh()
     exit_result = run_watchlist_exit_evaluation()
-    notify_result = notify_watchlist_events(summary_result.get("narrative_events", []))
     digest_result = send_daily_digest()
     return {
         "watchlist_companies": sync_result["companies"],
@@ -440,9 +360,6 @@ def run_watchlist_notification_pipeline() -> dict[str, object]:
         "watchlist_invalidated": exit_result["invalidated"],
         "watchlist_price_flagged": exit_result["price_flagged"],
         "watchlist_stale": exit_result["stale"],
-        "emails_sent": notify_result["sent"],
-        "emails_skipped_disabled": notify_result["skipped_disabled"],
-        "emails_failed": notify_result["failed"],
         "digest_sent": digest_result["sent"],
         "digest_skipped_disabled": digest_result["skipped_disabled"],
         "digest_failed": digest_result["failed"],
@@ -457,8 +374,8 @@ def main() -> int:
         "rows": result["watchlist_companies"],
         "rows_written": result["narratives_generated"],
         **result,
-        "fallback_used": bool(result["narratives_failed"] or result["emails_failed"] or result["digest_failed"]),
-        "state_advanced": result["narratives_generated"] > 0 or result["emails_sent"] > 0 or result["digest_sent"] > 0,
+        "fallback_used": bool(result["narratives_failed"] or result["digest_failed"]),
+        "state_advanced": result["narratives_generated"] > 0 or result["digest_sent"] > 0,
         "status": "blocked" if result["narratives_blocked"] else "ok",
     }
     print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)
