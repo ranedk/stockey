@@ -6,10 +6,11 @@
 #
 # Mechanism: pure \copy (survives cross-version/extension differences --
 # note the source has ~100 active TimescaleDB hypertables, corrected in
-# docs/DATA_CONTRACT.md 2026-08-05; \copy against a hypertable's parent
-# still works transparently, this script makes no hypertable-specific
-# assumptions either way). If a table is missing in systrade its DDL is
-# generated from the source's information_schema.
+# docs/DATA_CONTRACT.md 2026-08-05; the `\copy (select * from $t) ...` form
+# below is required -- bare `\copy $t TO ...` only touches a hypertable's
+# empty parent shell and silently copies 0 rows, found 2026-08-14). If a
+# table is missing in systrade its DDL is generated from the source's
+# information_schema.
 #
 # - FULL_TABLES: small; truncated and fully re-copied every run.
 # - INCR_TABLES: large; only rows with date > local max(date).
@@ -50,14 +51,16 @@ FULL_TABLES=(
   nseindia_corporate_actions
   nseindia_holidays
   dim_trading_days
-  nseindia_ohlcv_adjusted   # adjustment factors + TR-adjusted prices
 )
 
 INCR_TABLES=(               # incremental on the "date" column + reconciliation
   dhan_ohlcv_daily          # 2015+, ~2400 stocks (unadjusted)
   nseindia_ohlcv            # raw NSE bhavcopy feed
   nseindia_indices          # index OHLCV + PE/PB/divyield (carry inputs)
-  advisory_adjusted_ohlcv_daily  # ADJUSTED closes 2013+, incl. delisted — primary backtest series
+  advisory_adjusted_ohlcv_daily  # ADJUSTED closes 2013+, incl. delisted — primary backtest series.
+                                  # A view on the source side since 2026-08-14 (was a written table);
+                                  # now also carries tr_adj_open/high/low/close (total-return-adjusted,
+                                  # dividend-reinvested) -- previously only in the removed nseindia_ohlcv_adjusted.
 )
 
 # Atomic full copy: spool source rows to disk first, then swap the table
