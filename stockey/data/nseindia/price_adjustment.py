@@ -178,44 +178,135 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
     return out
 
 
-# ---- persisted adjusted-close table: the "fix at source" so consumers read adj_close, not raw close ----
+# ---- adjustment factors (redesigned 2026-08-14): store ONLY the compact per-(symbol,date) factor,
+# never a second, duplicated "adjusted price" table. advisory_adjusted_ohlcv_daily is a VIEW joining
+# nseindia_ohlcv (raw) x this table on read -- one source for a symbol with all adjustments already
+# applied, instead of a separately-written price series that can drift stale. Replaces the old
+# advisory_adjusted_ohlcv_daily TABLE (same name, now a view) and supersedes the never-fully-wired
+# nseindia_ohlcv_adjusted table entirely -- its total-return columns are folded in here instead,
+# sourced from events_dividend (the existing structured dividend-events table) rather than re-parsing
+# corporate-action subject text a second time.
 
-ADJUSTED_TABLE = "advisory_adjusted_ohlcv_daily"
-MIGRATION_ID = "20260714_advisory_adjusted_ohlcv_daily"
-SCHEMA_STATEMENTS = [
+ADJUSTMENT_FACTORS_TABLE = "nseindia_adjustment_factors"
+ADJUSTED_VIEW = "advisory_adjusted_ohlcv_daily"
+FACTORS_MIGRATION_ID = "20260814_nseindia_adjustment_factors"
+VIEW_MIGRATION_ID = "20260814_advisory_adjusted_ohlcv_daily_view"
+
+FACTORS_SCHEMA_STATEMENTS = [
     f"""
-    CREATE TABLE IF NOT EXISTS {ADJUSTED_TABLE} (
+    CREATE TABLE IF NOT EXISTS {ADJUSTMENT_FACTORS_TABLE} (
         symbol TEXT NOT NULL,
         date TIMESTAMPTZ NOT NULL,
-        series TEXT,
-        close DOUBLE PRECISION,
-        adj_close DOUBLE PRECISION,
-        cum_adj_factor DOUBLE PRECISION,
+        cum_price_adjustment_factor DOUBLE PRECISION,
         ca_flag TEXT,
+        cum_total_return_factor DOUBLE PRECISION,
         load_ts TIMESTAMPTZ,
         UNIQUE (symbol, date)
     )
     """,
 ]
 
+# CREATE OR REPLACE VIEW is safe/idempotent -- but only once the OLD advisory_adjusted_ohlcv_daily
+# TABLE is gone (a view can't replace a table of the same name). That drop is a one-time, manual,
+# reviewed step (see the 2026-08-14 cutover), never baked into this idempotent migration.
+VIEW_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE OR REPLACE VIEW {ADJUSTED_VIEW} AS
+    SELECT
+        o.symbol,
+        o.date,
+        o.series,
+        o.close,
+        o.close * f.cum_price_adjustment_factor AS adj_close,
+        o.open * f.cum_price_adjustment_factor AS adj_open,
+        o.high * f.cum_price_adjustment_factor AS adj_high,
+        o.low * f.cum_price_adjustment_factor AS adj_low,
+        o.volume / NULLIF(f.cum_price_adjustment_factor, 0) AS adj_volume,
+        o.close * f.cum_total_return_factor AS tr_adj_close,
+        o.open * f.cum_total_return_factor AS tr_adj_open,
+        o.high * f.cum_total_return_factor AS tr_adj_high,
+        o.low * f.cum_total_return_factor AS tr_adj_low,
+        f.cum_price_adjustment_factor AS cum_adj_factor,
+        f.cum_total_return_factor,
+        f.ca_flag,
+        f.load_ts
+    FROM nseindia_ohlcv o
+    JOIN {ADJUSTMENT_FACTORS_TABLE} f ON f.symbol = o.symbol AND f.date = o.date
+    WHERE o.series IN ('EQ', 'BE')
+    """,
+]
 
-def ensure_table() -> None:
+
+def ensure_factors_table() -> None:
     from utils.schema_migrations import apply_schema_migration
     apply_schema_migration(
-        migration_id=MIGRATION_ID,
-        statements=SCHEMA_STATEMENTS,
+        migration_id=FACTORS_MIGRATION_ID,
+        statements=FACTORS_SCHEMA_STATEMENTS,
         owner="data.nseindia.price_adjustment",
-        description="Split/bonus-adjusted daily close derived from price steps (complete, no CA-record dependency).",
-        metadata={"tables": [ADJUSTED_TABLE], "workflow": "price_adjustment"},
+        description="Compact per-(symbol,date) adjustment factors -- split/bonus (price-step-derived) and total-return (dividend-derived).",
+        metadata={"tables": [ADJUSTMENT_FACTORS_TABLE], "workflow": "price_adjustment"},
     )
 
 
-def build_adjusted_ohlcv(*, dry_run: bool = False) -> dict[str, Any]:
-    """Populate advisory_adjusted_ohlcv_daily for the whole EQ+BE universe (EQ+BE treated as one series
-    per symbol, so a T2T migration stays continuous). Returns a summary."""
+def ensure_view() -> None:
+    from utils.schema_migrations import apply_schema_migration
+    apply_schema_migration(
+        migration_id=VIEW_MIGRATION_ID,
+        statements=VIEW_SCHEMA_STATEMENTS,
+        owner="data.nseindia.price_adjustment",
+        description="advisory_adjusted_ohlcv_daily as a view over nseindia_ohlcv x nseindia_adjustment_factors (no longer a written table).",
+        metadata={"tables": [ADJUSTED_VIEW], "workflow": "price_adjustment"},
+    )
+
+
+def compute_total_return_factor(prices: pd.DataFrame, dividends: pd.DataFrame, *,
+                                 symbol_col: str = "symbol", date_col: str = "date",
+                                 previous_close_col: str = "previous_close") -> pd.Series:
+    """Cumulative total-return (dividend-reinvested) factor per row of `prices`, aligned to its index.
+
+    Daily TR factor on an ex-dividend date is (prev_close - dividend_amount) / prev_close; 1.0 on every
+    other date. cum_total_return_factor[t] = product of daily factors STRICTLY AFTER t (per symbol), same
+    convention as adjust_frame's cum_adj_factor -- so a dividend back-adjusts only its pre-ex-date history.
+    Sourced from events_dividend (the existing structured dividend-events table), not re-parsed CA text.
+    """
+    if prices.empty:
+        return pd.Series(dtype="float64", index=prices.index)
+    if dividends.empty:
+        return pd.Series(1.0, index=prices.index)
+
+    div = dividends[["symbol", "ex_date", "dividend_amount"]].dropna(subset=["dividend_amount"]).copy()
+    div["ex_date"] = pd.to_datetime(div["ex_date"], utc=True, errors="coerce").dt.normalize()
+    div = div.groupby(["symbol", "ex_date"], as_index=False)["dividend_amount"].sum()  # multiple same-day entries -> one combined event
+
+    work = prices[[symbol_col, date_col, previous_close_col]].copy()
+    work["__date_norm"] = pd.to_datetime(work[date_col], utc=True, errors="coerce").dt.normalize()
+    merged = work.merge(
+        div.rename(columns={"symbol": symbol_col, "ex_date": "__date_norm"}),
+        on=[symbol_col, "__date_norm"],
+        how="left",
+    )
+    valid = merged["dividend_amount"].notna() & merged[previous_close_col].notna() & (merged[previous_close_col] > 0)
+    daily_factor = pd.Series(1.0, index=merged.index)
+    daily_factor.loc[valid] = (
+        (merged.loc[valid, previous_close_col] - merged.loc[valid, "dividend_amount"]) / merged.loc[valid, previous_close_col]
+    ).clip(lower=0.0)
+
+    ordered = pd.DataFrame({symbol_col: prices[symbol_col].to_numpy(), date_col: prices[date_col].to_numpy(),
+                            "_daily_factor": daily_factor.to_numpy()}, index=prices.index)
+    ordered = ordered.sort_values([symbol_col, date_col])
+    desc = ordered.sort_values([symbol_col, date_col], ascending=[True, False])
+    cum_incl_self = desc.groupby(symbol_col)["_daily_factor"].cumprod()
+    desc = desc.assign(cum_total_return_factor=cum_incl_self / desc["_daily_factor"])
+    return desc.sort_index()["cum_total_return_factor"]
+
+
+def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
+    """Populate nseindia_adjustment_factors for the whole EQ+BE universe (EQ+BE treated as one series per
+    symbol, so a T2T migration stays continuous). Split/bonus factor: price-step detection (adjust_frame,
+    unchanged). Total-return factor: events_dividend-derived (compute_total_return_factor). Returns a summary."""
     from utils.db import sql_to_df, upsert_to_db
     raw = sql_to_df(
-        "SELECT symbol, date, series, open, close FROM nseindia_ohlcv WHERE series IN ('EQ','BE') "
+        "SELECT symbol, date, series, open, close, previous_close FROM nseindia_ohlcv WHERE series IN ('EQ','BE') "
         "ORDER BY symbol, date"
     )
     if raw.empty:
@@ -223,29 +314,37 @@ def build_adjusted_ohlcv(*, dry_run: bool = False) -> dict[str, Any]:
     raw["date"] = pd.to_datetime(raw["date"], utc=True, errors="coerce")
     declared_ratios = load_declared_ca_ratios()  # NSE Bc feed confirms/supplies ratios the price snap misses
     adj = adjust_frame(raw, declared_ratios=declared_ratios)  # price-step + declared-CA back-adjustment
+
+    dividends = sql_to_df("SELECT symbol, ex_date, dividend_amount FROM events_dividend")
+    adj["cum_total_return_factor"] = compute_total_return_factor(adj, dividends).to_numpy()
+
     now = pd.Timestamp.utcnow()
-    out = adj[["symbol", "date", "series", "close", "adj_close", "cum_adj_factor", "ca_flag"]].copy()
+    out = adj[["symbol", "date", "cum_adj_factor", "ca_flag", "cum_total_return_factor"]].rename(
+        columns={"cum_adj_factor": "cum_price_adjustment_factor"}
+    ).copy()
     out["load_ts"] = now
     summary = {
         "rows": int(len(out)),
         "symbols": int(out["symbol"].nunique()),
         "declared_ca_ratios_loaded": int(len(declared_ratios)),
-        "split_bonus_events": int((out["ca_flag"] == "split_bonus").sum()),
-        "ca_confirmed_events": int((out["ca_flag"] == "split_bonus_ca").sum()),
-        "ambiguous_flags": int((out["ca_flag"] == "ambiguous").sum()),
-        "adjusted_rows": int((out["cum_adj_factor"] != 1.0).sum()),
+        "dividend_events_loaded": int(len(dividends)),
+        "split_bonus_events": int((adj["ca_flag"] == "split_bonus").sum()),
+        "ca_confirmed_events": int((adj["ca_flag"] == "split_bonus_ca").sum()),
+        "ambiguous_flags": int((adj["ca_flag"] == "ambiguous").sum()),
+        "price_adjusted_rows": int((out["cum_price_adjustment_factor"] != 1.0).sum()),
+        "total_return_adjusted_rows": int((out["cum_total_return_factor"] != 1.0).sum()),
     }
     if not dry_run:
-        ensure_table()
-        upsert_to_db(out, ADJUSTED_TABLE, unique_keys=["symbol", "date"], timescaledb_column="date")
+        ensure_factors_table()
+        upsert_to_db(out, ADJUSTMENT_FACTORS_TABLE, unique_keys=["symbol", "date"], timescaledb_column="date")
     return summary
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build the split/bonus-adjusted daily close table from price steps (complete, self-contained).")
+    parser = argparse.ArgumentParser(description="Build split/bonus + total-return adjustment factors from price steps and dividend events (complete, self-contained).")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    print(json.dumps(build_adjusted_ohlcv(dry_run=bool(args.dry_run)), indent=2, default=str))
+    print(json.dumps(build_adjustment_factors(dry_run=bool(args.dry_run)), indent=2, default=str))
     return 0
 
 

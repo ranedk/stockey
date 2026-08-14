@@ -17,8 +17,8 @@ framework) needs only the price/CA/rates/identity core below.
 | Source | Modules (data/…) | Tables |
 |---|---|---|
 | NSE bhavcopy | nseindia/bhavcopy_{downloader,history,parser} | nseindia_ohlcv, nseindia_mcap, nseindia_mto, nseindia_52wk, nseindia_cmvolt, nseindia_circuit_hit, nseindia_cat_turnover, nseindia_catg, nseindia_var1, nseindia_short_selling |
-| NSE corporate actions | nseindia/corporate_action_events, nseindia/adjusted_prices (`--only normalize`, scheduled 2026-08-05) | nseindia_corporate_actions_bc_raw, nseindia_corporate_actions_normalized, events_dividend, events_capital_change |
-| Price adjustment | data/nseindia/price_adjustment.py (promoted from advisory/ 2026-07-28) | advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) |
+| NSE corporate actions | nseindia/corporate_action_events, nseindia/adjusted_prices (scheduled 2026-08-05) | nseindia_corporate_actions_bc_raw, nseindia_corporate_actions_normalized, events_dividend, events_capital_change |
+| Price adjustment | data/nseindia/price_adjustment.py | nseindia_adjustment_factors (written); advisory_adjusted_ohlcv_daily is a VIEW over it x nseindia_ohlcv (systrader's PRIMARY series, not a written table) |
 | NSE indices | nseindia/indices_{downloader,parser} | nseindia_indices |
 | NSE calendar | nseindia/holidays | nseindia_holidays, dim_trading_days |
 | Dhan broker | dhanlive/* (incl. auth/web_login) | master_dhan_instruments, dhan_ohlcv_daily, dhan_ohlcv_intraday (future 1-min landing zone) |
@@ -139,14 +139,17 @@ physically stayed until the Phase 5 cleanup below finally ran:
   `scripts/hot_table_retention.py`'s RETENTION_TABLES had their entries for
   dropped tables removed in the same pass so neither errors on next run.
   Two additional undocumented tables found by the same audit were held back
-  pending a separate decision, then also dropped 2026-08-14 (same-day, second
-  pass, own targeted `pg_dump` first) once resolved:
-  - `nseindia_ohlcv_adjusted` — stale since 2026-02-09, superseded by
-    `advisory_adjusted_ohlcv_daily`. Turned out to be its own small instance of
-    the tracked_symbols.txt placeholder-scope bug: only 2 symbols
-    (HDFCBANK, SHAKTIPUMP) ever populated, out of the full universe
-    `adjusted_prices.py`'s `adjust` stage was meant to cover -- confirmed dead,
-    never in this list either way.
+  pending a separate decision:
+  - `nseindia_ohlcv_adjusted` — dropped, then found NOT dead: `systrade/scripts/
+    sync_from_stockey.sh` had it in `FULL_TABLES` for its TR-adjusted columns,
+    a real gap `DATA_CONTRACT.md`'s own prose didn't mention -- checking the
+    doc wasn't enough, the actual sync script is the ground truth. Its own
+    backup came back empty too (a second, unrelated finding: it's a
+    TimescaleDB hypertable, and plain `pg_dump -t`/`\copy tablename` silently
+    copy 0 rows for those -- see `DATA_CONTRACT.md`'s hypertable section).
+    Net result: not restored -- superseded instead, by the `nseindia_adjustment_factors`
+    + `advisory_adjusted_ohlcv_daily`-view redesign above, which now covers
+    total-return adjustment from the full universe instead of 2 symbols.
   - `nseindia_var1_archive_pre_dedup_20260801` -- 209M rows / 52 GB, zero code
     or doc references anywhere. Its unique index
     (`for_date, entry_number, series, symbol, isin`) has one extra column vs

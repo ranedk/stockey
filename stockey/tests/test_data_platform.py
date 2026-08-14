@@ -6447,6 +6447,92 @@ def test_price_adjustment_declared_ca_fixes_missed_split():
     assert (a2["cum_adj_factor"] == 1.0).all() and (a2["ca_flag"] == "").all()
 
 
+def test_compute_total_return_factor_back_adjusts_pre_dividend_history():
+    # 2026-08-14 redesign: TR factor derived from events_dividend, not re-parsed CA text. A Rs 5 dividend
+    # on 2026-01-03 (prev_close 100) -> daily factor 0.95; pre-ex-date history is back-adjusted by it,
+    # post-ex-date history untouched (same reverse-cumprod convention as adjust_frame's cum_adj_factor).
+    from data.nseindia import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=4, tz="UTC")
+    prices = pd.DataFrame({
+        "symbol": "S", "date": dates,
+        "previous_close": [99.0, 100.0, 100.0, 96.0],  # ex-date (2026-01-03) previous_close = 100
+    })
+    dividends = pd.DataFrame({"symbol": ["S"], "ex_date": [dates[2]], "dividend_amount": [5.0]})
+
+    factor = pa.compute_total_return_factor(prices, dividends)
+
+    assert abs(factor.iloc[0] - 0.95) < 1e-9
+    assert abs(factor.iloc[1] - 0.95) < 1e-9
+    assert abs(factor.iloc[2] - 1.0) < 1e-9   # the ex-date row itself and after: untouched
+    assert abs(factor.iloc[3] - 1.0) < 1e-9
+
+
+def test_compute_total_return_factor_empty_dividends_is_all_ones():
+    from data.nseindia import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
+    prices = pd.DataFrame({"symbol": "S", "date": dates, "previous_close": [100.0, 101.0, 102.0]})
+    factor = pa.compute_total_return_factor(prices, pd.DataFrame(columns=["symbol", "ex_date", "dividend_amount"]))
+    assert (factor == 1.0).all()
+
+
+def test_compute_total_return_factor_multiple_same_day_dividends_combine():
+    # two dividend rows on the same ex-date (e.g. interim + final recorded separately) must combine into
+    # one event, not be applied independently (which would double-count via two separate merge rows).
+    from data.nseindia import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=2, tz="UTC")
+    prices = pd.DataFrame({"symbol": "S", "date": dates, "previous_close": [100.0, 100.0]})
+    dividends = pd.DataFrame({
+        "symbol": ["S", "S"], "ex_date": [dates[1], dates[1]], "dividend_amount": [3.0, 2.0],
+    })
+    factor = pa.compute_total_return_factor(prices, dividends)
+    assert abs(factor.iloc[0] - 0.95) < 1e-9   # combined Rs 5 dividend, not two separate 0.97/0.98 factors
+
+
+def test_build_adjustment_factors_writes_compact_table(monkeypatch):
+    from data.nseindia import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
+    prices = pd.DataFrame({
+        "symbol": ["S", "S", "S"], "date": dates, "series": ["EQ", "EQ", "EQ"],
+        "open": [100.0, 101.0, 102.0], "close": [100.0, 101.0, 102.0], "previous_close": [99.0, 100.0, 101.0],
+    })
+    dividends = pd.DataFrame({"symbol": ["S"], "ex_date": [dates[1]], "dividend_amount": [2.0]})
+
+    def fake_sql_to_df(query, params=None):
+        if "nseindia_ohlcv" in query:
+            return prices
+        if "events_dividend" in query:
+            return dividends
+        raise AssertionError(f"unexpected query: {query}")
+
+    captured = {}
+
+    def fake_upsert(df, table, **kwargs):
+        captured["table"] = table
+        captured["df"] = df
+        captured["kwargs"] = kwargs
+
+    # build_adjustment_factors() imports sql_to_df/upsert_to_db locally (from utils.db import ...) on
+    # every call, so the source module -- not this module's namespace -- must be patched.
+    import utils.db as db_module
+    monkeypatch.setattr(db_module, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(db_module, "upsert_to_db", fake_upsert)
+    monkeypatch.setattr(pa, "load_declared_ca_ratios", lambda: {})
+    monkeypatch.setattr(pa, "ensure_factors_table", lambda: None)
+
+    summary = pa.build_adjustment_factors(dry_run=False)
+
+    assert summary["rows"] == 3
+    assert summary["symbols"] == 1
+    assert summary["dividend_events_loaded"] == 1
+    assert captured["table"] == pa.ADJUSTMENT_FACTORS_TABLE
+    assert list(captured["df"].columns) == ["symbol", "date", "cum_price_adjustment_factor", "ca_flag", "cum_total_return_factor", "load_ts"]
+    assert captured["kwargs"]["unique_keys"] == ["symbol", "date"]
+    row0 = captured["df"].iloc[0]
+    row1 = captured["df"].iloc[1]
+    assert abs(row0["cum_total_return_factor"] - 0.98) < 1e-9  # Rs 2 dividend on prev_close 100 -> 0.98, back-adjusts pre-ex-date history
+    assert abs(row1["cum_total_return_factor"] - 1.0) < 1e-9   # the ex-date row itself: untouched
+
+
 def test_rbi_currency_parse_rate_rows():
     from data.rbi.download_currency_rates import parse_rate_rows
     # current RBI header carries unit suffixes + EUR/JPY + new AED/IDR -- the old fixed ["USD","GBP","EURO",

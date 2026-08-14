@@ -23,9 +23,12 @@ reintroduce research/signal/LLM logic here — it belongs in systrader.
 - Preserve point-in-time behavior. Do not use future data, backdated assumptions,
   stale latest rows, or non-causal labels.
 - Corporate-action adjustment is derived from price steps first
-  (`data/nseindia/price_adjustment.py`, systrader's PRIMARY series), corroborated
-  by declared NSE corporate actions (`nseindia_corporate_actions_bc_raw`/
-  `_normalized`) where available — never guess an adjustment factor.
+  (`data/nseindia/price_adjustment.py`), corroborated by declared NSE corporate
+  actions (`nseindia_corporate_actions_bc_raw`/`_normalized`) where available —
+  never guess an adjustment factor. Only the compact per-(symbol,date) factor is
+  written (`nseindia_adjustment_factors`); `advisory_adjusted_ohlcv_daily`
+  (systrader's PRIMARY series) is a VIEW over that table joined with raw
+  `nseindia_ohlcv`, not a separately-maintained price series.
 - Do not mutate broker/auth behavior (Dhan login, CDP) unless the user explicitly
   asks for that task — a botched change here can lock out the account (see
   `data/dhanlive/auth.py`'s login lock and timezone-aware expiry check).
@@ -56,7 +59,8 @@ per-job comments in the template for each line's UTC/IST pair:
    Dhan daily bar predates the last completed trading day
    (`data/dhanlive/ohlcv_reconcile.py`).
 4. `all_price_adjustment.sh` (18:50, right after the reconcile) — rebuilds
-   `advisory_adjusted_ohlcv_daily`, systrader's PRIMARY equity series.
+   `nseindia_adjustment_factors`, the compact factor table behind
+   `advisory_adjusted_ohlcv_daily` (a view, systrader's PRIMARY equity series).
 5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
    bhavcopy/Dhan/benchmark freshness and runs bounded repairs.
 6. Log rotation (06:50, `scripts/rotate_logs.sh`).

@@ -23,7 +23,7 @@ CA_STEP_LOW = 0.65
 CA_STEP_HIGH = 1.5
 LOOKBACK_DAYS = 250
 CROSS_SOURCE_MISMATCH_PCT = 0.10
-ADJUSTED_TABLE_MIN_SYMBOLS = 100  # below this, nseindia_ohlcv_adjusted is unusable for adjustment
+ADJUSTED_TABLE_MIN_SYMBOLS = 100  # below this, advisory_adjusted_ohlcv_daily is unusable for adjustment
 
 
 @dataclass(frozen=True)

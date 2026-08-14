@@ -120,7 +120,7 @@ python -m data.nseindia.indices_parser
 python -m data.nseindia.offmarket_parser
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
-python -m data.nseindia.adjusted_prices --only all
+python -m data.nseindia.adjusted_prices
 ```
 
 Chrome remote debugging is required for the Playwright/browser-driven flows:

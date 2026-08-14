@@ -27,8 +27,9 @@ The whole pipeline is cron jobs defined in `config/stockey.crontab.template`:
    NSE/Dhan sessions don't collide.
 3. `all_ohlcv_reconcile.sh` (18:45) — backfills any universe symbol whose
    latest Dhan daily bar predates the last completed trading day.
-4. `all_price_adjustment.sh` (18:50) — rebuilds `advisory_adjusted_ohlcv_daily`,
-   systrader's PRIMARY equity series.
+4. `all_price_adjustment.sh` (18:50) — rebuilds `nseindia_adjustment_factors`,
+   the factor table behind `advisory_adjusted_ohlcv_daily` (a view), systrader's
+   PRIMARY equity series.
 5. `all_data_readiness.sh` (22:30) — checks bhavcopy/Dhan/benchmark freshness
    and runs bounded repairs.
 6. `all_data_coverage_report.sh` — non-fatal daily coverage/health report

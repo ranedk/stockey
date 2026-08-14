@@ -42,7 +42,7 @@ DOWNLOADER_STEPS = [
 PARSER_STEPS = [
     {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"},
-    {"module": "data.nseindia.adjusted_prices", "args": ["--only", "normalize"], "purpose": "corporate_action_normalize"},
+    {"module": "data.nseindia.adjusted_prices", "args": [], "purpose": "corporate_action_normalize"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
 ]

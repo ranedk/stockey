@@ -45,7 +45,7 @@ here; flagged for a decision on whether backfill is worth pursuing.
 ### NSE corporate actions
 `nseindia_corporate_actions_bc_raw` (the real, comprehensive source — parsed
 from the bhavcopy CA feed, ~5,700 symbols) and `nseindia_corporate_actions_normalized`
-(derived from it via `data/nseindia/adjusted_prices.py --only normalize`,
+(derived from it via `data/nseindia/adjusted_prices.py`,
 detects split/bonus/etc. and feeds `data/dhanlive/ohlcv.py`'s
 recent-adjustment check). `events_dividend` / `events_capital_change` cover
 dividends and capital changes separately (~19% of `events_dividend` rows lack
@@ -61,9 +61,12 @@ ever covered 2 placeholder symbols in `config/tracked_symbols.txt`, entirely
 superseded by `_bc_raw`.
 
 ### Price adjustment (systrader's PRIMARY series)
-`advisory_adjusted_ohlcv_daily` — derived purely from price steps
-(`data/nseindia/price_adjustment.py`), corroborated by declared NSE corporate
-actions where available. 2013+, ~3,970 symbols, current.
+`advisory_adjusted_ohlcv_daily` is a view over raw `nseindia_ohlcv` joined with
+`nseindia_adjustment_factors` (`data/nseindia/price_adjustment.py`) — split/bonus
+factor derived purely from price steps, corroborated by declared NSE corporate
+actions where available; total-return factor derived from `events_dividend`.
+2013+, ~3,970 symbols, current — always in sync with `nseindia_ohlcv` since
+nothing is separately written for the adjusted series itself.
 
 ### NSE indices / calendar
 `nseindia_indices` (2014+, 226 index names, current). `nseindia_holidays` /

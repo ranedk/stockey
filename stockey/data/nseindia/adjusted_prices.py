@@ -156,138 +156,6 @@ def normalize_corporate_actions(symbols: Iterable[str] | None = None) -> pd.Data
     return attach_security_identity(raw)
 
 
-def build_adjusted_prices(symbols: Iterable[str] | None = None) -> pd.DataFrame:
-    symbol_clause = ""
-    params: tuple = ()
-    if symbols:
-        symbols = list(symbols)
-        placeholders = ", ".join(["%s"] * len(symbols))
-        symbol_clause = f" WHERE symbol IN ({placeholders})"
-        params = tuple(symbols)
-
-    prices = sql_to_df(
-        f"""
-        SELECT date, isin, symbol, series, open, high, low, close, last, previous_close, volume, total_value, number_of_trades
-        FROM nseindia_ohlcv
-        {symbol_clause}
-        ORDER BY isin, series, symbol, date
-        """,
-        params=params,
-    )
-    if prices.empty:
-        return prices
-
-    prices["date"] = pd.to_datetime(prices["date"], utc=True)
-    actions = normalize_corporate_actions(symbols)
-
-    if actions.empty:
-        adjusted = prices.copy()
-        adjusted["cum_price_adjustment_factor"] = 1.0
-        adjusted["cum_volume_adjustment_factor"] = 1.0
-        adjusted["cum_total_return_factor"] = 1.0
-        adjusted["adjustment_source"] = "none"
-        adjusted = attach_security_identity(adjusted)
-        return adjusted
-
-    adjusted_frames = []
-    group_cols = ["isin", "series", "symbol"]
-    prices["join_isin"] = prices["isin"].fillna("")
-    for keys, price_group in prices.groupby(["join_isin", "series", "symbol"], dropna=False):
-        _, series, symbol = keys
-        action_group = actions[
-            (actions["series"] == series)
-            & (actions["symbol"] == symbol)
-        ].copy()
-
-        price_group = price_group.sort_values("date").copy()
-        if not action_group.empty:
-            action_group = action_group.merge(
-                price_group[["date", "previous_close"]].rename(columns={"previous_close": "action_previous_close"}),
-                on="date",
-                how="left",
-            )
-            action_group["effective_total_return_factor"] = action_group["price_adjustment_factor"].fillna(1.0)
-            dividend_mask = (
-                action_group["action_type"].eq("dividend")
-                & action_group["cash_amount_per_share"].notna()
-                & action_group["action_previous_close"].notna()
-                & (action_group["action_previous_close"] > 0)
-            )
-            action_group.loc[dividend_mask, "effective_total_return_factor"] = (
-                (action_group.loc[dividend_mask, "action_previous_close"] - action_group.loc[dividend_mask, "cash_amount_per_share"])
-                / action_group.loc[dividend_mask, "action_previous_close"]
-            )
-            action_group["effective_total_return_factor"] = action_group["effective_total_return_factor"].clip(lower=0.0)
-            daily_factors = action_group.groupby("date", dropna=False).agg(
-                daily_price_factor=("price_adjustment_factor", lambda s: s.dropna().prod() if s.notna().any() else 1.0),
-                daily_volume_factor=("volume_adjustment_factor", lambda s: s.dropna().prod() if s.notna().any() else 1.0),
-                daily_total_return_factor=("effective_total_return_factor", lambda s: s.dropna().prod() if s.notna().any() else 1.0),
-            ).reset_index()
-        else:
-            daily_factors = pd.DataFrame(
-                columns=["date", "daily_price_factor", "daily_volume_factor", "daily_total_return_factor"]
-            )
-
-        price_group = price_group.merge(daily_factors, on="date", how="left")
-        for col in ["daily_price_factor", "daily_volume_factor", "daily_total_return_factor"]:
-            price_group[col] = pd.to_numeric(price_group[col], errors="coerce").fillna(1.0)
-
-        reverse_price = price_group["daily_price_factor"].iloc[::-1].cumprod().iloc[::-1]
-        reverse_volume = price_group["daily_volume_factor"].iloc[::-1].cumprod().iloc[::-1]
-        reverse_total = price_group["daily_total_return_factor"].iloc[::-1].cumprod().iloc[::-1]
-        price_group["cum_price_adjustment_factor"] = reverse_price.shift(-1, fill_value=1.0)
-        price_group["cum_volume_adjustment_factor"] = reverse_volume.shift(-1, fill_value=1.0)
-        price_group["cum_total_return_factor"] = reverse_total.shift(-1, fill_value=1.0)
-
-        for col in ["open", "high", "low", "close", "last", "previous_close"]:
-            price_group[f"adj_{col}"] = price_group[col] * price_group["cum_price_adjustment_factor"]
-            price_group[f"tr_adj_{col}"] = price_group[col] * price_group["cum_total_return_factor"]
-        price_group["adj_volume"] = price_group["volume"] * price_group["cum_volume_adjustment_factor"]
-        price_group["adjustment_source"] = "normalized_corporate_actions"
-        price_group = price_group.drop(
-            columns=["daily_price_factor", "daily_volume_factor", "daily_total_return_factor"],
-            errors="ignore",
-        )
-        adjusted_frames.append(price_group)
-
-    adjusted = pd.concat(adjusted_frames, ignore_index=True)
-    adjusted = attach_security_identity(adjusted)
-    adjusted = adjusted.drop(columns=["join_isin"])
-    return adjusted[[
-        "security_id",
-        "identity_mapping_source",
-        "identity_confidence",
-    ] + group_cols + [
-        "date",
-        "open",
-        "high",
-        "low",
-        "close",
-        "last",
-        "previous_close",
-        "volume",
-        "total_value",
-        "number_of_trades",
-        "cum_price_adjustment_factor",
-        "cum_volume_adjustment_factor",
-        "cum_total_return_factor",
-        "adj_open",
-        "adj_high",
-        "adj_low",
-        "adj_close",
-        "adj_last",
-        "adj_previous_close",
-        "tr_adj_open",
-        "tr_adj_high",
-        "tr_adj_low",
-        "tr_adj_close",
-        "tr_adj_last",
-        "tr_adj_previous_close",
-        "adj_volume",
-        "adjustment_source",
-    ]]
-
-
 def sync_normalized_actions(symbols: Iterable[str] | None = None) -> pd.DataFrame:
     normalized = normalize_corporate_actions(symbols)
     if normalized.empty:
@@ -303,34 +171,22 @@ def sync_normalized_actions(symbols: Iterable[str] | None = None) -> pd.DataFram
     return normalized
 
 
-def sync_adjusted_prices(symbols: Iterable[str] | None = None) -> pd.DataFrame:
-    adjusted = build_adjusted_prices(symbols)
-    if adjusted.empty:
-        return adjusted
-
-    adjusted = attach_company_master_id(adjusted, ticker_column="symbol", exchange="NSE")
-    upsert_to_db(
-        adjusted,
-        "nseindia_ohlcv_adjusted",
-        unique_keys=["date", "symbol", "series"],
-        timescaledb_column="date",
-    )
-    return adjusted
-
-
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def main():
+    """Normalize NSE corporate actions into nseindia_corporate_actions_normalized.
+
+    2026-08-14: the adjusted-price build (`build_adjusted_prices`/`sync_adjusted_prices`,
+    the `--only adjust`/`all` modes, `nseindia_ohlcv_adjusted`) was removed -- superseded by
+    `data/nseindia/price_adjustment.py`'s factor table + `advisory_adjusted_ohlcv_daily` view,
+    which covers both split/bonus and total-return adjustment from one source. This module's
+    only remaining job is corporate-action normalization, which `has_recent_adjustment()`
+    (`data/dhanlive/ohlcv.py`) depends on to detect recent splits/bonuses.
+    """
     global STOCKEY_RUN_STATE
-    parser = argparse.ArgumentParser(description="Normalize NSE corporate actions and build adjusted prices")
+    parser = argparse.ArgumentParser(description="Normalize NSE corporate actions")
     parser.add_argument("--symbols", nargs="*", help="Optional symbols, comma-separated or repeated")
-    parser.add_argument(
-        "--only",
-        choices=["normalize", "adjust", "all"],
-        default="all",
-        help="Run only one stage or both",
-    )
     args = parser.parse_args()
 
     symbols = None
@@ -339,15 +195,12 @@ def main():
         for item in args.symbols:
             symbols.extend(part.strip().upper() for part in item.split(",") if part.strip())
 
-    state: dict[str, object] = {"status": "ok", "only": args.only}
-    if args.only in {"normalize", "all"}:
-        normalized = sync_normalized_actions(symbols)
-        state["normalized_rows"] = int(len(normalized))
-        state["normalized_symbols"] = int(normalized["symbol"].nunique()) if not normalized.empty else 0
-    if args.only in {"adjust", "all"}:
-        adjusted = sync_adjusted_prices(symbols)
-        state["adjusted_rows"] = int(len(adjusted))
-        state["adjusted_symbols"] = int(adjusted["symbol"].nunique()) if not adjusted.empty else 0
+    normalized = sync_normalized_actions(symbols)
+    state: dict[str, object] = {
+        "status": "ok",
+        "normalized_rows": int(len(normalized)),
+        "normalized_symbols": int(normalized["symbol"].nunique()) if not normalized.empty else 0,
+    }
     STOCKEY_RUN_STATE = state
     print(json.dumps(state, default=str), flush=True)
 

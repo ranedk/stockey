@@ -23,8 +23,9 @@
 are plain PostgreSQL, TimescaleDB was tried and removed, nothing may assume
 hypertables" — does not hold on the cloud DB. The `timescaledb` extension is
 installed there and ~100 tables are still active hypertables, including
-`advisory_adjusted_ohlcv_daily` (the PRIMARY series), `dhan_ohlcv_daily`,
-`dhan_ohlcv_intraday`, `nseindia_corporate_actions_bc_raw`/`_normalized`,
+`nseindia_adjustment_factors` (feeds the PRIMARY series view, see below),
+`dhan_ohlcv_daily`, `dhan_ohlcv_intraday`,
+`nseindia_corporate_actions_bc_raw`/`_normalized`,
 `nseindia_indices`, `rbi_bank_rates`/`rbi_currency_rates`,
 `events_dividend`/`events_capital_change`, `historical_mcap`, and dozens of
 `advisory_*` tables (confirmed via `pg_extension` +
@@ -44,6 +45,19 @@ plain postgres size functions. `systrader/scripts/sync_from_stockey.sh`'s
 `\copy`-based sync still works correctly against these tables (transparent
 querying), but its stated rationale ("both sides are plain postgres") is
 inaccurate.
+
+**Second hazard, found 2026-08-14 (cost: one silently-empty backup, twice):**
+plain `\copy hypertable_name TO ...` and `pg_dump -t hypertable_name` do
+**NOT** work — Postgres/TimescaleDB stores hypertable rows in per-chunk child
+tables, and both of those forms only ever touch the empty parent shell (0
+rows copied, no error from `pg_dump`, just a silently near-empty dump file).
+Before dropping or backing up any table in the list above, always wrap it:
+`\copy (SELECT * FROM hypertable_name) TO ...` — the `SELECT` form correctly
+unions all chunks (confirmed: this is exactly why `sync_from_stockey.sh`'s
+own INCR/FULL loops use `\copy (SELECT ...)`, not bare table names). Verify
+any backup by checking its actual row count before trusting it, not just
+that a dump file exists or that a `pg_restore -l` table-of-contents entry is
+present — a TOC entry does not prove the data section has any rows.
 
 ## The load rule (why the mirror exists)
 
@@ -68,14 +82,14 @@ detects column drift and recreates); renames/drops must be coordinated —
 
 | Table | Producer (stockey) | Notes |
 |---|---|---|
-| advisory_adjusted_ohlcv_daily | `data/nseindia/price_adjustment.py` (promoted from `advisory/` 2026-07-28) | PRIMARY equity series (2013+, CA-adjusted, incl. delisted) |
+| advisory_adjusted_ohlcv_daily | VIEW (2026-08-14) over `nseindia_ohlcv` x `nseindia_adjustment_factors`, the latter written by `data/nseindia/price_adjustment.py` | PRIMARY equity series (2013+, CA-adjusted + total-return-adjusted, incl. delisted); no longer a written table, `\copy (SELECT * FROM ...)` works against it exactly like a table |
 | nseindia_ohlcv | `data/nseindia/bhavcopy_history.py` | raw OHLC; source of adjusted opens |
 | nseindia_indices | `data/nseindia/indices_downloader.py` | mixed-case names ("Nifty 50"); PE/PB/div yield = carry inputs |
 | dhan_ohlcv_daily | `data/dhanlive/ohlcv_pull.py` | fallback only (2021+ post-reorg) |
 | dhan_ohlcv_intraday | `data/dhanlive/ohlcv.py` (via `sync_many_intraday`) | 1-min bars, ALREADY LIVE since 2025-09-22 (22M+ rows, 630 tickers as of 2026-08-04) — corrected 2026-08-05, this was previously (wrongly) described below as a not-yet-started future landing zone |
 | master_dhan_instruments | `data/dhanlive/scrip_master.py` | security ids, lots, expiries |
 | dim_security | `data/nseindia/security_history.py` | identity mapping |
-| nseindia_corporate_actions_bc_raw / nseindia_corporate_actions_normalized | `data/nseindia/bhavcopy_parser.py` / `data/nseindia/adjusted_prices.py --only normalize` | corrected 2026-08-05: the plain `nseindia_corporate_actions` table (previously listed here) is no longer written — its collector only ever covered 2 placeholder symbols and was unscheduled; `_bc_raw` (bhavcopy CA feed, 5,728 symbols) is the comprehensive source, `_normalized` derives from it (now scheduled daily, was 1yr+ stale until fixed) |
+| nseindia_corporate_actions_bc_raw / nseindia_corporate_actions_normalized | `data/nseindia/bhavcopy_parser.py` / `data/nseindia/adjusted_prices.py` | corrected 2026-08-05: the plain `nseindia_corporate_actions` table (previously listed here) is no longer written — its collector only ever covered 2 placeholder symbols and was unscheduled; `_bc_raw` (bhavcopy CA feed, 5,728 symbols) is the comprehensive source, `_normalized` derives from it (now scheduled daily, was 1yr+ stale until fixed) |
 | nseindia_mcap | `data/nseindia/bhavcopy_parser.py`'s `parse_mcap` | point-in-time universe, 2024-02+ |
 | nseindia_holidays | `data/nseindia/holidays.py` | |
 | dim_trading_days | producer unidentified — locate before relying on it | |

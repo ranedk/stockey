@@ -14,7 +14,7 @@ in what order — check there first if this drifts.
 | `all_downloaders_queue.sh` | 08:30/12:30/16:30 | `python -m data.download_queue` — enqueues single-client NSE/Dhan work |
 | `all_external_workers.sh` | +5 min after queue | `python -m utils.external_task_queue --queue {dhan,nse} --worker --drain` — drains the queues |
 | `all_ohlcv_reconcile.sh` | 18:45 | `python -m data.dhanlive.ohlcv_reconcile` — backfills symbols whose latest Dhan bar is stale |
-| `all_price_adjustment.sh` | 18:50 | `python -m data.nseindia.price_adjustment` — rebuilds `advisory_adjusted_ohlcv_daily` (systrader's PRIMARY series) |
+| `all_price_adjustment.sh` | 18:50 | `python -m data.nseindia.price_adjustment` — rebuilds `nseindia_adjustment_factors`; `advisory_adjusted_ohlcv_daily` (systrader's PRIMARY series) is a view over it, not a written table |
 | `all_data_readiness.sh` | 22:30 | `python -m data.data_readiness --fix` — freshness checks + bounded repairs |
 | `all_data_coverage_report.sh` | daily | `python scripts/data_coverage_report.py` — non-fatal per-table coverage/health report, see `docs/DATA_COVERAGE.md` |
 | `start_cron.sh` | manual | supported way to (re)start `go-crond`: runs data readiness + OHLCV reconcile first, then execs `go-crond config/stockey.generated.crontab` |
@@ -46,7 +46,7 @@ Parsers (`PARSER_STEPS`), in order:
 ```
 data.nseindia.offmarket_parser
 data.nseindia.bhavcopy_parser
-data.nseindia.adjusted_prices --only normalize
+data.nseindia.adjusted_prices
 data.nseindia.indices_parser
 data.benchmark_sync
 ```
@@ -65,7 +65,8 @@ deliberately not registered above.
 ```sh
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
-python -m data.nseindia.adjusted_prices --only all
+python -m data.nseindia.adjusted_prices
+python -m data.nseindia.price_adjustment
 ```
 
 Run sequentially, not in parallel — they touch the same derived identity

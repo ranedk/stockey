@@ -40,7 +40,6 @@ SPECS: tuple[BackfillSpec, ...] = (
     BackfillSpec("nseindia_var1", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_catg", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_corporate_actions_normalized", "symbol", exchange="NSE"),
-    BackfillSpec("nseindia_ohlcv_adjusted", "symbol", exchange="NSE"),
     BackfillSpec("dim_security_history", "symbol", exchange="NSE"),
 )
 
