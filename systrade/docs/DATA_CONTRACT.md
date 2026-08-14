@@ -84,7 +84,7 @@ both sides.
 | nseindia_mcap | `data/nseindia/bhavcopy_parser.py`'s `parse_mcap` | point-in-time universe, 2024-02+ |
 | historical_mcap | frozen archive, no longer written | pre-2024 market-cap history (2012+, ~970 symbols) `nseindia_mcap` doesn't have |
 | nseindia_holidays | `data/nseindia/holidays.py` | |
-| dim_trading_days | producer unidentified — locate before relying on it | |
+| dim_trading_days | producer unidentified — locate before relying on it | confirmed live 2026-08-14: no write site anywhere in the current codebase, yet it's read by `utils/advisory_date.py` (used in the 18:45 IST `ohlcv_reconcile.py` cron job) and is currently populated 2014-01-01→2026-12-31 (3245 rows) — not stale today, but nothing will extend it past 2026-12-31 until a producer is found/rebuilt |
 | rbi_bank_rates / fbil_gsec_par | `data/rbi/*` | risk-free (repo/T-bill) + G-sec carry |
 | events_dividend | `data/nseindia/corporate_action_events.py` | keyed on `ex_date`; a minority of rows lack `dividend_amount` — TR math must handle nulls. Input for NIFTY TR benchmark + equity carry |
 | events_capital_change | `data/nseindia/corporate_action_events.py` | |
