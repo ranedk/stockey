@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import shutil
 import sys
 import tempfile
 import time
@@ -397,10 +398,17 @@ def archive_or_delete_table(
                 chunk_summaries.append(chunk_summary)
         return chunk_summaries
 
-    summary["chunks"] = execute_db_operation(
-        _archive_or_delete_chunks,
-        operation_name=f"hot_table_retention:archive_or_delete:{spec.table_name}",
-    )
+    try:
+        summary["chunks"] = execute_db_operation(
+            _archive_or_delete_chunks,
+            operation_name=f"hot_table_retention:archive_or_delete:{spec.table_name}",
+        )
+    finally:
+        # gzip archive chunks are written here transiently and already durably persisted to S3 (when
+        # archive_s3) or no longer needed (when not) by the time this call returns -- confirmed live
+        # 2026-08-14: nothing ever removed this directory, and ~72 empty dirs accumulated under /tmp
+        # over 3 days of --execute runs.
+        shutil.rmtree(tmp_root, ignore_errors=True)
     summary["status"] = "ok"
     summary["elapsed_seconds"] = round(time.monotonic() - started, 2)
     summary["deleted_rows"] = sum(int(chunk.get("deleted_rows") or 0) for chunk in summary["chunks"])

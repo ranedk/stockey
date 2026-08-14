@@ -106,3 +106,21 @@ rate), `rbi_currency_rates`, `fbil_gsec_par`, `fbil_gsec_quote`.
   baseline) — decide whether backfilling is worth it.
 - `dhan_ohlcv_intraday` living in the cloud DB rather than locally, and not
   synced to systrader at all — see `DATA_CONTRACT.md`'s open item.
+- `dim_trading_days` has no producer in the current codebase (confirmed live
+  2026-08-14) — populated through 2026-12-31 today, not stale, but a live
+  cron job (`ohlcv_reconcile.py`) depends on it; find/rebuild the producer
+  before end of 2026. See `DATA_CONTRACT.md`'s table.
+- Write-only tables with no reader anywhere, confirmed live 2026-08-14:
+  `master_sharpely_funds`, `nseindia_mto`/`_52wk`/`_cmvolt`/`_circuit_hit`/
+  `_cat_turnover`/`_catg`/`_var1`, `nseindia_short_selling`/`_block_deals`/
+  `_bulk_deals`, `fbil_gsec_quote`. All written daily by their respective
+  collectors; none read anywhere in stockey, none in `sync_from_stockey.sh`,
+  none in `DATA_CONTRACT.md`'s Table API. Extracted data with no consumer is
+  a real gap, not a someday-maybe (per this repo's own principle) — either
+  wire a consumer or stop writing them.
+- `advisory_identity_issues` / `advisory_fallback_events`: write paths are
+  active (Dhan identity-issue recording, fallback telemetry) but their
+  read/resolve/summarize functions (`utils/identity_issues.py`,
+  `utils/fallback_telemetry.py`'s `summarize_fallback_events`) are never
+  invoked by any cron job or documented runbook step — confirmed live
+  2026-08-14. Open issues/events accumulate with no scheduled review.

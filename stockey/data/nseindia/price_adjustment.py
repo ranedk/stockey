@@ -72,7 +72,16 @@ def load_declared_ca_ratios() -> tuple[dict[tuple[str, Any], float], set[tuple[s
     RAYMOND, IDFC and 17 more demergers, 9 rights issues, 11 schemes of arrangement were all found
     misclassified as split_bonus by the price-snap heuristic alone, in the PRIMARY series). A declared
     non-split reason for a circuit-breaching date is stronger evidence than a coincidental round ratio --
-    adjust_frame() must not let the price-snap fallback override it."""
+    adjust_frame() must not let the price-snap fallback override it.
+
+    A (symbol, ex-date) can carry MULTIPLE distinct subjects (confirmed live: AHLEAST 2022-10-06 declared
+    both 'DEMERGER' and 'BONUS 1:2' the same day, across its EQ and BE series rows). Unioning every
+    subject's events at that key -- the pre-2026-08-14 behavior -- let the bonus event silently win: the
+    date got the bonus-only factor (0.667) even though the real overnight step (0.528) also carried the
+    demerger's value carve-out, permanently under-adjusting the symbol's pre-event history. A key is now
+    tracked as "mixed" (has a genuine split/bonus event AND a subject that parsed to none) and routed to
+    non_split_dates instead of ratios -- adjust_frame() then flags it 'declared_non_split_ca' (unadjusted,
+    for manual review) rather than confidently applying a ratio that ignores the other action."""
     from utils.db import sql_to_df
     df = sql_to_df(
         "SELECT symbol, date, subject FROM nseindia_corporate_actions_bc_raw WHERE subject IS NOT NULL"
@@ -81,18 +90,25 @@ def load_declared_ca_ratios() -> tuple[dict[tuple[str, Any], float], set[tuple[s
         return {}, set()
     dates = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.date
     events_by_key: dict[tuple[str, Any], set[tuple[str, int, int]]] = {}
+    has_non_split_subject: dict[tuple[str, Any], bool] = {}
     for sym, dt, subj in zip(df["symbol"], dates, df["subject"]):
         if pd.isna(dt):
             continue
-        events_by_key.setdefault((sym, dt), set()).update(_events_from_subject(subj))
+        key = (sym, dt)
+        subject_events = _events_from_subject(subj)
+        events_by_key.setdefault(key, set()).update(subject_events)
+        if not subject_events:
+            has_non_split_subject[key] = True  # this subject row carries no split/bonus event of its own
     ratios: dict[tuple[str, Any], float] = {}
     non_split_dates: set[tuple[str, Any]] = set()
     for key, events in events_by_key.items():
         f = _factor_for_events(events)
-        if f is not None and f > 0 and abs(f - 1.0) > 0.02:
+        if f is not None and f > 0 and abs(f - 1.0) > 0.02 and not has_non_split_subject.get(key, False):
             ratios[key] = f
         else:
-            non_split_dates.add(key)  # a subject WAS declared for this date, just not a split/bonus one
+            # either no split/bonus event was declared for this date at all, or one WAS declared but a
+            # separate non-split subject was ALSO declared for the same date (mixed -- see docstring)
+            non_split_dates.add(key)
     return ratios, non_split_dates
 
 # a single-day close step beyond the widest Indian circuit band (~20%) is a CA or data artifact
@@ -302,7 +318,15 @@ def compute_total_return_factor(prices: pd.DataFrame, dividends: pd.DataFrame, *
 
     div = dividends[["symbol", "ex_date", "dividend_amount"]].dropna(subset=["dividend_amount"]).copy()
     div["ex_date"] = pd.to_datetime(div["ex_date"], utc=True, errors="coerce").dt.normalize()
-    div = div.groupby(["symbol", "ex_date"], as_index=False)["dividend_amount"].sum()  # multiple same-day entries -> one combined event
+    # NSE republishes/reformats the same declared dividend under different subject wording (confirmed live
+    # 2026-08-14: 1,764 (symbol, ex_date) groups carry an identical amount under >=2 distinct subject
+    # strings, e.g. SYMPHONY 2017-08-23's Rs 1 dividend appears 3x). events_dividend's uniqueness key is
+    # (symbol, ex_date, subject), so those wording-variant duplicates survive into this table as separate
+    # rows. Dedupe on the (symbol, ex_date, amount) triple BEFORE summing, so a same-day reworded republish
+    # collapses to one payout while two genuinely distinct same-day dividends (different amounts) still
+    # both count.
+    div = div.drop_duplicates(subset=["symbol", "ex_date", "dividend_amount"])
+    div = div.groupby(["symbol", "ex_date"], as_index=False)["dividend_amount"].sum()  # distinct same-day amounts -> one combined event
 
     work = prices[[symbol_col, date_col, previous_close_col]].copy()
     work["__date_norm"] = pd.to_datetime(work[date_col], utc=True, errors="coerce").dt.normalize()

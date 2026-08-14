@@ -78,7 +78,10 @@ each line's UTC/IST pair:
    `advisory_adjusted_ohlcv_daily` (a view, systrader's PRIMARY equity series).
 5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
    bhavcopy/Dhan/benchmark freshness and runs bounded repairs.
-6. Log rotation (06:50, `scripts/rotate_logs.sh`).
+6. `all_data_coverage_report.sh` (17:10 UTC) — `scripts/data_coverage_report.py`:
+   non-fatal per-table coverage/staleness report (`docs/DATA_COVERAGE.md`),
+   monitoring only, not a data producer.
+7. Log rotation (06:50, `scripts/rotate_logs.sh`).
 
 `data/nseindia/earnings_events.py` and `data/nseindia/recent_events.py` are
 BORDERLINE (LLM-free, useful for FnO event-vol research later per
@@ -90,13 +93,13 @@ carve-out from the pure-TA boundary above (long-term fundamental screening —
 screener/watchlist/narrative/portfolio — not technicals/trading;
 `docs/FUNDAMENTAL_SCREENER_PRD.md`):
 
-7. `all_fundamentals_screener.sh` (19:15, weekdays) — runs
+8. `all_fundamentals_screener.sh` (19:15, weekdays) — runs
    `fundamentals.run_pipeline`: sector reference, L1/L2 refresh, event
    collectors, OCR + structured extraction, sector capital-cycle, L3 alerts
    (rule + LLM triage), descriptive technicals, and the watchlist/narrative/
    email pipeline, in dependency order. One step failing does not abort the
    run.
-8. `all_fundamentals_api.sh` (every 5 min, no weekday restriction) — long-running
+9. `all_fundamentals_api.sh` (every 5 min, no weekday restriction) — long-running
    FastAPI service (`fundamentals/api/app.py`) serving the `screener/` Nuxt
    frontend. Cron retries every 5 minutes; `with_lock.sh` no-ops while a real
    instance holds the lock, and the script's own `/api/health` check no-ops

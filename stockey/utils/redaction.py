@@ -53,16 +53,20 @@ SENSITIVE_QUERY_KEYS = {
 
 AUTH_HEADER_RE = re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 KEY_VALUE_RE = re.compile(
-    r"(?P<key>access[-_ ]?token|refresh[-_ ]?token|tokenId|authorization|api[-_ ]?key|password|secret|totp|pin|cookie)"
+    r"(?P<key>access[-_ ]?token|refresh[-_ ]?token|access[-_ ]?key(?:[-_ ]?id)?|token(?:[-_ ]?id)?"
+    r"|authorization|api[-_ ]?key|password|secret|totp|pin|cookie)"
     r"(?P<sep>\s*[:=]\s*)"
     r"(?P<value>[^\s,;&\"']+)",
     re.IGNORECASE,
 )
 ENV_ASSIGNMENT_RE = re.compile(
-    r"\b(?P<key>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PIN|TOTP|API_KEY|MOBILE)[A-Z0-9_]*)=(?P<value>[^\s]+)"
+    r"\b(?P<key>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PIN|TOTP|API_KEY|ACCESS_KEY|MOBILE)[A-Z0-9_]*)=(?P<value>[^\s]+)"
 )
 INDIAN_MOBILE_RE = re.compile(r"(?<!\d)(?:\+?91[-\s]?)?[6-9]\d{9}(?!\d)")
-URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+# any scheme, not just http(s) -- a DB DSN (postgresql://, redis://, ...) never matched the old http(s)-only
+# pattern, so a connection string with a real embedded password (utils/db.py builds exactly this) sailed
+# through untouched if it ever surfaced in an exception message.
+URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
 
 
 def is_sensitive_key(key: Any) -> bool:
@@ -95,9 +99,20 @@ def _redact_url(match: re.Match[str]) -> str:
             changed = True
         else:
             query_pairs.append((key, value))
+
+    netloc = parts.netloc
+    # userinfo in the authority (scheme://user:pass@host) -- a DB DSN embeds real credentials exactly
+    # here, and the query-string redaction above never looks at this part of the URL at all.
+    if parts.username or parts.password:
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        netloc = f"{REDACTED}@{host}" if host else REDACTED
+        changed = True
+
     if not changed:
         return url
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query_pairs, doseq=True), parts.fragment))
+    return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query_pairs, doseq=True), parts.fragment))
 
 
 def redact_text(value: Any) -> str | None:

@@ -3794,6 +3794,28 @@ def test_redaction_masks_secrets_mobile_and_auth_urls():
     assert redaction.REDACTED in redacted
 
 
+def test_redaction_masks_db_dsn_userinfo_credentials():
+    # 2026-08-14 gap found live: URL_RE only matched http(s):// -- a DB DSN (utils/db.py builds
+    # postgresql+psycopg2://user:pass@host:port/db with a real password) never matched at all, and even
+    # within a matched URL the userinfo segment (user:pass@) was never inspected -- only query-string keys
+    # were redacted. Any exception surfacing a raw DSN would have leaked the password in plaintext into
+    # fallback telemetry / logs.
+    dsn = "postgresql+psycopg2://systrade_user:S3cr3tPass123@10.0.0.5:5432/stockey?sslmode=require"
+    redacted = redaction.redact_text(f"connect failed: {dsn}")
+    assert "S3cr3tPass123" not in redacted
+    assert "systrade_user" not in redacted
+    assert "10.0.0.5:5432/stockey" in redacted  # host/db stay visible -- useful for debugging, not secret
+    assert redaction.REDACTED in redacted
+
+
+def test_redaction_masks_access_key_id_style_keys():
+    # 2026-08-14 gap found live: the key-pattern regexes caught AWS_SECRET_ACCESS_KEY but missed
+    # AWS_ACCESS_KEY_ID / bare access_key / bare token spellings.
+    assert "AKIAABCDEF1234567890" not in redaction.redact_text("AWS_ACCESS_KEY_ID=AKIAABCDEF1234567890")
+    assert "AKIAABCDEF1234567890" not in redaction.redact_text("access_key_id: AKIAABCDEF1234567890")
+    assert "abc123def456" not in redaction.redact_text("token=abc123def456")
+
+
 def test_redaction_url_parse_failure_records_fallback(monkeypatch):
     events = []
 
@@ -6416,6 +6438,31 @@ def test_load_declared_ca_ratios_separates_split_bonus_from_other_declared_actio
     }
 
 
+def test_load_declared_ca_ratios_mixed_split_and_non_split_same_date_is_not_split(monkeypatch):
+    # 2026-08-14 bug found live: AHLEAST declared BOTH 'DEMERGER' and 'BONUS 1:2' for 2022-10-06 (across
+    # its EQ/BE series rows). Unioning every subject's events at that key let the bonus event silently win
+    # -- the date got the bonus-only factor (0.667) even though the real overnight step (0.528) also
+    # carried the demerger's value carve-out, permanently under-adjusting the symbol's pre-event history.
+    # A mixed date (real split/bonus event + a subject that parsed to none) must route to non_split_dates,
+    # not ratios, so adjust_frame flags it for review instead of confidently misadjusting it.
+    from data.nseindia import price_adjustment as pa
+    import datetime as _dt
+
+    rows = pd.DataFrame({
+        "symbol": ["AHLEAST", "AHLEAST", "CLEAN"],
+        "date": pd.to_datetime(["2022-10-06", "2022-10-06", "2026-01-01"], utc=True),
+        "subject": ["DEMERGER", "BONUS 1:2", "BONUS 1:1"],
+    })
+    monkeypatch.setattr("utils.db.sql_to_df", lambda query: rows)
+
+    ratios, non_split_dates = pa.load_declared_ca_ratios()
+
+    assert ("AHLEAST", _dt.date(2022, 10, 6)) not in ratios
+    assert ("AHLEAST", _dt.date(2022, 10, 6)) in non_split_dates
+    # an unmixed date (only a bonus declared) is unaffected
+    assert ratios == {("CLEAN", _dt.date(2026, 1, 1)): 0.5}
+
+
 def test_compute_total_return_factor_back_adjusts_pre_dividend_history():
     # 2026-08-14 redesign: TR factor derived from events_dividend, not re-parsed CA text. A Rs 5 dividend
     # on 2026-01-03 (prev_close 100) -> daily factor 0.95; pre-ex-date history is back-adjusted by it,
@@ -6455,6 +6502,30 @@ def test_compute_total_return_factor_multiple_same_day_dividends_combine():
     })
     factor = pa.compute_total_return_factor(prices, dividends)
     assert abs(factor.iloc[0] - 0.95) < 1e-9   # combined Rs 5 dividend, not two separate 0.97/0.98 factors
+
+
+def test_compute_total_return_factor_dedupes_reworded_same_amount_duplicate():
+    # 2026-08-14 bug found live: NSE republishes/reformats the same declared dividend under different
+    # subject wording, and events_dividend's uniqueness key (symbol, ex_date, subject) lets each wording
+    # variant survive as its own row -- e.g. SYMPHONY 2017-08-23's real Rs 1 dividend appeared 3x under
+    # 3 different subjects. Summing them blindly (the old behavior) tripled the payout to Rs 3. Identical
+    # (symbol, ex_date, amount) duplicates must collapse to ONE payout...
+    from data.nseindia import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=2, tz="UTC")
+    prices = pd.DataFrame({"symbol": "S", "date": dates, "previous_close": [100.0, 100.0]})
+    reworded_duplicate = pd.DataFrame({
+        "symbol": ["S", "S", "S"], "ex_date": [dates[1], dates[1], dates[1]], "dividend_amount": [1.0, 1.0, 1.0],
+    })
+    factor = pa.compute_total_return_factor(prices, reworded_duplicate)
+    assert abs(factor.iloc[0] - 0.99) < 1e-9   # ONE Rs 1 dividend, not three -- not (100-3)/100 = 0.97
+
+    # ...while two GENUINELY distinct same-day dividends (different amounts) still both count, same as
+    # test_compute_total_return_factor_multiple_same_day_dividends_combine above.
+    genuinely_distinct = pd.DataFrame({
+        "symbol": ["S", "S"], "ex_date": [dates[1], dates[1]], "dividend_amount": [3.0, 2.0],
+    })
+    factor2 = pa.compute_total_return_factor(prices, genuinely_distinct)
+    assert abs(factor2.iloc[0] - 0.95) < 1e-9
 
 
 def test_build_adjustment_factors_writes_compact_table(monkeypatch):
@@ -6546,6 +6617,10 @@ def test_corporate_action_events_parsers():
     assert classify_capital_change("FVSPLT FRM RS 10 TO RE 1")["event_type"] == "split"
     assert classify_capital_change("BON 2:1/FVSPLT FRM RS 2 TO RE 1")["event_type"] == "bonus+split"
     assert classify_capital_change("DIV - RS 2 PER SH") is None
+    # 2026-08-14 bug found live: a combined interim+special declaration carries TWO figures, not one --
+    # the old first-match-only regex understated 193 real subjects this way.
+    assert parse_dividend("DIV-RS 4/SPL DIV-RS 3")["dividend_amount"] == 7.0
+    assert parse_dividend("AGM/DIV-RS 7/SPLDIV-RS15")["dividend_amount"] == 22.0
 
 
 def test_price_data_sanity_report_contract():
@@ -8011,7 +8086,7 @@ def test_hot_table_retention_blocks_delete_without_archive(monkeypatch):
     assert "archive" in result["message"].lower()
 
 
-def test_hot_table_retention_execute_uses_retryable_operation(monkeypatch):
+def test_hot_table_retention_execute_uses_retryable_operation(monkeypatch, tmp_path):
     from scripts import hot_table_retention
 
     spec = hot_table_retention.RETENTION_TABLES["dhan_ohlcv_intraday"]
@@ -8044,6 +8119,18 @@ def test_hot_table_retention_execute_uses_retryable_operation(monkeypatch):
     monkeypatch.setattr(hot_table_retention, "db_session", lambda: FakeSession())
     monkeypatch.setattr(hot_table_retention, "execute_db_operation", fake_execute_db_operation)
     monkeypatch.setattr(hot_table_retention, "delete_chunk", lambda **_kwargs: 7)
+    # 2026-08-14 bug found live: tempfile.mkdtemp()'d tmp_root was never cleaned up -- 72 empty dirs
+    # accumulated under /tmp over 3 days of --execute runs. Capture the actual dir mkdtemp() hands back
+    # and assert it's gone once archive_or_delete_table returns.
+    created_dirs = []
+    real_mkdtemp = hot_table_retention.tempfile.mkdtemp
+
+    def spying_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=tmp_path, **kwargs)
+        created_dirs.append(path)
+        return path
+
+    monkeypatch.setattr(hot_table_retention.tempfile, "mkdtemp", spying_mkdtemp)
 
     result = hot_table_retention.archive_or_delete_table(
         spec,
@@ -8061,6 +8148,8 @@ def test_hot_table_retention_execute_uses_retryable_operation(monkeypatch):
     assert result["status"] == "ok"
     assert result["deleted_rows"] == 7
     assert result["chunks"][0]["deleted_rows"] == 7
+    assert len(created_dirs) == 1
+    assert not os.path.exists(created_dirs[0])  # cleaned up, not leaked
 
 
 

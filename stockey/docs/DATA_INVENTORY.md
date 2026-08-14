@@ -12,7 +12,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 
 | Source | Modules (`data/…`) | Tables |
 |---|---|---|
-| NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap`, `nseindia_mto`, `nseindia_52wk`, `nseindia_cmvolt`, `nseindia_circuit_hit`, `nseindia_cat_turnover`, `nseindia_catg`, `nseindia_var1`, `nseindia_short_selling`, `nseindia_block_deals`, `nseindia_bulk_deals` |
+| NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap`, `nseindia_mto`, `nseindia_52wk`, `nseindia_cmvolt`, `nseindia_circuit_hit`, `nseindia_cat_turnover`, `nseindia_catg`, `nseindia_var1`, `nseindia_short_selling`, `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_reg`, `nseindia_pe`, `nseindia_csqr` |
 | NSE corporate actions | `nseindia/corporate_action_events`, `nseindia/adjusted_prices` | `nseindia_corporate_actions_bc_raw`, `nseindia_corporate_actions_normalized`, `events_dividend`, `events_capital_change` |
 | Price adjustment | `data/nseindia/price_adjustment.py` | `nseindia_adjustment_factors` (written); `advisory_adjusted_ohlcv_daily` is a VIEW over it × `nseindia_ohlcv` (systrader's PRIMARY series, not a written table) |
 | NSE indices | `nseindia/indices_{downloader,parser}` | `nseindia_indices` |
@@ -20,7 +20,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 | Dhan broker | `dhanlive/*` (incl. auth/web_login) | `master_dhan_instruments`, `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` (1-min bars) |
 | RBI/FBIL | `rbi/*` | `rbi_bank_rates`, `rbi_currency_rates`, `fbil_gsec_par`, `fbil_gsec_quote` |
 | Identity | `company_master`, `nseindia/security_history` | `company_master`, `dim_security*` |
-| Sharpely identity/sector mapping | `sharpelydata/scrip_master.py` | `master_sharpely_equity`, `master_sharpely_funds` — feeds `company_master`'s `sharpely_id` identity fallback and `fundamentals/collectors/sector_data.py`'s NSE→BSE sector-code mapping |
+| Sharpely identity/sector mapping | `sharpelydata/scrip_master.py` | `master_sharpely_equity` — feeds `company_master`'s `sharpely_id` identity fallback and `fundamentals/collectors/sector_data.py`'s NSE→BSE sector-code mapping. `master_sharpely_funds` (also written here) has zero readers anywhere — confirmed live 2026-08-14, write-only |
 | Download run state | `data/download_runner.py` (via `utils/sync_state.py`) | `advisory_sync_state` (load-bearing — never drop) |
 | Promoted utility tables | `utils/fallback_telemetry.py`, `utils/external_task_queue.py`, `utils/identity_issues.py` | `advisory_fallback_events`, `advisory_external_task_queue`, `advisory_identity_issues` |
 
@@ -37,7 +37,7 @@ event-vol research.
 
 ## Cron
 
-Six core jobs (`config/stockey.crontab.template`, times are intended IST
+Seven core jobs (`config/stockey.crontab.template`, times are intended IST
 wall-clock — the crontab file itself is written in UTC since go-crond has no
 `CRON_TZ`/`TZ` support):
 

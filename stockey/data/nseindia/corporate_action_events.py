@@ -37,16 +37,19 @@ _DIV_AMOUNT_RE = re.compile(r"(?:RS|RE)\.?\s*([0-9]+(?:\.[0-9]+)?)")
 def parse_dividend(subject: str) -> dict[str, Any] | None:
     """Parse a dividend event from a Bc PURPOSE string, or None if it isn't a dividend.
 
-    amount is the per-share rupee value ("DIV - RS 2 PER SH" -> 2.0), or None when NSE states only
-    "DIVIDEND"/"INTERIM DIVIDEND" with no figure. type is interim / special / final.
+    amount is the per-share rupee value, summed across every "RS n"/"RE n" figure in the subject --
+    a combined interim+special declaration ("DIV-RS 4/SPL DIV-RS 3") is one payout of Rs 7, not Rs 4
+    (confirmed live 2026-08-14: 193 distinct subjects carry more than one figure; using only the first
+    match, as this did before, systematically understated the total-return dividend amount). None when
+    NSE states only "DIVIDEND"/"INTERIM DIVIDEND" with no figure at all. type is interim / special / final.
     """
     up = str(subject).upper()
     if _SUBDIV_RE.search(up):          # subdivision = split -> not a dividend
         return None
     if "DIV" not in up:
         return None
-    m = _DIV_AMOUNT_RE.search(up)
-    amount = float(m.group(1)) if m else None
+    figures = _DIV_AMOUNT_RE.findall(up)
+    amount = sum(float(f) for f in figures) if figures else None
     if "INT" in up:                    # INTERIM DIVIDEND / INTDIV
         dtype = "interim"
     elif "SPECIAL" in up:

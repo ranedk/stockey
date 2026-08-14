@@ -17,7 +17,14 @@ stay the stable spec; this tracks what's actually next.
 
 ## Next up
 
-Nothing queued yet. Add the next set of work here when it's scoped.
+- Three write-only tables with zero readers, confirmed live 2026-08-14:
+  `fundamentals_screenerin_query_results` (`fundamentals/collectors/
+  screenerin.py`'s deleveraging screen — scheduled since 2026-08-14 but its
+  output still has no consumer), `fundamentals_industry_group_reference` and
+  `fundamentals_basic_industry_reference` (written unconditionally alongside
+  `fundamentals_sector_reference` in `fundamentals/collectors/sector_data.py`,
+  but unlike that sibling, never read anywhere). Per this doc's own
+  principle above, wire a consumer or stop writing them.
 
 ## Explicitly not now
 
