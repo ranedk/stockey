@@ -37,7 +37,7 @@ from data.dhanlive import auth_cli as dhan_auth_cli
 from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv, scrip_master as dhan_scrip_master
-from data.nseindia import bhavcopy_downloader, bhavcopy_parser, corporate_actions, earnings_events, indices_downloader, indices_parser, offmarket, recent_events, security_history
+from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, offmarket, recent_events, security_history
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
@@ -3549,46 +3549,6 @@ def test_identity_issues_writes_use_retryable_operations(monkeypatch):
     assert "resolution_error_text = %s" in executed[2][0]
 
 
-def test_identity_issues_records_dhan_ohlcv_history_issue(monkeypatch):
-    operation_names: list[str] = []
-    executed: list[tuple[str, object]] = []
-
-    class FakeCursor:
-        def execute(self, query, params=None):
-            executed.append((str(query), params))
-
-    class FakeSession:
-        def __enter__(self):
-            return None, FakeCursor()
-
-        def __exit__(self, *_args):
-            return False
-
-    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
-        operation_names.append(operation_name)
-        return operation()
-
-    monkeypatch.setattr(identity_issues, "ensure_identity_issues_table", lambda: None)
-    monkeypatch.setattr(identity_issues, "db_session", lambda: FakeSession())
-    monkeypatch.setattr(identity_issues, "execute_db_operation", fake_execute_db_operation)
-
-    row = identity_issues.record_dhan_ohlcv_history_issue(
-        symbol="HUIL",
-        requested_exchange="NSE",
-        asset_type="stock",
-        reason="dhan_daily_sync_failed_no_history",
-        error_text="Dhan API request failed with status 400",
-    )
-
-    assert row["issue_key"] == "dhan_ohlcv_history_unavailable:stock:NSE:HUIL"
-    assert row["issue_type"] == "dhan_ohlcv_history_unavailable"
-    assert row["symbol"] == "HUIL"
-    assert "explicitly exclude" in row["suggested_action"]
-    assert operation_names == ["identity_issues:record_dhan_ohlcv_history_issue"]
-    assert "INSERT INTO" in executed[0][0]
-    assert executed[0][1]["issue_type"] == "dhan_ohlcv_history_unavailable"
-
-
 def test_identity_issue_resolution_for_ohlcv_history_requires_local_history(monkeypatch):
     rows = pd.DataFrame(
         [
@@ -6188,98 +6148,6 @@ def test_sharpely_scrip_master_main_exports_runner_state(monkeypatch, capsys):
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["state_advanced"] is True
 
 
-def test_nse_corporate_actions_sync_returns_standard_run_state(monkeypatch):
-    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
-    persisted: list[dict[str, object]] = []
-    upserts: list[pd.DataFrame] = []
-    cursors: list[tuple[str, object]] = []
-
-    class FakeRedis:
-        def close(self):
-            return None
-
-    class FakeEquity:
-        def __init__(self, symbol: str):
-            self.display_name = f"{symbol} LTD"
-
-    class FakePage:
-        def goto(self, *_args, **_kwargs):
-            return None
-
-        def wait_for_timeout(self, *_args, **_kwargs):
-            return None
-
-        def close(self):
-            return None
-
-    class FakeContext:
-        def new_page(self):
-            return FakePage()
-
-    class FakeBrowser:
-        contexts = [FakeContext()]
-
-        def close(self):
-            return None
-
-    class FakeChromium:
-        def connect_over_cdp(self, *_args, **_kwargs):
-            return FakeBrowser()
-
-    class FakePlaywright:
-        chromium = FakeChromium()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    def fake_fetch(_page, symbol, _issuer, _from_date, _to_date):
-        return pd.DataFrame(
-            [
-                {
-                    "date": pd.Timestamp("2026-06-10"),
-                    "symbol": symbol,
-                    "series": "EQ",
-                    "subject": "Bonus issue",
-                }
-            ]
-        )
-
-    monkeypatch.setattr(corporate_actions, "normalize_date_window", lambda from_date, to_date: (pd.Timestamp("2026-06-01").to_pydatetime(), pd.Timestamp("2026-06-11").to_pydatetime()))
-    monkeypatch.setattr(corporate_actions, "get_redis_client", lambda *_args, **_kwargs: FakeRedis())
-    monkeypatch.setattr(corporate_actions, "sync_playwright", lambda: FakePlaywright())
-    monkeypatch.setattr(corporate_actions, "get_nse_equity", lambda symbol: FakeEquity(symbol))
-    monkeypatch.setattr(corporate_actions, "choose_from_date", lambda explicit, candidates: pd.Timestamp("2026-06-01").to_pydatetime())
-    monkeypatch.setattr(corporate_actions, "get_redis_cursor", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(corporate_actions, "get_db_max_date", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(corporate_actions, "fetch_corporate_actions", fake_fetch)
-    monkeypatch.setattr(corporate_actions, "attach_company_master_id", lambda df, **_kwargs: df.copy())
-    monkeypatch.setattr(corporate_actions, "upsert_to_db", lambda df, *_args, **_kwargs: upserts.append(df.copy()))
-    monkeypatch.setattr(corporate_actions, "set_redis_cursor", lambda redis_client, key, value: cursors.append((key, value)))
-    monkeypatch.setattr(corporate_actions, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
-
-    result = corporate_actions.sync_corporate_actions(["aaa", "BBB"], from_date=None, to_date=None)
-
-    assert result["source"] == corporate_actions.SYNC_SOURCE_NAME
-    assert result["rows"] == 2
-    assert result["rows_read"] == 2
-    assert result["rows_written"] == 2
-    assert result["symbol_count"] == 2
-    assert result["symbols_queried"] == 2
-    assert result["symbols_skipped"] == 0
-    assert result["from_date"] == "2026-06-01"
-    assert result["to_date"] == "2026-06-11"
-    assert result["latest_item_ts"].startswith("2026-06-10")
-    assert result["state_advanced"] is True
-    assert len(upserts) == 2
-    assert len(cursors) == 2
-    assert persisted[-1]["source_name"] == corporate_actions.SYNC_SOURCE_NAME
-    assert persisted[-1]["status"] == "ok"
-    assert persisted[-1]["state"]["rows_written"] == 2
-
-
 def test_recent_events_main_exports_runner_state(monkeypatch, capsys):
     persisted: list[dict[str, object]] = []
 
@@ -6518,6 +6386,8 @@ def test_build_adjustment_factors_writes_compact_table(monkeypatch):
     monkeypatch.setattr(db_module, "upsert_to_db", fake_upsert)
     monkeypatch.setattr(pa, "load_declared_ca_ratios", lambda: {})
     monkeypatch.setattr(pa, "ensure_factors_table", lambda: None)
+    view_calls = []
+    monkeypatch.setattr(pa, "ensure_view", lambda: view_calls.append(True))
 
     summary = pa.build_adjustment_factors(dry_run=False)
 
@@ -6531,6 +6401,9 @@ def test_build_adjustment_factors_writes_compact_table(monkeypatch):
     row1 = captured["df"].iloc[1]
     assert abs(row0["cum_total_return_factor"] - 0.98) < 1e-9  # Rs 2 dividend on prev_close 100 -> 0.98, back-adjusts pre-ex-date history
     assert abs(row1["cum_total_return_factor"] - 1.0) < 1e-9   # the ex-date row itself: untouched
+    # ensure_view() must run every non-dry-run build (2026-08-14 bug: it was defined but never called,
+    # so a fresh DB or an accidental drop would silently never get advisory_adjusted_ohlcv_daily back).
+    assert view_calls == [True]
 
 
 def test_rbi_currency_parse_rate_rows():
@@ -13663,9 +13536,11 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 14
+    assert len(fundamentals_run_pipeline.STEPS) == 15
     assert fundamentals_run_pipeline.STEPS[-1] == "fundamentals.screens.notifications"
     assert "fundamentals.screens.investor_classification" in fundamentals_run_pipeline.STEPS
+    # 2026-08-14: the deleveraging screen (PRD sec 8 step 2) was built but never scheduled -- now is.
+    assert "fundamentals.collectors.screenerin" in fundamentals_run_pipeline.STEPS
 
 
 def test_main_exits_zero_when_not_all_steps_failed(monkeypatch, capsys):

@@ -1,13 +1,12 @@
 """Database utilities."""
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime
 import json
 from pathlib import Path
 import sys
 import tempfile
 import time
-from typing import Any, Callable, List, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, List, Sequence, Tuple, TypeVar
 
 import pandas as pd
 import pandas.api.types as pdt
@@ -854,79 +853,6 @@ def get_sql( sql_query: str, params: Tuple = ()) -> pd.Series:
 
     # RealDictCursor gives us a dict → easy DataFrame/Series conversion
     return pd.Series(rows[0])
-
-
-def table_has_date(
-    table: str,
-    column: str,
-    target: Union[date, datetime],
-) -> tuple[bool, date | None]:
-    """
-    Return True if *table.column* contains *target* ignoring any time part.
-
-    Parameters
-    ----------
-    table   : table name (unquoted; will be wrapped safely)
-    column  : column name (unquoted)
-    target  : a datetime.date or datetime.datetime
-
-    Raises
-    ------
-    ValueError if the column is not of type DATE.
-    """
-
-    def _fetch_column() -> dict | None:
-        with db_session(dict_factory=True) as (conn, cur):
-            cur.execute(
-                """
-                SELECT data_type
-                FROM   information_schema.columns
-                WHERE  table_schema = 'public'
-                  AND  table_name   = %s
-                  AND  column_name  = %s
-                """,
-                (table, column),
-            )
-            return cur.fetchone()
-
-    row = with_db_retries(_fetch_column, operation_name="table_has_date:column")
-    if row is None:
-        raise ValueError(f"{table}.{column} does not exist")
-    if row["data_type"] not in ["date", "timestamp", "timestamp with time zone"]:
-        raise ValueError(
-            f"{table}.{column} is {row['data_type'].upper()}, not DATE"
-        )
-
-    date_only = target.date() if isinstance(target, datetime) else target
-
-    query = sql.SQL(
-        """
-        SELECT
-            EXISTS(SELECT 1
-                   FROM   {schema}.{table}
-                   WHERE  {column}::date = %s
-                   LIMIT  1)                     AS has_target,
-            MAX({column}::date)                 AS latest_date
-        FROM {schema}.{table}
-        """
-    ).format(
-        schema=sql.Identifier("public"),
-        table=sql.Identifier(table),
-        column=sql.Identifier(column),
-    )
-
-    def _fetch_date_status() -> dict:
-        with db_session(dict_factory=True) as (_, cur):
-            cur.execute(query, (date_only,))
-            return cur.fetchone()
-
-    row = with_db_retries(_fetch_date_status, operation_name="table_has_date:status")
-    has_target = row["has_target"]
-    latest_date = row["latest_date"]
-
-    if latest_date and isinstance(latest_date, datetime):
-        latest_date = latest_date.date()
-    return has_target, latest_date
 
 
 def get_max_date(feature_table):

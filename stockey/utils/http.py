@@ -12,7 +12,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 import ua_generator
-from bs4 import BeautifulSoup
 from environs import Env
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -23,23 +22,6 @@ env = Env()
 env.read_env()
 _CACHE_DIR = Path(env("HTTP_CACHE"))
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def hidden_inputs_to_dict(html: str) -> dict[str, str | None]:
-    """
-    Parse HTML and return a dict of all <input type="hidden"> elements,
-    keyed by their 'name' attribute with values from their 'value' attribute.
-    If either attribute is missing, that element is skipped.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    hidden_fields = {}
-    for tag in soup.find_all("input", {"type": "hidden"}):
-        name = tag.get("name")
-        value = tag.get("value")  # returns None if attribute missing
-        if name is not None:  # ignore unnamed inputs
-            hidden_fields[name] = value
-    return hidden_fields
 
 
 def get_dynamic_headers():

@@ -154,12 +154,6 @@ def get_file_content(key: str) -> bytes:
     return _download_bytes(key)
 
 
-def get_file_handle(key: str) -> bytes:
-    """ Download a file from S3 and return its content as a file handle. """
-    s3 = _get_client()
-    return s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"]
-
-
 def get_as_temp_file(key: str) -> bytes:
     """ Download a file from S3 and return its content as a temporary file. """
     content = _download_bytes(key)

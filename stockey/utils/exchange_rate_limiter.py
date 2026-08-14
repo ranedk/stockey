@@ -8,7 +8,7 @@ around exchange_gate(domain="nse", ...); existing NSE callers are unchanged.
 
 Every Playwright page.goto() (or plain requests.get()) against a rate-sensitive
 source, across every process on this machine, MUST go through exchange_request_gate()
-(or the exchange_goto() convenience wrapper) so that, per domain:
+so that, per domain:
   - at most one process has a request in flight at any time (no parallel requests)
   - consecutive requests are spaced at least <DOMAIN>_MIN_REQUEST_INTERVAL_SECONDS
     apart, enforced globally across processes -- not just within one script's own loop
@@ -124,9 +124,3 @@ def exchange_request_gate(
             except OSError:
                 pass
         handle.close()
-
-
-def exchange_goto(page, url: str, *, domain: str, **kwargs):
-    """Navigate a Playwright page to a `domain` URL through the shared cross-process gate."""
-    with exchange_request_gate(domain=domain):
-        return page.goto(url, **kwargs)

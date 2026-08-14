@@ -104,14 +104,6 @@
       "examples": []
     },
     {
-      "name": "load_sharpely_mcap",
-      "category": "ingestion",
-      "description": "Refresh historical market-cap rows (mcap-only slice; fundamentals extraction was removed in the pure-TA cut).",
-      "command": ["python", "-m", "data.sharpelydata.sharpely_data"],
-      "read_only": false,
-      "examples": []
-    },
-    {
       "name": "download_nse_bhavcopy",
       "category": "download",
       "description": "Run the NSE bhavcopy downloader.",

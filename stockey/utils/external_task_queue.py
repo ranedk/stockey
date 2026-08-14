@@ -46,7 +46,6 @@ EXTERNAL_TASK_QUEUE_SCHEMA_STATEMENTS = [
 SINGLE_CLIENT_QUEUES = {"nse", "dhan"}
 ALLOWED_NSE_MODULES = {
     "data.nseindia.holidays",
-    "data.nseindia.corporate_actions",
     "data.nseindia.earnings_events",
     "data.nseindia.offmarket",
     "data.nseindia.bhavcopy_downloader",

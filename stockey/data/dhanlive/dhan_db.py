@@ -71,17 +71,6 @@ def get_nse_equity(ticker: str):
     )
 
 
-def get_bse_equity(ticker: str):
-    return get_sql(
-        """
-        SELECT * from master_dhan_instruments
-        WHERE instrument='EQUITY' and instrument_type='ES'
-        and exch_id='BSE' and security_id::text=%s and valid_to IS NULL;
-        """,
-        (ticker,),
-    )
-
-
 def get_company_master_equity(ticker: str, exchange: str):
     exchange_upper = exchange.upper()
     company = load_company_master_records(ticker, exchanges=[exchange_upper])

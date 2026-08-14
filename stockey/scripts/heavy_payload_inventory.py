@@ -11,7 +11,6 @@ import pandas as pd
 from utils.db import sql_to_df
 
 
-TEXT_TYPES = {"text", "json", "jsonb", "character varying"}
 ANNOUNCEMENT_TABLES = {"announcement_pipeline_documents", "announcement_pipeline_reports"}
 HIGH_RISK_NAME_PARTS = ("raw", "payload", "summary", "context", "response", "report", "transcript", "ocr", "json")
 CONTROL_PLANE_PREFIXES = (
@@ -40,10 +39,6 @@ def _json_default(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return str(value)
-
-
-def is_text_payload_type(data_type: str) -> bool:
-    return str(data_type or "").lower() in TEXT_TYPES
 
 
 def is_pointer_metadata_column(column_name: str) -> bool:

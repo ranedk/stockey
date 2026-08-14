@@ -337,6 +337,7 @@ def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
     if not dry_run:
         ensure_factors_table()
         upsert_to_db(out, ADJUSTMENT_FACTORS_TABLE, unique_keys=["symbol", "date"], timescaledb_column="date")
+        ensure_view()  # CREATE OR REPLACE is cheap/idempotent -- self-heals a fresh DB or an accidental drop
     return summary
 
 

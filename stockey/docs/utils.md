@@ -41,11 +41,11 @@ python -m utils.ocr /path/to/file.pdf --provider openai --pages 1,3-5
 python -m utils.ocr /path/to/file.pdf --provider both --pages all
 ```
 
-Standalone utility, not invoked by any cron/KEEP-scope collector (the
-announcement pipeline that used to call it was removed in the pure-TA cut —
-`docs/DATA_INVENTORY.md`). Set `OCR_USING=codex` or `OCR_USING=codex:<model>`
-to route through Codex CLI instead of hosted APIs; `CODEX_CLI_OCR_MODEL`
-chooses the default model for that path.
+Used by `fundamentals/collectors/ocr_pipeline.py` (`ocr_pdf_with_local`) as
+part of the fundamentals-screener pipeline, plus available standalone via the
+CLI above. Set `OCR_USING=codex` or `OCR_USING=codex:<model>` to route through
+Codex CLI instead of hosted APIs; `CODEX_CLI_OCR_MODEL` chooses the default
+model for that path.
 
 Tested locally with:
 

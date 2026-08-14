@@ -129,18 +129,19 @@ exists because concurrent logins triggered Dhan's "too many attempts" block.
 - `docs/PURE_TA_MIGRATION_PLAN.md` — the phased history of how stockey became
   pure-TA; useful for "why does X work this way" questions.
 - `DATA_CONTRACT.md` (repo root; canonical copy in systrader) — the table API
-  systrader depends on, the cloud-DB load rule, Dhan auth handoff, and the
-  TimescaleDB-hypertable correction (several KEEP tables, including the primary
-  price series, are still hypertables — use `hypertable_size()` for capacity
-  work, plain `pg_total_relation_size()` dramatically undercounts them).
+  systrader depends on, the cloud-DB load rule, Dhan auth handoff, the
+  TimescaleDB-hypertable correction (several KEEP tables are still
+  hypertables — use `hypertable_size()` for capacity work, plain
+  `pg_total_relation_size()` dramatically undercounts them; also `pg_dump -t`/
+  `\copy tablename` silently copy zero rows for a hypertable — the
+  `\copy (SELECT * FROM ...)` form is required).
 - `data/download_runner.py` for the downloader/parser registry (what actually
   runs and in what order).
 - `data/data_readiness.py` for the freshness checks and bounded repairs.
-- `docs/scripts.md`, `docs/operators_manual.md` — **stale**, still describe the
-  pre-2026-07-27 advisory system; useful for historical context only, not
-  current behavior. A broader docs/ cleanup pass (advisory_manual.md,
-  llm_decision_authority.md, hypothesis_*.md, operator_*.md, and similar) is
-  still outstanding.
+- `docs/operators_manual.md` — **stale**, still describes the pre-2026-07-27
+  advisory system; useful for historical context only, not current behavior.
+  `docs/scripts.md` is current/maintained despite living in the same era —
+  don't assume everything from that period is stale without checking.
 
 ## Coding Rules
 
