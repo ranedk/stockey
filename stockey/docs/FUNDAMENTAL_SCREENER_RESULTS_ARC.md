@@ -34,3 +34,17 @@ Nothing queued yet. Add the next set of work here when it's scoped.
   right after a pull-forward -- one prompt re-check, not a sustained retry loop.
 - `classify_announcement` doesn't catch the `"Revision of outcome"` BSE
   subcategory (re-submitted/corrected results) -- seen once live, low volume.
+- BSE-exclusive companies (no NSE listing -- confirmed live: 10 of 192 in one
+  L1 run, via `map_company_master_ids_nse_or_bse`) get full event coverage
+  (results, PIT/SAST, rating actions, capital raises, auditor changes, RPTs --
+  `bse_announcements.py` crawls BSE directly by scrip code, no NSE dependency,
+  verified live) but zero price/technicals/market-cap (`advisory_adjusted_
+  ohlcv_daily` has no BSE-only rows -- no BSE bhavcopy-equivalent collector
+  exists) and no structured corporate-action detection (NSE's CA feed doesn't
+  cover them; nothing extracts split/bonus/dividend data from BSE
+  announcement text either). Degrades gracefully -- a visible fallback event
+  in `technicals.py`, not a crash -- these companies just carry a
+  filings-only profile. A real gap, not scoped out by mistake; a BSE
+  bhavcopy-equivalent collector would close it but is real new scope (new
+  source, new rate-limit surface, new adjustment logic for a series that
+  currently doesn't exist at all).
