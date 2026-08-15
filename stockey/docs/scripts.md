@@ -36,7 +36,6 @@ data.dhanlive.ohlcv
 data.rbi.download_fbil_gsec
 data.rbi.download_bank_rates
 data.rbi.download_currency_rates
-data.nseindia.offmarket
 data.nseindia.bhavcopy_downloader
 data.nseindia.indices_downloader
 ```
@@ -44,12 +43,15 @@ data.nseindia.indices_downloader
 Parsers (`PARSER_STEPS`), in order:
 
 ```
-data.nseindia.offmarket_parser
 data.nseindia.bhavcopy_parser
 data.nseindia.adjusted_prices
 data.nseindia.indices_parser
 data.benchmark_sync
 ```
+
+(`data.nseindia.offmarket`/`offmarket_parser` retired 2026-08-15 along with
+`nseindia_short_selling`/`_block_deals`/`_bulk_deals` — write-only, zero
+readers anywhere; see `docs/DATA_INVENTORY.md`.)
 
 `market_wide`, `benchmark_sync`, and `dhan_ohlcv_precheck` purposes are CRITICAL — a
 failure there fails the whole run. Everything else (macro/RBI, mcap) is

@@ -21,9 +21,11 @@ Three-level hierarchy in the response, all keyed the same way dim_security.secto
 already is at the top level: sector (22, e.g. "IN0101"->"Chemicals") -> industry group
 (59, e.g. "IN010101"->"Chemicals & Petrochemicals") -> basic industry (197, e.g.
 "IN010101001"->"Commodity Chemicals"). dim_security only carries the top (sector)
-level, so that's what this module stores and what sector_cycle.py groups by; the
-finer levels are captured too (for a future finer-grained pass) but nothing currently
-consumes them.
+level, so that's what this module stores and what sector_cycle.py groups by. The finer
+levels used to also be captured (for a possible future finer-grained pass) and written
+to fundamentals_industry_group_reference/fundamentals_basic_industry_reference --
+retired 2026-08-15, zero readers anywhere from the day they were first written,
+confirmed live. Re-add if that finer-grained pass actually gets built.
 """
 
 from __future__ import annotations
@@ -39,8 +41,6 @@ from utils.http import get_with_retries
 
 SYNC_SOURCE_NAME = "fundamentals.collectors.sector_data"
 SECTOR_TABLE = "fundamentals_sector_reference"
-INDUSTRY_GROUP_TABLE = "fundamentals_industry_group_reference"
-BASIC_INDUSTRY_TABLE = "fundamentals_basic_industry_reference"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 SECTOR_DATA_URL = "https://pyapiv2.mintbox.ai/api/v2/core/getAllSectorData"
@@ -89,14 +89,10 @@ def _rows_from_level(entries: list[dict], *, code_key: str, desc_key: str, level
 
 def build_reference_rows(data: dict, *, as_of_date=None) -> dict[str, list[dict]]:
     as_of_date = as_of_date or pd.Timestamp.now(tz="UTC").date()
-    equity = {"sector": [], "indgrp": [], "ind": []}
-    for level in equity:
-        equity[level] = (data.get(level) or {}).get("EQ") or []
+    sector_entries = (data.get("sector") or {}).get("EQ") or []
 
     return {
-        "sector": _rows_from_level(equity["sector"], code_key="sector_code", desc_key="sector_desc", level="sector", as_of_date=as_of_date),
-        "industry_group": _rows_from_level(equity["indgrp"], code_key="industry_code", desc_key="industry_desc", level="industry_group", as_of_date=as_of_date),
-        "basic_industry": _rows_from_level(equity["ind"], code_key="basic_industry_code", desc_key="basic_industry_desc", level="basic_industry", as_of_date=as_of_date),
+        "sector": _rows_from_level(sector_entries, code_key="sector_code", desc_key="sector_desc", level="sector", as_of_date=as_of_date),
     }
 
 
@@ -106,15 +102,9 @@ def run_sector_reference_refresh() -> dict[str, object]:
 
     if rows["sector"]:
         upsert_to_db(pd.DataFrame(rows["sector"]), SECTOR_TABLE, unique_keys=["code", "as_of_date"])
-    if rows["industry_group"]:
-        upsert_to_db(pd.DataFrame(rows["industry_group"]), INDUSTRY_GROUP_TABLE, unique_keys=["code", "as_of_date"])
-    if rows["basic_industry"]:
-        upsert_to_db(pd.DataFrame(rows["basic_industry"]), BASIC_INDUSTRY_TABLE, unique_keys=["code", "as_of_date"])
 
     return {
         "sectors": len(rows["sector"]),
-        "industry_groups": len(rows["industry_group"]),
-        "basic_industries": len(rows["basic_industry"]),
     }
 
 
@@ -123,8 +113,8 @@ def main() -> int:
     result = run_sector_reference_refresh()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
-        "rows": result["sectors"] + result["industry_groups"] + result["basic_industries"],
-        "rows_written": result["sectors"] + result["industry_groups"] + result["basic_industries"],
+        "rows": result["sectors"],
+        "rows_written": result["sectors"],
         **result,
         "fallback_used": False,
         "state_advanced": result["sectors"] > 0,

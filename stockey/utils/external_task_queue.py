@@ -47,11 +47,9 @@ SINGLE_CLIENT_QUEUES = {"nse", "dhan"}
 ALLOWED_NSE_MODULES = {
     "data.nseindia.holidays",
     "data.nseindia.earnings_events",
-    "data.nseindia.offmarket",
     "data.nseindia.bhavcopy_downloader",
     "data.nseindia.indices_downloader",
     "data.nseindia.recent_events",
-    "data.nseindia.offmarket_parser",
     "data.nseindia.bhavcopy_parser",
     "data.nseindia.indices_parser",
 }

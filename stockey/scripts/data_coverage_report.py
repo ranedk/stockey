@@ -61,20 +61,9 @@ SCHEMA_STATEMENTS = [
 TABLES: list[tuple[str, str | None, str | None, str, str]] = [
     ("nseindia_ohlcv", "date", "symbol", "daily", "NSE bhavcopy"),
     ("nseindia_mcap", "date", "symbol", "daily", "NSE bhavcopy"),
-    ("nseindia_mto", "date", "symbol", "daily", "NSE bhavcopy"),
-    ("nseindia_52wk", "date", "symbol", "daily", "NSE bhavcopy"),
-    ("nseindia_cmvolt", "date", "symbol", "daily", "NSE bhavcopy"),
-    ("nseindia_circuit_hit", "date", "symbol", "informational", "NSE bhavcopy"),
-    # NSE bundles cat_turnover_*.xls (and Margintrdg_*.zip) into the bhavcopy archive
-    # intermittently, not every trading day -- confirmed 2026-08-10 by diffing the actual
-    # zip contents of two ordinary trading days (2026-07-15: 22 files, no cat_turnover;
-    # 2026-07-24: 24 files, cat_turnover present). Coverage also dropped from ~95-100%
-    # (2025) to ~30% (2026-04 onward) -- a real change in NSE's publishing pattern, not a
-    # parser regression. "daily" here was alerting on a source that was never daily.
-    ("nseindia_cat_turnover", "trade_date", None, "informational", "NSE bhavcopy"),
-    ("nseindia_catg", None, "symbol", "informational", "NSE bhavcopy"),
-    ("nseindia_var1", "for_date", "symbol", "daily", "NSE bhavcopy"),
-    ("nseindia_short_selling", "date", "symbol", "informational", "NSE bhavcopy"),
+    # nseindia_mto/52wk/cmvolt/circuit_hit/cat_turnover/catg/var1 and the offmarket-sourced
+    # short_selling/block_deals/bulk_deals were retired 2026-08-15 (write-only, zero readers
+    # anywhere -- see docs/DATA_COVERAGE.md) and dropped from the DB; removed from here with them.
     ("nseindia_corporate_actions_bc_raw", "date", "symbol", "informational", "NSE corporate actions"),
     ("nseindia_corporate_actions_normalized", "date", "symbol", "informational", "NSE corporate actions"),
     ("events_dividend", "ex_date", "symbol", "informational", "NSE corporate actions"),
@@ -89,7 +78,7 @@ TABLES: list[tuple[str, str | None, str | None, str, str]] = [
     ("rbi_bank_rates", "date", None, "informational", "RBI/FBIL"),
     ("rbi_currency_rates", "date", None, "daily", "RBI/FBIL"),
     ("fbil_gsec_par", "date", None, "daily", "RBI/FBIL"),
-    ("fbil_gsec_quote", "date", "isin", "daily", "RBI/FBIL"),
+    # fbil_gsec_quote retired 2026-08-15 (zero readers, confirmed live) and dropped from the DB.
     ("company_master", None, "company_master_id", "informational", "Identity"),
     ("dim_security", "effective_from", "symbol", "informational", "Identity"),
     ("historical_mcap", "date", "symbol", "daily", "Sharpely (mcap slice)"),

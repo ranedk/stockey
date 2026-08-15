@@ -15,33 +15,11 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def get_latest_from_sharpely(headers):
-    # Non-Stock entities - ETFs, MFs etc.
-    fund_keys = [
-        "plan_id",
-        "isin_code",
-        "amfi_code",
-        "sharpely_id",
-        "regular_plan_id",
-        "nse_symbol",
-        "bse_symbol",
-        "bse_scheme_code",
-        "basic_name",
-        "is_index_fund",
-        "is_etf_fund",
-        "is_fof",
-        "is_dividend",
-        "variant",
-        "variant_fund_id",
-        "amc_full_name",
-        "category_id",
-        "category_name",
-        "sharpely_bm_id",
-        "plan_name",
-        "type_id",
-        "is_direct_plan",
-        "objective_text",
-    ]
-
+    # instrumentType=2 is equity (feeds master_sharpely_equity -> company_master's sharpely_id
+    # fallback and sector_data.py's NSE->BSE sector-code mapping). Types 0/1 (non-stock entities --
+    # ETFs, MFs) used to also be fetched here and written to master_sharpely_funds; retired
+    # 2026-08-15 (zero readers anywhere, confirmed live) along with that table, so this no longer
+    # requests them at all -- one less unnecessary call to the sharpely/mintbox API per run.
     stock_keys = [
         "sharpely_id",
         "symbol",
@@ -54,26 +32,19 @@ def get_latest_from_sharpely(headers):
         "sector_code",
     ]
 
-    keys_of_interest = {0: fund_keys, 1: fund_keys, 2: stock_keys}
+    resp = get_with_retries(
+        "https://pyapiv2.mintbox.ai/api/core/getAllFundsV2/instrumentType=2",
+        headers=headers,
+    ).json()
+    data = json.loads(resp)
+    response_keys = list(data["keys"])
 
-    dfs = []
-    for i in [0, 1, 2]:
-        _data = []
-        resp = get_with_retries(
-            f"https://pyapiv2.mintbox.ai/api/core/getAllFundsV2/instrumentType={i}",
-            headers=headers,
-        ).json()
-        data = json.loads(resp)
-        response_keys = list(data["keys"])
+    _data = []
+    for val in json.loads(data["values"]):
+        row_map = dict(zip(response_keys, val))
+        _data.append({key: row_map.get(key) for key in stock_keys})
 
-        for val in json.loads(data["values"]):
-            row_map = dict(zip(response_keys, val))
-            _data.append({key: row_map.get(key) for key in keys_of_interest[i]})
-
-        df = pd.DataFrame(_data, columns=keys_of_interest[i])
-        dfs.append(df)
-
-    return dfs
+    return pd.DataFrame(_data, columns=stock_keys)
 
 
 def update_masters() -> dict[str, object]:
@@ -81,20 +52,12 @@ def update_masters() -> dict[str, object]:
     env.read_env()
 
     headers = get_sharpely_headers()
-    dfs = get_latest_from_sharpely(headers)
-    df_funds = pd.concat([dfs[0], dfs[1]])
-    df_funds = df_funds.dropna(subset=["amfi_code"])
-
-    df_equity = dfs[2]
+    df_equity = get_latest_from_sharpely(headers)
+    raw_equity_rows = len(df_equity)
     df_equity = df_equity[
         ~((df_equity["symbol"].isna()) & (df_equity["bse_ticker"].isna()))
     ]
 
-    upsert_to_db(
-        df_funds,
-        "master_sharpely_funds",
-        unique_keys=["amfi_code"],
-    )
     upsert_to_db(
         df_equity,
         "master_sharpely_equity",
@@ -103,14 +66,11 @@ def update_masters() -> dict[str, object]:
     load_ts = pd.Timestamp.now(tz=timezone.utc)
     return {
         "source": "sharpely",
-        "rows": int(len(df_funds) + len(df_equity)),
-        "rows_read": int(sum(len(df) for df in dfs)),
-        "rows_written": int(len(df_funds) + len(df_equity)),
-        "fund_rows": int(len(df_funds)),
+        "rows": int(len(df_equity)),
+        "rows_read": raw_equity_rows,
+        "rows_written": int(len(df_equity)),
         "equity_rows": int(len(df_equity)),
-        "raw_fund_rows": int(len(dfs[0]) + len(dfs[1])),
-        "raw_equity_rows": int(len(dfs[2])),
-        "instrument_type_count": int(len(dfs)),
+        "raw_equity_rows": raw_equity_rows,
         "load_ts": load_ts.isoformat(),
         "fallback_used": False,
         "state_advanced": True,

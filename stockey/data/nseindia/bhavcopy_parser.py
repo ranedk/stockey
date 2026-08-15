@@ -18,7 +18,8 @@ from utils.company_master import attach_company_master_id
 from utils.db import sql_to_df, upsert_to_db
 from utils.ingestion_state import get_failed_entries, get_processed_keys, mark_failed, mark_processed
 from utils import store
-from utils.date import pd_to_datetime, remove_invalid_dates
+from utils.date import pd_to_datetime
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import get_redis_client
 
 
@@ -330,8 +331,31 @@ def with_company_master(df: pd.DataFrame) -> pd.DataFrame:
     return attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
 
 
+def ensure_mcap_last_trade_date_is_typed_date() -> None:
+    """One-time migration (2026-08-15): last_trade_date was stored as free TEXT, mixing real
+    'DD Mon YYYY' date strings with a literal 'Not Traded' sentinel for symbols with no trades --
+    confirmed live, 3230 of 1.6M rows. That conflates NULL with a magic string and makes any
+    ORDER BY/range query on the column lexicographic garbage, not chronological (audit finding,
+    2026-08-15). Converts the column to a real DATE in place; 'Not Traded' becomes a genuine NULL."""
+    apply_schema_migration(
+        migration_id="20260815_nseindia_mcap_last_trade_date_to_date",
+        description="nseindia_mcap.last_trade_date: TEXT (mixing dates with a 'Not Traded' sentinel) -> DATE (NULL for not-traded).",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": ["nseindia_mcap"]},
+        statements=[
+            """
+            ALTER TABLE nseindia_mcap ALTER COLUMN last_trade_date TYPE DATE
+            USING (CASE WHEN last_trade_date ~ '^[0-9]{1,2} [A-Za-z]{3} [0-9]{4}$'
+                        THEN to_date(last_trade_date, 'DD Mon YYYY')
+                        ELSE NULL END)
+            """
+        ],
+    )
+
+
 def parse_mcap(path):
     emit("Processing MCAP")
+    ensure_mcap_last_trade_date_is_typed_date()
     data = open(path).read()
     lines = [line.strip().rstrip(".") for line in data.strip().split("\n")]
     cleaned_data = "\n".join(lines[:-3])
@@ -352,6 +376,9 @@ def parse_mcap(path):
     ]
     df["date"] = pd.to_datetime(df["trade_date"], format="%d %b %Y")
     df = df.drop(columns=["trade_date", "security_name"])
+    # 'Not Traded' (a symbol with zero trades on this trade_date) is not a date -- a real NULL,
+    # not a magic string (see ensure_mcap_last_trade_date_is_typed_date's docstring).
+    df["last_trade_date"] = pd.to_datetime(df["last_trade_date"], format="%d %b %Y", errors="coerce")
     df["issue_size"] = pd.to_numeric(df["issue_size"], errors="coerce").astype("Int64")
     for c in ["face_value_rs", "close_price_paid_up_value_rs", "market_cap_rs"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -359,38 +386,6 @@ def parse_mcap(path):
     df = df.drop_duplicates(subset=unique_keys, keep="last")
     df = with_company_master(df)
     upsert_to_db(df, "nseindia_mcap", unique_keys=unique_keys)
-    return df
-
-
-def parse_circuit_hit(path):
-    emit("Processing Circuit Hit")
-    parts = os.path.basename(path)
-    try:
-        for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
-    except ValueError as exc: # Format issue
-        record_local_fallback_event(
-            module=SYNC_SOURCE_NAME,
-            source=str(path),
-            fallback_type="nse_bhavcopy_circuit_hit_date_fallback",
-            severity="info",
-            reason="Circuit-hit file date did not match short-year format; trying long-year fallback parser.",
-            deterministic_fallback=True,
-            error=exc,
-            metadata={"path": str(path), "filename": parts, "fallback_format": "bh%d%m%Y.csv"},
-        )
-        for_date = pd.to_datetime(parts, format="bh%d%m%Y.csv")
-
-    df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
-    df.columns = ["symbol", "series", "circuit_hit"]
-    df["date"] = for_date
-    unique_keys = ["date", "symbol", "series", "circuit_hit"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(
-        df,
-        "nseindia_circuit_hit",
-        unique_keys=unique_keys,
-    )
     return df
 
 
@@ -529,352 +524,6 @@ def parse_ohlcv(csv_path):
     return df
 
 
-def parse_reg(path):
-    emit("Processing REG")
-    parts = path.split("_")[-1].split(".")[0]
-    for_date = pd.to_datetime(parts, format="IND%d%m%y")
-    df = pd.read_csv(path, skiprows=1)
-    df = df.reset_index(drop=True)
-    df.columns = [
-        "scrip_code",
-        "symbol",
-        "nse_exclusive",
-        "status",
-        "series",
-        "gsm",
-        "long_term_asm",
-        "unsolicited_sms",
-        "irp",
-        "short_term_asm",
-        "default",
-        "ica",
-        "filler4",
-        "filler5",
-        "pledge",
-        "add_on_pb",
-        "total_pledge",
-        "social_media_platforms",
-        "esm",
-        "loss_making",
-        "encumbered_share_gt_50pct",
-        "under_bz_sz_series",
-        "annual_listing_fee_default",
-        "filler12",
-        "fo_contracts_moved_out",
-        "filler13",
-        "filler14",
-        "filler15",
-        "filler16",
-    ]
-    df.drop(
-        columns=[
-            "scrip_code",
-            "filler4",
-            "filler5",
-            "filler12",
-            "filler13",
-            "filler14",
-            "filler15",
-            "filler16",
-        ],
-        inplace=True,
-    )
-    for c in [
-        "gsm",
-        "long_term_asm",
-        "unsolicited_sms",
-        "irp",
-        "short_term_asm",
-        "default",
-        "ica",
-        "pledge",
-        "add_on_pb",
-        "total_pledge",
-        "social_media_platforms",
-        "esm",
-        "loss_making",
-        "encumbered_share_gt_50pct",
-        "under_bz_sz_series",
-        "annual_listing_fee_default",
-        "fo_contracts_moved_out",
-    ]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["date"] = for_date
-    unique_keys = ["date", "symbol"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(df, "nseindia_reg", unique_keys=unique_keys)
-    return df
-
-
-def parse_pe(path):
-    emit("Processing PE")
-    parts = path.split("_")[-1].split(".")[0]
-    for_date = pd.to_datetime(parts, format="%d%m%y")
-    df = pd.read_csv(path, skiprows=1)
-    df = df.reset_index(drop=True)
-    df.columns = ["symbol", "pe", "adjusted_pe"]
-    for c in ["pe", "adjusted_pe"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["date"] = for_date
-    unique_keys = ["date", "symbol"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(df, "nseindia_pe", unique_keys=unique_keys)
-    return df
-
-
-def parse_mto(path):
-    emit("Processing MTO")
-    parts = path.split("_")[-1].split(".")[0]
-    for_date = pd.to_datetime(parts, format="%d%m%Y")
-    # header=None: the 4 skipped lines are preamble (title / "10,MTO" / trade-date / column-name row); the
-    # first "20,..." security row must be read as DATA, not consumed as the header (that silently dropped
-    # the first stock's delivery every day). Columns are assigned explicitly below.
-    df = pd.read_csv(path, skiprows=4, header=None)
-    df = df.reset_index(drop=True)
-    df.columns = [
-        "record_type",
-        "sr_no",
-        "symbol",
-        "series",
-        "volume",
-        "deliverable_volume",
-        "deliverable_percent",
-    ][: df.shape[1]]
-    df["date"] = for_date
-    # keep only security rows (record_type == 20); drop the "90,..." grand-total trailer if present.
-    df = df[df["record_type"].astype(str).str.strip() == "20"]
-    for c in ["volume", "deliverable_volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    df["deliverable_percent"] = pd.to_numeric(
-        df["deliverable_percent"], errors="coerce"
-    )
-    df["symbol"] = df["symbol"].astype(str).str.strip()
-    df["series"] = df["series"].astype(str).str.strip()
-    unique_keys = ["date", "symbol"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(df, "nseindia_mto", unique_keys=unique_keys)
-    return df
-
-
-def parse_wk52(path):
-    emit("Processing 52WK")
-    parts = path.split("_")[-1].split(".")[0]
-    for_date = pd.to_datetime(parts, format="%d%m%Y")
-    # 2 disclaimer/effective-date lines precede the header row.
-    df = pd.read_csv(path, skiprows=2)
-    df = df.reset_index(drop=True)
-    df.columns = [
-        "symbol",
-        "series",
-        "adjusted_52_week_high",
-        "high_date",
-        "adjusted_52_week_low",
-        "low_date",
-    ][: len(df.columns)]
-    df["date"] = for_date
-    df["symbol"] = df["symbol"].astype(str).str.strip()
-    df["series"] = df["series"].astype(str).str.strip()
-    for c in ["adjusted_52_week_high", "adjusted_52_week_low"]:
-        df[c] = pd.to_numeric(df[c].astype(str).str.strip(), errors="coerce")
-    for c in ["high_date", "low_date"]:
-        df[c] = pd.to_datetime(df[c].astype(str).str.strip(), format="%d-%b-%Y", errors="coerce")
-    df = df[df["symbol"].notna() & (df["symbol"] != "") & (df["symbol"].str.lower() != "nan")]
-    unique_keys = ["date", "symbol"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(df, "nseindia_52wk", unique_keys=unique_keys)
-    return df
-
-
-def parse_csqr(path):
-    emit("Processing CSQR")
-    parts = path.split("_")[-1].split(".")[0]
-    for_date = pd.to_datetime(parts, format="%d%m%Y")
-    df = pd.read_csv(path)
-    df = df.reset_index(drop=True)
-    df.columns = [
-        "symbol",
-        "series",
-        "market_type",
-        "settlement_number",
-        "official_close",
-    ]
-    df["date"] = for_date
-    df["settlement_number"] = pd.to_numeric(
-        df["settlement_number"], errors="coerce"
-    ).astype("Int64")
-    df["official_close"] = pd.to_numeric(df["official_close"], errors="coerce")
-    unique_keys = ["date", "symbol", "settlement_number"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(
-        df, "nseindia_csqr", unique_keys=unique_keys
-    )
-    return df
-
-
-def parse_cmvolt(path):
-    emit("Processing CMVOL")
-    df = pd.read_csv(path, skiprows=1)
-    df = df.iloc[:, :8]
-    df = df.reset_index(drop=True)
-    df.columns = [
-        "date",
-        "symbol",
-        "close",
-        "previous_close",
-        "log_return",
-        "previous_day_daily_volatility",
-        "current_day_daily_volatility",
-        "annualized_volatility",
-    ]
-    df["date"] = pd.to_datetime(df["date"])
-    for c in [
-        "close",
-        "previous_close",
-        "log_return",
-        "previous_day_daily_volatility",
-        "current_day_daily_volatility",
-        "annualized_volatility",
-    ]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    unique_keys = ["date", "symbol"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(df, "nseindia_cmvolt", unique_keys=unique_keys)
-    return df
-
-
-VAR1_MARGIN_COLUMNS = [
-    "security_var",
-    "index_var",
-    "var_margin",
-    "extreme_loss_rate",
-    "adhoc_margin",
-    "applicable_margin",
-]
-
-
-def _read_var1_file(path: str) -> pd.DataFrame:
-    """Parse one NSE C_VAR1 file into a raw per-entry frame (one row per symbol/series/isin as
-    published in this specific numbered file)."""
-    with open(path) as f:
-        parts = f.readline().strip().split(",")
-        for_date = datetime.strptime(parts[1], "%d%m%Y").date()
-        entry_number = 1 if len(parts) == 4 else int(parts[3])
-
-    df = pd.read_csv(path, skiprows=1)
-    df.columns = [
-        "record_type",
-        "symbol",
-        "series",
-        "isin",
-        "security_var",
-        "index_var",
-        "var_margin",
-        "extreme_loss_rate",
-        "adhoc_margin",
-        "applicable_margin",
-    ]
-    df = df.drop(columns="record_type")
-    for c in VAR1_MARGIN_COLUMNS:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["for_date"] = pd.to_datetime(for_date)
-    df["entry_number"] = entry_number
-    return df
-
-
-def parse_var1(paths: str | Iterable[str]):
-    """Parse one day's NSE C_VAR1 file(s) into `nseindia_var1`, one row per (for_date, series,
-    symbol, isin).
-
-    NSE republishes VaR margin several times a day as separately entry-numbered files
-    (C_VAR1_ddmmyyyy_1.DAT, _2.DAT, ...); most republishes carry unchanged values, but real
-    intraday margin recalculation does happen for a meaningful share of symbols (~22% of
-    symbol/days in a spot-check). Storing every numbered file as its own row (keyed on
-    entry_number) is what grew this table to 209M rows / 52GB for no informational gain: the
-    only consumer (advisory/event_evidence_store.py) already collapses to
-    `max(...) GROUP BY (date, symbol)`. Reducing to one column-wise-MAX row per
-    (for_date, series, symbol, isin) here, at ingestion, matches that consumer's aggregation
-    exactly -- zero change to any value it reads -- while cutting stored rows ~6x.
-    `entry_number` is kept as the highest entry_number that contributed, for provenance only;
-    it is no longer part of the row identity.
-    """
-    emit("Processing VAR1")
-    paths = [paths] if isinstance(paths, str) else list(paths)
-    frames = [_read_var1_file(p) for p in paths]
-    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-
-    group_keys = ["for_date", "series", "symbol", "isin"]
-    agg = {c: "max" for c in VAR1_MARGIN_COLUMNS}
-    agg["entry_number"] = "max"
-    df = df.groupby(group_keys, as_index=False).agg(agg)
-
-    unique_keys = ["for_date", "series", "symbol", "isin"]
-    df = df.drop_duplicates(subset=unique_keys, keep="last")
-    df = with_company_master(df)
-    upsert_to_db(df, "nseindia_var1", unique_keys=unique_keys)
-    return df
-
-
-def parse_cat_turnover(path):
-    emit("Processing CAT Turnover")
-    try:
-        df = pd.read_excel(path, sheet_name="Daily", skiprows=2, header=None)
-    except ValueError:
-        try:
-            df = pd.read_excel(path, skiprows=3, header=None)
-        except Exception as exc:
-            raise RuntimeError(f"Unable to read CAT Turnover workbook fallback path={path}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Unable to read CAT Turnover workbook path={path}") from exc
-
-    df = df.iloc[:, :4]
-    df.columns = ["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"]
-    df.dropna(
-        subset=["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"],
-        inplace=True,
-    )
-    df = remove_invalid_dates(df, "trade_date")
-    df = pd_to_datetime(df, "trade_date", ["%d %b %y", "%d-%b-%y"], errors="coerce")
-    df["buy_rs_cr"] = pd.to_numeric(df["buy_rs_cr"], errors="coerce")
-    df["sell_rs_cr"] = pd.to_numeric(df["sell_rs_cr"], errors="coerce")
-    upsert_to_db(
-        df, "nseindia_cat_turnover", unique_keys=["trade_date", "client_category"]
-    )
-    return df
-
-
-def parse_catg(path):
-    emit("Processing CATG")
-    with open(path) as f:
-        header = f.readline().strip().split(",")
-        for_month = datetime.strptime(f"01,{header[1]},{header[2]}", "%d,%b,%Y").date()
-    df = pd.read_csv(path, skiprows=1)
-    df = df.reset_index(drop=True)
-    df.columns = ["record_type", "symbol", "series", "isin", "category", "impact_cost"]
-    df = df.drop(columns="record_type")
-    df["category"] = pd.to_numeric(df["category"], errors="coerce").astype("Int64")
-    df["impact_cost"] = pd.to_numeric(df["impact_cost"], errors="coerce")
-    df["for_month"] = pd.to_datetime(for_month)
-
-    # ISIN is not unique, there can be multiple Symbols with the same ISIN because the same underlying
-    # can be traded in different series (e.g. Nifty 50 and Nifty 50 Future)
-    # Also, the same symbol and isin can be a part of more than one series (e.g. a
-    # single company traded in both series BE and EQ, confirmed live)
-    # When company changes its name, symbol also changes but ISIN remains the same
-    df = with_company_master(df)
-    upsert_to_db(
-        df, "nseindia_catg", unique_keys=["for_month", "series", "symbol", "isin"]
-    )
-    return df
-
-
 def _ci_glob(root: str, prefix: str, suffix: str = ".csv") -> list[str]:
     """Case-insensitive recursive match of basenames starting with `prefix` and ending with `suffix`.
 
@@ -927,28 +576,22 @@ def unzip_and_process(zip_path):
 
         failures: list[str] = []
 
-        def _run(label: str, file_path: str, parser, *, soft_error_substrings: tuple[str, ...] = ()) -> None:
+        def _run(label: str, file_path: str, parser) -> None:
             try:
                 parser(file_path)
             except Exception as exc:
-                # A minor, occasionally corrupt-at-source file (e.g. a truncated cat_turnover .xls NSE
-                # itself no longer serves) should NOT fail the whole day and trap it in permanent retry --
-                # the day's important numerical data (OHLCV, delivery, ...) parsed fine. Downgrade only the
-                # KNOWN corruption signature to a visible warning; any other error still fails hard so a
-                # real schema/parser regression is still caught.
-                soft = any(s in str(exc) for s in soft_error_substrings)
-                emit(f"{'⚠️ Skipped (corrupt source)' if soft else '❌ Failed'} {label} file={file_path}: {exc.__class__.__name__}: {exc}")
+                # A file inside the bhavcopy archive failed to parse -- the parent archive is marked
+                # failed for retry/review, but this file's own failure doesn't stop the others in the
+                # same zip from being attempted. (Used to also have a "soft skip" path for a KNOWN
+                # corrupt-at-source signature -- cat_turnover, the only caller of it -- retired
+                # 2026-08-15 along with that parser; removed with it since nothing else used it.)
+                emit(f"❌ Failed {label} file={file_path}: {exc.__class__.__name__}: {exc}")
                 record_local_fallback_event(
                     module=SYNC_SOURCE_NAME,
                     source=str(file_path),
-                    fallback_type="nse_bhavcopy_file_unrecoverable_skipped" if soft else "nse_bhavcopy_file_parse_failed",
+                    fallback_type="nse_bhavcopy_file_parse_failed",
                     severity="warn",
-                    reason=(
-                        "A minor bhavcopy file is corrupt at source and unrecoverable; skipped visibly so the day's "
-                        "other tables are retained instead of the whole archive being marked failed."
-                        if soft else
-                        "A file inside the bhavcopy archive failed to parse; the parent archive will be marked failed for retry/review."
-                    ),
+                    reason="A file inside the bhavcopy archive failed to parse; the parent archive will be marked failed for retry/review.",
                     error=exc,
                     metadata={
                         "label": str(label),
@@ -956,52 +599,7 @@ def unzip_and_process(zip_path):
                         "filename": os.path.basename(file_path),
                     },
                 )
-                if not soft:
-                    failures.append(f"{label}:{os.path.basename(file_path)}:{exc.__class__.__name__}:{exc}")
-
-        catg_files = glob.glob(os.path.join(tmpdir, "**", "C_CATG_*.T*"), recursive=True)
-        for file_path in catg_files:
-            _run("catg", file_path, parse_catg)
-
-        var1_files = glob.glob(os.path.join(tmpdir, "**", "C_VAR1_*_*.DAT"), recursive=True)
-        if var1_files:
-            # NSE republishes VAR1 several times a day as separately entry-numbered files;
-            # parse_var1 combines all of a day's files into one deduped upsert (see its docstring).
-            var1_label = f"{len(var1_files)} files: " + ", ".join(sorted(os.path.basename(p) for p in var1_files))
-            _run("var1", var1_label, lambda _label: parse_var1(var1_files))
-
-        cat_turnover_files = glob.glob(os.path.join(tmpdir, "**", "cat_turnover_*.xls"), recursive=True)
-        for file_path in cat_turnover_files:
-            _run("cat_turnover", file_path, parse_cat_turnover,
-                 soft_error_substrings=("Unable to read CAT Turnover workbook",))
-
-        cmvolt_files = glob.glob(os.path.join(tmpdir, "**", "CMVOLT_*.CSV"), recursive=True)
-        for file_path in cmvolt_files:
-            _run("cmvolt", file_path, parse_cmvolt)
-
-        csqr_files = glob.glob(os.path.join(tmpdir, "**", "CSQR_*.CSV"), recursive=True)
-        for file_path in csqr_files:
-            _run("csqr", file_path, parse_csqr)
-
-        # NSE ships the security-wise delivery report as MTO_<ddmmyyyy>.DAT (not .CSV); the old .CSV glob
-        # never matched, so delivery was silently un-parsed despite the file being present since 2013.
-        mto_files = glob.glob(os.path.join(tmpdir, "**", "MTO_*.DAT"), recursive=True)
-        mto_files += glob.glob(os.path.join(tmpdir, "**", "MTO_*.CSV"), recursive=True)
-        for file_path in mto_files:
-            _run("mto", file_path, parse_mto)
-
-        # 52-week high/low (CM_52_wk_High_low_<ddmmyyyy>.csv) -- NSE started publishing this file in 2020.
-        wk52_files = glob.glob(os.path.join(tmpdir, "**", "CM_52_wk_High_low_*.csv"), recursive=True)
-        for file_path in wk52_files:
-            _run("wk52", file_path, parse_wk52)
-
-        pe_files = glob.glob(os.path.join(tmpdir, "**", "PE_*.CSV"), recursive=True)
-        for file_path in pe_files:
-            _run("pe", file_path, parse_pe)
-
-        reg_files = glob.glob(os.path.join(tmpdir, "**", "REG_*.CSV"), recursive=True)
-        for file_path in reg_files:
-            _run("reg", file_path, parse_reg)
+                failures.append(f"{label}:{os.path.basename(file_path)}:{exc.__class__.__name__}:{exc}")
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "cm*.zip"), recursive=True)
         for nested_zip in nested_zips:
@@ -1087,10 +685,6 @@ def unzip_and_process(zip_path):
                 bc_files = _ci_glob(nested_tmpdir, "bc")
                 for file_path in bc_files:
                     _run("corporate_actions_bc", file_path, parse_corporate_actions_bc)
-
-                bh_files = _ci_glob(nested_tmpdir, "bh")
-                for file_path in bh_files:
-                    _run("circuit_hit", file_path, parse_circuit_hit)
 
                 mcap_files = _ci_glob(nested_tmpdir, "mcap")
                 for file_path in mcap_files:

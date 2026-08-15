@@ -136,22 +136,6 @@
       "examples": []
     },
     {
-      "name": "download_nse_offmarket",
-      "category": "download",
-      "description": "Run the NSE block, bulk, and short-selling downloader.",
-      "command": ["python", "-m", "data.nseindia.offmarket"],
-      "read_only": false,
-      "examples": []
-    },
-    {
-      "name": "parse_nse_offmarket",
-      "category": "ingestion",
-      "description": "Parse downloaded NSE off-market CSV files.",
-      "command": ["python", "-m", "data.nseindia.offmarket_parser"],
-      "read_only": false,
-      "examples": []
-    },
-    {
       "name": "load_rbi_bank_rates",
       "category": "ingestion",
       "description": "Refresh RBI key policy bank rates.",

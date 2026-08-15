@@ -111,14 +111,15 @@ python -m data.rbi.download_currency_rates
 ```sh
 python -m data.nseindia.bhavcopy_downloader
 python -m data.nseindia.indices_downloader
-python -m data.nseindia.offmarket
 python -m data.nseindia.bhavcopy_parser
 python -m data.nseindia.indices_parser
-python -m data.nseindia.offmarket_parser
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
 python -m data.nseindia.adjusted_prices
 ```
+
+(`data.nseindia.offmarket`/`offmarket_parser` retired 2026-08-15 — see
+`docs/DATA_INVENTORY.md`.)
 
 Chrome remote debugging is required for the Playwright/browser-driven flows:
 

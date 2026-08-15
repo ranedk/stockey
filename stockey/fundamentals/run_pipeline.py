@@ -58,9 +58,9 @@ from typing import Any
 
 STEPS: list[str] = [
     "fundamentals.collectors.sector_data",
-    "fundamentals.collectors.screenerin",  # deleveraging screen (PRD sec 8 step 2) -- standalone, append-only,
-    # nothing else depends on it and it depends on nothing else in this list; runs early to match its original
-    # PRD build-order position. Wired in 2026-08-14 -- built weeks earlier but never actually scheduled.
+    # fundamentals.collectors.screenerin's deleveraging screen (was here 2026-08-14 to 08-15) is retired --
+    # fundamentals_screenerin_query_results had zero readers from the day it was scheduled. The module
+    # itself stays (l1_universe/l2_state still import its shared screener.in scraping infra).
     "fundamentals.screens.l1_universe",
     "fundamentals.screens.l2_state",
     "fundamentals.collectors.bse_announcements",

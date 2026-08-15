@@ -37,7 +37,7 @@ from data.dhanlive import auth_cli as dhan_auth_cli
 from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv, scrip_master as dhan_scrip_master
-from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, offmarket, recent_events, security_history
+from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, recent_events, security_history
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
@@ -206,8 +206,6 @@ def test_ingestion_state_extract_failure_classification_handles_missing_values()
 
 
 def test_file_state_parser_failure_classifiers_follow_shared_contract():
-    from data.nseindia import offmarket_parser
-
     parser_contracts = [
         (
             "bhavcopy",
@@ -228,16 +226,6 @@ def test_file_state_parser_failure_classifiers_follow_shared_contract():
                 RuntimeError("unexpected parser branch"): "parser_bug",
             },
             {"bad_file_retryable", "schema_changed", "parser_bug"},
-        ),
-        (
-            "offmarket",
-            offmarket_parser.classify_offmarket_parse_failure,
-            {
-                pd.errors.EmptyDataError("empty"): "empty_valid_source",
-                KeyError("client_name"): "schema_changed",
-                RuntimeError("unexpected parser branch"): "parser_bug",
-            },
-            {"empty_valid_source", "schema_changed", "parser_bug"},
         ),
     ]
 
@@ -1134,6 +1122,54 @@ def test_map_company_master_ids_nse_or_bse_no_telemetry_when_all_resolve(monkeyp
 
     assert out.loc[0] == "nse:X"
     assert events == []
+
+
+def test_ensure_company_master_dhan_ids_migration_uses_schema_registry(monkeypatch):
+    # 2026-08-15 bug found live: dhan_bse_id/dhan_nse_id were stored as DOUBLE PRECISION -- a LEFT
+    # merge introduces NaN for unmatched rows, silently upcasting the pandas int64 column to
+    # float64, which upsert_to_db then wrote as DOUBLE PRECISION instead of BIGINT (the type of the
+    # source column, master_dhan_instruments.security_id). Confirmed live: dhan_bse_id = 503696.0.
+    calls = []
+    monkeypatch.setattr(company_master_utils, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    company_master_utils.ensure_company_master_dhan_ids_are_bigint()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == "20260815_company_master_dhan_ids_to_bigint"
+    assert call["metadata"]["tables"] == ["company_master"]
+    ddl = "\n".join(call["statements"])
+    assert "ALTER COLUMN dhan_bse_id TYPE BIGINT" in ddl
+    assert "ALTER COLUMN dhan_nse_id TYPE BIGINT" in ddl
+
+
+def test_sync_company_master_ticker_case_normalized_and_dhan_ids_nullable_int(monkeypatch):
+    # Both 2026-08-15 fixes together: nse_ticker/bse_ticker upper-cased (a third-party feed can
+    # supply mixed case, e.g. real live row "Praxis-RE1", which would otherwise silently fail an
+    # uppercase lookup from any NSE-sourced caller); dhan_bse_id/dhan_nse_id stay integer through
+    # the left-merge NaN-upcast instead of drifting to float.
+    monkeypatch.setattr(company_master_utils, "ensure_company_master_dhan_ids_are_bigint", lambda: None)
+    monkeypatch.setattr(
+        company_master_utils,
+        "_company_master_sql_to_df",
+        lambda query, *, params=None, operation: {
+            "sync_sharpely_columns": pd.DataFrame({"column_name": ["sharpely_id"]}),
+            "sync_sharpely_equity": pd.DataFrame(
+                [{"nse_ticker": "Praxis-RE1", "bse_ticker": None, "company_name": "Praxis Home Retail", "sharpely_id": "sh1"}]
+            ),
+            "sync_dhan_bse": pd.DataFrame(columns=["bse_ticker", "dhan_bse_id"]),
+            "sync_dhan_nse": pd.DataFrame([{"nse_ticker": "praxis-re1", "dhan_nse_id": 12345}]),
+        }[operation],
+    )
+    upserts = []
+    monkeypatch.setattr(company_master_utils, "upsert_to_db", lambda df, table, keys: upserts.append((df, table, keys)))
+
+    result = company_master_utils.sync_company_master()
+
+    assert result.iloc[0]["nse_ticker"] == "PRAXIS-RE1"  # upper-cased despite the source's mixed case
+    assert result.iloc[0]["dhan_nse_id"] == 12345         # matched despite dhan's own lowercase ticker
+    assert str(result["dhan_nse_id"].dtype) == "Int64"    # nullable integer, not float64
+    assert len(upserts) == 1
 
 
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
@@ -2126,22 +2162,6 @@ def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
     assert result["state_advanced"] is True
 
 
-def test_bhavcopy_parser_cat_turnover_raises_visible_error(monkeypatch):
-    monkeypatch.setattr(
-        bhavcopy_parser.pd,
-        "read_excel",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("corrupt workbook")),
-    )
-
-    try:
-        bhavcopy_parser.parse_cat_turnover("/tmp/cat_turnover_bad.xls")
-    except RuntimeError as exc:
-        assert "CAT Turnover workbook" in str(exc)
-        assert "/tmp/cat_turnover_bad.xls" in str(exc)
-    else:
-        raise AssertionError("expected parse_cat_turnover to raise RuntimeError")
-
-
 def test_bhavcopy_parser_records_failed_key(monkeypatch):
     failed: list[tuple[str, str, str]] = []
     events: list[dict[str, object]] = []
@@ -2309,40 +2329,28 @@ def test_bhavcopy_parser_records_empty_zip_stat_failure(monkeypatch):
     assert events[0]["source"] == "/tmp/missing.zip"
 
 
-def test_bhavcopy_parser_records_circuit_hit_date_fallback(monkeypatch, tmp_path):
-    events: list[dict[str, object]] = []
-    path = tmp_path / "bh01012026.csv"
-    path.write_text("SYMBOL,SERIES,IGNORED,CIRCUIT\nABC,EQ,x,UPPER\n", encoding="utf-8")
-    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
-    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
-    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda *_args, **_kwargs: None)
-
-    frame = bhavcopy_parser.parse_circuit_hit(str(path))
-
-    assert frame["date"].iloc[0] == pd.Timestamp("2026-01-01")
-    assert events[0]["fallback_type"] == "nse_bhavcopy_circuit_hit_date_fallback"
-    assert events[0]["metadata"]["fallback_format"] == "bh%d%m%Y.csv"
-
-
 def test_bhavcopy_parser_records_inner_file_parse_failure(monkeypatch, tmp_path):
     import zipfile
 
     events: list[dict[str, object]] = []
     zip_path = tmp_path / "bhavcopy_2026-01-01.zip"
+    nested_zip_path = tmp_path / "cm_nested.zip"
+    with zipfile.ZipFile(nested_zip_path, "w") as nested:
+        nested.writestr("cm_bad.csv", "bad")
     with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("C_CATG_BAD.TXT", "bad")
+        archive.write(nested_zip_path, "cm_nested.zip")
     monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
     monkeypatch.setattr(
         bhavcopy_parser,
-        "parse_catg",
-        lambda path: (_ for _ in ()).throw(ValueError("bad catg schema")),
+        "parse_ohlcv",
+        lambda path: (_ for _ in ()).throw(ValueError("bad ohlcv schema")),
     )
 
-    with pytest.raises(RuntimeError, match="catg:C_CATG_BAD.TXT"):
+    with pytest.raises(RuntimeError, match="ohlcv:cm_bad.csv"):
         bhavcopy_parser.unzip_and_process(str(zip_path))
 
     assert events[0]["fallback_type"] == "nse_bhavcopy_file_parse_failed"
-    assert events[0]["metadata"]["label"] == "catg"
+    assert events[0]["metadata"]["label"] == "ohlcv"
 
 
 def test_bhavcopy_parser_records_nested_bad_zip(monkeypatch, tmp_path):
@@ -2385,6 +2393,53 @@ def test_bhavcopy_downloader_excludes_failed_keys_from_downloaded_set(monkeypatc
     )
 
     assert bhavcopy_downloader.load_downloaded_dates_from_store() == {"2015-01-17"}
+
+
+def test_parse_mcap_converts_not_traded_sentinel_to_null_date(monkeypatch, tmp_path):
+    # 2026-08-15 bug found live: last_trade_date was written as free TEXT, mixing real 'DD Mon YYYY'
+    # date strings with a literal 'Not Traded' sentinel for symbols with zero trades that trade_date
+    # (confirmed live: 3230 of 1.6M nseindia_mcap rows) -- conflating NULL with a magic string and
+    # making any ORDER BY/range query on the column lexicographic garbage. parse_mcap must now parse
+    # it to a real (possibly-null) datetime instead of passing the raw text through.
+    monkeypatch.setattr(bhavcopy_parser, "ensure_mcap_last_trade_date_is_typed_date", lambda: None)
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
+
+    path = tmp_path / "MCAP01092025.csv"
+    path.write_text(
+        "disclaimer line\n"
+        "Trade Date,Symbol,Series,Security Name,Category,Last Trade Date,Face Value(Rs.),Issue Size,Close/Paid up Value(Rs.),Market Cap(Rs.)\n"
+        "01 SEP 2025,TRADED,EQ,Traded Co,A,23 SEP 2025,10,1000,100,100000\n"
+        "01 SEP 2025,SUSPENDED,EQ,Suspended Co,A,Not Traded,10,1000,50,50000\n"
+        "trailer line 1\n"
+        "trailer line 2\n"
+        "trailer line 3\n",
+        encoding="utf-8",
+    )
+
+    frame = bhavcopy_parser.parse_mcap(str(path))
+
+    assert captured["table"] == "nseindia_mcap"
+    traded = frame[frame["symbol"] == "TRADED"].iloc[0]
+    assert traded["last_trade_date"] == pd.Timestamp("2025-09-23")
+    suspended = frame[frame["symbol"] == "SUSPENDED"].iloc[0]
+    assert pd.isna(suspended["last_trade_date"])  # 'Not Traded' -> real NULL, not the literal string
+
+
+def test_ensure_mcap_last_trade_date_migration_uses_schema_registry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bhavcopy_parser, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    bhavcopy_parser.ensure_mcap_last_trade_date_is_typed_date()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == "20260815_nseindia_mcap_last_trade_date_to_date"
+    assert call["metadata"]["tables"] == ["nseindia_mcap"]
+    ddl = call["statements"][0]
+    assert "ALTER TABLE nseindia_mcap ALTER COLUMN last_trade_date TYPE DATE" in ddl
+    assert "'Not Traded'" not in ddl  # generic regex match, not a hardcoded literal check
 
 
 def test_bhavcopy_downloader_records_malformed_store_key(monkeypatch):
@@ -2512,96 +2567,6 @@ def test_bhavcopy_history_parsers_and_split_detection():
     assert abs(float(ca.iloc[0]["adj_factor"]) - 0.20) < 1e-6      # open/prevclose = 20/100
 
 
-def test_bhavcopy_parser_mto_dat_delivery(monkeypatch, tmp_path):
-    # NSE ships delivery as MTO_<ddmmyyyy>.DAT with 4 preamble lines, "20,..." security rows, and a
-    # "90,..." grand-total trailer. The parser must read the .DAT layout and drop the trailer.
-    captured: dict[str, object] = {}
-    path = tmp_path / "MTO_02012018.DAT"
-    path.write_text(
-        "Security Wise Delivery Position - Compulsory Rolling Settlement\n"
-        "10,MTO,02012018,723652832,0002021\n"
-        "Trade Date <02-JAN-2018>,Settlement Type <N>\n"
-        "Record Type,Sr No,Name of Security,Series,Quantity Traded,Deliverable Quantity,Percentage\n"
-        "20,1,RELIANCE,EQ,1000,600,60.00\n"
-        "20,2,TCS,EQ,500,250,50.00\n"
-        "90,MTO,02012018,1500,850\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
-    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
-
-    frame = bhavcopy_parser.parse_mto(str(path))
-
-    assert captured["table"] == "nseindia_mto"
-    assert set(frame["symbol"]) == {"RELIANCE", "TCS"}          # the "90" trailer row is dropped
-    reliance = frame[frame["symbol"] == "RELIANCE"].iloc[0]
-    assert int(reliance["deliverable_volume"]) == 600
-    assert abs(float(reliance["deliverable_percent"]) - 60.0) < 1e-9
-    assert reliance["date"] == pd.Timestamp("2018-01-02")
-
-
-def test_bhavcopy_parser_wk52_high_low(monkeypatch, tmp_path):
-    # CM_52_wk_High_low_<ddmmyyyy>.csv -- 2 disclaimer/effective-date lines precede the header.
-    captured: dict[str, object] = {}
-    path = tmp_path / "CM_52_wk_High_low_02012018.csv"
-    path.write_text(
-        '"Disclaimer - adjusted for corporate actions"\n'
-        '"Effective for 02-Jan-2018"\n'
-        '"SYMBOL","SERIES","Adjusted 52_Week_High","52_Week_High_Date","Adjusted 52_Week_Low","52_Week_Low_DT"\n'
-        '"RELIANCE","EQ","    1200.50","18-JAN-2017","     900.25","23-AUG-2017"\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
-    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
-
-    frame = bhavcopy_parser.parse_wk52(str(path))
-
-    assert captured["table"] == "nseindia_52wk"
-    row = frame[frame["symbol"] == "RELIANCE"].iloc[0]
-    assert abs(float(row["adjusted_52_week_high"]) - 1200.50) < 1e-9
-    assert abs(float(row["adjusted_52_week_low"]) - 900.25) < 1e-9
-    assert row["high_date"] == pd.Timestamp("2017-01-18")
-    assert row["date"] == pd.Timestamp("2018-01-02")
-
-
-def test_bhavcopy_parser_var1_dedupes_same_day_entries(monkeypatch, tmp_path):
-    # NSE republishes VAR1 several times a day as separately entry-numbered files. Storing every
-    # numbered file as its own row grew nseindia_var1 to 209M rows for no informational gain (the
-    # only consumer already collapses to MAX per day). parse_var1 must combine all of a day's
-    # files into ONE column-wise-MAX row per (for_date, series, symbol, isin) -- matching that
-    # consumer's aggregation exactly -- and RELIANCE's genuinely-revised margin (up in entry 2)
-    # must not be shadowed by the unchanged TCS row.
-    header_cols = "RecordType,Symbol,Series,ISIN,SecVaR,IdxVaR,VaRMargin,ELR,AdhocMargin,ApplicableMargin\n"
-    entry1 = tmp_path / "C_VAR1_02012018_1.DAT"
-    entry1.write_text(
-        "01,02012018,X,Y\n" + header_cols +          # 4 comma-fields -> entry_number defaults to 1
-        "1,RELIANCE,EQ,INE002A01018,3.5,4.0,7.5,1.0,0,8.5\n"
-        "1,TCS,EQ,INE467B01029,3.0,4.0,7.0,1.0,0,8.0\n",
-        encoding="utf-8",
-    )
-    entry2 = tmp_path / "C_VAR1_02012018_2.DAT"
-    entry2.write_text(
-        "01,02012018,X,2,Y\n" + header_cols +         # 5 comma-fields -> entry_number = parts[3] = 2
-        "1,RELIANCE,EQ,INE002A01018,4.0,4.0,8.0,1.0,0,9.0\n"     # margin genuinely revised up
-        "1,TCS,EQ,INE467B01029,3.0,4.0,7.0,1.0,0,8.0\n",         # unchanged republish
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df, "unique_keys": kw.get("unique_keys")}))
-
-    frame = bhavcopy_parser.parse_var1([str(entry1), str(entry2)])
-
-    assert captured["table"] == "nseindia_var1"
-    assert captured["unique_keys"] == ["for_date", "series", "symbol", "isin"]
-    assert len(frame) == 2                                              # one row per symbol, not per entry
-    reliance = frame[frame["symbol"] == "RELIANCE"].iloc[0]
-    assert abs(float(reliance["applicable_margin"]) - 9.0) < 1e-9        # kept the higher, revised value
-    assert int(reliance["entry_number"]) == 2                           # provenance: highest contributing entry
-    tcs = frame[frame["symbol"] == "TCS"].iloc[0]
-    assert abs(float(tcs["applicable_margin"]) - 8.0) < 1e-9             # unchanged across entries
-
-
 def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
     # Operator decision: core numerical bhavcopy data must never be archived out of the live DB. The
     # legacy-archival tool must skip every protected table by default, and only proceed under an
@@ -2609,13 +2574,13 @@ def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
     from scripts import archive_legacy_nse_tables as ala
     from scripts.db_table_retention_report import PROTECTED_NUMERICAL_TABLES
 
-    assert {"nseindia_ohlcv", "nseindia_mto", "nseindia_52wk", "nseindia_indices"} <= PROTECTED_NUMERICAL_TABLES
+    assert {"nseindia_ohlcv", "nseindia_mcap", "nseindia_indices"} <= PROTECTED_NUMERICAL_TABLES
 
     calls: list[str] = []
     monkeypatch.setattr(ala, "archive_table", lambda *, table_name, **kw: calls.append(table_name) or {"table_name": table_name, "deleted_rows": 0})
 
     result = ala.run_archive(
-        tables=["nseindia_ohlcv", "nseindia_mto"], retention_days=365, cutoff="2020-01-01",
+        tables=["nseindia_ohlcv", "nseindia_mcap"], retention_days=365, cutoff="2020-01-01",
         archive_s3=True, delete=True, execute=True, allow_delete_without_archive=True,
         archive_prefix="x", max_chunks=1, exact_counts=False,
     )
@@ -2739,29 +2704,6 @@ def test_bhavcopy_ci_glob_survives_nse_case_change(tmp_path):
     assert bc == {"Bc010925.csv", "bc01072026.csv"}          # both cases, not pr/pd
     assert mcap == {"MCAP01092025.csv", "mcap01072026.csv"}
     assert bh == {"bh01072026.csv"}
-
-
-def test_bhavcopy_soft_skips_unrecoverable_cat_turnover(monkeypatch, tmp_path):
-    import zipfile
-
-    # A corrupt-at-source cat_turnover .xls (NSE no longer serves a good copy) must NOT fail the whole
-    # day -- it is skipped visibly so the day's other tables are retained. A different cat_turnover
-    # error (e.g. a schema change) still fails hard.
-    events: list[dict[str, object]] = []
-    zip_path = tmp_path / "bhavcopy_2025-08-05.zip"
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("cat_turnover_050825.xls", "corrupt-ole-bytes")
-    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
-    monkeypatch.setattr(
-        bhavcopy_parser, "parse_cat_turnover",
-        lambda path: (_ for _ in ()).throw(RuntimeError(f"Unable to read CAT Turnover workbook path={path}")),
-    )
-
-    # the corrupt cat_turnover is the only file -> the day completes (no RuntimeError raised)
-    result = bhavcopy_parser.unzip_and_process(str(zip_path))
-    assert result is not False
-    assert events and events[0]["fallback_type"] == "nse_bhavcopy_file_unrecoverable_skipped"
-    assert events[0]["severity"] == "warn"
 
 
 def test_indices_downloader_confirmed_gap_reconciliation():
@@ -3074,39 +3016,6 @@ def test_indices_parser_records_inner_file_parse_failure(monkeypatch, tmp_path):
 
     assert events[0]["fallback_type"] == "nse_indices_file_parse_failed"
     assert events[0]["metadata"]["filename"] == "ind_close_bad.csv"
-
-
-def test_offmarket_downloader_uses_s3_ranges_as_source_of_truth(monkeypatch):
-    monkeypatch.setattr(
-        offmarket.store,
-        "list_files",
-        lambda prefix: iter(
-            [
-                "nsedeals/block_deals_01-01-2015_03-01-2015.csv",
-                "nsedeals/bulk_deals_05-01-2015_05-01-2015.csv",
-                "nsedeals/ignore.txt",
-            ]
-        ),
-    )
-
-    assert offmarket.load_downloaded_dates_from_store("block_deals") == {
-        "2015-01-01",
-        "2015-01-02",
-        "2015-01-03",
-    }
-    assert offmarket.load_downloaded_dates_from_store("bulk_deals") == {"2015-01-05"}
-
-
-def test_offmarket_downloader_records_malformed_download_key(monkeypatch):
-    events: list[dict[str, object]] = []
-    monkeypatch.setattr(offmarket, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
-
-    dates = offmarket.extract_downloaded_dates_from_key("nsedeals/block_deals_bad.csv", "block_deals")
-
-    assert dates == set()
-    assert events[0]["fallback_type"] == "nse_offmarket_download_key_date_parse_failed"
-    assert events[0]["source"] == "nsedeals/block_deals_bad.csv"
-    assert events[0]["metadata"]["dtype"] == "block_deals"
 
 
 def test_recent_events_always_refreshes_today(monkeypatch):
@@ -4971,353 +4880,6 @@ def test_company_master_backfill_uses_retryable_operations(monkeypatch):
     assert len([query for query, _ in executed if "SET LOCAL statement_timeout = 0" in query]) == 2
 
 
-def test_nse_offmarket_exports_retry_run_state(monkeypatch):
-    class FakeRedis:
-        def close(self):
-            return None
-
-    class FakePlaywrightContext:
-        def __enter__(self):
-            return object()
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    calls = {"get_next": 0, "download": 0}
-
-    def fake_get_next(rop, dtype, g_start, g_end, skipped_dates=None):
-        if dtype == "block_deals" and calls["get_next"] == 0:
-            calls["get_next"] += 1
-            return offmarket.datetime(2026, 6, 9), offmarket.datetime(2026, 6, 10)
-        calls["get_next"] += 1
-        return None
-
-    def fake_download_data(playwright, dtype, from_date, to_date, rop):
-        calls["download"] += 1
-        return calls["download"] == 2
-
-    monkeypatch.setattr(offmarket, "get_redis_client", lambda *args, **kwargs: FakeRedis())
-    monkeypatch.setattr(offmarket, "sync_playwright", lambda: FakePlaywrightContext())
-    monkeypatch.setattr(offmarket, "latest_completed_day", lambda: offmarket.datetime(2026, 6, 10))
-    monkeypatch.setattr(offmarket, "NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS", 1)
-    monkeypatch.setattr(offmarket, "get_next_download_block", fake_get_next)
-    monkeypatch.setattr(offmarket, "download_data", fake_download_data)
-
-    assert offmarket.main() == 0
-
-    state = offmarket.STOCKEY_RUN_STATE
-    assert state["source"] == "data.nseindia.offmarket"
-    assert state["blocks_attempted"] == 1
-    assert state["download_attempts"] == 2
-    assert state["attempt_count"] == 2
-    assert state["retry_count"] == 1
-    assert state["failed_attempt_count"] == 1
-    assert state["downloaded_blocks"] == 1
-    assert state["dates_downloaded"] == 2
-    assert state["rows_written"] == 2
-    assert state["state_advanced"] is True
-
-
-def test_nse_offmarket_records_download_failure_fallback(monkeypatch):
-    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
-    events: list[dict[str, object]] = []
-
-    class FakePage:
-        def goto(self, *_args, **_kwargs):
-            raise RuntimeError("offmarket timeout")
-
-        def close(self):
-            return None
-
-    class FakeContext:
-        def new_page(self):
-            return FakePage()
-
-    class FakeBrowser:
-        contexts = []
-
-        def new_context(self):
-            return FakeContext()
-
-        def close(self):
-            return None
-
-    class FakeChromium:
-        def connect_over_cdp(self, _endpoint):
-            return FakeBrowser()
-
-    class FakePlaywright:
-        chromium = FakeChromium()
-
-    class FakeRedis:
-        def sadd(self, *_args, **_kwargs):
-            raise AssertionError("download failure must not mark redis downloaded")
-
-    monkeypatch.setattr(offmarket, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
-
-    ok = offmarket.download_data(
-        FakePlaywright(),
-        "block_deals",
-        offmarket.datetime(2026, 6, 9),
-        offmarket.datetime(2026, 6, 10),
-        FakeRedis(),
-    )
-
-    assert ok is False
-    assert len(events) == 1
-    event = events[0]
-    assert event["module"] == "data.nseindia.offmarket"
-    assert event["source"] == "nsedeals:block_deals:2026-06-09:2026-06-10"
-    assert event["fallback_type"] == "nse_offmarket_download_failed"
-    assert event["severity"] == "warn"
-    assert isinstance(event["error"], RuntimeError)
-    assert str(event["error"]) == "offmarket timeout"
-    assert event["metadata"] == {
-        "dtype": "block_deals",
-        "from_date": "2026-06-09",
-        "to_date": "2026-06-10",
-        "from_date_display": "09-06-2026",
-        "to_date_display": "10-06-2026",
-    }
-
-
-def test_nse_offmarket_parser_exports_file_run_state(monkeypatch):
-    from data.nseindia import offmarket_parser
-
-    failed_states = []
-    monkeypatch.setattr(
-        offmarket_parser,
-        "get_processed_keys",
-        lambda _source, status="processed": {"nsedeals/already.csv"} if status == "processed" else set(),
-    )
-    monkeypatch.setattr(
-        offmarket_parser,
-        "mark_failed",
-        lambda source_prefix, object_key, error_message: failed_states.append((source_prefix, object_key, error_message)),
-    )
-    monkeypatch.setattr(
-        offmarket_parser.store,
-        "list_files",
-        lambda _prefix: ["nsedeals/already.csv", "nsedeals/block_deals.csv", "nsedeals/bad.csv"],
-    )
-    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: f"/tmp/{key.rsplit('/', 1)[-1]}")
-
-    def fake_process(file_name, _csv_path):
-        if file_name == "nsedeals/bad.csv":
-            raise ValueError("bad schema")
-        return {"file_name": file_name, "dtype": "block_deals", "rows": 4, "from_date": "2026-06-01", "to_date": "2026-06-02"}
-
-    monkeypatch.setattr(offmarket_parser, "process_csv", fake_process)
-
-    state = offmarket_parser.run_parser()
-
-    assert state["source"] == "data.nseindia.offmarket_parser"
-    assert state["files_seen"] == 3
-    assert state["already_processed_count"] == 1
-    assert state["files_considered"] == 2
-    assert state["parsed_count"] == 1
-    assert state["failed_count"] == 1
-    assert state["failed_attempt_count"] == 1
-    assert state["parse_failed_count"] == 1
-    assert state["failed_classifications"] == {"parser_bug": 1}
-    assert state["rows_written"] == 4
-    assert state["from_date"] == "2026-06-01"
-    assert state["to_date"] == "2026-06-02"
-    assert state["failed_files"][0]["file_name"] == "nsedeals/bad.csv"
-    assert state["failed_files"][0]["classification"] == "parser_bug"
-    assert failed_states == [("nsedeals", "nsedeals/bad.csv", "classification=parser_bug; ValueError: bad schema")]
-    assert state["state_advanced"] is True
-
-
-def test_nse_offmarket_parser_records_parse_failure_fallback(monkeypatch):
-    from data.nseindia import offmarket_parser
-
-    failed_states = []
-    events = []
-    monkeypatch.setattr(offmarket_parser, "get_processed_keys", lambda _source, status="processed": set())
-    monkeypatch.setattr(
-        offmarket_parser,
-        "mark_failed",
-        lambda source_prefix, object_key, error_message: failed_states.append((source_prefix, object_key, error_message)),
-    )
-    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/bulk_deals_bad.csv"])
-    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: "/tmp/bulk_deals_bad.csv")
-    monkeypatch.setattr(
-        offmarket_parser,
-        "process_csv",
-        lambda _file_name, _csv_path: (_ for _ in ()).throw(KeyError("client_name")),
-    )
-    monkeypatch.setattr(
-        offmarket_parser,
-        "record_local_fallback_event",
-        lambda **kwargs: events.append(kwargs),
-    )
-
-    state = offmarket_parser.run_parser()
-
-    assert state["failed_count"] == 1
-    assert state["failed_classifications"] == {"schema_changed": 1}
-    assert failed_states == [
-        ("nsedeals", "nsedeals/bulk_deals_bad.csv", "classification=schema_changed; KeyError: 'client_name'")
-    ]
-    assert len(events) == 1
-    event = events[0]
-    assert event["module"] == "data.nseindia.offmarket_parser"
-    assert event["source"] == "nsedeals/bulk_deals_bad.csv"
-    assert event["fallback_type"] == "nse_offmarket_parse_failed"
-    assert event["severity"] == "warn"
-    assert isinstance(event["error"], KeyError)
-    assert event["metadata"] == {
-        "file_name": "nsedeals/bulk_deals_bad.csv",
-        "classification": "schema_changed",
-        "error_message": "classification=schema_changed; KeyError: 'client_name'",
-    }
-
-
-def test_nse_offmarket_parser_marks_empty_valid_source(monkeypatch):
-    from data.nseindia import offmarket_parser
-
-    monkeypatch.setattr(offmarket_parser, "get_processed_keys", lambda _source, status="processed": set())
-    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/empty.csv"])
-    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: "/tmp/empty.csv")
-    monkeypatch.setattr(
-        offmarket_parser,
-        "process_csv",
-        lambda file_name, _csv_path: {
-            "file_name": file_name,
-            "dtype": "bulk_deals",
-            "status": offmarket_parser.EMPTY_VALID_STATUS,
-            "rows": 0,
-        },
-    )
-
-    state = offmarket_parser.run_parser()
-
-    assert state["files_considered"] == 1
-    assert state["parsed_count"] == 0
-    assert state["empty_valid_count"] == 1
-    assert state["failed_count"] == 0
-    assert state["rows_written"] == 1
-    assert state["state_advanced"] is True
-
-
-def test_nse_offmarket_parser_treats_empty_valid_source_as_completed(monkeypatch):
-    from data.nseindia import offmarket_parser
-
-    monkeypatch.setattr(
-        offmarket_parser,
-        "get_processed_keys",
-        lambda _source, status="processed": {"nsedeals/empty.csv"} if status == offmarket_parser.EMPTY_VALID_STATUS else set(),
-    )
-    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/empty.csv"])
-    monkeypatch.setattr(
-        offmarket_parser.store,
-        "get_as_temp_file",
-        lambda key: (_ for _ in ()).throw(AssertionError("completed empty key should not be fetched")),
-    )
-
-    state = offmarket_parser.run_parser()
-
-    assert state["already_processed_count"] == 1
-    assert state["files_considered"] == 0
-    assert state["empty_valid_count"] == 0
-    assert state["state_advanced"] is False
-
-
-def test_nse_offmarket_parser_schema_helpers_use_retryable_operations(monkeypatch):
-    from data.nseindia import offmarket_parser
-
-    operation_names = []
-    executed = []
-    fetch_rows = iter(
-        [
-            ("public.nseindia_offmarket_block_deals",),
-            None,
-            ("public.nseindia_offmarket_block_deals",),
-            ("integer",),
-        ]
-    )
-
-    class FakeCursor:
-        def execute(self, query, params=None):
-            executed.append((str(query), params))
-
-        def fetchone(self):
-            return next(fetch_rows)
-
-    class FakeSession:
-        def __enter__(self):
-            return None, FakeCursor()
-
-        def __exit__(self, *_args):
-            return False
-
-    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
-        operation_names.append(operation_name)
-        return operation()
-
-    monkeypatch.setattr(offmarket_parser, "db_session", lambda: FakeSession())
-    monkeypatch.setattr(offmarket_parser, "execute_db_operation", fake_execute_db_operation)
-
-    offmarket_parser.ensure_unique_constraint(
-        "nseindia_offmarket_block_deals",
-        "uniq_test",
-        ["date", "symbol"],
-        drop_constraints=["old_constraint"],
-        drop_indexes=["old_index"],
-    )
-    offmarket_parser.ensure_text_columns("nseindia_offmarket_block_deals", ["symbol"])
-
-    assert operation_names == [
-        "offmarket_parser:ensure_unique_constraint:nseindia_offmarket_block_deals",
-        "offmarket_parser:ensure_text_columns:nseindia_offmarket_block_deals",
-    ]
-    assert any("DROP CONSTRAINT IF EXISTS old_constraint" in query for query, _ in executed)
-    assert any("DROP INDEX IF EXISTS old_index" in query for query, _ in executed)
-    assert any("ADD CONSTRAINT uniq_test UNIQUE (date, symbol)" in query for query, _ in executed)
-    assert any(
-        "ALTER TABLE nseindia_offmarket_block_deals ALTER COLUMN symbol TYPE TEXT" in query
-        for query, _ in executed
-    )
-
-
-def test_nse_offmarket_parser_failure_classifier_distinguishes_schema_and_parser_errors():
-    from data.nseindia import offmarket_parser
-
-    assert offmarket_parser.classify_offmarket_parse_failure(pd.errors.EmptyDataError("empty")) == "empty_valid_source"
-    assert offmarket_parser.classify_offmarket_parse_failure(KeyError("client_name")) == "schema_changed"
-    assert offmarket_parser.classify_offmarket_parse_failure(ValueError("Length mismatch: Expected axis has 4 elements")) == "schema_changed"
-    assert offmarket_parser.classify_offmarket_parse_failure(RuntimeError("unexpected parser branch")) == "parser_bug"
-
-
-def test_nse_offmarket_parser_main_exports_run_state(monkeypatch, capsys):
-    from data.nseindia import offmarket_parser
-
-    payload = {
-        "source": "data.nseindia.offmarket_parser",
-        "rows": 0,
-        "rows_read": 0,
-        "rows_written": 0,
-        "files_seen": 1,
-        "failed_count": 1,
-        "failed_attempt_count": 1,
-        "parse_failed_count": 1,
-        "state_advanced": False,
-    }
-
-    class FakeRedis:
-        def close(self):
-            pass
-
-    monkeypatch.setattr(offmarket_parser, "run_parser", lambda: payload)
-    monkeypatch.setattr(offmarket_parser, "rop", FakeRedis())
-
-    assert offmarket_parser.main() == 0
-    capsys.readouterr()
-
-    assert offmarket_parser.STOCKEY_RUN_STATE["source"] == "data.nseindia.offmarket_parser"
-    assert offmarket_parser.STOCKEY_RUN_STATE["failed_count"] == 1
-    assert offmarket_parser.STOCKEY_RUN_STATE["state_advanced"] is False
 
 
 def test_bhavcopy_downloader_exports_retry_run_state(monkeypatch):
@@ -6189,14 +5751,10 @@ def test_dhan_scrip_master_main_exports_schema_failure_state(monkeypatch, tmp_pa
 
 
 def test_sharpely_scrip_master_main_exports_runner_state(monkeypatch, capsys):
+    # 2026-08-15: master_sharpely_funds (instrumentType 0/1, non-stock entities) retired -- zero
+    # readers anywhere. get_latest_from_sharpely now fetches+returns only the equity frame directly
+    # (not a 3-element list), and only master_sharpely_equity is ever upserted.
     writes: list[tuple[str, int, list[str]]] = []
-    fund_a = pd.DataFrame(
-        [
-            {"amfi_code": "1001", "plan_name": "Fund A"},
-            {"amfi_code": None, "plan_name": "Fund Missing"},
-        ]
-    )
-    fund_b = pd.DataFrame([{"amfi_code": "2001", "plan_name": "Fund B"}])
     equity = pd.DataFrame(
         [
             {"symbol": "AAA", "bse_ticker": None, "proper_name": "AAA Ltd"},
@@ -6206,7 +5764,7 @@ def test_sharpely_scrip_master_main_exports_runner_state(monkeypatch, capsys):
     )
 
     monkeypatch.setattr(sharpely_scrip_master, "get_sharpely_headers", lambda: {"Authorization": "Bearer test"})
-    monkeypatch.setattr(sharpely_scrip_master, "get_latest_from_sharpely", lambda headers: [fund_a.copy(), fund_b.copy(), equity.copy()])
+    monkeypatch.setattr(sharpely_scrip_master, "get_latest_from_sharpely", lambda headers: equity.copy())
     monkeypatch.setattr(
         sharpely_scrip_master,
         "upsert_to_db",
@@ -6217,18 +5775,14 @@ def test_sharpely_scrip_master_main_exports_runner_state(monkeypatch, capsys):
     capsys.readouterr()
 
     assert writes == [
-        ("master_sharpely_funds", 2, ["amfi_code"]),
         ("master_sharpely_equity", 2, ["symbol", "bse_ticker"]),
     ]
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["source"] == "sharpely"
-    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows"] == 4
-    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows_read"] == 6
-    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows_written"] == 4
-    assert sharpely_scrip_master.STOCKEY_RUN_STATE["fund_rows"] == 2
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows"] == 2
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows_read"] == 3
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows_written"] == 2
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["equity_rows"] == 2
-    assert sharpely_scrip_master.STOCKEY_RUN_STATE["raw_fund_rows"] == 3
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["raw_equity_rows"] == 3
-    assert sharpely_scrip_master.STOCKEY_RUN_STATE["instrument_type_count"] == 3
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["fallback_used"] is False
     assert sharpely_scrip_master.STOCKEY_RUN_STATE["state_advanced"] is True
 
@@ -7517,6 +7071,8 @@ def test_fbil_gsec_try_parsing_date_records_format_fallback(monkeypatch):
 def test_fbil_gsec_parse_xls_records_trade_date_and_sheet_fallbacks(monkeypatch):
     from data.rbi import download_fbil_gsec as fbil_gsec
 
+    # 2026-08-15: fbil_gsec_quote retired (zero readers) -- parse_xls no longer reads the "G-Sec"
+    # sheet's full quote table (skiprows=5), only its trade_date cell (no skiprows), plus Par Yield.
     events: list[dict[str, object]] = []
     calls: list[tuple[str, object]] = []
 
@@ -7524,21 +7080,6 @@ def test_fbil_gsec_parse_xls_records_trade_date_and_sheet_fallbacks(monkeypatch)
         calls.append((str(sheet_name), skiprows))
         if sheet_name == "G-Sec" and skiprows is None:
             return pd.DataFrame([[None, None, None], [None, None, "bad-date"]])
-        if sheet_name == "G-Sec" and skiprows == 5:
-            return pd.DataFrame(
-                [
-                    [
-                        "IN000000001",
-                        "7.1",
-                        "31-Dec-2030",
-                        "100.2",
-                        "7.0",
-                        None,
-                        None,
-                        "liquid",
-                    ]
-                ]
-            )
         if sheet_name == "Par Yield":
             raise ValueError("missing Par Yield")
         if sheet_name == "Par-Yield":
@@ -7548,9 +7089,9 @@ def test_fbil_gsec_parse_xls_records_trade_date_and_sheet_fallbacks(monkeypatch)
     monkeypatch.setattr(fbil_gsec.pd, "read_excel", fake_read_excel)
     monkeypatch.setattr(fbil_gsec, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
 
-    quote, par = fbil_gsec.parse_xls("dummy.xls", date(2026, 6, 8))
+    par = fbil_gsec.parse_xls("dummy.xls", date(2026, 6, 8))
 
-    assert quote["trade_date"].iloc[0] == date(2026, 6, 8)
+    assert par["trade_date"].iloc[0] == date(2026, 6, 8)
     assert float(par["par_yield_sa"].iloc[0]) == 7.2
     assert [event["fallback_type"] for event in events] == [
         "fbil_gsec_trade_date_parse_failed",
@@ -7559,6 +7100,7 @@ def test_fbil_gsec_parse_xls_records_trade_date_and_sheet_fallbacks(monkeypatch)
     assert events[0]["metadata"]["raw_trade_date"] == "bad-date"
     assert all(event["metadata"]["date"] == "2026-06-08" for event in events)
     assert ("Par-Yield", 5) in calls
+    assert ("G-Sec", 5) not in calls
 
 
 def test_fbil_gsec_main_exports_failed_run_state(monkeypatch, capsys):
@@ -8711,7 +8253,7 @@ def test_copy_bse_scrip_code_from_ticker_skips_when_nothing_eligible(monkeypatch
     assert upserts == []
 
 
-# fundamentals/collectors/screenerin.py -- deleveraging screen (step 2).
+# fundamentals/collectors/screenerin.py -- shared screener.in scraping infra (used by L1/L2).
 
 SCREENERIN_FIXTURE_HTML = """
 <div data-page-results><table>
@@ -8856,42 +8398,6 @@ def test_run_query_zero_results_does_not_fetch_a_second_page(monkeypatch):
 
     assert calls == [1]
     assert companies == []
-
-
-def test_run_deleveraging_screen_upserts_and_summarizes(monkeypatch):
-    companies = [
-        {"company_id": 1274762, "name": "Ksolves India", "ticker": "KSOLVES", "url": "/company/KSOLVES/", "metrics": {"mar_cap_rscr": 652.52}},
-        {"company_id": 3163, "name": "Aqylon Nexus", "ticker": "AQYLON", "url": "/company/AQYLON/", "metrics": {"mar_cap_rscr": 676.2}},
-    ]
-    monkeypatch.setattr(fundamentals_screenerin, "run_query", lambda session, query_text: ("screener_url", companies))
-
-    upserts = []
-    monkeypatch.setattr(fundamentals_screenerin, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
-
-    result = fundamentals_screenerin.run_deleveraging_screen(session=object())
-
-    assert result == {
-        "query_name": "deleveraging",
-        "rows": 2,
-        "companies": ["Ksolves India", "Aqylon Nexus"],
-    }
-    assert len(upserts) == 1
-    df, table, kwargs = upserts[0]
-    assert table == fundamentals_screenerin.RESULTS_TABLE
-    assert kwargs["unique_keys"] == ["query_name", "run_date", "company_id"]
-    assert set(df["company_id"]) == {1274762, 3163}
-    assert json.loads(df.iloc[0]["metrics_json"]) == companies[0]["metrics"]
-
-
-def test_run_deleveraging_screen_skips_upsert_when_no_results(monkeypatch):
-    monkeypatch.setattr(fundamentals_screenerin, "run_query", lambda session, query_text: ("screener_url", []))
-    upserts = []
-    monkeypatch.setattr(fundamentals_screenerin, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))
-
-    result = fundamentals_screenerin.run_deleveraging_screen(session=object())
-
-    assert result == {"query_name": "deleveraging", "rows": 0, "companies": []}
-    assert upserts == []
 
 
 # fundamentals/screens/l1_universe.py -- L1 universe filter (step 3).
@@ -9487,6 +8993,46 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     assert pd.isna(row2["valuation_vs_own_history_ratio"])
     assert pd.isna(row2["valuation_sector_percentile"])
     assert any(e["fallback_type"] == "l2_fields_not_sourced" for e in fallback_events)
+
+
+def test_run_l2_state_refresh_isolates_one_market_wide_query_failure(monkeypatch):
+    # 2026-08-15 bug found live: fetch_pledge_levels/fetch_valuation_levels ran back-to-back with
+    # no isolation -- either one raising took down the ENTIRE L2 step, before any per-company
+    # detail fetch even started. Confirmed live: fetch_valuation_levels (added 2026-08-13) failing
+    # with "Could not find screener.in results table in the response" crashed 2 days running.
+    # Now: a failing query degrades to empty levels (same "absent from this dict" case every
+    # company without real data already goes through) instead of aborting the run, and both
+    # failures are recorded distinctly via fallback telemetry.
+    universe = pd.DataFrame([{"company_id": 1, "company_name": "Aarey Drugs", "ticker": "AAREYDRUGS"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {1: 5.0})
+    monkeypatch.setattr(
+        fundamentals_l2_state,
+        "fetch_valuation_levels",
+        lambda session: (_ for _ in ()).throw(ValueError("Could not find screener.in results table in the response")),
+    )
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {"AAREYDRUGS": "IN01"})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"rows": {"Promoters": [74.37, 74.37, 74.37, 74.37]}},
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(
+        fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs)
+    )
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["rows"] == 1  # the run completes -- did NOT abort on the valuation query failure
+    assert result["failed_companies"] == []
+    valuation_failures = [e for e in fallback_events if e["fallback_type"] == "l2_market_wide_query_failed"]
+    assert len(valuation_failures) == 1
+    assert valuation_failures[0]["metadata"]["query_name"] == "valuation"
 
 
 def test_run_l2_state_refresh_writes_synthetic_event_on_institutional_first_entry(monkeypatch):
@@ -12596,11 +12142,12 @@ SECTOR_DATA_FIXTURE = {
 }
 
 
-def test_build_reference_rows_extracts_all_three_levels():
+def test_build_reference_rows_extracts_sector_level():
+    # 2026-08-15: industry_group/basic_industry levels retired (zero readers) -- only sector is
+    # extracted now, even though the fixture still carries indgrp/ind data (unused, ignored).
     rows = fundamentals_sector_data.build_reference_rows(SECTOR_DATA_FIXTURE, as_of_date=date(2026, 8, 11))
     assert len(rows["sector"]) == 2
-    assert len(rows["industry_group"]) == 1
-    assert len(rows["basic_industry"]) == 1
+    assert set(rows) == {"sector"}
 
 
 def test_build_reference_rows_collapses_embedded_whitespace():
@@ -12618,7 +12165,7 @@ def test_build_reference_rows_maps_ratio_fields():
 
 
 def test_build_reference_rows_skips_entries_without_code():
-    data = {"sector": {"EQ": [{"sector_desc": "No code here"}]}, "indgrp": {"EQ": []}, "ind": {"EQ": []}}
+    data = {"sector": {"EQ": [{"sector_desc": "No code here"}]}}
     rows = fundamentals_sector_data.build_reference_rows(data, as_of_date=date(2026, 8, 11))
     assert rows["sector"] == []
 
@@ -12647,20 +12194,16 @@ def test_fetch_sector_reference_data_handles_single_encoded_json(monkeypatch):
     assert data == SECTOR_DATA_FIXTURE
 
 
-def test_run_sector_reference_refresh_upserts_all_three_tables(monkeypatch):
+def test_run_sector_reference_refresh_upserts_sector_table(monkeypatch):
     monkeypatch.setattr(fundamentals_sector_data, "fetch_sector_reference_data", lambda: SECTOR_DATA_FIXTURE)
     upserts = []
     monkeypatch.setattr(fundamentals_sector_data, "upsert_to_db", lambda df, table, **k: upserts.append((table, len(df), k)))
 
     result = fundamentals_sector_data.run_sector_reference_refresh()
 
-    assert result == {"sectors": 2, "industry_groups": 1, "basic_industries": 1}
+    assert result == {"sectors": 2}
     tables_upserted = {table for table, _, _ in upserts}
-    assert tables_upserted == {
-        fundamentals_sector_data.SECTOR_TABLE,
-        fundamentals_sector_data.INDUSTRY_GROUP_TABLE,
-        fundamentals_sector_data.BASIC_INDUSTRY_TABLE,
-    }
+    assert tables_upserted == {fundamentals_sector_data.SECTOR_TABLE}
     for _, _, kwargs in upserts:
         assert kwargs["unique_keys"] == ["code", "as_of_date"]
 
@@ -13661,11 +13204,12 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 15
+    assert len(fundamentals_run_pipeline.STEPS) == 14
     assert fundamentals_run_pipeline.STEPS[-1] == "fundamentals.screens.notifications"
     assert "fundamentals.screens.investor_classification" in fundamentals_run_pipeline.STEPS
-    # 2026-08-14: the deleveraging screen (PRD sec 8 step 2) was built but never scheduled -- now is.
-    assert "fundamentals.collectors.screenerin" in fundamentals_run_pipeline.STEPS
+    # 2026-08-15: the deleveraging screen (fundamentals.collectors.screenerin's standalone step) was
+    # retired -- its output table had zero readers. The module itself is not a pipeline step anymore.
+    assert "fundamentals.collectors.screenerin" not in fundamentals_run_pipeline.STEPS
 
 
 def test_main_exits_zero_when_not_all_steps_failed(monkeypatch, capsys):

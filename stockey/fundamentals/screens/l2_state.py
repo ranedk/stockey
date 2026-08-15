@@ -192,6 +192,26 @@ def _record_no_universe_fallback() -> None:
     )
 
 
+def _record_market_wide_query_fallback(query_name: str, error: Exception) -> None:
+    # 2026-08-15 found live: fetch_pledge_levels/fetch_valuation_levels ran back-to-back with no
+    # isolation between them -- either one's failure took down the ENTIRE L2 step (192 companies'
+    # worth of detail fetches never even started), unlike the per-company fetch loop below, which
+    # already isolates one bad company from sinking the batch. VALUATION_QUERY is the newer of the
+    # two (added 2026-08-13) and the one observed failing in production; isolating both means a
+    # screener.in-side issue with one query degrades that query's levels to "none available" (a
+    # company simply gets no pledge/valuation fields, same as today's "absent from this dict" case)
+    # instead of blocking the whole run.
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        source="screenerin",
+        fallback_type="l2_market_wide_query_failed",
+        severity="warn",
+        reason=f"L2 state refresh's {query_name} market-wide query failed; that query's levels are unavailable this run, other L2 fields still computed.",
+        error=error,
+        metadata={"query_name": query_name},
+    )
+
+
 def _num(value) -> object:
     cleaned = clean_text(value)
     if cleaned is None:
@@ -649,8 +669,16 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         return {"rows": 0, "failed_companies": [], "checks_deferred": list(DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0, "companies_due": 0}
 
     session = session or build_authenticated_session()
-    pledge_levels = fetch_pledge_levels(session)
-    valuation_levels = fetch_valuation_levels(session)
+    try:
+        pledge_levels = fetch_pledge_levels(session)
+    except Exception as exc:  # noqa: BLE001 -- one market-wide query's failure must not sink the whole run
+        pledge_levels = {}
+        _record_market_wide_query_fallback("pledge", exc)
+    try:
+        valuation_levels = fetch_valuation_levels(session)
+    except Exception as exc:  # noqa: BLE001 -- see above
+        valuation_levels = {}
+        _record_market_wide_query_fallback("valuation", exc)
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     load_ts = pd.Timestamp.now(tz="UTC")

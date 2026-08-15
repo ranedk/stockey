@@ -1,15 +1,13 @@
-"""screener.in collector -- fundamental screener step 2, the deleveraging screen
-(docs/FUNDAMENTAL_SCREENER_PRD.md sec 8 step 2).
+"""screener.in query infrastructure -- login, authenticated session, and paginated
+HTML-table parsing, shared by fundamentals/screens/l1_universe.py and l2_state.py
+(both import build_authenticated_session/run_query/clean_text/to_number from here).
 
 Auth/query mechanics adapted from the pre-2026-07-27 advisory/ implementation
 (data/screenerin/{auth,ad_hoc_query,screener_parser}.py -- deleted in the pure-TA cut,
 still reachable via `git show fb84396^:data/screenerin/` since the old advisory-archive
 branch was never pushed and didn't survive this workspace's machine migration). Reused
 because the login flow and HTML table parsing were sound, already-tested plumbing, not
-the decision logic that made the old system fail. This module is deliberately much
-smaller: one query, one result table, no query registry, no run-history table, no
-schema-migration ceremony -- per docs/FUNDAMENTAL_SCREENER_PRD.md's "own crawler, much
-simpler" instruction.
+the decision logic that made the old system fail.
 
 Query submission: GET https://www.screener.in/screen/raw/?query=<TEXT>, authenticated
 via cookies copied from a logged-in Chrome CDP session (the same CDP-session pattern
@@ -17,22 +15,25 @@ every other stockey collector already uses -- confirmed 2026-08-10 that an
 unauthenticated request redirects straight to screener.in's Register page, custom
 queries are login-gated). Response is an HTML page with a results table
 (<tr data-row-company-id=...>), not JSON -- parsed via BeautifulSoup.
-"""
+
+This module used to also run its own standalone query (the "deleveraging screen",
+fundamental screener step 2) and write fundamentals_screenerin_query_results. Retired
+2026-08-15: that table had zero readers from the day it was first scheduled -- removed
+per "unused tables and code should be removed" rather than keep running a screen
+nothing consumes. The shared scraping infra below is unaffected; L1/L2 still depend
+on it."""
 
 from __future__ import annotations
 
-import json
 import re
 from urllib.parse import urlencode
 
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from environs import Env
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from utils.db import sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.http import get_dynamic_headers
@@ -51,8 +52,6 @@ PASSWORD_SELECTOR = "input#id_password[name='password']"
 SUBMIT_SELECTOR = "button[type='submit'].button-primary"
 
 SYNC_SOURCE_NAME = "fundamentals.collectors.screenerin"
-RESULTS_TABLE = "fundamentals_screenerin_query_results"
-STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def _record_fallback(fallback_type: str, *, reason: str, error: Exception | str, severity: str = "warn", metadata=None) -> None:
@@ -232,83 +231,3 @@ def run_query(
         first_page = page_companies  # reuse as "last page fetched" for the loop condition
 
     return first_url, all_companies
-
-
-# The deleveraging screen: source PRD calls it the pipeline-validation step,
-# "highest signal-to-effort, ~90% screener-derivable, arithmetic mechanism".
-# Companies actively paying down debt, with a market-cap band (source PRD scope is
-# explicitly smallcap/microcap, fundamental_basic_goal.md line 3) and a basic
-# liquidity floor so this doesn't return untradeable/megacap names.
-#
-# Every field name below verified live against screener.in's actual query language
-# 2026-08-10 -- two guesses from the first draft were wrong and are noted here so the
-# same mistake isn't repeated: "Average volume 1month" doesn't exist (screener.in
-# rejected it with "Unknown word: average volume 1month" -- plain "Volume" is the
-# validated field, same-day traded volume, not the PRD's ideal 20-day median; a more
-# precise liquidity floor could later cross-reference nseindia_mto/dhan_ohlcv_daily,
-# which stockey already collects, instead of guessing at more screener.in field
-# names). "Change in Debt" also doesn't exist as its own field ("Unknown word: change
-# in debt") -- screener.in supports comparing two fields directly instead, and
-# "Debt preceding year" exists as its own field, so "Debt < Debt preceding year"
-# expresses the same condition validly.
-#
-# Market cap band (100-5000 Rs Cr) is a first-cut smallcap/microcap default, not
-# precisely calibrated -- easy to tune later, not a structural decision.
-DELEVERAGING_QUERY_NAME = "deleveraging"
-DELEVERAGING_QUERY = (
-    "Market Capitalization > 100 AND\n"
-    "Market Capitalization < 5000 AND\n"
-    "Volume > 10000 AND\n"
-    "Debt > 0 AND\n"
-    "Debt preceding year > 0 AND\n"
-    "Debt < Debt preceding year"
-)
-
-
-def run_deleveraging_screen(session: requests.Session | None = None) -> dict[str, object]:
-    """Run DELEVERAGING_QUERY and upsert results into RESULTS_TABLE, keyed by
-    (query_name, run_date, company_id) -- append-only across runs (docs/
-    FUNDAMENTAL_SCREENER_PRD.md sec 2: append-only, versioned state, always)."""
-    session = session or build_authenticated_session()
-    screener_url, companies = run_query(session, DELEVERAGING_QUERY)
-
-    run_date = pd.Timestamp.now(tz="UTC").normalize()
-    rows = [
-        {
-            "query_name": DELEVERAGING_QUERY_NAME,
-            "query_text": DELEVERAGING_QUERY,
-            "run_date": run_date,
-            "company_id": company["company_id"],
-            "company_name": company["name"],
-            "ticker": company["ticker"],
-            "company_url": company["url"],
-            "metrics_json": json.dumps(company["metrics"], ensure_ascii=False, default=str),
-            "screener_url": screener_url,
-            "load_ts": pd.Timestamp.now(tz="UTC"),
-        }
-        for company in companies
-    ]
-    if rows:
-        upsert_to_db(
-            pd.DataFrame(rows), RESULTS_TABLE, unique_keys=["query_name", "run_date", "company_id"]
-        )
-    return {"query_name": DELEVERAGING_QUERY_NAME, "rows": len(rows), "companies": [c["name"] for c in companies][:20]}
-
-
-def main() -> int:
-    global STOCKEY_RUN_STATE
-    result = run_deleveraging_screen()
-    STOCKEY_RUN_STATE = {
-        "source": SYNC_SOURCE_NAME,
-        "rows": result["rows"],
-        "rows_written": result["rows"],
-        "query_name": result["query_name"],
-        "fallback_used": False,
-        "state_advanced": result["rows"] > 0,
-    }
-    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

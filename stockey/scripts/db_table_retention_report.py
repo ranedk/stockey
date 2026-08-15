@@ -15,21 +15,14 @@ env.read_env()
 
 DEFAULT_RETENTION_DAYS = env.int("NSE_LEGACY_RETENTION_DAYS", 365)
 
+# 2026-08-15: nseindia_var1/cmvolt/catg/circuit_hit/bulk_deals/block_deals/short_selling/cat_turnover/
+# mto/52wk retired (write-only, zero readers -- see docs/DATA_COVERAGE.md's prior "Still open" entry,
+# now resolved) and dropped from the DB entirely; removed from here along with them.
 LEGACY_NSE_TABLES: dict[str, str] = {
-    "nseindia_var1": "for_date",
     "nseindia_ohlcv": "date",
-    "nseindia_cmvolt": "date",
-    "nseindia_catg": "for_month",
     "nseindia_mcap": "date",
-    "nseindia_circuit_hit": "date",
-    "nseindia_bulk_deals": "date",
-    "nseindia_block_deals": "date",
-    "nseindia_short_selling": "date",
-    "nseindia_cat_turnover": "trade_date",
     "nseindia_events": "date",
     "nseindia_indices": "date",
-    "nseindia_mto": "date",
-    "nseindia_52wk": "date",
 }
 
 # Numerical bhavcopy-derived tables that are core research inputs and must NEVER be archived/deleted

@@ -12,15 +12,15 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 
 | Source | Modules (`data/…`) | Tables |
 |---|---|---|
-| NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap`, `nseindia_mto`, `nseindia_52wk`, `nseindia_cmvolt`, `nseindia_circuit_hit`, `nseindia_cat_turnover`, `nseindia_catg`, `nseindia_var1`, `nseindia_short_selling`, `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_reg`, `nseindia_pe`, `nseindia_csqr` |
+| NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap` |
 | NSE corporate actions | `nseindia/corporate_action_events`, `nseindia/adjusted_prices` | `nseindia_corporate_actions_bc_raw`, `nseindia_corporate_actions_normalized`, `events_dividend`, `events_capital_change` |
 | Price adjustment | `data/nseindia/price_adjustment.py` | `nseindia_adjustment_factors` (written); `advisory_adjusted_ohlcv_daily` is a VIEW over it × `nseindia_ohlcv` (systrader's PRIMARY series, not a written table) |
 | NSE indices | `nseindia/indices_{downloader,parser}` | `nseindia_indices` |
 | NSE calendar | `nseindia/holidays` | `nseindia_holidays`, `dim_trading_days` |
 | Dhan broker | `dhanlive/*` (incl. auth/web_login) | `master_dhan_instruments`, `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` (1-min bars) |
-| RBI/FBIL | `rbi/*` | `rbi_bank_rates`, `rbi_currency_rates`, `fbil_gsec_par`, `fbil_gsec_quote` |
+| RBI/FBIL | `rbi/*` | `rbi_bank_rates`, `rbi_currency_rates`, `fbil_gsec_par` |
 | Identity | `company_master`, `nseindia/security_history` | `company_master`, `dim_security*` |
-| Sharpely identity/sector mapping | `sharpelydata/scrip_master.py` | `master_sharpely_equity` — feeds `company_master`'s `sharpely_id` identity fallback and `fundamentals/collectors/sector_data.py`'s NSE→BSE sector-code mapping. `master_sharpely_funds` (also written here) has zero readers anywhere — confirmed live 2026-08-14, write-only |
+| Sharpely identity/sector mapping | `sharpelydata/scrip_master.py` | `master_sharpely_equity` — feeds `company_master`'s `sharpely_id` identity fallback and `fundamentals/collectors/sector_data.py`'s NSE→BSE sector-code mapping |
 | Download run state | `data/download_runner.py` (via `utils/sync_state.py`) | `advisory_sync_state` (load-bearing — never drop) |
 | Promoted utility tables | `utils/fallback_telemetry.py`, `utils/external_task_queue.py`, `utils/identity_issues.py` | `advisory_fallback_events`, `advisory_external_task_queue`, `advisory_identity_issues` |
 
@@ -40,16 +40,53 @@ but nothing writes it; confirmed live 2026-08-14 it's empty (0 rows) and has
 no populating code path anywhere — a human is expected to hand-edit rows
 here, which apparently hasn't happened yet.
 
-`nseindia_ohlcv_adjusted` — an earlier, never-fully-wired adjusted-price
-table superseded by `data/nseindia/price_adjustment.py`'s factor table +
-`advisory_adjusted_ohlcv_daily` view — was confirmed live 2026-08-14 to be
-empty with zero write or read call sites anywhere in either repo, and was
-dropped.
-
 `nseindia_earnings_events` and `nseindia_events` (NSE earnings-date and
 board-meeting/AGM calendars) have collectors that exist but are deliberately
 not scheduled — frozen, not deleted, kept for possible future FnO
 event-vol research.
+
+### Retired 2026-08-15 (write-only, zero readers anywhere, confirmed live)
+
+An audit of every table against actual read call sites (not just docs) found
+these had never had a consumer since the day they were first written. Per
+"unused tables and code should be removed," each was archived in full to S3
+(`archives/retired_2026-08-15/<table>/`, gzip CSV, one object per month for
+the large ones) and then dropped from the live DB — not just stopped, fully
+retired:
+
+- `nseindia_mto`, `nseindia_52wk`, `nseindia_cmvolt`, `nseindia_circuit_hit`,
+  `nseindia_cat_turnover`, `nseindia_catg`, `nseindia_var1` — the `bhavcopy_
+  parser.py` parsers for all seven deleted along with the dispatch that fed
+  them; `nseindia_var1`'s only-ever consumer was `advisory/event_evidence_
+  store.py`, deleted in the pure-TA cut, orphaning it.
+- `nseindia_short_selling`, `nseindia_block_deals`, `nseindia_bulk_deals` —
+  the whole `data/nseindia/offmarket.py`/`offmarket_parser.py` collector
+  deleted (it was also independently broken: NSE download-trigger timeouts
+  on every recent run, see `docs/DATA_COVERAGE.md`'s log-sweep note).
+- `master_sharpely_funds` — `sharpelydata/scrip_master.py` no longer
+  requests instrumentType 0/1 (non-stock entities) from the sharpely API at
+  all, only the equity type it actually stores.
+- `fbil_gsec_quote` — `rbi/download_fbil_gsec.py` no longer parses the
+  "G-Sec" sheet's full quote table, only the trade-date cell (still needed
+  to stamp `fbil_gsec_par`, which is consumed) and the "Par Yield" sheet.
+- `fundamentals_screenerin_query_results` — the deleveraging screen
+  (`fundamentals/collectors/screenerin.py`'s standalone step) removed from
+  `run_pipeline.py`'s `STEPS`; the module's shared screener.in scraping
+  infra (`build_authenticated_session`/`run_query`/etc., used by L1/L2)
+  stays.
+- `fundamentals_industry_group_reference`, `fundamentals_basic_industry_
+  reference` — `fundamentals/collectors/sector_data.py` no longer extracts
+  the finer two levels of Sharpely's sector hierarchy, only the top
+  (sector) level `sector_cycle.py` actually groups by.
+- `nseindia_ohlcv_adjusted` — separately confirmed empty and dropped
+  2026-08-14 (see above), an earlier adjusted-price design superseded by
+  the factor-table + view.
+- `nseindia_reg`, `nseindia_pe`, `nseindia_csqr` — `bhavcopy_parser.py`'s
+  `parse_reg`/`parse_pe`/`parse_csqr` deleted; these tables never existed
+  in the DB at all (confirmed live 2026-08-14: the globs matching `REG_*.
+  CSV`/`PE_*.CSV`/`CSQR_*.CSV` inside the downloaded bhavcopy archive had
+  never matched a single file since this collector's inception — dead
+  code, not a stopped collector).
 
 ## Cron
 
@@ -99,6 +136,7 @@ No BSE price or corporate-action data — `company_master` currently has zero
 BSE-only companies (everything tracked is NSE-listed or NSE+BSE
 cross-listed, and a cross-listed company's corporate actions are already
 covered by the NSE feed). No macro data beyond RBI/FBIL rates. No insider/
-deal-flow data beyond block/bulk/short-selling. No fundamentals data in
-stockey's own pure-TA scope — that's `fundamentals/`'s job, a separate
-carve-out with its own PRD.
+deal-flow data at all (block/bulk-deals, short-selling collection retired
+2026-08-15 — see above). No fundamentals data in stockey's own pure-TA
+scope — that's `fundamentals/`'s job, a separate carve-out with its own
+PRD.

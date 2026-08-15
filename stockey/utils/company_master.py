@@ -5,11 +5,30 @@ from typing import Iterable, Optional, Sequence
 import pandas as pd
 
 from utils.fallback_telemetry import record_local_fallback_event
+from utils.schema_migrations import apply_schema_migration
 
 from .db import sql_to_df, upsert_to_db
 
 
 COMPANY_MASTER_TABLE = "company_master"
+
+
+def ensure_company_master_dhan_ids_are_bigint() -> None:
+    """One-time migration (2026-08-15): dhan_bse_id/dhan_nse_id were stored as DOUBLE PRECISION --
+    a LEFT merge introduces NaN for unmatched rows, which silently upcasts a pandas int64 column to
+    float64, and upsert_to_db's dtype-to-column-type mapping then wrote DOUBLE PRECISION instead of
+    BIGINT like the source (master_dhan_instruments.security_id). Converts both columns to BIGINT
+    in place; sync_company_master() now also writes them as Int64 so this doesn't drift back."""
+    apply_schema_migration(
+        migration_id="20260815_company_master_dhan_ids_to_bigint",
+        description="company_master.dhan_bse_id/dhan_nse_id: DOUBLE PRECISION -> BIGINT.",
+        owner="utils.company_master",
+        metadata={"tables": [COMPANY_MASTER_TABLE]},
+        statements=[
+            f"ALTER TABLE {COMPANY_MASTER_TABLE} ALTER COLUMN dhan_bse_id TYPE BIGINT USING (dhan_bse_id::BIGINT)",
+            f"ALTER TABLE {COMPANY_MASTER_TABLE} ALTER COLUMN dhan_nse_id TYPE BIGINT USING (dhan_nse_id::BIGINT)",
+        ],
+    )
 
 
 def _company_master_sql_to_df(query: str, *, params: object | None = None, operation: str) -> pd.DataFrame:
@@ -29,6 +48,7 @@ def _company_master_sql_to_df(query: str, *, params: object | None = None, opera
 
 
 def sync_company_master() -> pd.DataFrame:
+    ensure_company_master_dhan_ids_are_bigint()
     sharpely_columns = _company_master_sql_to_df(
         """
         SELECT column_name
@@ -53,8 +73,17 @@ def sync_company_master() -> pd.DataFrame:
     if sharpely.empty:
         return sharpely
 
-    sharpely["nse_ticker"] = _clean_text_series(sharpely["nse_ticker"])
-    sharpely["bse_ticker"] = _clean_text_series(sharpely["bse_ticker"])
+    # nse_ticker/bse_ticker specifically upper-cased (not company_name/sharpely_id, which must keep
+    # their natural casing) -- 2026-08-15 found live: master_sharpely_equity is a third-party feed
+    # whose casing isn't NSE-normalized (e.g. a real 'Praxis-RE1' row), while every NSE-sourced
+    # caller of map_company_master_ids(exchange="NSE") cleans its own ticker with only .strip(),
+    # never .upper(), because bhavcopy-derived symbols are already uppercase at the source. An
+    # uppercase lookup for "PRAXIS-RE1" (what any bhavcopy-derived caller would look up) silently
+    # failed to match this row under the old mixed-case value -- same failure shape as the
+    # already-fixed BSE/NSE identity-resolution gap, just via inconsistent case instead of a
+    # missing fallback exchange.
+    sharpely["nse_ticker"] = _clean_text_series(sharpely["nse_ticker"]).str.upper()
+    sharpely["bse_ticker"] = _clean_text_series(sharpely["bse_ticker"]).str.upper()
     sharpely["company_name"] = _clean_text_series(sharpely["company_name"])
     sharpely["sharpely_id"] = _clean_text_series(sharpely["sharpely_id"])
 
@@ -77,7 +106,7 @@ def sync_company_master() -> pd.DataFrame:
         operation="sync_dhan_bse",
     )
     if not dhan_bse.empty:
-        dhan_bse["bse_ticker"] = _clean_text_series(dhan_bse["bse_ticker"])
+        dhan_bse["bse_ticker"] = _clean_text_series(dhan_bse["bse_ticker"]).str.upper()
 
     dhan_nse = _company_master_sql_to_df(
         """
@@ -95,10 +124,19 @@ def sync_company_master() -> pd.DataFrame:
         operation="sync_dhan_nse",
     )
     if not dhan_nse.empty:
-        dhan_nse["nse_ticker"] = _clean_text_series(dhan_nse["nse_ticker"])
+        dhan_nse["nse_ticker"] = _clean_text_series(dhan_nse["nse_ticker"]).str.upper()
 
     company_master = sharpely.merge(dhan_bse, on="bse_ticker", how="left")
     company_master = company_master.merge(dhan_nse, on="nse_ticker", how="left")
+    # dhan_bse_id/dhan_nse_id come from master_dhan_instruments.security_id (BIGINT) but a LEFT
+    # merge introduces NaN for every unmatched row, which silently upcasts an int64 column to
+    # float64 (classic pandas footgun) -- confirmed live 2026-08-15: company_master.dhan_bse_id/
+    # dhan_nse_id were stored as DOUBLE PRECISION (e.g. "503696.0") instead of BIGINT like every
+    # other ID column derived from this same source, a lossy-round-trip/type-drift risk for any
+    # join or comparison against the real bigint ID columns. Int64 (pandas nullable) preserves
+    # both the integer semantics and the NULL for unmatched rows through to upsert_to_db.
+    company_master["dhan_bse_id"] = company_master["dhan_bse_id"].astype("Int64")
+    company_master["dhan_nse_id"] = company_master["dhan_nse_id"].astype("Int64")
     company_master["company_master_id"] = company_master.apply(_build_company_master_id, axis=1)
     company_master = company_master[
         [
@@ -272,6 +310,13 @@ def load_company_master_records(ticker: str, exchanges: Optional[Sequence[str]] 
 
 
 def _build_company_master_id(row: pd.Series) -> str:
+    # CAVEAT (found live 2026-08-15, fixing the nse_ticker case-normalization bug above): since
+    # company_master_id is DERIVED from nse_ticker/bse_ticker (for rows without a sharpely_id), any
+    # future change to how a ticker's case/text is cleaned changes the computed ID too -- upsert_to_
+    # db's ON CONFLICT (company_master_id) then INSERTs a new row under the new ID rather than
+    # UPDATEing the old one, silently orphaning the old row (which this fix's own rollout did for
+    # one real row, "Praxis-RE1" -> "PRAXIS-RE1"; cleaned up manually, see 2026-08-15 commit). A
+    # sharpely_id-keyed row (the common case) isn't affected -- sharpely_id doesn't change case here.
     sharpely_id = _clean_scalar(row.get("sharpely_id"))
     nse_ticker = _clean_scalar(row.get("nse_ticker"))
     bse_ticker = _clean_scalar(row.get("bse_ticker"))

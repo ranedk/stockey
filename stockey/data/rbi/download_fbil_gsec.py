@@ -3,7 +3,6 @@ import time
 import json
 from datetime import date, datetime
 
-import numpy as np
 import pandas as pd
 import redis
 import requests
@@ -73,6 +72,11 @@ def try_parsing_date(text):
 
 
 def parse_xls(xls_path, fdate):
+    # Only the "Par Yield" sheet is parsed/stored (-> fbil_gsec_par, the risk-free carry input
+    # systrader actually consumes). The "G-Sec" sheet's full quote table (isin/coupon/clean_price/
+    # ytm) used to also be parsed here and written to fbil_gsec_quote -- retired 2026-08-15, zero
+    # readers anywhere, confirmed live. Still need one small read of "G-Sec" (no skiprows) purely
+    # for its trade_date cell -- that date is stamped onto the par-yield rows below.
     df = pd.read_excel(xls_path, sheet_name="G-Sec")
     trade_date = df.iloc[1, 2]
     try:
@@ -87,26 +91,6 @@ def parse_xls(xls_path, fdate):
             metadata={"raw_trade_date": str(trade_date)},
         )
         trade_date = fdate
-
-    expected_cols = [
-        "isin",
-        "coupon_pct",
-        "maturity_date",
-        "clean_price",
-        "ytm_sa",
-        "remark1",
-        "remark2",
-        "liquidity_signal",
-    ]
-    df_quote = pd.read_excel(xls_path, sheet_name="G-Sec", skiprows=5)
-    df_quote = df_quote.dropna(axis=1, how="all")
-    df_quote = df_quote.iloc[:, : len(expected_cols)]
-    df_quote.columns = expected_cols[: df_quote.shape[1]]
-
-    for col in expected_cols[df_quote.shape[1] :]:
-        df_quote[col] = np.nan
-    df_quote = df_quote[expected_cols]
-    df_quote = df_quote.dropna(subset=["isin", "coupon_pct"])
 
     try:
         df_par = pd.read_excel(xls_path, sheet_name="Par Yield", skiprows=5)
@@ -126,16 +110,6 @@ def parse_xls(xls_path, fdate):
     ]
     df_par = df_par.dropna(axis=1, how="all")
 
-    # Convert types
-    df_quote["coupon_pct"] = pd.to_numeric(df_quote["coupon_pct"], errors="coerce")
-    df_quote["clean_price"] = df_quote["clean_price"].astype(float)
-    df_quote["ytm_sa"] = df_quote["ytm_sa"].astype(float)
-    df_quote["maturity_date"] = pd.to_datetime(
-        df_quote["maturity_date"], format="%d-%b-%Y"
-    )
-    df_quote = df_quote.dropna(subset=["coupon_pct"])
-    df_quote = df_quote.drop_duplicates("isin", keep="last")
-
     df_par = df_par.dropna(axis=1, how="all")
     df_par = df_par.dropna(subset=["tenor_years", "par_yield_sa", "par_yield_ann"])
     df_par["tenor_years"] = df_par["tenor_years"].astype(float)
@@ -143,10 +117,9 @@ def parse_xls(xls_path, fdate):
         ["par_yield_sa", "par_yield_ann"]
     ].astype(float)
 
-    df_quote.insert(0, "trade_date", trade_date)
     df_par.insert(0, "trade_date", trade_date)
 
-    return df_quote, df_par
+    return df_par
 
 
 def download_gsec(fdate: date, cookies):
@@ -155,7 +128,6 @@ def download_gsec(fdate: date, cookies):
             "date": fdate.isoformat(),
             "status": "skipped_weekend",
             "rows": 0,
-            "quote_rows": 0,
             "par_rows": 0,
         }
 
@@ -178,27 +150,17 @@ def download_gsec(fdate: date, cookies):
             "status": "source_unavailable",
             "status_code": int(response.status_code),
             "rows": 0,
-            "quote_rows": 0,
             "par_rows": 0,
         }
 
     with tempfile.NamedTemporaryFile(suffix=".xls", delete=False) as tmp:
         tmp.write(response.content)
         print(tmp.name)
-        df_quote, df_par = parse_xls(tmp.name, fdate)
+        df_par = parse_xls(tmp.name, fdate)
 
-    df_quote = df_quote.rename(columns={"trade_date": "date"})
     df_par = df_par.rename(columns={"trade_date": "date"})
-
-    df_quote["date"] = pd.to_datetime(df_quote["date"], format="%Y-%m-%d")
     df_par["date"] = pd.to_datetime(df_par["date"], format="%Y-%m-%d")
 
-    upsert_to_db(
-        df_quote,
-        "fbil_gsec_quote",
-        unique_keys=["date", "isin"],
-        timescaledb_column="date",
-    )
     upsert_to_db(
         df_par,
         "fbil_gsec_par",
@@ -212,8 +174,7 @@ def download_gsec(fdate: date, cookies):
     return {
         "date": formatted_date,
         "status": "downloaded",
-        "rows": int(len(df_quote) + len(df_par)),
-        "quote_rows": int(len(df_quote)),
+        "rows": int(len(df_par)),
         "par_rows": int(len(df_par)),
     }
 
