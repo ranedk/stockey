@@ -360,6 +360,15 @@ scanning):
 One item still genuinely open: whether extraction should use `gpt-5.4-mini`
 or something else — flagged in §3.1, not blocking.
 
+**2026-08-15 additions** (both user-requested, both bounded to a new table
+each — neither changes the §1 rule that L4 is a human act):
+
+| Question | Decision |
+|---|---|
+| L4 thesis drafting cadence | Daily, as part of the existing watchlist/email pipeline — but gated on the same `last_alert_at` staleness signal watch_summary already uses, not a fixed re-run of every company every day (no new evidence -> nothing to re-draft). `fundamentals/screens/l4_thesis_draft.py` writes only `fundamentals_l4_thesis_draft`, never `fundamentals_l4_thesis` — see that module's own docstring for the guardrail this preserves. |
+| L4 draft confidence score | 0–100, LLM-self-calibrated per prediction — scores the FORECAST ("will this specific prediction resolve true"), never the company or a buy/sell conviction. Surfaced in the daily digest email, clearly labeled candidate/not-saved. |
+| BSE-only-company price coverage | `data/bseindia/` (new package, pure-TA scope, not inside `fundamentals/`) — one market-wide bhavcopy CSV/day, reusing `data/nseindia/price_adjustment.py`'s price-step adjustment algorithm rather than a second implementation. Confirmed live 2026-08-15: 43 active L1-universe companies (not the earlier "10" estimate) have no NSE listing at all. |
+
 ---
 
 Nothing above blocks starting. Step 0 (security master extension) and step
