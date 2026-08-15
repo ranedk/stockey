@@ -1,6 +1,8 @@
 """Watchlist email notifications -- fundamental screener step 12, closing out the
-watchlist pipeline started by fundamentals/screens/watchlist.py (step 10) and
-fundamentals/screens/watch_summary.py (step 11).
+watchlist pipeline started by fundamentals/screens/watchlist.py (step 10),
+fundamentals/screens/watch_summary.py (step 11), and fundamentals/screens/
+l4_thesis_draft.py (step 11.5, added 2026-08-15 at the user's request to make L4
+thesis-drafting part of the daily run and its own email).
 
 send_daily_digest() sends exactly one consolidated email per pipeline run, listing
 the ENTIRE active watchlist regardless of whether anything changed today -- a
@@ -8,10 +10,15 @@ standing end-of-day summary, not a per-change alert. (Until 2026-08-14 this modu
 also sent a separate email per new-candidate/narrative-change event via
 notify_watchlist_events(); removed at the user's request so a run producing several
 watchlist changes sends one digest, not a burst of individual emails.) Rendered as
-an HTML table + narrative section (2026-08-12, "more like a dashboard than a textual
-email" per the user) -- a plain-text part is always included alongside it as the
-universal fallback every client falls back to when HTML rendering is off, per RFC
-2046's multipart/alternative convention.
+an HTML table + narrative section + draft-theses section (2026-08-12, "more like a
+dashboard than a textual email" per the user) -- a plain-text part is always included
+alongside it as the universal fallback every client falls back to when HTML rendering
+is off, per RFC 2046's multipart/alternative convention.
+
+The draft-theses section is clearly labeled CANDIDATE / NOT SAVED throughout (in both
+the HTML and plain-text bodies) -- l4_thesis_draft.py never writes fundamentals_l4_
+thesis, and this email never implies it did. See that module's own docstring for the
+full guardrail rationale; this module just renders what it already wrote.
 
 SAFETY: sending is OFF by default (WATCHLIST_ALERT_EMAIL_ENABLED, unset/false).
 Turning it on requires WATCHLIST_ALERT_EMAIL_FROM and WATCHLIST_ALERT_EMAIL_TO to be
@@ -44,6 +51,7 @@ import boto3
 import pandas as pd
 from environs import Env
 
+from fundamentals.screens.l4_thesis_draft import load_current_drafts_by_company, run_l4_thesis_drafting
 from fundamentals.screens.signal_pointers import load_satisfied_strategies_by_company
 from fundamentals.screens.watch_summary import run_watch_summary_refresh
 from fundamentals.screens.watchlist import sync_watchlist_from_alerts
@@ -162,8 +170,10 @@ def load_full_watchlist() -> list[dict]:
     # strategies_by_company() is a screens/-level shared helper (not imported from
     # api/queries.py, keeping the "screens/ stays independent of api/" direction).
     strategies_by_company = load_satisfied_strategies_by_company()
+    drafts_by_company = load_current_drafts_by_company()
     for row in rows:
         row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
+        row["draft_thesis"] = drafts_by_company.get(row["company_master_id"])
     return rows
 
 
@@ -206,6 +216,17 @@ _DIGEST_HTML_STYLE = (
     ".sub{color:#64748b;font-size:13px;margin:0 0 4px}"
     ".footer{color:#94a3b8;font-size:12px;margin-top:8px}"
     ".strategy-badge{display:inline-block;background:#eef2ff;color:#4338ca;border-radius:999px;padding:1px 7px;font-size:10px;margin:2px 4px 0 0;white-space:nowrap}"
+    ".draft-banner{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:8px 12px;font-size:12px;margin:0 0 14px}"
+    ".draft-block{padding:14px 0;border-bottom:1px solid #f1f5f9}"
+    ".draft-block:last-child{border-bottom:none}"
+    ".draft-ticker{font-weight:600;font-size:14px}"
+    ".draft-confidence{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600;margin-left:8px}"
+    ".draft-confidence.high{background:#dcfce7;color:#166534}"
+    ".draft-confidence.mid{background:#fef3c7;color:#92400e}"
+    ".draft-confidence.low{background:#fee2e2;color:#991b1b}"
+    ".draft-prediction{font-size:13px;color:#0f172a;margin-top:6px}"
+    ".draft-meta{font-size:12px;color:#64748b;margin-top:4px}"
+    ".draft-invalidation{font-size:12px;color:#94a3b8;margin-top:4px;font-style:italic}"
 )
 
 # Mirrors the frontend's STRATEGY_LABELS map (screener/app/utils/strategyLabels.ts) --
@@ -236,6 +257,16 @@ def _strategy_label(trigger_type: str) -> str:
     return STRATEGY_LABELS.get(trigger_type, trigger_type)
 
 
+def _confidence_css_class(confidence_score) -> str:
+    if confidence_score is None or (isinstance(confidence_score, float) and pd.isna(confidence_score)):
+        return "mid"
+    if confidence_score >= 66:
+        return "high"
+    if confidence_score >= 33:
+        return "mid"
+    return "low"
+
+
 def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, str]:
     """Returns (subject, text_body, html_body). HTML is the primary rendering -- a
     compact table (watching-since, entry-vs-today's-close, event count, watch-until)
@@ -252,12 +283,14 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
     text_lines = [f"{len(watchlist_rows)} companies on the watchlist as of {today}. One consolidated summary, not a change alert.\n"]
     table_rows_html = []
     narrative_blocks_html = []
+    draft_blocks_html = []
 
     for row in watchlist_rows:
         ticker = str(row["company_master_id"]).removeprefix("nse:")
         company_name = row.get("company_name") or "name unknown"
         narrative = row.get("narrative_text") or "(narrative not generated yet)"
         strategies = row.get("strategies") or []
+        draft = row.get("draft_thesis")
 
         text_lines.append(f"--- {ticker} ({company_name}) ---")
         text_lines.append(
@@ -269,6 +302,12 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         text_lines.append(str(narrative))
         if row.get("suggested_watch_until"):
             text_lines.append(f"Suggested watch until: {row['suggested_watch_until']}")
+        if draft:
+            text_lines.append(
+                f"[DRAFT L4 thesis, NOT SAVED, confidence {draft.get('confidence_score')}/100] {draft.get('prediction_text')} "
+                f"(by {draft.get('target_date')})"
+            )
+            text_lines.append(f"  Invalidation: {draft.get('invalidation_criteria')}")
         text_lines.append("")
 
         strategy_badges_html = "".join(f'<span class="strategy-badge">{html.escape(_strategy_label(s))}</span>' for s in strategies)
@@ -290,9 +329,37 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
             f'<div class="narrative-text">{html.escape(str(narrative))}</div>'
             "</div>"
         )
+        if draft:
+            confidence_score = draft.get("confidence_score")
+            confidence_class = _confidence_css_class(confidence_score)
+            confidence_label = f"{confidence_score}/100" if confidence_score is not None else "n/a"
+            draft_blocks_html.append(
+                '<div class="draft-block">'
+                f'<span class="draft-ticker">{html.escape(ticker)}</span>'
+                f'<span class="draft-confidence {confidence_class}">confidence {html.escape(confidence_label)}</span>'
+                f'<div class="draft-prediction">{html.escape(str(draft.get("prediction_text") or ""))}</div>'
+                f'<div class="draft-meta">Target: {html.escape(_fmt_plain(draft.get("target_date")))}</div>'
+                f'<div class="draft-invalidation">Invalidation: {html.escape(str(draft.get("invalidation_criteria") or ""))}</div>'
+                "</div>"
+            )
 
     text_lines.append("This is a descriptive screener digest, not a trade recommendation.")
+    if draft_blocks_html:
+        text_lines.append(
+            "DRAFT L4 theses above are LLM-drafted candidates only -- nothing is saved to the real thesis "
+            "register until a human reviews and commits it."
+        )
     text_body = "\n".join(text_lines)
+
+    draft_section_html = ""
+    if draft_blocks_html:
+        draft_section_html = (
+            '<div class="card"><h1>Draft L4 Theses</h1>'
+            '<div class="draft-banner">CANDIDATE ONLY &mdash; nothing here is saved to the real thesis register. '
+            "Each is an LLM-drafted, falsifiable prediction with a confidence score for your review; commit or "
+            "discard it yourself.</div>"
+            f'{"".join(draft_blocks_html)}</div>'
+        )
 
     html_body = (
         f'<html><head><meta charset="utf-8"><style>{_DIGEST_HTML_STYLE}</style></head><body>'
@@ -301,6 +368,7 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         "<table><tr><th>Company</th><th>Watching since</th><th>Entry &rarr; Today's close</th>"
         f"<th>Events</th><th>Watch until</th></tr>{''.join(table_rows_html)}</table></div>"
         f'<div class="card"><h1>Why</h1>{"".join(narrative_blocks_html)}</div>'
+        f"{draft_section_html}"
         '<p class="footer">Descriptive screener digest, not a trade recommendation.</p>'
         "</body></html>"
     )
@@ -337,17 +405,23 @@ def send_daily_digest() -> dict[str, object]:
 
 
 def run_watchlist_notification_pipeline() -> dict[str, object]:
-    """Chains watchlist sync -> narrative regen -> EXIT STATUS EVALUATION -> daily
-    digest, in that order. watchlist_exit runs right after narrative regen
-    (2026-08-13, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md's "we will crowd the
-    watchlist" gap fix) so it evaluates against a freshly-updated suggested_watch_
-    until/narrative_generated_at, and before the digest so send_daily_digest's own
-    default active-only filter reflects this run's status, not last run's. (Until
-    2026-08-14 this also ran notify_watchlist_events between exit evaluation and the
-    digest, sending one email per changed company; removed so a run with several
-    changes sends only the one consolidated digest -- see module docstring.)"""
+    """Chains watchlist sync -> narrative regen -> L4 THESIS DRAFTING -> exit status
+    evaluation -> daily digest, in that order. watchlist_exit runs right after
+    narrative regen (2026-08-13, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md's "we will
+    crowd the watchlist" gap fix) so it evaluates against a freshly-updated
+    suggested_watch_until/narrative_generated_at, and before the digest so
+    send_daily_digest's own default active-only filter reflects this run's status,
+    not last run's. L4 thesis drafting (2026-08-15) sits between narrative regen and
+    exit evaluation -- after narrative regen so it can read the freshly-generated
+    narrative_text as part of its own evidence bundle (see l4_thesis_draft.py's
+    docstring), before exit evaluation/digest so a newly-drafted thesis shows up in
+    the SAME run's email rather than one run behind. (Until 2026-08-14 this also ran
+    notify_watchlist_events between exit evaluation and the digest, sending one email
+    per changed company; removed so a run with several changes sends only the one
+    consolidated digest -- see module docstring.)"""
     sync_result = sync_watchlist_from_alerts()
     summary_result = run_watch_summary_refresh()
+    draft_result = run_l4_thesis_drafting()
     exit_result = run_watchlist_exit_evaluation()
     digest_result = send_daily_digest()
     return {
@@ -356,6 +430,9 @@ def run_watchlist_notification_pipeline() -> dict[str, object]:
         "narratives_generated": summary_result["generated"],
         "narratives_failed": summary_result["failed"],
         "narratives_blocked": summary_result["blocked"],
+        "theses_drafted": draft_result["drafted"],
+        "theses_draft_failed": draft_result["failed"],
+        "theses_draft_blocked": draft_result["blocked"],
         "watchlist_active": exit_result["active"],
         "watchlist_invalidated": exit_result["invalidated"],
         "watchlist_price_flagged": exit_result["price_flagged"],
@@ -374,9 +451,9 @@ def main() -> int:
         "rows": result["watchlist_companies"],
         "rows_written": result["narratives_generated"],
         **result,
-        "fallback_used": bool(result["narratives_failed"] or result["digest_failed"]),
-        "state_advanced": result["narratives_generated"] > 0 or result["digest_sent"] > 0,
-        "status": "blocked" if result["narratives_blocked"] else "ok",
+        "fallback_used": bool(result["narratives_failed"] or result["theses_draft_failed"] or result["digest_failed"]),
+        "state_advanced": result["narratives_generated"] > 0 or result["theses_drafted"] > 0 or result["digest_sent"] > 0,
+        "status": "blocked" if (result["narratives_blocked"] or result["theses_draft_blocked"]) else "ok",
     }
     print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)
     return 0

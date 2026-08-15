@@ -15,6 +15,8 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 | NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap` |
 | NSE corporate actions | `nseindia/corporate_action_events`, `nseindia/adjusted_prices` | `nseindia_corporate_actions_bc_raw`, `nseindia_corporate_actions_normalized`, `events_dividend`, `events_capital_change` |
 | Price adjustment | `data/nseindia/price_adjustment.py` | `nseindia_adjustment_factors` (written); `advisory_adjusted_ohlcv_daily` is a VIEW over it × `nseindia_ohlcv` (systrader's PRIMARY series, not a written table) |
+| BSE bhavcopy (BSE-only companies) | `data/bseindia/bhavcopy.py` | `bseindia_ohlcv` — one market-wide file/day, closes a fundamentals-screener gap (43 active L1-universe companies with no NSE listing had zero price/technicals coverage, confirmed live 2026-08-15); not systrader's PRIMARY series (that stays NSE-only) |
+| BSE price adjustment | `data/bseindia/price_adjustment.py` | `bseindia_adjustment_factors` (written, price-step-derived only — no BSE-side corporate-actions feed to corroborate against); `bse_advisory_adjusted_ohlcv_daily` is a VIEW over it × `bseindia_ohlcv`, keyed by `scrip_code` (BSE's real identity key, not its ticker text) |
 | NSE indices | `nseindia/indices_{downloader,parser}` | `nseindia_indices` |
 | NSE calendar | `nseindia/holidays` | `nseindia_holidays`, `dim_trading_days` |
 | Dhan broker | `dhanlive/*` (incl. auth/web_login) | `master_dhan_instruments`, `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` (1-min bars) |

@@ -118,11 +118,18 @@ review, five independent passes):
   idea, but scoped out given 0/43 real filings (checked live) have anything to
   track it against quarterly; revisit as a separate *annual*-cadence build if the
   narrative/triage layer needs richer per-company context later.
-- More rating agencies (CARE, Acuité, Brickwork, Infomerics) -- was a
-  self-clearing Todos board with zero real occurrences when deferred; no
-  longer true -- confirmed live 2026-08-15, 43 of 59 collected rating_action
-  events are now `unsupported_agency`. Worth a fresh look, the original
-  "zero occurrences" reasoning has expired.
+- More rating agencies (Acuité, Brickwork, Infomerics) -- still a
+  self-clearing Todos board with zero real occurrences; re-confirmed live
+  2026-08-15 (a prior pass this session briefly misread this as having
+  expired -- it hasn't). The 43 `unsupported_agency` rows are entirely
+  `agency_name = "unnamed"`: generic BSE boilerplate announcements
+  ("Please refer attached file", "Intimation of Credit Rating") with no
+  agency name in the announcement text at all, and none have gone through
+  OCR/structured extraction yet (all have a real attachment). No new
+  agency-specific scraper would help here -- `structured_extraction.py`'s
+  `RATING_ACTION_SCHEMA` already extracts `rating_agency` from the OCR'd
+  PDF text itself, and the OCR/extraction batch-size increase (2026-08-15,
+  see below) is what will actually clear this backlog.
 - Watchlist-exit reactivation logic (a flagged company whose situation later
   resolves isn't auto-reactivated) -- noted as a possible follow-up in
   `watchlist_exit.py`'s own docstring, not built.

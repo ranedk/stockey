@@ -258,6 +258,59 @@ def _value_at(period_table: dict[str, object], label: str, *, offset: int = 0):
     return values[index]
 
 
+def compute_trend_direction(values: list) -> dict[str, object]:
+    """Multi-year trend read over a chronological (oldest-first, matching _value_at's own
+    convention) numeric series -- e.g. screener.in's annual Balance Sheet rows, confirmed live
+    2026-08-15 to typically carry ~10-12 years of history per company. Previously this history
+    was fetched in full but only ever compared as a single latest-vs-preceding delta (offset=0
+    vs offset=1); everything past that was discarded. This reads the whole available series:
+
+    - consecutive_declining_periods: how many periods immediately before the latest have been
+      strictly declining, walking backward from the most recent transition. 0 if the latest
+      period didn't decline; None if there's fewer than 2 usable periods to compare at all.
+    - trend_direction: accelerating_decline/decelerating_decline/steady_decline (mirrored for
+      increase), flat (two zero deltas), or reversal (sign flipped between the two most recent
+      deltas -- deliberately not folded into accelerating/decelerating, a sign flip is a more
+      significant event than a change of pace in the same direction). Needs at least 3 usable
+      periods (2 deltas) to compare; None below that ("insufficient history", never guessed).
+    """
+    numeric = [v for v in values if isinstance(v, (int, float))]
+    if len(numeric) < 2:
+        return {"consecutive_declining_periods": None, "trend_direction": None}
+
+    deltas = [numeric[i] - numeric[i - 1] for i in range(1, len(numeric))]
+    consecutive_declining = 0
+    for delta in reversed(deltas):
+        if delta < 0:
+            consecutive_declining += 1
+        else:
+            break
+
+    trend_direction = None
+    if len(deltas) >= 2:
+        latest_delta, preceding_delta = deltas[-1], deltas[-2]
+        if latest_delta < 0 and preceding_delta < 0:
+            if latest_delta < preceding_delta:
+                trend_direction = "accelerating_decline"
+            elif latest_delta > preceding_delta:
+                trend_direction = "decelerating_decline"
+            else:
+                trend_direction = "steady_decline"  # same magnitude both periods, not slowing or speeding up
+        elif latest_delta > 0 and preceding_delta > 0:
+            if latest_delta > preceding_delta:
+                trend_direction = "accelerating_increase"
+            elif latest_delta < preceding_delta:
+                trend_direction = "decelerating_increase"
+            else:
+                trend_direction = "steady_increase"
+        elif latest_delta == 0 and preceding_delta == 0:
+            trend_direction = "flat"
+        else:
+            trend_direction = "reversal"  # sign flipped between the two most recent deltas
+
+    return {"consecutive_declining_periods": consecutive_declining, "trend_direction": trend_direction}
+
+
 def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[str, object]) -> dict[str, object]:
     net_debt_latest = _value_at(balance_sheet, "Borrowings")
     net_debt_preceding = _value_at(balance_sheet, "Borrowings", offset=1)
@@ -266,6 +319,7 @@ def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[
         if isinstance(net_debt_latest, (int, float)) and isinstance(net_debt_preceding, (int, float))
         else None
     )
+    debt_trend = compute_trend_direction(balance_sheet.get("rows", {}).get("Borrowings") or [])
 
     operating_profit_latest = _value_at(profit_loss, "Operating Profit")
     interest_latest = _value_at(profit_loss, "Interest")
@@ -286,6 +340,8 @@ def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[
     return {
         "net_debt_rscr": net_debt_latest,
         "net_debt_yoy_delta_rscr": net_debt_yoy_delta,
+        "net_debt_consecutive_declining_years": debt_trend["consecutive_declining_periods"],
+        "net_debt_trend_direction": debt_trend["trend_direction"],
         "interest_coverage": interest_coverage,
         "debt_to_ebitda": debt_to_ebitda,
     }
@@ -302,7 +358,22 @@ def compute_cwip_ratio(balance_sheet: dict[str, object]) -> dict[str, object]:
     latest_ratio = ratio_at(0)
     preceding_ratio = ratio_at(1)
     delta = latest_ratio - preceding_ratio if latest_ratio is not None and preceding_ratio is not None else None
-    return {"cwip_ratio": latest_ratio, "cwip_ratio_yoy_delta": delta}
+
+    cwip_raw = balance_sheet.get("rows", {}).get("CWIP") or []
+    fixed_assets_raw = balance_sheet.get("rows", {}).get("Fixed Assets") or []
+    ratio_series = [
+        cwip / fixed_assets
+        for cwip, fixed_assets in zip(cwip_raw, fixed_assets_raw)
+        if isinstance(cwip, (int, float)) and isinstance(fixed_assets, (int, float)) and fixed_assets != 0
+    ]
+    cwip_trend = compute_trend_direction(ratio_series)
+
+    return {
+        "cwip_ratio": latest_ratio,
+        "cwip_ratio_yoy_delta": delta,
+        "cwip_ratio_consecutive_declining_years": cwip_trend["consecutive_declining_periods"],
+        "cwip_ratio_trend_direction": cwip_trend["trend_direction"],
+    }
 
 
 def compute_promoter_stake(shareholding: dict[str, object]) -> dict[str, object]:

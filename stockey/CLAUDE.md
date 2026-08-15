@@ -62,8 +62,10 @@ is written in UTC (IST − 5:30) — see the per-job comments in the template fo
 each line's UTC/IST pair:
 
 1. `complete_data.sh` (07:10 + 17:30) — runs `data.download_runner --phase all`:
-   downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
-   scrip master + OHLCV, RBI/FBIL rates, and normalizes corporate actions. See
+   downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, BSE
+   bhavcopy (BSE-only companies, `data/bseindia/bhavcopy.py` — a fundamentals-
+   screener gap fix, not part of systrader's PRIMARY series), Dhan scrip
+   master + OHLCV, RBI/FBIL rates, and normalizes corporate actions. See
    `data/download_runner.py`'s `DOWNLOADER_STEPS` / `PARSER_STEPS` for the
    exact registry.
 2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30 and
@@ -75,7 +77,9 @@ each line's UTC/IST pair:
    (`data/dhanlive/ohlcv_reconcile.py`).
 4. `all_price_adjustment.sh` (18:50, right after the reconcile) — rebuilds
    `nseindia_adjustment_factors`, the compact factor table behind
-   `advisory_adjusted_ohlcv_daily` (a view, systrader's PRIMARY equity series).
+   `advisory_adjusted_ohlcv_daily` (a view, systrader's PRIMARY equity series),
+   then its BSE-only-company twin (`bseindia_adjustment_factors` /
+   `bse_advisory_adjusted_ohlcv_daily`, `data/bseindia/price_adjustment.py`).
 5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
    bhavcopy/Dhan/benchmark freshness and runs bounded repairs.
 6. `all_data_coverage_report.sh` (17:10 UTC) — `scripts/data_coverage_report.py`:

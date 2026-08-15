@@ -39,10 +39,12 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
 import requests
+from environs import Env
 from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.collectors.events_store import RESULTS_TABLE, _ensure_events_schema
@@ -54,6 +56,9 @@ from utils.fallback_telemetry import record_local_fallback_event
 from utils.ocr.llm_ocr import ocr_pdf_with_local
 from utils.store import save_file_content
 
+env = Env()
+env.read_env()
+
 SYNC_SOURCE_NAME = "fundamentals.collectors.ocr_pipeline"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
@@ -62,12 +67,21 @@ BSE_PDF_HEADERS = {"User-Agent": UA, "Referer": "https://www.bseindia.com/", "Ac
 ICRA_PDF_HEADERS = {"User-Agent": UA, "Referer": "https://www.icra.in/Rating/AllRatingRationales"}
 
 CIRCUIT_BREAKER_THRESHOLD = 3
-# A daily batch is bounded by L3's own scope (only pit_sast/rating_action/results
-# filings ever reach fundamentals_events at all -- see bse_announcements.py's
-# docstring), not by anything in this module; still capped defensively so one run
-# can't runaway-OCR an unexpectedly large backlog on a slow CPU-only machine
-# (confirmed live: ~95-290s/page).
-DEFAULT_BATCH_LIMIT = 50
+# 2026-08-15: raised 50 -> 200 (user request: "pace up so we don't have backlog" --
+# confirmed live the real eligible backlog was 1060 documents across all filing types,
+# and at 50/day this pipeline was barely keeping pace with new arrivals, not closing
+# the gap). Still capped defensively so one run can't runaway-OCR an unexpectedly
+# large backlog on a slow CPU-only machine (confirmed live: ~95-290s/page, and
+# per-item cost is highly variable -- one observed run took 8.1 hours for 50 items,
+# another took 7 minutes for the same count) -- MAX_RUNTIME_SECONDS below is the real
+# safety net now, this limit is a sanity ceiling underneath it.
+DEFAULT_BATCH_LIMIT = 200
+# Wall-clock budget for one run, independent of item count -- protects the REST of
+# that day's fundamentals pipeline (L1/L2/L3/watchlist/notifications all run after
+# this step in run_pipeline.py's STEPS) from a bad day of large scanned documents
+# consuming the entire run. Any row not reached before the cutoff stays pending and
+# is picked up next run -- safe, idempotent, no partial/lost work.
+MAX_RUNTIME_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_RUNTIME_SECONDS", 3 * 60 * 60)
 
 OCR_COLUMN_TYPES = {
     "ocr_status": "TEXT",
@@ -184,13 +198,19 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
 
     pending = load_pending_ocr_targets(limit or DEFAULT_BATCH_LIMIT)
     if pending.empty:
-        return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False}
+        return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False}
 
     counts = {"ocred": 0, "failed": 0, "no_document": 0}
     consecutive_failures_by_domain: dict[str, int] = {}
     blocked_domains: set[str] = set()
+    run_started = time.monotonic()
+    time_budget_exceeded = False
 
     for _, row in pending.iterrows():
+        if time.monotonic() - run_started >= MAX_RUNTIME_SECONDS:
+            time_budget_exceeded = True
+            break
+
         source_info = resolve_document_source(row.to_dict())
         if source_info is None:
             counts["no_document"] += 1
@@ -238,7 +258,7 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
         counts["ocred"] += 1
         _set_ocr_result(source=row["source"], news_id=row["news_id"], status="done", fields=fields)
 
-    return {**counts, "blocked": bool(blocked_domains)}
+    return {**counts, "blocked": bool(blocked_domains), "time_budget_exceeded": time_budget_exceeded}
 
 
 def main() -> int:
@@ -251,6 +271,7 @@ def main() -> int:
         "failed": result["failed"],
         "no_document": result["no_document"],
         "blocked": result["blocked"],
+        "time_budget_exceeded": result["time_budget_exceeded"],
         "fallback_used": bool(result["failed"] or result["blocked"]),
         "state_advanced": result["ocred"] > 0,
         "status": "blocked" if result["blocked"] else "ok",

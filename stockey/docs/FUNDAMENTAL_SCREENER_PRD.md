@@ -142,7 +142,7 @@ fundamentals/
     screenerin.py           # screener.in financials/ratios/shareholding (own crawler this time, not the old advisory/ one)
     bse_announcements.py    # bseindia.com/corporates/ann.html
     bse_announcements.py    # also covers PIT-SAST + results-calendar detection (3 of L3's 4 triggers in one crawler) -- built as bse_announcements.py, not the bse_pit_sast.py name planned here
-    nse_pit.py               # NSE structured PIT (api/corporates-pit) -- built as nse_pit.py, not the nse_announcements.py name planned here; NSE is secondary/redundant per fundamental_basic_goal.md §3.2
+    nse_pit.py               # NSE structured PIT (api/corporates-pit-gg + per-filing XBRL, migrated from api/corporates-pit 2026-08-1x) -- built as nse_pit.py, not the nse_announcements.py name planned here; NSE is secondary/redundant per fundamental_basic_goal.md §3.2
     rating_agencies.py       # CRISIL/ICRA/CARE/India Ratings/Acuité listing+detail (shell-plus-XHR pattern)
     ocr_pipeline.py          # fetch filing -> OCR (pluggable provider) -> LLM structured extraction (see §6)
   screens/

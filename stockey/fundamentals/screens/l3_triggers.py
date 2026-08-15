@@ -148,7 +148,9 @@ def load_latest_l2_state() -> pd.DataFrame:
     return sql_to_df(
         """
         SELECT DISTINCT ON (ticker) ticker, company_name, net_debt_rscr, net_debt_yoy_delta_rscr,
+               net_debt_consecutive_declining_years, net_debt_trend_direction,
                interest_coverage, debt_to_ebitda, cwip_ratio, cwip_ratio_yoy_delta,
+               cwip_ratio_consecutive_declining_years, cwip_ratio_trend_direction,
                pledge_pct, promoter_pct, promoter_stake_direction, run_date
         FROM fundamentals_l2_state
         ORDER BY ticker, run_date DESC

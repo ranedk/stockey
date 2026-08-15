@@ -59,6 +59,7 @@ from fundamentals.screens import technicals as fundamentals_technicals
 from fundamentals.screens import watchlist as fundamentals_watchlist
 from fundamentals.screens import watchlist_exit as fundamentals_watchlist_exit
 from fundamentals.screens import watch_summary as fundamentals_watch_summary
+from fundamentals.screens import l4_thesis_draft as fundamentals_l4_thesis_draft
 from fundamentals.screens import notifications as fundamentals_notifications
 from fundamentals.api import queries as fundamentals_api_queries
 from fundamentals.api.app import app as fundamentals_api_app
@@ -2603,6 +2604,204 @@ def test_bhavcopy_history_parsers_and_split_detection():
     ca = bh.split_factors(df)
     assert set(ca["symbol"]) == {"FIVEONE"}
     assert abs(float(ca.iloc[0]["adj_factor"]) - 0.20) < 1e-6      # open/prevclose = 20/100
+
+
+# data/bseindia/bhavcopy.py + price_adjustment.py -- BSE-only-company price coverage
+# (2026-08-15, fundamentals screener gap fix).
+
+_BSE_UDIFF_CSV = (
+    b"TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,SctySrs,XpryDt,FininstrmActlXpryDt,StrkPric,"
+    b"OptnTp,FinInstrmNm,OpnPric,HghPric,LwPric,ClsPric,LastPric,PrvsClsgPric,UndrlygPric,SttlmPric,OpnIntrst,"
+    b"ChngInOpnIntrst,TtlTradgVol,TtlTrfVal,TtlNbOfTxsExctd,SsnId,NewBrdLotQty,Rmks,Rsvd1,Rsvd2,Rsvd3,Rsvd4\n"
+    b"2026-08-14,2026-08-14,CM,BSE,STK,500166,INE192A01029,GOODRICKE,X,,,,,GOODRICKE GROUP LTD,213,220,204,"
+    b"215.9,215.9,217.95,,,,,24901,5356464,312,F,1,,,,,\n"
+    b"2026-08-14,2026-08-14,CM,BSE,STK,505036,INE117A01022,ACGL,B,,,,,ACGL,1808,1858.3,1808,1823.35,1823.35,"
+    b"1834.85,,,,,1238,2258000,90,F,1,,,,,\n"
+)
+
+
+def test_bhavcopy_url_matches_bse_udiff_pattern():
+    from data.bseindia.bhavcopy import bhavcopy_url
+
+    assert bhavcopy_url(date(2026, 8, 14)) == "https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_20260814_F_0000.CSV"
+
+
+def test_parse_bhavcopy_maps_udiff_columns():
+    from data.bseindia.bhavcopy import parse_bhavcopy
+
+    df = parse_bhavcopy(_BSE_UDIFF_CSV)
+    assert len(df) == 2
+    row = df[df["scrip_code"] == "500166"].iloc[0]
+    assert row["symbol"] == "GOODRICKE"
+    assert row["series"] == "X"
+    assert row["isin"] == "INE192A01029"
+    assert row["close"] == 215.9
+    assert row["previous_close"] == 217.95
+    assert str(row["date"].date()) == "2026-08-14"
+
+
+def test_parse_bhavcopy_drops_rows_with_no_scrip_code():
+    from data.bseindia.bhavcopy import parse_bhavcopy
+
+    csv = _BSE_UDIFF_CSV.replace(b"500166", b"")  # blank FinInstrmId -> NaN after parse
+    df = parse_bhavcopy(csv)
+    assert "" not in df["scrip_code"].tolist()
+
+
+def test_attach_identity_joins_on_scrip_code_not_ticker_text(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    captured = {}
+
+    def fake_attach(df, *, ticker_column, exchange):
+        captured["ticker_column"] = ticker_column
+        captured["exchange"] = exchange
+        return df.assign(company_master_id="nse:GOODRICKE")
+
+    monkeypatch.setattr(bse_bhavcopy, "attach_company_master_id", fake_attach)
+    df = bse_bhavcopy.parse_bhavcopy(_BSE_UDIFF_CSV)
+    bse_bhavcopy.attach_identity(df)
+
+    assert captured["ticker_column"] == "scrip_code"  # not "symbol" -- BSE ticker text doesn't match company_master
+    assert captured["exchange"] == "BSE"
+
+
+def test_fetch_bhavcopy_csv_raises_not_available_for_html_response(monkeypatch):
+    from data.bseindia.bhavcopy import BseBhavcopyNotAvailableError, fetch_bhavcopy_csv
+
+    class FakeResponse:
+        content = b"<html>not found</html>"
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def get(self, url, headers, timeout):
+            return FakeResponse()
+
+    with pytest.raises(BseBhavcopyNotAvailableError):
+        fetch_bhavcopy_csv(date(2026, 8, 14), session=FakeSession())
+
+
+def test_fetch_bhavcopy_csv_returns_bytes_for_real_csv(monkeypatch):
+    from data.bseindia.bhavcopy import fetch_bhavcopy_csv
+
+    class FakeResponse:
+        content = _BSE_UDIFF_CSV
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def get(self, url, headers, timeout):
+            return FakeResponse()
+
+    assert fetch_bhavcopy_csv(date(2026, 8, 14), session=FakeSession()) == _BSE_UDIFF_CSV
+
+
+def test_collect_range_skips_weekends_and_counts_non_trading_days(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    calls = []
+
+    def fake_fetch(d, *, session=None):
+        calls.append(d)
+        if d.weekday() == 4:  # Friday: pretend it's a holiday
+            raise bse_bhavcopy.BseBhavcopyNotAvailableError("holiday")
+        return _BSE_UDIFF_CSV
+
+    monkeypatch.setattr(bse_bhavcopy, "fetch_bhavcopy_csv", fake_fetch)
+    monkeypatch.setattr(bse_bhavcopy, "attach_identity", lambda df: df.assign(company_master_id="nse:X"))
+    upserts = []
+    monkeypatch.setattr(bse_bhavcopy, "upsert_to_db", lambda df, table, **k: upserts.append(df))
+
+    # 2026-08-10 (Mon) .. 2026-08-16 (Sun): Fri 08-14 is the faked holiday, Sat/Sun skipped outright
+    result = bse_bhavcopy.collect_range(date(2026, 8, 10), date(2026, 8, 16))
+
+    assert result["days_written"] == 4  # Mon, Tue, Wed, Thu
+    assert result["non_trading_days"] == 1  # Fri
+    assert result["blocked"] is False
+    assert len(calls) == 5  # weekdays only -- weekends never even attempted
+    assert len(upserts) == 4
+
+
+def test_collect_range_trips_circuit_breaker(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+
+    def always_fails(d, *, session=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bse_bhavcopy, "fetch_bhavcopy_csv", always_fails)
+    monkeypatch.setattr(bse_bhavcopy, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(bse_bhavcopy, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = bse_bhavcopy.collect_range(date(2026, 8, 10), date(2026, 8, 20))  # 8 weekdays available
+
+    assert result["blocked"] is True
+    assert len(result["failed_days"]) == 3
+    assert any(a and a[0] == "bse_bhavcopy_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_run_bse_bhavcopy_collection_returns_early_when_fully_caught_up(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: {bse_bhavcopy.datetime.now().date() - timedelta(days=1)})
+    monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_EARLIEST_DATE", bse_bhavcopy.datetime.now().date() - timedelta(days=2))
+
+    result = bse_bhavcopy.run_bse_bhavcopy_collection(lookback_days=1)
+
+    assert result["days_written"] == 0
+    assert result["candidate_dates"] == 0
+
+
+def test_build_bse_adjustment_factors_returns_zero_rows_when_empty(monkeypatch):
+    from data.bseindia import price_adjustment as bse_pa
+
+    monkeypatch.setattr(bse_pa, "sql_to_df", lambda q: pd.DataFrame())
+    assert bse_pa.build_adjustment_factors(dry_run=True) == {"rows": 0}
+
+
+def test_build_bse_adjustment_factors_uses_scrip_code_as_symbol_col(monkeypatch):
+    from data.bseindia import price_adjustment as bse_pa
+
+    raw = pd.DataFrame(
+        [
+            {"scrip_code": "500166", "symbol": "GOODRICKE", "date": pd.Timestamp("2026-08-13", tz="UTC"), "series": "X", "open": 217, "close": 217.95, "previous_close": 220},
+            {"scrip_code": "500166", "symbol": "GOODRICKE", "date": pd.Timestamp("2026-08-14", tz="UTC"), "series": "X", "open": 213, "close": 215.9, "previous_close": 217.95},
+        ]
+    )
+
+    def fake_sql_to_df(query):
+        if "bseindia_ohlcv" in query:
+            return raw
+        return pd.DataFrame(columns=["symbol", "ex_date", "dividend_amount"])
+
+    monkeypatch.setattr(bse_pa, "sql_to_df", fake_sql_to_df)
+    summary = bse_pa.build_adjustment_factors(dry_run=True)
+
+    assert summary["rows"] == 2
+    assert summary["scrips"] == 1
+    assert summary["split_bonus_events"] == 0  # no >35% overnight gap in this fixture
+
+
+def test_ensure_bse_view_creates_ohlcv_table_first(monkeypatch):
+    # a CREATE VIEW referencing bseindia_ohlcv fails outright if that table doesn't
+    # exist yet -- ensure_view() must self-heal it, not assume bhavcopy.py already ran.
+    from data.bseindia import price_adjustment as bse_pa
+
+    calls = []
+    monkeypatch.setattr(bse_pa, "ensure_ohlcv_table", lambda: calls.append("ohlcv"))
+    monkeypatch.setattr(bse_pa, "ensure_factors_table", lambda: calls.append("factors"))
+    monkeypatch.setattr(bse_pa, "apply_schema_migration", lambda **k: calls.append("view"))
+
+    bse_pa.ensure_view()
+
+    assert calls == ["ohlcv", "factors", "view"]
 
 
 def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
@@ -8720,6 +8919,9 @@ def test_compute_debt_trajectory_matches_hand_computed_values():
     assert result == {
         "net_debt_rscr": 3,
         "net_debt_yoy_delta_rscr": 3 - 17,
+        # fixture only has 2 periods -- 1 delta, not enough to compare a rate of change against
+        "net_debt_consecutive_declining_years": 1,
+        "net_debt_trend_direction": None,
         "interest_coverage": 31 / 3,
         "debt_to_ebitda": 3 / 31,
     }
@@ -8751,7 +8953,45 @@ def test_compute_cwip_ratio_matches_hand_computed_values():
 def test_compute_cwip_ratio_handles_zero_fixed_assets():
     balance_sheet = {"periods": ["Mar 2026"], "rows": {"CWIP": [4], "Fixed Assets": [0]}}
     result = fundamentals_l2_state.compute_cwip_ratio(balance_sheet)
-    assert result == {"cwip_ratio": None, "cwip_ratio_yoy_delta": None}
+    assert result == {
+        "cwip_ratio": None,
+        "cwip_ratio_yoy_delta": None,
+        "cwip_ratio_consecutive_declining_years": None,  # zero-fixed-assets period excluded -> no usable series
+        "cwip_ratio_trend_direction": None,
+    }
+
+
+# 2026-08-15: multi-year trend scoring (user request, "pace up 7 too") -- screener.in's annual
+# Balance Sheet rows carry ~10-12 years of real history per company (confirmed live), but
+# compute_debt_trajectory/compute_cwip_ratio only ever compared the latest 2 periods, discarding
+# the rest. compute_trend_direction reads the whole available series.
+@pytest.mark.parametrize(
+    "values,expected_consecutive_declining,expected_direction",
+    [
+        ([17, 3], 1, None),  # only 1 delta -- not enough to compare a rate of change
+        ([50, 40, 30, 20], 3, "steady_decline"),  # deltas -10,-10,-10 -- same magnitude, not a change of pace
+        ([50, 45, 30, 5], 3, "accelerating_decline"),  # deltas -5,-15,-25 -- decline speeding up
+        ([10, 20, 25, 40], 0, "accelerating_increase"),  # deltas +10,+5,+15 -- latest jump bigger than prior
+        ([10, 20, 30, 35], 0, "decelerating_increase"),  # deltas +10,+10,+5 -- latest gain smaller than prior
+        ([10, 20, 15, 25], 0, "reversal"),  # deltas +10,-5,+10 -- sign flipped between the last two deltas
+        ([10, 10, 10, 10], 0, "flat"),  # deltas 0,0,0
+        ([10, 8, 9], 0, "reversal"),  # deltas -2,+1 -- declined then reversed to a gain
+        ([], None, None),  # no data at all
+        ([10], None, None),  # single point, no deltas possible
+    ],
+)
+def test_compute_trend_direction_reads_full_available_history(values, expected_consecutive_declining, expected_direction):
+    result = fundamentals_l2_state.compute_trend_direction(values)
+    assert result["consecutive_declining_periods"] == expected_consecutive_declining
+    assert result["trend_direction"] == expected_direction
+
+
+def test_compute_trend_direction_ignores_non_numeric_gaps():
+    # screener.in cells can be non-numeric ("", None) for an early period with no disclosed data --
+    # must not crash, and must not silently treat a gap as a real 0-valued data point.
+    result = fundamentals_l2_state.compute_trend_direction([None, "", 50, 40, 30])
+    assert result["consecutive_declining_periods"] == 2
+    assert result["trend_direction"] == "steady_decline"  # deltas -10, -10 -- same magnitude both periods
 
 
 @pytest.mark.parametrize(
@@ -9934,10 +10174,15 @@ def test_upsert_events_with_dedup_empty_rows_is_a_noop(monkeypatch):
 
 
 # fundamentals/collectors/nse_pit.py -- L3 detection, NSE half (step 5).
+# Rewritten 2026-08-15 for NSE's corporates-pit -> corporates-pit-gg migration (see
+# module docstring): the endpoint's list rows no longer carry flat acquirer/quantity
+# fields, so those now come from parsing each matched filing's own XBRL document, and
+# the collector fetches one market-wide list per run instead of one per company.
 
 
-def test_parse_nse_pit_date_parses_dd_mon_yyyy():
+def test_parse_nse_pit_date_parses_dd_mon_yyyy_and_iso():
     assert fundamentals_nse_pit._parse_nse_pit_date("15-Jul-2026") == date(2026, 7, 15)
+    assert fundamentals_nse_pit._parse_nse_pit_date("2026-07-15") == date(2026, 7, 15)
 
 
 def test_parse_nse_pit_date_handles_missing_and_garbage():
@@ -9958,57 +10203,92 @@ def test_parse_nse_pit_timestamp_handles_missing_and_garbage():
     assert fundamentals_nse_pit._parse_nse_pit_timestamp("garbage") is None
 
 
-def test_build_pit_row_maps_structured_fields_with_no_pdf():
-    raw = {
-        "did": "D1",
-        "pid": "P1",
-        "acqName": "Jane Promoter",
-        "personCategory": "Promoter",
-        "tdpTransactionType": "Purchase",
-        "secAcq": "25,000",
-        "intimDt": "01-Aug-2026",
-        "date": "01-Aug-2026 10:15",
-    }
-    row = fundamentals_nse_pit.build_pit_row("AAREYDRUGS", "nse:AAREYDRUGS", "INE198H01019", raw)
+# Real (trimmed) corporates-pit-gg XBRL fragment, captured live 2026-08-15 against a
+# real BlueStone Jewellery and Lifestyle Limited PIT filing -- the module docstring's
+# endpoint-migration record.
+_REAL_PIT_XBRL_FRAGMENT = """<in-bse-co:ScripCode contextRef="MainI">544484</in-bse-co:ScripCode><in-bse-co:Symbol contextRef="MainI">BLUESTONE</in-bse-co:Symbol><in-bse-co:NameOfTheCompany contextRef="MainI">BlueStone Jewellery and Lifestyle Limited</in-bse-co:NameOfTheCompany><in-bse-co:DateOfFiling contextRef="MainI">2026-08-14</in-bse-co:DateOfFiling><in-bse-co:ISINCode contextRef="MainI">INE304W01038</in-bse-co:ISINCode><in-bse-co:DisclosureUnderRegulation contextRef="MainI">Regulation 7 (2)</in-bse-co:DisclosureUnderRegulation><in-bse-co:CategoryOfPerson contextRef="Disclosure1">Designated Person</in-bse-co:CategoryOfPerson><in-bse-co:NameOfThePerson contextRef="Disclosure1">SUDEEP NAGAR</in-bse-co:NameOfThePerson><in-bse-co:SecuritiesAcquiredOrDisposedNumberOfSecurity contextRef="Disclosure1" unitRef="shares" decimals="INF">110000</in-bse-co:SecuritiesAcquiredOrDisposedNumberOfSecurity><in-bse-co:SecuritiesAcquiredOrDisposedTransactionType contextRef="Disclosure1">Pledge</in-bse-co:SecuritiesAcquiredOrDisposedTransactionType><in-bse-co:DateOfIntimationToCompany contextRef="Disclosure1">2026-08-14</in-bse-co:DateOfIntimationToCompany>"""
+
+
+def test_parse_pit_xbrl_extracts_filing_and_single_disclosure():
+    parsed = fundamentals_nse_pit.parse_pit_xbrl(_REAL_PIT_XBRL_FRAGMENT)
+    assert parsed["filing"]["Symbol"] == "BLUESTONE"
+    assert parsed["filing"]["ISINCode"] == "INE304W01038"
+    assert len(parsed["disclosures"]) == 1
+    assert parsed["disclosures"][0]["NameOfThePerson"] == "SUDEEP NAGAR"
+    assert parsed["disclosures"][0]["SecuritiesAcquiredOrDisposedTransactionType"] == "Pledge"
+
+
+def test_parse_pit_xbrl_handles_multiple_disclosure_contexts_in_one_filing():
+    # A single filing covering two transactions -- confirmed live 2026-08-15 against a
+    # real Sonata Software Employee Welfare Trust filing (Disclosure1 + Disclosure2).
+    xml = (
+        '<in-bse-co:Symbol contextRef="MainI">SONATSOFTW</in-bse-co:Symbol>'
+        '<in-bse-co:NameOfThePerson contextRef="Disclosure1">Sonata Software Limited Employee Welfare Trust</in-bse-co:NameOfThePerson>'
+        '<in-bse-co:SecuritiesAcquiredOrDisposedNumberOfSecurity contextRef="Disclosure1">500</in-bse-co:SecuritiesAcquiredOrDisposedNumberOfSecurity>'
+        '<in-bse-co:NameOfThePerson contextRef="Disclosure2">Sonata Software Limited Employee Welfare Trust</in-bse-co:NameOfThePerson>'
+        '<in-bse-co:SecuritiesAcquiredOrDisposedNumberOfSecurity contextRef="Disclosure2">800</in-bse-co:SecuritiesAcquiredOrDisposedNumberOfSecurity>'
+    )
+    parsed = fundamentals_nse_pit.parse_pit_xbrl(xml)
+    assert len(parsed["disclosures"]) == 2
+    assert [d["SecuritiesAcquiredOrDisposedNumberOfSecurity"] for d in parsed["disclosures"]] == ["500", "800"]
+
+
+def test_parse_pit_xbrl_ignores_elements_without_a_context_ref():
+    parsed = fundamentals_nse_pit.parse_pit_xbrl('<in-bse-co:Foo>no context here</in-bse-co:Foo>')
+    assert parsed == {"filing": {}, "disclosures": []}
+
+
+def test_build_pit_rows_maps_a_real_captured_disclosure():
+    parsed = fundamentals_nse_pit.parse_pit_xbrl(_REAL_PIT_XBRL_FRAGMENT)
+    rows = fundamentals_nse_pit.build_pit_rows(
+        symbol="BLUESTONE",
+        company_master_id="nse:BLUESTONE",
+        isin=None,
+        app_id="2283",
+        detail_url="https://nsearchives.nseindia.com/corporate/ixbrl/IT_25008_WEB.html",
+        broadcast_datetime="14-Aug-2026 22:29:18",
+        filing=parsed["filing"],
+        disclosures=parsed["disclosures"],
+    )
+    assert len(rows) == 1
+    row = rows[0]
     assert row["source"] == "nse"
-    assert row["news_id"] == "nse-pit:D1:P1:01-Aug-2026"
-    assert row["scrip_code"] == "AAREYDRUGS"
-    assert row["isin"] == "INE198H01019"
+    assert row["news_id"] == "nse-pit:2283:1"
+    assert row["scrip_code"] == "BLUESTONE"
+    assert row["isin"] == "INE304W01038"  # from the XBRL filing itself, not the isin= arg
     assert row["filing_type"] == "pit_sast"
-    assert row["quantity"] == 25000
-    assert row["insider_name"] == "Jane Promoter"
-    assert row["transaction_type"] == "Purchase"
-    assert row["disclosure_date"] == date(2026, 8, 1)
-    assert row["announcement_timestamp"] is not None
+    assert row["quantity"] == 110000
+    assert row["insider_name"] == "SUDEEP NAGAR"
+    assert row["transaction_type"] == "Pledge"
+    assert row["subcategory"] == "Designated Person"
+    assert row["disclosure_date"] == date(2026, 8, 14)
+    # 14-Aug-2026 22:29:18 IST -> 16:59:18 UTC
+    assert row["announcement_timestamp"] == pd.Timestamp("2026-08-14 16:59:18", tz="UTC")
+    assert row["detail_url"] == "https://nsearchives.nseindia.com/corporate/ixbrl/IT_25008_WEB.html"
     assert row["detection_source"] == "nse_corporates_pit"
     assert row["enrichment_status"] == "structured"  # no OCR needed, unlike BSE's rows
     assert row["sources"] == "nse"
+    assert json.loads(row["raw_json"])["disclosure"]["NameOfThePerson"] == "SUDEEP NAGAR"
 
 
-def test_build_pit_row_matches_a_real_captured_disclosure():
-    # Real corporates-pit row, captured live 2026-08-10 against RELIANCE (the L1
-    # smallcap/microcap universe itself had zero PIT disclosures in a 90-day window
-    # across 21 companies -- plausible, not a bug, confirmed by sanity-checking
-    # against a large-cap known for frequent promoter-family transactions).
-    raw = {
-        "acqMode": "Off Market", "acqName": "Shaila Narayan", "acqfromDt": "13-Feb-2026", "acqtoDt": "13-Feb-2026",
-        "afterAcqSharesNo": "29620", "afterAcqSharesPer": "0", "anex": "7(2)", "befAcqSharesNo": "26500", "befAcqSharesPer": "0",
-        "buyQuantity": "0", "buyValue": "0", "company": "Reliance Industries Limited", "date": "18-Feb-2026 19:06",
-        "derivativeType": "-", "did": "563849", "exchange": "NA", "intimDt": "16-Feb-2026", "personCategory": "Immediate relative",
-        "pid": "1194033", "remarks": "-", "secAcq": "3120", "secType": "Equity Shares", "secVal": "4430088",
-        "securitiesTypePost": "Equity Shares", "sellValue": "0", "sellquantity": "0", "symbol": "RELIANCE",
-        "tdpDerivativeContractType": "-", "tdpTransactionType": "Buy", "tkdAcqm": None,
-        "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/IT_1194033_1627626_18022026070637_WEB.xml", "xbrlFileSize": None,
-    }
-    row = fundamentals_nse_pit.build_pit_row("RELIANCE", "nse:RELIANCE", "INE002A01018", raw)
-    assert row["news_id"] == "nse-pit:563849:1194033:16-Feb-2026"
-    assert row["quantity"] == 3120
-    assert row["insider_name"] == "Shaila Narayan"
-    assert row["transaction_type"] == "Buy"
-    assert row["disclosure_date"] == date(2026, 2, 16)
-    # 18-Feb-2026 19:06 IST -> 13:36 UTC
-    assert row["announcement_timestamp"] == pd.Timestamp("2026-02-18 13:36:00", tz="UTC")
-    assert json.loads(row["raw_json"]) == raw
+def test_build_pit_rows_falls_back_to_resolved_isin_when_xbrl_has_none():
+    rows = fundamentals_nse_pit.build_pit_rows(
+        symbol="X", company_master_id="nse:X", isin="INE_RESOLVED",
+        app_id="1", detail_url=None, broadcast_datetime=None,
+        filing={}, disclosures=[{"NameOfThePerson": "Someone"}],
+    )
+    assert rows[0]["isin"] == "INE_RESOLVED"
+
+
+def test_build_pit_rows_returns_one_row_per_disclosure_context():
+    rows = fundamentals_nse_pit.build_pit_rows(
+        symbol="X", company_master_id="nse:X", isin=None,
+        app_id="7", detail_url=None, broadcast_datetime=None,
+        filing={"DateOfFiling": "2026-08-14"},
+        disclosures=[{"NameOfThePerson": "A"}, {"NameOfThePerson": "B"}],
+    )
+    assert [r["news_id"] for r in rows] == ["nse-pit:7:1", "nse-pit:7:2"]
+    assert [r["insider_name"] for r in rows] == ["A", "B"]
 
 
 def test_resolve_company_identity_uses_events_store_helpers(monkeypatch):
@@ -10017,16 +10297,15 @@ def test_resolve_company_identity_uses_events_store_helpers(monkeypatch):
         fundamentals_nse_pit, "map_company_master_ids_nse_or_bse", lambda series, **k: pd.Series(["nse:AAREYDRUGS"], index=series.index, dtype="string")
     )
     monkeypatch.setattr(fundamentals_nse_pit, "resolve_isin", lambda cmids: pd.Series(["INE198H01019"], index=cmids.index))
-    monkeypatch.setattr(fundamentals_nse_pit, "resolve_issuer_names", lambda cmids: pd.Series(["Aarey Drugs & Pharmaceuticals"], index=cmids.index))
 
     result = fundamentals_nse_pit.resolve_company_identity(tickers)
 
     assert result.loc[0, "company_master_id"] == "nse:AAREYDRUGS"
     assert result.loc[0, "isin"] == "INE198H01019"
-    assert result.loc[0, "issuer"] == "Aarey Drugs & Pharmaceuticals"
+    assert "issuer" not in result.columns  # no longer needed -- see module docstring
 
 
-def test_fetch_company_pit_raises_on_missing_data_key(monkeypatch):
+def test_fetch_pit_disclosures_raises_on_missing_data_key(monkeypatch):
     monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", lambda **kwargs: contextlib.nullcontext())
 
     class FakePage:
@@ -10034,12 +10313,10 @@ def test_fetch_company_pit_raises_on_missing_data_key(monkeypatch):
             return {"unexpected": "shape"}
 
     with pytest.raises(fundamentals_nse_pit.NsePitBlockedError):
-        fundamentals_nse_pit.fetch_company_pit(
-            FakePage(), symbol="X", issuer="X Ltd", from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8)
-        )
+        fundamentals_nse_pit.fetch_pit_disclosures(FakePage(), from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8))
 
 
-def test_fetch_company_pit_wraps_page_evaluate_exceptions(monkeypatch):
+def test_fetch_pit_disclosures_wraps_page_evaluate_exceptions(monkeypatch):
     monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", lambda **kwargs: contextlib.nullcontext())
 
     class FakePage:
@@ -10047,22 +10324,55 @@ def test_fetch_company_pit_wraps_page_evaluate_exceptions(monkeypatch):
             raise RuntimeError("HTTP 403")
 
     with pytest.raises(fundamentals_nse_pit.NsePitBlockedError):
-        fundamentals_nse_pit.fetch_company_pit(
-            FakePage(), symbol="X", issuer="X Ltd", from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8)
-        )
+        fundamentals_nse_pit.fetch_pit_disclosures(FakePage(), from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8))
 
 
-def test_fetch_company_pit_returns_data_rows(monkeypatch):
+def test_fetch_pit_disclosures_returns_data_rows(monkeypatch):
     monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", lambda **kwargs: contextlib.nullcontext())
 
     class FakePage:
         def evaluate(self, script, url):
-            return {"data": [{"did": "D1"}]}
+            assert "symbol" not in url and "issuer" not in url  # market-wide, not per-company
+            return {"data": [{"symbol": "X"}]}
 
-    rows = fundamentals_nse_pit.fetch_company_pit(
-        FakePage(), symbol="X", issuer="X Ltd", from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8)
-    )
-    assert rows == [{"did": "D1"}]
+    rows = fundamentals_nse_pit.fetch_pit_disclosures(FakePage(), from_date=datetime(2026, 8, 1), to_date=datetime(2026, 8, 8))
+    assert rows == [{"symbol": "X"}]
+
+
+def test_fetch_pit_disclosure_xml_uses_nse_goto_not_a_nested_gate(monkeypatch):
+    # nse_goto already applies nse_request_gate internally -- a second nested
+    # acquisition from the same process would spin until its 900s timeout (see module
+    # docstring). Fail the test loudly if fetch_pit_disclosure_xml ever wraps the
+    # nse_goto call in its own nse_request_gate() again.
+    def _poison(*a, **k):
+        raise AssertionError("fetch_pit_disclosure_xml must not nest nse_request_gate around nse_goto")
+
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_request_gate", _poison)
+
+    calls = []
+
+    def fake_nse_goto(page, url, **kwargs):
+        calls.append(url)
+
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_goto", fake_nse_goto)
+
+    class FakePage:
+        def content(self):
+            return "<xml/>"
+
+    result = fundamentals_nse_pit.fetch_pit_disclosure_xml(FakePage(), xml_url="https://nsearchives.nseindia.com/x.xml")
+    assert result == "<xml/>"
+    assert calls == ["https://nsearchives.nseindia.com/x.xml"]
+
+
+def test_fetch_pit_disclosure_xml_wraps_nse_goto_exceptions(monkeypatch):
+    def failing_goto(page, url, **kwargs):
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(fundamentals_nse_pit, "nse_goto", failing_goto)
+
+    with pytest.raises(fundamentals_nse_pit.NsePitBlockedError):
+        fundamentals_nse_pit.fetch_pit_disclosure_xml(object(), xml_url="https://nsearchives.nseindia.com/x.xml")
 
 
 class _FakeNsePitPage:
@@ -10074,6 +10384,9 @@ class _FakeNsePitPage:
 
     def wait_for_timeout(self, ms):
         pass
+
+    def evaluate(self, script, url):
+        return {"data": []}
 
 
 class _FakeNsePitContext:
@@ -10122,20 +10435,34 @@ def _nse_identity_df(tickers):
         {
             "company_master_id": [f"nse:{t}" for t in tickers],
             "isin": [f"ISIN{t}" for t in tickers],
-            "issuer": [f"{t} Ltd" for t in tickers],
         },
         index=tickers.index,
     )
 
 
 def test_run_nse_pit_detection_happy_path(monkeypatch):
-    universe = _nse_universe_df(2)
+    universe = _nse_universe_df(2)  # tickers TICK1, TICK2
     monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
     monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
     _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
 
-    raw = {"did": "D1", "pid": "P1", "acqName": "Someone", "tdpTransactionType": "Purchase", "secAcq": "100", "intimDt": "01-Aug-2026", "date": "01-Aug-2026 10:00"}
-    monkeypatch.setattr(fundamentals_nse_pit, "fetch_company_pit", lambda page, **k: [raw])
+    # Market-wide list has 3 filings: 2 match the universe (TICK1, TICK2), 1 doesn't
+    # (OUTSIDE) -- proves local filtering, not an NSE-side per-company filter.
+    filings = [
+        {"symbol": "TICK1", "appId": "1", "xmlFileName": "https://nsearchives.nseindia.com/1.xml", "ixbrl": "u1", "broadcastDateTime": "01-Aug-2026 10:00"},
+        {"symbol": "TICK2", "appId": "2", "xmlFileName": "https://nsearchives.nseindia.com/2.xml", "ixbrl": "u2", "broadcastDateTime": "01-Aug-2026 11:00"},
+        {"symbol": "OUTSIDE", "appId": "3", "xmlFileName": "https://nsearchives.nseindia.com/3.xml", "ixbrl": "u3", "broadcastDateTime": "01-Aug-2026 12:00"},
+    ]
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosures", lambda page, **k: filings)
+
+    def fake_fetch_xml(page, *, xml_url):
+        return xml_url  # identity -- parse_pit_xbrl below just needs a distinguishable string
+
+    def fake_parse(xml_text):
+        return {"filing": {"DateOfFiling": "2026-08-01"}, "disclosures": [{"NameOfThePerson": "Someone", "SecuritiesAcquiredOrDisposedNumberOfSecurity": "100"}]}
+
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosure_xml", fake_fetch_xml)
+    monkeypatch.setattr(fundamentals_nse_pit, "parse_pit_xbrl", fake_parse)
     dedup_calls = []
     monkeypatch.setattr(
         fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: dedup_calls.append(rows) or {"inserted": len(rows), "merged": 0}
@@ -10144,10 +10471,11 @@ def test_run_nse_pit_detection_happy_path(monkeypatch):
 
     result = fundamentals_nse_pit.run_nse_pit_detection()
 
-    assert result["companies_scanned"] == 2
-    assert result["rows"] == 2  # one PIT row per company
+    assert result["filings_matched"] == 2  # OUTSIDE dropped, not scanned
+    assert result["filings_scanned"] == 2
+    assert result["rows"] == 2  # one disclosure per matched filing in this fixture
     assert result["blocked"] is False
-    assert result["failed_companies"] == []
+    assert result["failed_filings"] == []
     assert len(dedup_calls) == 1 and len(dedup_calls[0]) == 2
 
 
@@ -10157,10 +10485,15 @@ def test_run_nse_pit_detection_trips_circuit_breaker(monkeypatch):
     monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
     _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
 
-    def always_fails(page, **k):
+    filings = [
+        {"symbol": f"TICK{i}", "appId": str(i), "xmlFileName": f"https://nsearchives.nseindia.com/{i}.xml"} for i in range(1, 6)
+    ]
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosures", lambda page, **k: filings)
+
+    def always_fails(page, *, xml_url):
         raise fundamentals_nse_pit.NsePitBlockedError("boom")
 
-    monkeypatch.setattr(fundamentals_nse_pit, "fetch_company_pit", always_fails)
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosure_xml", always_fails)
     monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     fallback_events = []
     monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
@@ -10168,31 +10501,28 @@ def test_run_nse_pit_detection_trips_circuit_breaker(monkeypatch):
     result = fundamentals_nse_pit.run_nse_pit_detection()
 
     assert result["blocked"] is True
-    assert len(result["failed_companies"]) == fundamentals_nse_pit.CIRCUIT_BREAKER_THRESHOLD
-    assert result["companies_scanned"] == 0
+    assert len(result["failed_filings"]) == fundamentals_nse_pit.CIRCUIT_BREAKER_THRESHOLD
+    assert result["filings_scanned"] == 0
     assert any(e["fallback_type"] == "l3_nse_circuit_breaker_tripped" for e in fallback_events)
 
 
-def test_run_nse_pit_detection_skips_companies_with_no_issuer(monkeypatch):
-    universe = _nse_universe_df(2)
+def test_run_nse_pit_detection_treats_list_fetch_failure_as_blocked(monkeypatch):
+    universe = _nse_universe_df(1)
     monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
-
-    def identity_with_one_missing_issuer(tickers):
-        df = _nse_identity_df(tickers)
-        df.loc[df.index[-1], "issuer"] = pd.NA
-        return df
-
-    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", identity_with_one_missing_issuer)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
     _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
-    monkeypatch.setattr(fundamentals_nse_pit, "fetch_company_pit", lambda page, **k: [])
-    monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
+
+    def failing_list(page, **k):
+        raise fundamentals_nse_pit.NsePitBlockedError("boom")
+
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosures", failing_list)
     fallback_events = []
     monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
 
     result = fundamentals_nse_pit.run_nse_pit_detection()
 
-    assert result["companies_total"] == 1
-    assert any(e["fallback_type"] == "l3_nse_issuer_missing" for e in fallback_events)
+    assert result == {"rows": 0, "filings_scanned": 0, "failed_filings": [], "blocked": True}
+    assert any(e["fallback_type"] == "l3_nse_pit_list_fetch_failed" for e in fallback_events)
 
 
 def test_run_nse_pit_detection_returns_early_without_cdp_endpoint(monkeypatch):
@@ -10205,7 +10535,7 @@ def test_run_nse_pit_detection_returns_early_without_cdp_endpoint(monkeypatch):
 
     result = fundamentals_nse_pit.run_nse_pit_detection()
 
-    assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+    assert result == {"rows": 0, "filings_scanned": 0, "failed_filings": [], "blocked": False}
     assert any(e["fallback_type"] == "l3_nse_no_cdp_endpoint" for e in fallback_events)
 
 
@@ -10216,7 +10546,7 @@ def test_run_nse_pit_detection_returns_early_on_empty_universe(monkeypatch):
 
     result = fundamentals_nse_pit.run_nse_pit_detection()
 
-    assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+    assert result == {"rows": 0, "filings_scanned": 0, "failed_filings": [], "blocked": False}
     assert any(e["fallback_type"] == "l3_nse_no_l1_universe" for e in fallback_events)
 
 
@@ -10881,7 +11211,7 @@ def test_run_ocr_pipeline_returns_early_when_nothing_pending(monkeypatch):
 
     result = fundamentals_ocr_pipeline.run_ocr_pipeline()
 
-    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False}
+    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False}
 
 
 def test_run_ocr_pipeline_marks_rows_with_no_document_reference(monkeypatch):
@@ -10931,6 +11261,46 @@ def test_run_ocr_pipeline_happy_path_stores_pdf_and_text(monkeypatch):
     assert call["fields"]["ocr_text_excerpt"] == "extracted rationale text"
     assert call["fields"]["source_pdf_s3_key"] == "fundamentals/filings/icra/n1.pdf"
     assert call["fields"]["source_pdf_sha256"] == hashlib.sha256(b"%PDF-1.4 fake").hexdigest()
+
+
+def test_run_ocr_pipeline_stops_at_time_budget_leaving_remaining_rows_pending(monkeypatch):
+    # 2026-08-15: DEFAULT_BATCH_LIMIT raised 50 -> 200 to close a real backlog (user
+    # request), but per-item OCR cost is highly variable (confirmed live: one run took
+    # 8.1 hours for 50 items, another 7 minutes for the same count) -- MAX_RUNTIME_
+    # SECONDS protects the rest of that day's pipeline (L1/L2/L3/notifications all run
+    # AFTER this step) from a bad day of large documents eating the whole run. A row
+    # not reached before the cutoff must stay untouched (pending), not marked failed.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame(
+        [
+            {"source": "icra", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": "https://www.icra.in/x?Id=1"},
+            {"source": "icra", "news_id": "n2", "attachment_name": None, "rationale_pdf_url": "https://www.icra.in/x?Id=2"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", lambda url, **k: b"%PDF-1.4 fake")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", lambda pdf_bytes: "text")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "save_file_content", lambda key, content: None)
+    from utils.blob_store import TextBlobMetadata
+
+    fake_metadata = TextBlobMetadata(key="k", sha256="abc", char_count=1, byte_count=1, excerpt="text")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "put_text_blob", lambda text, key: fake_metadata)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: status_calls.append(kwargs))
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "MAX_RUNTIME_SECONDS", 100)
+    # monotonic() called once for run_started, then once per loop iteration's check --
+    # first check (before item 1) is within budget, second check (before item 2) is past it.
+    clock = iter([0, 0, 200])
+    monkeypatch.setattr(fundamentals_ocr_pipeline.time, "monotonic", lambda: next(clock))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["ocred"] == 1  # only the first row was processed
+    assert result["time_budget_exceeded"] is True
+    assert len(status_calls) == 1  # n2 was never touched -- stays pending, not marked failed
+    assert status_calls[0]["news_id"] == "n1"
+    assert status_calls[0]["status"] == "done"
 
 
 def test_run_ocr_pipeline_trips_circuit_breaker_per_domain(monkeypatch):
@@ -12486,7 +12856,39 @@ def test_compute_technicals_computes_returns_and_dma_with_full_history():
     assert result["z_score_vs_200d_mean"] > 0  # last close is an outlier above a flat run
 
 
+def test_load_adjusted_price_history_falls_back_to_bse_view_when_nse_empty(monkeypatch):
+    # a BSE-only company (2026-08-15 gap fix) has nothing in advisory_adjusted_ohlcv_daily
+    # at all -- must fall back to bse_advisory_adjusted_ohlcv_daily keyed by scrip_code.
+    bse_rows = pd.DataFrame({"date": pd.to_datetime(["2026-08-13", "2026-08-14"]), "adj_close": [217.95, 215.9]})
+    calls = []
+
+    def fake_sql_to_df(query, params=None):
+        calls.append(query)
+        if "bse_advisory_adjusted_ohlcv_daily" in query:
+            return bse_rows
+        return pd.DataFrame(columns=["date", "adj_close"])  # NSE view: empty
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_technicals.load_adjusted_price_history("500166")
+
+    assert len(result) == 2
+    assert result["adj_close"].tolist() == [217.95, 215.9]
+    assert any("advisory_adjusted_ohlcv_daily" in q and "bse_" not in q for q in calls)  # NSE tried first
+    assert any("bse_advisory_adjusted_ohlcv_daily" in q for q in calls)
+
+
+def test_load_adjusted_price_history_uses_nse_view_when_available(monkeypatch):
+    nse_rows = pd.DataFrame({"date": pd.to_datetime(["2026-08-14"]), "adj_close": [100.0]})
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, params=None: nse_rows)
+
+    result = fundamentals_technicals.load_adjusted_price_history("RELIANCE")
+
+    assert result["adj_close"].tolist() == [100.0]
+
+
 def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: pd.DataFrame())
     fallback_events = []
     monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
@@ -12498,6 +12900,7 @@ def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
 
 
 def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypatch):
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
     tickers = pd.DataFrame([{"ticker": "AAA", "company_name": "A Co"}, {"ticker": "BBB", "company_name": "B Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
 
@@ -12814,18 +13217,181 @@ def test_run_watch_summary_refresh_handles_malformed_llm_response(monkeypatch):
     assert any(a and a[0] == "watch_summary_generation_failed" for a, k in fallback_events)
 
 
+# fundamentals/screens/l4_thesis_draft.py -- L4 thesis DRAFTING, step 11.5 (2026-08-15).
+# Never writes fundamentals_l4_thesis -- see module docstring guardrail.
+
+
+def test_run_l4_thesis_drafting_returns_early_when_no_candidates(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_companies_needing_draft_refresh", lambda limit=None: pd.DataFrame())
+
+    result = fundamentals_l4_thesis_draft.run_l4_thesis_drafting()
+
+    assert result == {"drafted": 0, "failed": 0, "blocked": False}
+
+
+def _patch_l4_draft_evidence_loaders(monkeypatch, alerts=None):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_company_alerts", lambda cmid: alerts if alerts is not None else pd.DataFrame())
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_latest_l2_state_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_latest_technicals_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_sector_context_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "get_stock_signal_pointers", lambda cmid: [])
+
+
+def test_run_l4_thesis_drafting_writes_expected_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    candidates = pd.DataFrame([{"company_master_id": "nse:X", "last_alert_at": date(2026, 8, 1), "narrative_text": "why we're watching"}])
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_companies_needing_draft_refresh", lambda limit=None: candidates)
+    _patch_l4_draft_evidence_loaders(monkeypatch)
+    monkeypatch.setattr(
+        fundamentals_l4_thesis_draft,
+        "generate_l4_thesis_draft",
+        lambda bundle, **k: {
+            "prediction_text": "Net debt/RSCR falls below 45 by Q2 FY27.",
+            "target_date": "2026-11-15",
+            "invalidation_criteria": "Net debt stays flat or rises.",
+            "confidence_score": 72,
+            "rationale": "because X",
+        },
+    )
+    upserts = []
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_l4_thesis_draft.run_l4_thesis_drafting(model="test-model")
+
+    assert result == {"drafted": 1, "failed": 0, "blocked": False}
+    assert len(upserts) == 1
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_l4_thesis_draft.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["company_master_id"]
+    row = df.iloc[0]
+    assert row["company_master_id"] == "nse:X"
+    assert row["prediction_text"] == "Net debt/RSCR falls below 45 by Q2 FY27."
+    assert row["target_date"] == date(2026, 11, 15)
+    assert row["confidence_score"] == 72
+    assert row["model"] == "test-model"
+
+
+def test_run_l4_thesis_drafting_includes_narrative_in_evidence_bundle(monkeypatch):
+    # this module runs AFTER watch_summary in the pipeline specifically so it can read
+    # the freshly-generated narrative -- confirm it actually reaches the LLM call.
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    candidates = pd.DataFrame([{"company_master_id": "nse:X", "last_alert_at": date(2026, 8, 1), "narrative_text": "the actual narrative text"}])
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_companies_needing_draft_refresh", lambda limit=None: candidates)
+    _patch_l4_draft_evidence_loaders(monkeypatch)
+    captured = {}
+
+    def fake_generate(bundle, **k):
+        captured.update(bundle=bundle)
+        return {"prediction_text": "p", "target_date": "2026-11-15", "invalidation_criteria": "i", "confidence_score": 50, "rationale": "r"}
+
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "generate_l4_thesis_draft", fake_generate)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "upsert_to_db", lambda df, table, **k: None)
+
+    fundamentals_l4_thesis_draft.run_l4_thesis_drafting()
+
+    assert captured["bundle"]["narrative_text"] == "the actual narrative text"
+
+
+def test_run_l4_thesis_drafting_trips_circuit_breaker(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    candidates = pd.DataFrame(
+        [{"company_master_id": f"nse:X{i}", "last_alert_at": date(2026, 8, 1), "narrative_text": None} for i in range(5)]
+    )
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_companies_needing_draft_refresh", lambda limit=None: candidates)
+    _patch_l4_draft_evidence_loaders(monkeypatch)
+
+    def always_fails(bundle, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "generate_l4_thesis_draft", always_fails)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_l4_thesis_draft.run_l4_thesis_drafting()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_l4_thesis_draft.CIRCUIT_BREAKER_THRESHOLD
+    assert result["drafted"] == 0
+    assert any(a and a[0] == "l4_thesis_draft_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_run_l4_thesis_drafting_handles_malformed_llm_response(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    candidates = pd.DataFrame(
+        [
+            {"company_master_id": "nse:BAD", "last_alert_at": date(2026, 8, 1), "narrative_text": None},
+            {"company_master_id": "nse:GOOD", "last_alert_at": date(2026, 8, 1), "narrative_text": None},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "load_companies_needing_draft_refresh", lambda limit=None: candidates)
+    _patch_l4_draft_evidence_loaders(monkeypatch)
+
+    def flaky(bundle, **k):
+        if bundle.get("company_master_id") == "nse:BAD":
+            return {"target_date": "2026-11-15", "invalidation_criteria": "i", "confidence_score": 50, "rationale": "r"}  # missing prediction_text
+        return {"prediction_text": "p", "target_date": "2026-11-15", "invalidation_criteria": "i", "confidence_score": 50, "rationale": "r"}
+
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "generate_l4_thesis_draft", flaky)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "upsert_to_db", lambda df, table, **k: upserts.append(df))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_l4_thesis_draft.run_l4_thesis_drafting()
+
+    assert result["blocked"] is False
+    assert result["drafted"] == 1
+    assert result["failed"] == 1
+    assert len(upserts) == 1
+    assert upserts[0].iloc[0]["company_master_id"] == "nse:GOOD"
+    assert any(a and a[0] == "l4_thesis_draft_generation_failed" for a, k in fallback_events)
+
+
+def test_latest_trigger_type_returns_last_alert_trigger_type():
+    alerts = pd.DataFrame([{"trigger_type": "llm_flagged", "alert_date": date(2026, 7, 1)}, {"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1)}])
+    assert fundamentals_l4_thesis_draft._latest_trigger_type(alerts) == "capital_raise"
+
+
+def test_latest_trigger_type_returns_none_for_empty_alerts():
+    assert fundamentals_l4_thesis_draft._latest_trigger_type(pd.DataFrame()) is None
+
+
+def test_load_current_drafts_by_company_keys_by_company_master_id(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    df = pd.DataFrame([{"company_master_id": "nse:X", "prediction_text": "p", "confidence_score": 60}])
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "sql_to_df", lambda q: df)
+
+    result = fundamentals_l4_thesis_draft.load_current_drafts_by_company()
+
+    assert result == {"nse:X": {"company_master_id": "nse:X", "prediction_text": "p", "confidence_score": 60}}
+
+
+def test_load_current_drafts_by_company_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_l4_thesis_draft.load_current_drafts_by_company() == {}
+
+
 def test_send_email_returns_none_when_disabled(monkeypatch):
     monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", False)
     assert fundamentals_notifications.send_email("subject", "body") is None
 
 
-def test_run_watchlist_notification_pipeline_chains_all_four_steps(monkeypatch):
+def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
     monkeypatch.setattr(
         fundamentals_notifications, "sync_watchlist_from_alerts", lambda: {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0}
     )
     narrative_events = [{"company_master_id": "nse:A", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
     monkeypatch.setattr(
         fundamentals_notifications, "run_watch_summary_refresh", lambda: {"generated": 1, "failed": 0, "blocked": False, "narrative_events": narrative_events}
+    )
+    draft_calls = []
+    monkeypatch.setattr(
+        fundamentals_notifications,
+        "run_l4_thesis_drafting",
+        lambda: draft_calls.append(1) or {"drafted": 1, "failed": 0, "blocked": False},
     )
     exit_calls = []
     monkeypatch.setattr(
@@ -12845,10 +13411,12 @@ def test_run_watchlist_notification_pipeline_chains_all_four_steps(monkeypatch):
     assert result["watchlist_companies"] == 5
     assert result["new_candidates"] == 2
     assert result["narratives_generated"] == 1
+    assert result["theses_drafted"] == 1
     assert result["watchlist_active"] == 4
     assert result["watchlist_invalidated"] == 1
     assert result["digest_sent"] == 1
     assert digest_calls == [1]
+    assert draft_calls == [1]
     assert exit_calls == [1]
     assert "emails_sent" not in result  # per-addition notifications removed 2026-08-14 -- digest only
 
@@ -13457,10 +14025,34 @@ def test_load_full_watchlist_attaches_strategies_per_company(monkeypatch):
     df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
     monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
     monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise"]})
+    monkeypatch.setattr(fundamentals_notifications, "load_current_drafts_by_company", lambda: {})
 
     result = fundamentals_notifications.load_full_watchlist()
 
     assert result[0]["strategies"] == ["capital_raise"]
+
+
+def test_load_full_watchlist_attaches_draft_thesis_per_company(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
+    monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
+    monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {})
+    draft = {"prediction_text": "p", "confidence_score": 55}
+    monkeypatch.setattr(fundamentals_notifications, "load_current_drafts_by_company", lambda: {"nse:FOO": draft})
+
+    result = fundamentals_notifications.load_full_watchlist()
+
+    assert result[0]["draft_thesis"] == draft
+
+
+def test_load_full_watchlist_missing_draft_thesis_is_none(monkeypatch):
+    df = pd.DataFrame([{"company_master_id": "nse:BAR", "first_seen_at": date(2026, 8, 1), "alert_count": 1}])
+    monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
+    monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {})
+    monkeypatch.setattr(fundamentals_notifications, "load_current_drafts_by_company", lambda: {})
+
+    result = fundamentals_notifications.load_full_watchlist()
+
+    assert result[0]["draft_thesis"] is None
 
 
 def test_build_daily_digest_content_empty_watchlist():
@@ -13533,6 +14125,56 @@ def test_build_daily_digest_content_escapes_html_special_characters():
     _, _, html_body = fundamentals_notifications.build_daily_digest_content(rows)
     assert "Foo &amp; &lt;Bar&gt;" in html_body
     assert "<Bar>" not in html_body
+
+
+def test_build_daily_digest_content_renders_draft_thesis_with_confidence(monkeypatch):
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 2, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {
+                "prediction_text": "Net debt/RSCR falls below 45 by Q2 FY27.",
+                "target_date": date(2026, 11, 15),
+                "invalidation_criteria": "Net debt stays flat or rises.",
+                "confidence_score": 72,
+            },
+        }
+    ]
+
+    subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+
+    assert "DRAFT L4 thesis, NOT SAVED, confidence 72/100" in text_body
+    assert "Net debt/RSCR falls below 45 by Q2 FY27." in text_body
+    assert "Invalidation: Net debt stays flat or rises." in text_body
+    assert "nothing is saved to the real thesis register" in text_body
+
+    assert "Draft L4 Theses" in html_body
+    assert "CANDIDATE ONLY" in html_body
+    assert 'class="draft-confidence high"' in html_body  # 72 >= 66
+    assert "Net debt/RSCR falls below 45 by Q2 FY27." in html_body
+
+
+def test_build_daily_digest_content_low_confidence_gets_low_css_class():
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {"prediction_text": "p", "target_date": date(2026, 11, 15), "invalidation_criteria": "i", "confidence_score": 20},
+        }
+    ]
+    _, _, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert 'class="draft-confidence low"' in html_body
+
+
+def test_build_daily_digest_content_no_draft_thesis_key_renders_fine():
+    # backward-compat: a row without a "draft_thesis" key (or with None) must not crash
+    # and must not render the draft section at all.
+    rows = [{"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}]
+    subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "DRAFT L4 thesis" not in text_body
+    assert "Draft L4 Theses" not in html_body
 
 
 def test_send_daily_digest_skips_when_disabled(monkeypatch):

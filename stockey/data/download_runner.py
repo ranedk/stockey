@@ -33,6 +33,15 @@ DOWNLOADER_STEPS = [
     {"module": "data.rbi.download_currency_rates", "args": [], "purpose": "macro"},
     {"module": "data.nseindia.bhavcopy_downloader", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.indices_downloader", "args": [], "purpose": "market_wide"},
+    # BSE-only-company price coverage (2026-08-15, fundamentals screener gap fix) --
+    # a fundamentals-screener side need (43 BSE-only companies' descriptive
+    # technicals), not systrader's PRIMARY series (that stays entirely NSE-sourced),
+    # so this is deliberately its own non-critical purpose tag, not "market_wide" --
+    # a BSE hiccup must not fail/abort the real (NSE) critical market-data path.
+    # Combines download+parse+upsert in one step (unlike NSE's split downloader/
+    # parser) -- BSE's bhavcopy is a single plain-CSV request, no ZIP/multi-report
+    # complexity to split across two modules.
+    {"module": "data.bseindia.bhavcopy", "args": [], "purpose": "bse_market_wide"},
 ]
 # nseindia.earnings_events and nseindia.recent_events are BORDERLINE (LLM-free,
 # useful for FnO event-vol later per DATA_INVENTORY.md) -- frozen, not deleted:

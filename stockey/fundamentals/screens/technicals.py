@@ -17,6 +17,18 @@ context where raw close is fine. Coverage confirmed live: 138/188 L1 tickers hav
 adjusted series (73%) -- the remainder (recent listings, series gaps) get a row with
 all stats None plus a fallback event, not silently skipped.
 
+BSE-only-company fallback (2026-08-15): a company with no NSE listing (confirmed
+live -- 43 of the active L1 universe) has nothing in advisory_adjusted_ohlcv_daily
+at all, since that view is entirely NSE/Dhan-sourced. load_adjusted_price_history()
+falls back to bse_advisory_adjusted_ohlcv_daily (data/bseindia/price_adjustment.py)
+keyed by scrip_code -- fundamentals_l1_universe.ticker for a BSE-only company IS
+already its BSE scrip code (confirmed live: company_master's identity resolution
+stores the scrip code in that slot for a company with no NSE ticker), so no extra
+identity lookup is needed here, the same `ticker` value is used against both views.
+This is a cross-package READ of a data/ table (fundamentals building on top of the
+pure-TA platform, not the reverse -- see CLAUDE.md's boundary section); this module
+still writes only its own fundamentals_technicals table.
+
 Windows are in trading days (63/126/252 for 3/6/12 months, standard convention), not
 calendar days -- a company needs that many rows of history for a given window to be
 computed at all; shorter-history companies get partial rows (some windows None), never
@@ -29,6 +41,7 @@ import json
 
 import pandas as pd
 
+from data.bseindia.price_adjustment import ensure_view as ensure_bse_view
 from utils.db import sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -68,7 +81,7 @@ def load_l1_tickers() -> pd.DataFrame:
 
 
 def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.DataFrame:
-    return sql_to_df(
+    nse_history = sql_to_df(
         """
         SELECT date, adj_close
         FROM advisory_adjusted_ohlcv_daily
@@ -77,7 +90,24 @@ def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.
         LIMIT %s
         """,
         params=(ticker, lookback_days),
-    ).sort_values("date").reset_index(drop=True)
+    )
+    if not nse_history.empty:
+        return nse_history.sort_values("date").reset_index(drop=True)
+
+    # BSE-only-company fallback -- see module docstring. `ticker` here is already the
+    # BSE scrip code for these companies, matching bse_advisory_adjusted_ohlcv_daily's
+    # own scrip_code key directly.
+    bse_history = sql_to_df(
+        """
+        SELECT date, adj_close
+        FROM bse_advisory_adjusted_ohlcv_daily
+        WHERE scrip_code = %s
+        ORDER BY date DESC
+        LIMIT %s
+        """,
+        params=(ticker, lookback_days),
+    )
+    return bse_history.sort_values("date").reset_index(drop=True)
 
 
 def compute_technicals(history: pd.DataFrame) -> dict:
@@ -127,6 +157,7 @@ def compute_technicals(history: pd.DataFrame) -> dict:
 
 
 def run_technicals_refresh() -> dict[str, object]:
+    ensure_bse_view()  # self-heals bseindia_ohlcv/bseindia_adjustment_factors/the view -- see module docstring
     tickers = load_l1_tickers()
     if tickers.empty:
         _record_fallback(

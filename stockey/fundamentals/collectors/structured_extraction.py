@@ -74,7 +74,14 @@ DEFAULT_MODEL = env("STRUCTURED_EXTRACTION_MODEL", "gpt-5.4-mini")
 # module already committed to rather than something introduced here.
 SCHEMA_VERSION = 2
 CIRCUIT_BREAKER_THRESHOLD = 3
-DEFAULT_BATCH_LIMIT = 50
+# 2026-08-15: raised 50 -> 400 (user request: "pace up so we don't have backlog").
+# This stage is a plain LLM text-extraction call, not an OCR image-render job --
+# confirmed live it's fast and low-variance (~3-4s/item), unlike ocr_pipeline.py's
+# per-page cost, so it can absorb a much larger limit safely. It's gated on
+# ocr_status='done' (load_pending_extraction_targets), so ocr_pipeline.py's own
+# throughput is the real bottleneck this stage can't outrun on its own -- this bump
+# just makes sure extraction is never the SECOND bottleneck once OCR speeds up.
+DEFAULT_BATCH_LIMIT = 400
 
 # Shared instruction, every filing_type -- the "null is correct far more often than a
 # guessed value" lesson from this module's own live testing (see module docstring).
