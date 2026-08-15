@@ -141,11 +141,19 @@ PLEDGE_QUERY = "Pledged percentage > 0"
 # historical EV/EBITDA field at all ("EVEBITDA 3years back" -> "Unknown word"), but
 # DOES have "Historical PE <N>Years" (median PE over the company's own trailing
 # history) as a first-class registered field -- PE substitutes for EV/EBITDA as the
-# valuation multiple here. "!= 0" (not "> 0") on Price to Earning: a genuinely
-# negative PE (loss-making company) is real, useful information (own-history ratio
-# is meaningless for it, but it's still excluded from -- not silently zeroed into --
-# the sector percentile), not something to filter out at the query level.
-VALUATION_QUERY = "Price to Earning != 0 AND Historical PE 5Years > 0"
+# valuation multiple here. Excludes PE == 0 (not just PE > 0) on Price to Earning: a
+# genuinely negative PE (loss-making company) is real, useful information (own-
+# history ratio is meaningless for it, but it's still excluded from -- not silently
+# zeroed into -- the sector percentile), not something to filter out at the query
+# level. BUG FOUND LIVE 2026-08-15: the original "!= 0" spelling of that condition is
+# rejected outright by screener.in's query parser ("Unknown word: price to earning
+# !"), so this query has raised on every single run since 2026-08-13 -- caught by
+# run_l2_state_refresh's per-query try/except (never crashed the pipeline), but pe/
+# valuation_vs_own_history_ratio/valuation_sector_percentile have been permanently
+# None for every company on every run, indistinguishable from "no data available".
+# "(Price to Earning > 0 OR Price to Earning < 0)" is logically equivalent to != 0
+# and confirmed live to work.
+VALUATION_QUERY = "(Price to Earning > 0 OR Price to Earning < 0) AND Historical PE 5Years > 0"
 
 # Not silently skipped -- see module docstring. Every run logs a fallback event naming
 # these, and the run summary/STOCKEY_RUN_STATE carries checks_deferred.

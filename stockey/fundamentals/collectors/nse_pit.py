@@ -68,6 +68,7 @@ module no longer makes.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -198,14 +199,28 @@ def parse_pit_xbrl(xml_text: str) -> dict:
     page.content() returns Chrome's live DOM serialization of its built-in XML viewer
     (a style/div wrapper around the real elements, not the original response bytes),
     so the tag/contextRef/text triple is matched directly instead of first
-    reconstructing a standalone XML document to hand to a strict parser."""
+    reconstructing a standalone XML document to hand to a strict parser. That
+    serialization DOUBLY HTML-escapes text content (found live 2026-08-15: a real
+    company name came back as "AVONMORE CAPITAL &amp;amp; MANAGEMENT SERVICES
+    LIMITED", i.e. `&amp;amp;` -- the XBRL source's own `&amp;` escaping, escaped a
+    second time by Chrome's HTML-based XML-viewer serialization), so every captured
+    text value is unescaped TWICE before use -- a single pass only recovers `&amp;`,
+    not the literal `&`. Names/text containing &, <, >, ', or " would otherwise
+    corrupt insider_name/headline/raw_json downstream."""
     fields: dict[str, dict[str, str]] = {}
     for tag, attrs, text in _XBRL_ELEMENT_RE.findall(xml_text):
         context_match = _XBRL_CONTEXT_REF_RE.search(attrs)
         if not context_match:
             continue
-        fields.setdefault(context_match.group(1), {})[tag] = text.strip()
-    disclosure_contexts = sorted(c for c in fields if c.startswith("Disclosure"))
+        fields.setdefault(context_match.group(1), {})[tag] = html.unescape(html.unescape(text.strip()))
+    # Numeric sort, not lexicographic -- found live 2026-08-15 on a real 11-disclosure
+    # filing (JSW Steel Employees Welfare Trust ESOP accounts): plain sorted() on the
+    # string "Disclosure10"/"Disclosure11" orders them before "Disclosure2".."Disclosure9",
+    # scrambling the natural person-order used for the news_id idx suffix.
+    disclosure_contexts = sorted(
+        (c for c in fields if c.startswith("Disclosure")),
+        key=lambda c: int(re.sub(r"\D", "", c) or 0),
+    )
     return {"filing": fields.get("MainI", {}), "disclosures": [fields[c] for c in disclosure_contexts]}
 
 

@@ -196,10 +196,51 @@ def attach_identity(df: pd.DataFrame) -> pd.DataFrame:
     return attach_company_master_id(df, ticker_column="scrip_code", exchange="BSE")
 
 
-def collect_range(from_date: date, to_date: date, *, dry_run: bool = False) -> dict[str, object]:
-    """Download + parse + upsert every trading day in [from_date, to_date]. Skips
-    weekends outright (BSE is closed); a genuine holiday inside that window is
-    detected via BseBhavcopyNotAvailableError and counted, not treated as a failure."""
+_NON_TRADING_TABLE_STATEMENT = """
+    CREATE TABLE IF NOT EXISTS bseindia_non_trading_dates (
+        date DATE PRIMARY KEY,
+        checked_at TIMESTAMPTZ
+    )
+"""
+
+
+def ensure_non_trading_table() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(_NON_TRADING_TABLE_STATEMENT)
+
+    execute_db_operation(_op, operation_name="bseindia_non_trading_dates:ensure_table")
+
+
+def load_known_non_trading_dates() -> set[date]:
+    """Weekday holidays BSE has already confirmed (via a live 'not found' response)
+    it will never serve a bhavcopy for -- persisted so a holiday isn't re-fetched
+    every single run forever (found live 2026-08-15: without this, a holiday inside
+    the lookback window never becomes "downloaded" and reappears as a missing
+    candidate on every future run indefinitely)."""
+    ensure_non_trading_table()
+    df = sql_to_df("SELECT date FROM bseindia_non_trading_dates")
+    if df.empty:
+        return set()
+    return {pd.Timestamp(d).date() for d in df["date"]}
+
+
+def _mark_non_trading_date(d: date) -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                "INSERT INTO bseindia_non_trading_dates (date, checked_at) VALUES (%s, %s) ON CONFLICT (date) DO NOTHING",
+                (d, pd.Timestamp.now(tz="UTC")),
+            )
+
+    execute_db_operation(_op, operation_name="bseindia_non_trading_dates:insert")
+
+
+def collect_dates(dates: list[date], *, dry_run: bool = False) -> dict[str, object]:
+    """Download + parse + upsert exactly this list of dates (caller has already
+    deduped against what's downloaded/known-non-trading -- this function does not
+    re-derive a date range and walk it, see collect_range()/run_bse_bhavcopy_
+    collection()'s own docstrings for why that distinction matters)."""
     ensure_ohlcv_table()
     session = requests.Session()
     days_written = 0
@@ -209,18 +250,15 @@ def collect_range(from_date: date, to_date: date, *, dry_run: bool = False) -> d
     consecutive_failures = 0
     blocked = False
 
-    d = from_date
-    while d <= to_date:
+    for d in sorted(dates):
         if blocked:
             break
-        if d.weekday() >= 5:
-            d += timedelta(days=1)
-            continue
         try:
             csv_bytes = fetch_bhavcopy_csv(d, session=session)
         except BseBhavcopyNotAvailableError:
             non_trading_days += 1
-            d += timedelta(days=1)
+            if not dry_run:
+                _mark_non_trading_date(d)
             continue
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
@@ -239,7 +277,6 @@ def collect_range(from_date: date, to_date: date, *, dry_run: bool = False) -> d
                     error="circuit breaker",
                     severity="error",
                 )
-            d += timedelta(days=1)
             continue
 
         consecutive_failures = 0
@@ -251,7 +288,6 @@ def collect_range(from_date: date, to_date: date, *, dry_run: bool = False) -> d
                 upsert_to_db(parsed[[*OUT_COLS, "company_master_id"]], RESULTS_TABLE, unique_keys=["date", "scrip_code", "series"])
             days_written += 1
             rows_written += len(parsed)
-        d += timedelta(days=1)
 
     return {
         "days_written": days_written,
@@ -260,6 +296,18 @@ def collect_range(from_date: date, to_date: date, *, dry_run: bool = False) -> d
         "failed_days": failed_days,
         "blocked": blocked,
     }
+
+
+def collect_range(from_date: date, to_date: date, *, dry_run: bool = False) -> dict[str, object]:
+    """CLI/backfill entrypoint over a plain [from_date, to_date] span -- skips
+    weekends outright (BSE is closed) but otherwise makes no assumption about
+    what's already downloaded (a manual backfill call is expected to name the
+    exact range it wants); collect_dates() re-fetches every weekday in range
+    regardless of bseindia_ohlcv's current contents. For the daily incremental
+    collector that DOES need to skip already-downloaded/known-non-trading dates,
+    see run_bse_bhavcopy_collection() below -- it does not call this function."""
+    dates = [from_date + timedelta(days=i) for i in range((to_date - from_date).days + 1) if (from_date + timedelta(days=i)).weekday() < 5]
+    return collect_dates(dates, dry_run=dry_run)
 
 
 def load_downloaded_dates() -> set[date]:
@@ -271,9 +319,16 @@ def load_downloaded_dates() -> set[date]:
 
 def run_bse_bhavcopy_collection(*, lookback_days: int | None = None) -> dict[str, object]:
     """Daily incremental collection -- same lookback-window-of-candidate-dates shape
-    as NSE's bhavcopy_downloader.py, but a plain date-range fetch (no store/redis
-    dedup layer needed: bseindia_ohlcv's own contents ARE the dedup state, checked
-    directly) since this is one lightweight request/day, not a heavy CDP download."""
+    as NSE's bhavcopy_downloader.py. Fetches ONLY the actual missing weekday dates
+    (via collect_dates(), not collect_range()) -- an earlier version called
+    collect_range(min(missing), max(missing)), which re-walks EVERY calendar day in
+    that span regardless of which specific dates were actually missing; since
+    weekends never get a written row, they always show up as "missing" and pull the
+    span wide, so every run re-fetched almost the entire lookback window (found live
+    2026-08-15, before this had ever run unattended). bseindia_ohlcv's own contents
+    plus bseindia_non_trading_dates ARE the complete dedup state, checked directly --
+    no separate store/redis dedup layer needed, since this is one lightweight
+    request per missing date, not a heavy CDP download."""
     ensure_ohlcv_table()
     today = datetime.now().date()
     start = today - timedelta(days=lookback_days if lookback_days is not None else BSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS)
@@ -281,11 +336,16 @@ def run_bse_bhavcopy_collection(*, lookback_days: int | None = None) -> dict[str
     end = today - timedelta(days=1)
 
     existing = load_downloaded_dates()
-    missing_candidates = [start + timedelta(days=i) for i in range((end - start).days + 1) if (start + timedelta(days=i)) not in existing]
+    known_non_trading = load_known_non_trading_dates()
+    all_candidate_days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    missing_candidates = [
+        d for d in all_candidate_days
+        if d.weekday() < 5 and d not in existing and d not in known_non_trading
+    ]
     if not missing_candidates:
         return {"days_written": 0, "rows_written": 0, "non_trading_days": 0, "failed_days": [], "blocked": False, "candidate_dates": 0}
 
-    result = collect_range(min(missing_candidates), max(missing_candidates))
+    result = collect_dates(missing_candidates)
     result["candidate_dates"] = len(missing_candidates)
     return result
 
@@ -306,7 +366,13 @@ def main() -> int:
         "status": "blocked" if result["blocked"] else "ok",
     }
     print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)
-    return 0
+    # BUG FOUND LIVE 2026-08-15: this used to always `return 0` regardless of
+    # `blocked` -- data.download_runner.py's own classify_run_status() only looks at
+    # the process's actual exit code (not this dict's own "status" string) to decide
+    # ok-vs-failed, so a circuit-breaker trip was invisible to the pipeline's status
+    # classification and got recorded as a clean "ok" in advisory_sync_state.
+    # Matches data/nseindia/bhavcopy_downloader.py's own established convention.
+    return 1 if result["blocked"] else 0
 
 
 if __name__ == "__main__":

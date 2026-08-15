@@ -221,10 +221,17 @@ def run_l4_thesis_drafting(*, limit: int | None = None, model: str = DEFAULT_MOD
         if blocked:
             continue
         company_master_id = candidate["company_master_id"]
-        alerts = load_company_alerts(company_master_id)
-        evidence_bundle = build_draft_evidence_bundle(company_master_id, alerts, candidate.get("narrative_text"))
 
         try:
+            # Evidence-gathering (including a DB read of fundamentals_l2_state) lives
+            # INSIDE this try, not before it -- watch_summary.py's own sibling loop
+            # had this exact bug (an unguarded call ahead of its try block let one
+            # bad company's exception abort the entire remaining batch with no
+            # fallback-telemetry record) and was fixed live 2026-08-15; that fix
+            # wasn't carried over here when this file was written the same day, so
+            # this repeats the mistake it should have avoided. Fixed here the same way.
+            alerts = load_company_alerts(company_master_id)
+            evidence_bundle = build_draft_evidence_bundle(company_master_id, alerts, candidate.get("narrative_text"))
             draft = generate_l4_thesis_draft(evidence_bundle, model=model)
             prediction_text = draft["prediction_text"]
             target_date = pd.Timestamp(draft["target_date"]).date()

@@ -210,14 +210,43 @@ def evaluate_rating_action_trigger(event: dict, l2_row: dict | None) -> dict | N
     return None
 
 
+def _resolve_pit_transaction_fields(event: dict) -> tuple[str | None, str | None]:
+    """(transaction_type, insider_name), preferring the flat columns but falling back
+    to structured_extraction_json -- same pattern as _resolve_rating_action_type,
+    for the same reason. BUG FOUND LIVE 2026-08-15: the flat transaction_type/
+    insider_name columns are ONLY ever populated by NSE's own structured
+    corporates-pit feed (fundamentals/collectors/nse_pit.py); bse_announcements.py
+    always writes them NULL for BSE-detected pit_sast filings (real trade detail
+    lives only in the OCR'd PDF, extracted separately by structured_extraction.py's
+    PIT_SAST_SCHEMA into structured_extraction_json). Confirmed live: 100% of the
+    620 pit_sast events in fundamentals_events today are BSE-sourced with NULL flat
+    columns, so this trigger -- including the "insider buy always alerts" rule this
+    module's own docstring calls out as unconditional -- had never actually fired
+    for any of them; at least 2 real promoter BUY transactions were confirmed sitting
+    in structured_extraction_json, silently marked not_alert_worthy."""
+    transaction_type = event.get("transaction_type")
+    insider_name = event.get("insider_name")
+    if transaction_type:
+        return str(transaction_type), insider_name
+    raw_json = event.get("structured_extraction_json")
+    if not raw_json:
+        return None, insider_name
+    try:
+        extracted = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return None, insider_name
+    return extracted.get("transaction_type"), insider_name or extracted.get("insider_name")
+
+
 def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
-    transaction_type = (event.get("transaction_type") or "").lower()
+    transaction_type_raw, insider_name = _resolve_pit_transaction_fields(event)
+    transaction_type = (transaction_type_raw or "").lower()
     if not transaction_type:
         return None  # the common case -- a procedural notice with no actual trade
     if "buy" in transaction_type:
         return {
             "trigger_type": "insider_buy",
-            "reasoning": f"Promoter/insider buy ({event.get('insider_name')}) -- rarer and higher-signal than a sell, alerted regardless of prior L2 state.",
+            "reasoning": f"Promoter/insider buy ({insider_name}) -- rarer and higher-signal than a sell, alerted regardless of prior L2 state.",
         }
     if "sell" in transaction_type:
         direction = (l2_row.get("promoter_stake_direction") if l2_row else None) or ""
@@ -225,7 +254,7 @@ def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
             return {
                 "trigger_type": "insider_sell_surprise",
                 "reasoning": (
-                    f"Promoter/insider sell ({event.get('insider_name')}) while L2's own promoter_stake_direction "
+                    f"Promoter/insider sell ({insider_name}) while L2's own promoter_stake_direction "
                     f"was '{direction or 'unknown'}', not already 'decreasing' -- this is new information, not "
                     "confirmation of a trend L2 had already captured."
                 ),

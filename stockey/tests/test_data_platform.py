@@ -2715,6 +2715,8 @@ def test_collect_range_skips_weekends_and_counts_non_trading_days(monkeypatch):
     monkeypatch.setattr(bse_bhavcopy, "attach_identity", lambda df: df.assign(company_master_id="nse:X"))
     upserts = []
     monkeypatch.setattr(bse_bhavcopy, "upsert_to_db", lambda df, table, **k: upserts.append(df))
+    marked_non_trading = []
+    monkeypatch.setattr(bse_bhavcopy, "_mark_non_trading_date", lambda d: marked_non_trading.append(d))
 
     # 2026-08-10 (Mon) .. 2026-08-16 (Sun): Fri 08-14 is the faked holiday, Sat/Sun skipped outright
     result = bse_bhavcopy.collect_range(date(2026, 8, 10), date(2026, 8, 16))
@@ -2724,6 +2726,7 @@ def test_collect_range_skips_weekends_and_counts_non_trading_days(monkeypatch):
     assert result["blocked"] is False
     assert len(calls) == 5  # weekdays only -- weekends never even attempted
     assert len(upserts) == 4
+    assert marked_non_trading == [date(2026, 8, 14)]  # persisted so it isn't re-fetched forever
 
 
 def test_collect_range_trips_circuit_breaker(monkeypatch):
@@ -2751,12 +2754,81 @@ def test_run_bse_bhavcopy_collection_returns_early_when_fully_caught_up(monkeypa
 
     monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
     monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: {bse_bhavcopy.datetime.now().date() - timedelta(days=1)})
+    monkeypatch.setattr(bse_bhavcopy, "load_known_non_trading_dates", lambda: set())
     monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_EARLIEST_DATE", bse_bhavcopy.datetime.now().date() - timedelta(days=2))
 
     result = bse_bhavcopy.run_bse_bhavcopy_collection(lookback_days=1)
 
     assert result["days_written"] == 0
     assert result["candidate_dates"] == 0
+
+
+def test_run_bse_bhavcopy_collection_only_fetches_actually_missing_dates(monkeypatch):
+    # found live 2026-08-15: an earlier version called collect_range(min(missing),
+    # max(missing)), which re-walks EVERY calendar day in that span -- since weekends
+    # never get a written row, they always show up as "missing" and pull the span
+    # wide, so a nearly-fully-caught-up collector would still re-fetch almost the
+    # entire lookback window every run. This pins the fix: only the genuinely
+    # missing weekday dates are ever fetched, nothing in between.
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_EARLIEST_DATE", date(2024, 1, 1))
+    # 2026-08-10 (Mon) .. 2026-08-14 (Fri): every weekday already downloaded except 08-12 (Wed)
+    downloaded = {date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 13), date(2026, 8, 14)}
+    monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: downloaded)
+    monkeypatch.setattr(bse_bhavcopy, "load_known_non_trading_dates", lambda: set())
+
+    class _FakeNow:
+        @staticmethod
+        def date():
+            return date(2026, 8, 15)
+
+    class _FakeDatetime:
+        @staticmethod
+        def now():
+            return _FakeNow()
+
+    monkeypatch.setattr(bse_bhavcopy, "datetime", _FakeDatetime)
+
+    fetched = []
+
+    def fake_collect_dates(dates, **k):
+        fetched.extend(dates)
+        return {"days_written": len(dates), "rows_written": 0, "non_trading_days": 0, "failed_days": [], "blocked": False}
+
+    monkeypatch.setattr(bse_bhavcopy, "collect_dates", fake_collect_dates)
+
+    result = bse_bhavcopy.run_bse_bhavcopy_collection(lookback_days=5)
+
+    assert fetched == [date(2026, 8, 12)]  # only the one genuinely missing weekday -- not the 5-day span
+    assert result["candidate_dates"] == 1
+
+
+def test_bse_bhavcopy_main_returns_nonzero_exit_code_when_blocked(monkeypatch):
+    # found live 2026-08-15: main() always `return 0` regardless of a circuit-breaker
+    # trip, so data.download_runner.py's exit-code-only classify_run_status() could
+    # never see a blocked BSE run as anything but "ok". Matches bhavcopy_downloader.py's
+    # own established "return 1 on real failure" convention.
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(
+        bse_bhavcopy,
+        "run_bse_bhavcopy_collection",
+        lambda: {"days_written": 0, "rows_written": 0, "non_trading_days": 0, "failed_days": ["2026-08-10", "2026-08-11", "2026-08-12"], "blocked": True, "candidate_dates": 3},
+    )
+    assert bse_bhavcopy.main() == 1
+
+
+def test_bse_bhavcopy_main_returns_zero_exit_code_when_not_blocked(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(
+        bse_bhavcopy,
+        "run_bse_bhavcopy_collection",
+        lambda: {"days_written": 1, "rows_written": 4900, "non_trading_days": 0, "failed_days": [], "blocked": False, "candidate_dates": 1},
+    )
+    assert bse_bhavcopy.main() == 0
 
 
 def test_build_bse_adjustment_factors_returns_zero_rows_when_empty(monkeypatch):
@@ -10233,6 +10305,27 @@ def test_parse_pit_xbrl_handles_multiple_disclosure_contexts_in_one_filing():
     assert [d["SecuritiesAcquiredOrDisposedNumberOfSecurity"] for d in parsed["disclosures"]] == ["500", "800"]
 
 
+def test_parse_pit_xbrl_sorts_disclosure_contexts_numerically_not_lexicographically():
+    # found live 2026-08-15 on a real 11-disclosure filing (JSW Steel Employees
+    # Welfare Trust ESOP accounts): plain sorted() puts "Disclosure10"/"Disclosure11"
+    # before "Disclosure2".."Disclosure9".
+    xml = "".join(
+        f'<in-bse-co:NameOfThePerson contextRef="Disclosure{i}">Person{i}</in-bse-co:NameOfThePerson>'
+        for i in [1, 2, 10, 11, 3]
+    )
+    parsed = fundamentals_nse_pit.parse_pit_xbrl(xml)
+    assert [d["NameOfThePerson"] for d in parsed["disclosures"]] == ["Person1", "Person2", "Person3", "Person10", "Person11"]
+
+
+def test_parse_pit_xbrl_unescapes_html_entities():
+    # found live 2026-08-15: a real company name came back as the literal string
+    # "AVONMORE CAPITAL &amp;amp; MANAGEMENT SERVICES LIMITED" -- page.content()'s
+    # HTML-escaped serialization was never decoded.
+    xml = '<in-bse-co:NameOfTheCompany contextRef="MainI">AVONMORE CAPITAL &amp;amp; MANAGEMENT SERVICES LIMITED</in-bse-co:NameOfTheCompany>'
+    parsed = fundamentals_nse_pit.parse_pit_xbrl(xml)
+    assert parsed["filing"]["NameOfTheCompany"] == "AVONMORE CAPITAL & MANAGEMENT SERVICES LIMITED"
+
+
 def test_parse_pit_xbrl_ignores_elements_without_a_context_ref():
     parsed = fundamentals_nse_pit.parse_pit_xbrl('<in-bse-co:Foo>no context here</in-bse-co:Foo>')
     assert parsed == {"filing": {}, "disclosures": []}
@@ -11591,6 +11684,36 @@ def test_evaluate_pit_sast_trigger_sell_confirming_known_trend_does_not_alert():
 def test_evaluate_pit_sast_trigger_no_transaction_data_does_not_alert():
     # the common real case -- a trading-window-closure procedural notice
     assert fundamentals_l3_triggers.evaluate_pit_sast_trigger({"transaction_type": None}, {"promoter_stake_direction": "flat"}) is None
+
+
+def test_evaluate_pit_sast_trigger_falls_back_to_structured_extraction_json():
+    # BUG FOUND LIVE 2026-08-15: bse_announcements.py always writes the flat
+    # transaction_type/insider_name columns NULL (only NSE's own corporates-pit feed
+    # populates them) -- 100% of real pit_sast events are BSE-sourced today, so this
+    # trigger had never fired without the structured_extraction_json fallback. This
+    # mirrors a real captured row (a promoter-entity buy).
+    raw_json = json.dumps({"transaction_type": "buy", "insider_name": "Sonitron Limited", "pct_of_holding_before": 17.293, "pct_of_holding_after": 17.353})
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": None, "insider_name": None, "structured_extraction_json": raw_json},
+        {"promoter_stake_direction": "flat"},
+    )
+    assert result["trigger_type"] == "insider_buy"
+    assert "Sonitron Limited" in result["reasoning"]
+
+
+def test_evaluate_pit_sast_trigger_flat_column_wins_over_json_when_both_present():
+    raw_json = json.dumps({"transaction_type": "sell", "insider_name": "JSON Name"})
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": "Buy", "insider_name": "Flat Name", "structured_extraction_json": raw_json},
+        {"promoter_stake_direction": "flat"},
+    )
+    assert result["trigger_type"] == "insider_buy"  # flat column ("Buy"), not the JSON's ("sell")
+    assert "Flat Name" in result["reasoning"]
+
+
+def test_evaluate_pit_sast_trigger_no_json_and_no_flat_column_does_not_alert():
+    assert fundamentals_l3_triggers.evaluate_pit_sast_trigger({"transaction_type": None, "structured_extraction_json": None}, {"promoter_stake_direction": "flat"}) is None
+    assert fundamentals_l3_triggers.evaluate_pit_sast_trigger({"transaction_type": None, "structured_extraction_json": "not json"}, {"promoter_stake_direction": "flat"}) is None
 
 
 def test_evaluate_capital_raise_trigger_always_alerts_regardless_of_l2_state():
