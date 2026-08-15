@@ -146,7 +146,7 @@
     {
       "name": "load_rbi_fbil_gsec",
       "category": "ingestion",
-      "description": "Refresh FBIL G-sec quote and par-curve rates.",
+      "description": "Refresh FBIL G-sec par-curve rates.",
       "command": ["python", "-m", "data.rbi.download_fbil_gsec"],
       "read_only": false,
       "examples": []
@@ -182,7 +182,7 @@
     {
       "name": "run_price_adjustment",
       "category": "orchestration",
-      "description": "Rebuild the split/bonus-adjusted daily close table (systrader's PRIMARY series) from price steps.",
+      "description": "Rebuild nseindia_adjustment_factors from price steps; advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) is a view over it, not a written table.",
       "command": ["bash", "all_price_adjustment.sh"],
       "read_only": false,
       "examples": []

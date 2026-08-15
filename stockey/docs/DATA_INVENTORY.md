@@ -22,6 +22,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 | Identity | `company_master`, `nseindia/security_history` | `company_master`, `dim_security*` |
 | Sharpely identity/sector mapping | `sharpelydata/scrip_master.py` | `master_sharpely_equity` — feeds `company_master`'s `sharpely_id` identity fallback and `fundamentals/collectors/sector_data.py`'s NSE→BSE sector-code mapping |
 | Download run state | `data/download_runner.py` (via `utils/sync_state.py`) | `advisory_sync_state` (load-bearing — never drop) |
+| Per-file ingestion state | `utils/ingestion_state.py` | `ingestion_file_state` — tracks per-object-key processed/failed status for the S3-backed parsers (`bhavcopy_parser.py`, `indices_parser.py`), backing `should_consider_key()`'s dedup and `scripts/ingestion_state_runner.py`'s inspection CLI |
 | Promoted utility tables | `utils/fallback_telemetry.py`, `utils/external_task_queue.py`, `utils/identity_issues.py` | `advisory_fallback_events`, `advisory_external_task_queue`, `advisory_identity_issues` |
 
 `historical_mcap` is kept as a frozen archive (2012+, ~970 symbols) — no
@@ -115,7 +116,7 @@ wall-clock — the crontab file itself is written in UTC since go-crond has no
    PRIMARY series) is a view over it, not a written table.
 5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
    freshness and runs bounded repairs.
-6. `all_data_coverage_report.sh` (daily) — non-fatal per-table coverage
+6. `all_data_coverage_report.sh` (17:10, weekdays) — non-fatal per-table coverage
    report (`docs/DATA_COVERAGE.md`), monitoring only, not a data producer.
 7. Log rotation (06:50, `scripts/rotate_logs.sh`).
 

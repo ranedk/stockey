@@ -64,6 +64,13 @@ def build_dim_security() -> pd.DataFrame:
         subset=["security_id"],
         keep="last",
     )
+    # `latest`'s own price_row_count (just one history row's value) is dropped before merging --
+    # `summary`'s is the real SUM across the security's full identity history, which is what
+    # "price_row_count" is meant to mean on the consolidated dim_security row. Both columns
+    # otherwise share the same name and the merge below would silently rename them to
+    # price_row_count_x/_y instead of erroring -- found live 2026-08-15: dim_security has exactly
+    # that _x/_y split today, and no query anywhere selects either suffixed name.
+    latest = latest.drop(columns=["price_row_count"])
     summary = history.groupby("security_id", dropna=False).agg(
         first_trade_date=("effective_from", "min"),
         last_trade_date=("effective_to", "max"),

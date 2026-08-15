@@ -225,6 +225,13 @@ def run_investor_classification(*, limit: int | None = None, model: str = DEFAUL
             continue
         try:
             judgment = classify_investor(candidate["investor_name_display"], model=model)
+            # 2026-08-15 bug found live: judgment["tier"]/["reasoning"] used to be indexed OUTSIDE
+            # this try block -- a malformed/non-conforming LLM response (schema drift, a strict-mode
+            # violation) would raise an uncaught KeyError there and abort the ENTIRE remaining batch
+            # with no fallback-telemetry record, instead of being handled as this one name's failure
+            # like every other error from this same call already is.
+            llm_tier = judgment["tier"]
+            llm_reasoning = judgment["reasoning"]
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
             counts["failed"] += 1
@@ -250,8 +257,8 @@ def run_investor_classification(*, limit: int | None = None, model: str = DEFAUL
             {
                 "investor_key": candidate["investor_key"],
                 "investor_name_display": candidate["investor_name_display"],
-                "llm_tier": judgment["tier"],
-                "llm_reasoning": judgment["reasoning"],
+                "llm_tier": llm_tier,
+                "llm_reasoning": llm_reasoning,
                 "llm_model": model,
                 "llm_prompt_version": PROMPT_VERSION,
                 "llm_classified_at": now,

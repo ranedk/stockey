@@ -211,7 +211,7 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
             _record_fallback(
                 "ocr_pipeline_document_failed",
                 source=domain,
-                reason="Fetching or OCR'ing this row's source document failed; it stays ocr_status=failed and can be retried.",
+                reason="Fetching or OCR'ing this row's source document failed; it stays ocr_status=failed permanently -- the pending-selection query only re-selects NULL/pending, so this needs a manual UPDATE to retry, not an automatic one.",
                 error=exc,
                 metadata={"news_id": row["news_id"], "url": url},
             )

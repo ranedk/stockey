@@ -16,7 +16,9 @@ in what order — check there first if this drifts.
 | `all_ohlcv_reconcile.sh` | 18:45 | `python -m data.dhanlive.ohlcv_reconcile` — backfills symbols whose latest Dhan bar is stale |
 | `all_price_adjustment.sh` | 18:50 | `python -m data.nseindia.price_adjustment` — rebuilds `nseindia_adjustment_factors`; `advisory_adjusted_ohlcv_daily` (systrader's PRIMARY series) is a view over it, not a written table |
 | `all_data_readiness.sh` | 22:30 | `python -m data.data_readiness --fix` — freshness checks + bounded repairs |
-| `all_data_coverage_report.sh` | daily | `python scripts/data_coverage_report.py` — non-fatal per-table coverage/health report, see `docs/DATA_COVERAGE.md` |
+| `all_data_coverage_report.sh` | 17:10, weekdays | `python scripts/data_coverage_report.py` — non-fatal per-table coverage/health report, see `docs/DATA_COVERAGE.md` |
+| `all_fundamentals_screener.sh` | 19:15, weekdays | `python -m fundamentals.run_pipeline` — the fundamentals-screener carve-out (sector reference, L1/L2/L3, event collectors, watchlist/narrative/email), see `docs/FUNDAMENTAL_SCREENER_PRD.md` |
+| `all_fundamentals_api.sh` | every 5 min | long-running FastAPI service (`fundamentals/api/app.py`) serving the `screener/` Nuxt frontend; cron just retries the start, `with_lock.sh`/its own health check no-op once a real instance is up |
 | `start_cron.sh` | manual | supported way to (re)start `go-crond`: runs data readiness + OHLCV reconcile first, then execs `go-crond config/stockey.generated.crontab` |
 
 All wrap through `scripts/run_with_markers.sh` (emits `[stockey.script] name=... status=start|done|failed`)

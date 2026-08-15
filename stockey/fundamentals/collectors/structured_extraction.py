@@ -422,7 +422,7 @@ def run_structured_extraction(*, limit: int | None = None, model: str = DEFAULT_
             _set_extraction_result(source=row["source"], news_id=row["news_id"], status="failed")
             _record_fallback(
                 "structured_extraction_failed",
-                reason="Structured extraction failed for this row; it stays structured_extraction_status=failed and can be retried.",
+                reason="Structured extraction failed for this row; it stays structured_extraction_status=failed permanently -- load_pending_extraction_targets only re-selects NULL/pending, so this needs a manual UPDATE to retry, not an automatic one.",
                 error=exc,
                 metadata={"news_id": row["news_id"], "filing_type": row["filing_type"]},
             )

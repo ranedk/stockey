@@ -296,7 +296,11 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
             "company_master_id": None,
             "asset_type": asset_type_lower,
             "exchange": exchange_upper,
-            "ticker": str(instrument.underlying_symbol).strip(),
+            # .upper() to match the stock branch's own ticker normalization above -- 2026-08-15
+            # found live: master_dhan_instruments.underlying_symbol has real mixed-case index rows
+            # ("Nifty IPO", "Nifty Healthcare", "Nifty GS 10Yr"); currently harmless only because
+            # the one index actually synced today (NIFTY) already happens to be uppercase.
+            "ticker": str(instrument.underlying_symbol).strip().upper(),
             "security_id": int(instrument.security_id),
             "exchange_segment": "IDX_I",
             "instrument": "INDEX",

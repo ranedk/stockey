@@ -37,7 +37,7 @@ from data.dhanlive import auth_cli as dhan_auth_cli
 from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv, scrip_master as dhan_scrip_master
-from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, recent_events, security_history
+from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, recent_events, security_dimension, security_history
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
@@ -446,6 +446,44 @@ def test_security_history_records_load_fallback(monkeypatch):
     assert isinstance(events[0]["error"], RuntimeError)
 
 
+def test_build_dim_security_price_row_count_is_summed_not_suffixed(monkeypatch):
+    # 2026-08-15 bug found live: `latest` (one history row's own price_row_count) and `summary`
+    # (the real SUM across all of a security's identity history) both carried a column named
+    # price_row_count into the same merge -- pandas silently renamed them price_row_count_x/_y
+    # instead of erroring, so no query anywhere could ever select the real, intended
+    # (summed) price_row_count. Confirmed live: dim_security has exactly that _x/_y split today.
+    history = pd.DataFrame(
+        [
+            {
+                "security_id": 1, "raw_security_key": "k1", "symbol": "ABC", "series": "EQ", "isin": "INE001",
+                "effective_from": "2020-01-01", "effective_to": "2021-01-01", "price_row_count": 100,
+                "mapping_source": "nse", "confidence": 1.0, "relation_type": "same",
+            },
+            {
+                "security_id": 1, "raw_security_key": "k1", "symbol": "ABC", "series": "EQ", "isin": "INE001",
+                "effective_from": "2021-01-01", "effective_to": "2026-01-01", "price_row_count": 250,
+                "mapping_source": "nse", "confidence": 1.0, "relation_type": "same",
+            },
+        ]
+    )
+    empty_dhan = pd.DataFrame(columns=["symbol", "series", "exch_id", "display_name", "instrument", "instrument_type", "tick_size", "lot_size"])
+    empty_company_master = pd.DataFrame(columns=["company_master_id", "symbol", "bse_ticker", "company_name", "sector_code"])
+
+    def fake_sql_to_df(query, **_k):
+        if "dim_security_history" in query:
+            return history
+        if "master_dhan_instruments" in query:
+            return empty_dhan
+        return empty_company_master
+
+    monkeypatch.setattr(security_dimension, "sql_to_df", fake_sql_to_df)
+
+    df = security_dimension.build_dim_security()
+
+    assert "price_row_count" in df.columns
+    assert "price_row_count_x" not in df.columns
+    assert "price_row_count_y" not in df.columns
+    assert df.iloc[0]["price_row_count"] == 350  # summed across both history rows, not just the latest one (250)
 
 
 def test_db_dedupe_for_upsert_keeps_last_on_conflict_keys():
@@ -3239,6 +3277,22 @@ def test_dhan_benchmark_identity_resolves_common_index_alias(monkeypatch):
     assert identity["ticker"] == "NIFTY"
     assert identity["security_id"] == 13
     assert identity["exchange_segment"] == "IDX_I"
+
+
+def test_dhan_index_identity_uppercases_mixed_case_underlying_symbol(monkeypatch):
+    # 2026-08-15 bug found live: the index branch skipped .upper(), unlike the stock branch --
+    # master_dhan_instruments.underlying_symbol has real mixed-case index rows ("Nifty Healthcare",
+    # "Nifty GS 10Yr"). Currently harmless only because NIFTY (the sole synced index) is already
+    # uppercase; this guards against a future sync silently writing a mixed-case ticker.
+    monkeypatch.setattr(
+        dhan_db,
+        "get_index_instrument",
+        lambda symbol, exchange: pd.Series({"underlying_symbol": "Nifty Healthcare", "security_id": 99}),
+    )
+
+    identity = dhan_db.resolve_dhan_identity("NIFTYHEALTHCARE", "NSE", asset_type="benchmark")
+
+    assert identity["ticker"] == "NIFTY HEALTHCARE"
 
 
 def test_dhan_index_identity_records_missing_alias_issue(monkeypatch):
@@ -11761,9 +11815,24 @@ def test_load_price_context_computes_expected_ratios(monkeypatch):
 
     assert ctx["close_on_or_before_event"] == 100.0
     assert ctx["price_pct_change_last_3_sessions"] == round((100.0 - 90.0) / 90.0 * 100, 2)
-    assert ctx["volume_on_event_vs_avg_ratio"] == round(200 / before["volume"].mean(), 2)
+    # 2026-08-15 bug found live: the baseline average must exclude the event day itself (row 0,
+    # volume=200) -- including it dilutes/understates the ratio by the event's own spike
+    # (confirmed live: nse:ONWARDTEC stored 18.1x when the true ratio was 180.9x). Prior-days-only
+    # average here is mean([50, 50]) = 50, not mean([200, 50, 50]) = 100.
+    assert ctx["volume_on_event_vs_avg_ratio"] == round(200 / 50, 2)
     assert ctx["price_pct_change_since_event"] == round((105.0 - 100.0) / 100.0 * 100, 2)
     assert ctx["sessions_since_event_available"] == 1
+
+
+def test_load_price_context_ratio_unavailable_with_only_event_day(monkeypatch):
+    # No prior-days history at all (only the event day itself) -- no guessed ratio, matching this
+    # module's "never a guessed value" discipline elsewhere.
+    before = pd.DataFrame([{"date": date(2026, 8, 4), "close": 100.0, "volume": 200}])
+    monkeypatch.setattr(fundamentals_llm_triage, "sql_to_df", lambda query, params=None: before if "date <= " in query else pd.DataFrame())
+
+    ctx = fundamentals_llm_triage.load_price_context("nse:X", date(2026, 8, 4))
+
+    assert ctx["volume_on_event_vs_avg_ratio"] is None
 
 
 def test_load_price_context_returns_empty_when_no_prior_data(monkeypatch):
@@ -12707,6 +12776,44 @@ def test_run_watch_summary_refresh_trips_circuit_breaker(monkeypatch):
     assert any(a and a[0] == "watch_summary_circuit_breaker_tripped" for a, k in fallback_events)
 
 
+def test_run_watch_summary_refresh_handles_malformed_llm_response(monkeypatch):
+    # 2026-08-15 bug found live: summary["narrative"]/["suggested_watch_duration_days"] used to be
+    # indexed OUTSIDE the try/except around the LLM call -- a response missing an expected key
+    # raised an uncaught KeyError there, aborting the entire remaining batch with no
+    # fallback-telemetry record. Now handled as this one company's failure, same as any other error.
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame(
+        [
+            {"company_master_id": "nse:BAD", "last_alert_at": date(2026, 8, 1), "narrative_generated_at": None, "narrative_text": None},
+            {"company_master_id": "nse:GOOD", "last_alert_at": date(2026, 8, 1), "narrative_generated_at": None, "narrative_text": None},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+
+    def flaky_summary(bundle, **k):
+        company_id = bundle.get("company_master_id") if isinstance(bundle, dict) else None
+        if company_id == "nse:BAD":
+            return {"suggested_watch_duration_days": 30, "confidence": "high"}  # missing "narrative"
+        return {"narrative": "fine", "suggested_watch_duration_days": 30, "confidence": "high"}
+
+    monkeypatch.setattr(fundamentals_watch_summary, "generate_watch_summary", flaky_summary)
+    monkeypatch.setattr(fundamentals_watch_summary, "build_company_evidence_bundle", lambda company_master_id, *a, **k: {"company_master_id": company_master_id})
+    updates = []
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: updates.append(kwargs))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_watch_summary, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh()
+
+    assert result["blocked"] is False  # did NOT abort on the malformed response
+    assert result["generated"] == 1
+    assert result["failed"] == 1
+    assert len(updates) == 1
+    assert updates[0]["company_master_id"] == "nse:GOOD"
+    assert any(a and a[0] == "watch_summary_generation_failed" for a, k in fallback_events)
+
+
 def test_send_email_returns_none_when_disabled(monkeypatch):
     monkeypatch.setattr(fundamentals_notifications, "WATCHLIST_ALERT_EMAIL_ENABLED", False)
     assert fundamentals_notifications.send_email("subject", "body") is None
@@ -13553,6 +13660,35 @@ def test_run_investor_classification_writes_classified_rows(monkeypatch):
     assert row["override_tier"] is None
     assert row["llm_model"] == "test-model"
     assert upserts[0][2]["unique_keys"] == ["investor_key"]
+
+
+def test_run_investor_classification_handles_malformed_llm_response(monkeypatch):
+    # 2026-08-15 bug found live: judgment["tier"]/["reasoning"] used to be indexed OUTSIDE the
+    # try/except around the LLM call -- a response missing an expected key raised an uncaught
+    # KeyError there, aborting the entire remaining batch with no fallback-telemetry record. Now
+    # handled as this one name's failure, same as any other error from the call.
+    monkeypatch.setattr(fundamentals_investor_classification, "_ensure_investor_classification_table", lambda: None)
+    candidates = [
+        {"investor_key": "bad fund", "investor_name_display": "Bad Fund", "source": "bse", "news_id": "n1"},
+        {"investor_key": "good fund", "investor_name_display": "Good Fund", "source": "bse", "news_id": "n2"},
+    ]
+    monkeypatch.setattr(fundamentals_investor_classification, "load_unclassified_investor_names", lambda limit=None: candidates)
+    monkeypatch.setattr(
+        fundamentals_investor_classification,
+        "classify_investor",
+        lambda name, **k: {"reasoning": "missing tier key"} if name == "Bad Fund" else {"tier": "unknown", "reasoning": "ok"},
+    )
+    upserts = []
+    monkeypatch.setattr(fundamentals_investor_classification, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    events = []
+    monkeypatch.setattr(fundamentals_investor_classification, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    result = fundamentals_investor_classification.run_investor_classification(model="test-model")
+
+    assert result == {"classified": 1, "failed": 1, "blocked": False}  # did NOT abort on the malformed response
+    assert len(upserts) == 1
+    assert upserts[0][0].iloc[0]["investor_key"] == "good fund"
+    assert any(e["fallback_type"] == "investor_classification_failed" and e["metadata"]["investor_key"] == "bad fund" for e in events)
 
 
 def test_run_investor_classification_trips_circuit_breaker(monkeypatch):

@@ -136,8 +136,13 @@ def load_price_context(company_master_id: str, event_date, *, lookback_days: int
 
     close_on_event = before.iloc[0]["close"]
     close_lookback_ago = before.iloc[-1]["close"]
-    avg_volume_before = before["volume"].mean()
     volume_on_event = before.iloc[0]["volume"]
+    # 2026-08-15 bug found live: averaging over `before` (which includes the event day itself,
+    # row 0) dilutes the ratio by the event's own spike -- confirmed live, e.g. nse:ONWARDTEC's
+    # 2026-06-26 event stored 18.1x when the true prior-19-day baseline ratio was 180.9x, a ~10x
+    # understatement. Prior-days-only average excludes row 0.
+    prior_volume = before["volume"].iloc[1:]
+    avg_volume_before = prior_volume.mean() if not prior_volume.empty else None
 
     context = {
         "close_on_or_before_event": float(close_on_event),
@@ -226,7 +231,7 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
             _set_triage_status(source=event_dict["source"], news_id=event_dict["news_id"], status="failed")
             _record_fallback(
                 "llm_triage_failed",
-                reason="LLM triage call failed for this event; it stays llm_triage_status=failed and can be retried.",
+                reason="LLM triage call failed for this event; it stays llm_triage_status=failed permanently -- load_candidate_events_for_triage only re-selects NULL/pending, so this needs a manual UPDATE to retry, not an automatic one.",
                 error=exc,
                 metadata={"news_id": event_dict["news_id"]},
             )

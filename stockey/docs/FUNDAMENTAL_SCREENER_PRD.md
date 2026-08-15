@@ -141,8 +141,8 @@ fundamentals/
     security_master.py     # extends dim_security/company_master (see §5) with EQUITY_L.csv + BSE scrip code
     screenerin.py           # screener.in financials/ratios/shareholding (own crawler this time, not the old advisory/ one)
     bse_announcements.py    # bseindia.com/corporates/ann.html
-    bse_pit_sast.py          # Insider_Trading_new, Sast.html, Regulation_29.aspx
-    nse_announcements.py     # nsearchives-first per fundamental_basic_goal.md §3.2; NSE is secondary/redundant, not primary
+    bse_announcements.py    # also covers PIT-SAST + results-calendar detection (3 of L3's 4 triggers in one crawler) -- built as bse_announcements.py, not the bse_pit_sast.py name planned here
+    nse_pit.py               # NSE structured PIT (api/corporates-pit) -- built as nse_pit.py, not the nse_announcements.py name planned here; NSE is secondary/redundant per fundamental_basic_goal.md §3.2
     rating_agencies.py       # CRISIL/ICRA/CARE/India Ratings/Acuité listing+detail (shell-plus-XHR pattern)
     ocr_pipeline.py          # fetch filing -> OCR (pluggable provider) -> LLM structured extraction (see §6)
   screens/
@@ -228,8 +228,9 @@ Storage split (per your instruction):
 
 ## 7. Schema (draft — refine at implementation time, not now)
 
-- `security_master` extensions: `dim_security.bse_scrip_code`,
-  reconciliation flags from the `EQUITY_L.csv` diff.
+- `security_master` extensions: `company_master.bse_scrip_code` (built here,
+  not on `dim_security` as originally planned), reconciliation flags from
+  the `EQUITY_L.csv` diff.
 - `fundamentals_events` — one normalized table, `source` as a column
   (mirrors `fundamental_basic_goal.md` §4 exactly): dedupe on
   `(isin, filing_type, disclosure_date, quantity)`, keep earliest
@@ -276,6 +277,10 @@ Concretizing `fundamental_basic_goal.md` §6 against what already exists:
    pipeline-validation step. Build `fundamentals/collectors/screenerin.py`
    scoped to only what this screen needs, not the full financials surface.
    This is the first thing that should produce a real, inspectable output.
+   (Built 2026-08-10, scheduled 2026-08-14, retired 2026-08-15 -- its
+   output table had zero readers from the day it was scheduled. Validated
+   the pipeline as intended; `screenerin.py`'s shared screener.in scraping
+   infra it built stays, used by `l1_universe.py`/`l2_state.py` today.)
 3. **L1 universe filter — built as a screener.in custom query, not a
    post-hoc SQL pass.** Decided 2026-08-10: filter at crawl time.
    screener.in's query language can express most of the source PRD's L1

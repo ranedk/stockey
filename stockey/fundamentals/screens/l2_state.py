@@ -160,9 +160,11 @@ def _record_deferred_fields_fallback() -> None:
         fallback_type="l2_fields_not_sourced",
         severity="warn",
         reason=(
-            "L2 state refresh ran without sector_cycle_phase and valuation_percentile -- "
-            "both are inherently cross-company/sector fields that belong to build-order "
-            "step 9 (sector aggregation), not a per-company state computation."
+            "L2 state refresh ran without sector_cycle_phase -- an inherently cross-company/sector "
+            "field that belongs to build-order step 9 (sector aggregation, fundamentals/screens/"
+            "sector_cycle.py), not a per-company state computation. (valuation_percentile was "
+            "un-deferred 2026-08-13, see module docstring -- this reason text is now specific to "
+            "the one field still in DEFERRED_FIELDS.)"
         ),
         error="deferred to step 9",
         metadata={"deferred_fields": list(DEFERRED_FIELDS)},

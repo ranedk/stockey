@@ -60,9 +60,13 @@ Run these sequentially — they touch the same derived identity tables, do not r
 ```sh
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
-python -m data.nseindia.adjusted_prices --only all
+python -m data.nseindia.adjusted_prices
 ```
 
-For the current operator flow, use `./complete_data.sh` for the broad refresh
-(it runs `adjusted_prices --only normalize` daily) or run the individual
-Python modules directly when debugging identity issues.
+`adjusted_prices.py`'s `--only`/adjusted-price-build modes were removed
+2026-08-14 (superseded by `data/nseindia/price_adjustment.py`'s factor
+table + `advisory_adjusted_ohlcv_daily` view) — it now only normalizes NSE
+corporate actions, no flag needed. For the current operator flow, use
+`./complete_data.sh` for the broad refresh (it runs `adjusted_prices`
+daily as part of `PARSER_STEPS`) or run the individual Python modules
+directly when debugging identity issues.

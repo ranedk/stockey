@@ -55,7 +55,7 @@ reintroduce research/signal/LLM logic here — it belongs in systrader.
 
 ## Current Architecture
 
-The core pure-TA pipeline is 6 cron jobs (`config/stockey.crontab.template`).
+The core pure-TA pipeline is 7 cron jobs (`config/stockey.crontab.template`).
 Times below are the intended IST wall-clock schedule; go-crond
 (webdevops/go-crond) has no `CRON_TZ`/`TZ` support, so the crontab file itself
 is written in UTC (IST − 5:30) — see the per-job comments in the template for

@@ -290,6 +290,13 @@ def run_watch_summary_refresh(*, limit: int | None = None, model: str = DEFAULT_
 
         try:
             summary = generate_watch_summary(evidence_bundle, model=model)
+            # 2026-08-15 bug found live: summary["narrative"]/["suggested_watch_duration_days"] used
+            # to be indexed OUTSIDE this try block -- a malformed/non-conforming LLM response would
+            # raise an uncaught KeyError there and abort the ENTIRE remaining batch with no
+            # fallback-telemetry record, instead of being handled as this one company's failure like
+            # every other error from this same call already is.
+            new_narrative_text = summary["narrative"]
+            suggested_watch_duration_days = int(summary["suggested_watch_duration_days"])
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
             counts["failed"] += 1
@@ -310,8 +317,7 @@ def run_watch_summary_refresh(*, limit: int | None = None, model: str = DEFAULT_
             continue
 
         consecutive_failures = 0
-        new_narrative_text = summary["narrative"]
-        suggested_watch_until = (now.normalize() + pd.Timedelta(days=int(summary["suggested_watch_duration_days"]))).date()
+        suggested_watch_until = (now.normalize() + pd.Timedelta(days=suggested_watch_duration_days)).date()
         _update_narrative(
             company_master_id=company_master_id,
             narrative_text=new_narrative_text,
