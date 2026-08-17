@@ -766,6 +766,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     rows: list[dict[str, object]] = []
     failed_companies: list[str] = []
     institutional_entry_events: list[dict[str, object]] = []
+    crawled: list[tuple] = []
     for _, company in universe.iterrows():
         ticker = company["ticker"]
         if not ticker:
@@ -781,7 +782,13 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         row["state_vector_version"] = STATE_VECTOR_VERSION
         row["load_ts"] = load_ts
         rows.append(row)
-        _mark_crawled(company["company_id"], ticker)
+        # _mark_crawled is NOT called here -- see below, after the batched upsert
+        # actually succeeds (BUG FOUND LIVE 2026-08-15: calling it per-company,
+        # inside this loop, meant a transient failure on the single batched write
+        # further down could leave a company's crawl-state cooldown advanced
+        # ~75 days with no corresponding fundamentals_l2_state row for this cycle
+        # at all, and no compensating fallback event).
+        crawled.append((company["company_id"], ticker))
 
         if row.get("institutional_first_entry"):
             periods = detail.get("shareholding", {}).get("periods") or []
@@ -804,6 +811,10 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             RESULTS_TABLE,
             unique_keys=["company_id", "run_date", "state_vector_version"],
         )
+        # Only advance a company's crawl-state cooldown once its L2 state row for
+        # THIS cycle is confirmed durably written -- see the loop above for why.
+        for company_id, ticker in crawled:
+            _mark_crawled(company_id, ticker)
     if institutional_entry_events:
         _ensure_events_schema()
         upsert_to_db(pd.DataFrame(institutional_entry_events), EVENTS_TABLE, unique_keys=["source", "news_id"])

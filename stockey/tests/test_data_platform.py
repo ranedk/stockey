@@ -9451,6 +9451,39 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     assert any(e["fallback_type"] == "l2_fields_not_sourced" for e in fallback_events)
 
 
+def test_run_l2_state_refresh_does_not_mark_crawled_when_the_batched_upsert_fails(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: _mark_crawled used to be called
+    # per-company INSIDE the fetch loop, well before the single batched
+    # fundamentals_l2_state upsert ran -- a transient failure on that upsert would
+    # leave a company's crawl-state cooldown advanced ~75 days with no L2 state row
+    # for this cycle at all. Now it's only called after the upsert succeeds.
+    universe = pd.DataFrame([{"company_id": 1, "company_name": "Aarey Drugs", "ticker": "AAREYDRUGS"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"rows": {"Promoters": [74.37, 74.37, 74.37, 74.37]}},
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+
+    def failing_upsert(df, table, **k):
+        raise RuntimeError("transient DB error")
+
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", failing_upsert)
+    monkeypatch.setattr(fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: None)
+    crawl_calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: crawl_calls.append((cid, ticker)))
+
+    with pytest.raises(RuntimeError):
+        fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert crawl_calls == []  # crawl-state cooldown was never advanced
+
+
 def test_run_l2_state_refresh_isolates_one_market_wide_query_failure(monkeypatch):
     # 2026-08-15 bug found live: fetch_pledge_levels/fetch_valuation_levels ran back-to-back with
     # no isolation -- either one raising took down the ENTIRE L2 step, before any per-company
@@ -12451,6 +12484,43 @@ def test_run_l3_rule_triggers_writes_an_alert_for_a_downgrade(monkeypatch):
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "alerted"}]
 
 
+def test_run_l3_rule_triggers_does_not_mark_alerted_when_the_batched_upsert_fails(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: rule_trigger_status used to be set to
+    # "alerted" per-event INSIDE the loop, before the single batched alert-row
+    # upsert ran -- a transient failure on that upsert would leave the event
+    # permanently marked "alerted" with no alert row ever written (load_candidate_
+    # events only re-selects NULL/pending). Now the status is only set AFTER the
+    # upsert succeeds, so a failing upsert must leave the event untouched (still
+    # NULL/pending) and eligible for retry next run.
+    monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "rating_action",
+                "headline": "downgrade notice", "rating_action_type": "downgraded", "transaction_type": None,
+                "insider_name": None, "quantity": None, "disclosure_date": date(2026, 8, 1),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
+    l2_state = pd.DataFrame([{"ticker": "X", "company_name": "X Ltd", "net_debt_yoy_delta_rscr": 3, "run_date": date(2026, 7, 1)}])
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: l2_state)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_investor_tiers", lambda: pd.DataFrame())
+
+    def failing_upsert(df, table, **k):
+        raise RuntimeError("transient DB error")
+
+    monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", failing_upsert)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "_set_rule_trigger_status", lambda **kwargs: status_calls.append(kwargs))
+
+    with pytest.raises(RuntimeError):
+        fundamentals_l3_triggers.run_l3_rule_triggers()
+
+    assert status_calls == []  # the event was never marked "alerted" -- stays retry-eligible
+
+
 def test_run_l3_rule_triggers_attaches_investor_tiers_to_capital_raise_reasoning(monkeypatch):
     monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
     monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
@@ -12646,6 +12716,43 @@ def test_run_llm_triage_writes_alert_when_flagged_interesting(monkeypatch):
     assert row["model"] == "test-model"
     assert row["prompt_version"] == fundamentals_llm_triage.PROMPT_VERSION
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "flagged"}]
+
+
+def test_run_llm_triage_does_not_mark_flagged_when_the_batched_upsert_fails(monkeypatch):
+    # Same bug/fix as l3_triggers.py's own rule pass (found live 2026-08-15):
+    # llm_triage_status must only be set to "flagged" AFTER the batched alert-row
+    # upsert succeeds, never before -- a failing upsert must leave the event
+    # untouched (still NULL/pending) and eligible for retry.
+    monkeypatch.setattr(fundamentals_llm_triage, "_bootstrap_triage_column", lambda: None)
+    monkeypatch.setattr(fundamentals_llm_triage, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "bse", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "rating_action",
+                "headline": "h", "subcategory": "s", "disclosure_date": date(2026, 8, 4),
+                "rating_action_type": "downgraded", "transaction_type": None, "insider_name": None,
+                "quantity": None, "structured_extraction_json": None,
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_llm_triage, "load_candidate_events_for_triage", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_llm_triage, "load_latest_l2_state", lambda: pd.DataFrame([{"ticker": "X", "run_date": date(2026, 7, 1)}]))
+    monkeypatch.setattr(fundamentals_llm_triage, "load_price_context", lambda cmid, d, **k: {"volume_on_event_vs_avg_ratio": 3.0})
+    monkeypatch.setattr(
+        fundamentals_llm_triage, "triage_event", lambda bundle, **k: {"interesting": True, "reasoning": "matters", "confidence": "high"}
+    )
+
+    def failing_upsert(df, table, **k):
+        raise RuntimeError("transient DB error")
+
+    monkeypatch.setattr(fundamentals_llm_triage, "upsert_to_db", failing_upsert)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_llm_triage, "_set_triage_status", lambda **kwargs: status_calls.append(kwargs))
+
+    with pytest.raises(RuntimeError):
+        fundamentals_llm_triage.run_llm_triage(model="test-model")
+
+    assert status_calls == []
 
 
 def test_run_llm_triage_skips_upsert_when_not_interesting(monkeypatch):
@@ -14696,6 +14803,7 @@ def test_run_investor_classification_writes_classified_rows(monkeypatch):
     assert len(upserts) == 1
     row = upserts[0][0].iloc[0]
     assert row["investor_key"] == "acme fund"
+    assert row["classification_status"] == "done"
     assert row["llm_tier"] == "unknown"
     assert row["override_tier"] is None
     assert row["llm_model"] == "test-model"
@@ -14727,7 +14835,19 @@ def test_run_investor_classification_handles_malformed_llm_response(monkeypatch)
 
     assert result == {"classified": 1, "failed": 1, "blocked": False}  # did NOT abort on the malformed response
     assert len(upserts) == 1
-    assert upserts[0][0].iloc[0]["investor_key"] == "good fund"
+    df = upserts[0][0]
+    assert len(df) == 2  # both the failed row and the successful row are written -- see below
+    good_row = df[df["investor_key"] == "good fund"].iloc[0]
+    assert good_row["classification_status"] == "done"
+    assert good_row["llm_tier"] == "unknown"
+    bad_row = df[df["investor_key"] == "bad fund"].iloc[0]
+    # BUG FOUND LIVE 2026-08-15, fixed here: a failed classification used to write
+    # NOTHING, unlike every sibling LLM-calling module's permanent-fail pattern --
+    # load_unclassified_investor_names() determines "known" purely by row presence,
+    # so a name with no persisted status was re-queued at the same stable position
+    # every run, forever.
+    assert bad_row["classification_status"] == "failed"
+    assert bad_row["llm_tier"] is None
     assert any(e["fallback_type"] == "investor_classification_failed" and e["metadata"]["investor_key"] == "bad fund" for e in events)
 
 

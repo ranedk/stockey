@@ -61,6 +61,7 @@ _INVESTOR_CLASSIFICATION_TABLE_STATEMENT = """
     CREATE TABLE IF NOT EXISTS fundamentals_investor_classification (
         investor_key TEXT PRIMARY KEY,
         investor_name_display TEXT NOT NULL,
+        classification_status TEXT,
         llm_tier TEXT,
         llm_reasoning TEXT,
         llm_model TEXT,
@@ -117,6 +118,11 @@ def _ensure_investor_classification_table() -> None:
     def _op() -> None:
         with db_session() as (_, cur):
             cur.execute(_INVESTOR_CLASSIFICATION_TABLE_STATEMENT)
+            # classification_status added 2026-08-17 -- CREATE TABLE IF NOT EXISTS
+            # above is a no-op against an already-existing table, so an explicit
+            # ALTER is needed to backfill the column onto it (same pattern as
+            # rating_agencies.py's _bootstrap_rating_columns).
+            cur.execute("ALTER TABLE fundamentals_investor_classification ADD COLUMN IF NOT EXISTS classification_status TEXT")
 
     execute_db_operation(_op, operation_name="fundamentals_investor_classification:ensure_table")
 
@@ -135,7 +141,12 @@ def load_unclassified_investor_names(limit: int | None = None) -> list[dict]:
     """Every (investor_key, investor_name_display, source, news_id) not yet in
     fundamentals_investor_classification, pulled from structured-extracted
     capital_raise events' investor_names array. A name seen in multiple filings this
-    run is only queued once (first occurrence wins first_seen_source/news_id)."""
+    run is only queued once (first occurrence wins first_seen_source/news_id).
+
+    "Already classified" is presence of ANY row for that investor_key, regardless of
+    classification_status -- a 'failed' row (see run_investor_classification) counts
+    as handled here too, requiring a manual UPDATE/DELETE to retry, matching every
+    sibling LLM-calling module's own permanent-fail convention."""
     events_df = sql_to_df(
         """
         SELECT source, news_id, structured_extraction_json
@@ -235,9 +246,38 @@ def run_investor_classification(*, limit: int | None = None, model: str = DEFAUL
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
             counts["failed"] += 1
+            # BUG FOUND LIVE 2026-08-15, fixed here: this used to write NOTHING on
+            # failure, unlike every sibling LLM-calling module (ocr_pipeline.py/
+            # structured_extraction.py/llm_triage.py all write a permanent 'failed'
+            # status, hardened specifically so a failure can't silently claim
+            # automatic retry it doesn't get). load_unclassified_investor_names()
+            # determines "already classified" purely by row PRESENCE, so a name
+            # with no persisted status at all was re-queued at the same stable
+            # queue position every single run, forever -- and if 3 such names
+            # clustered, they'd trip the circuit breaker on every run too. A
+            # 'failed' row (llm_tier left None -- never a guessed/real tier)
+            # requires the same deliberate manual reset the sibling modules do.
+            rows.append(
+                {
+                    "investor_key": candidate["investor_key"],
+                    "investor_name_display": candidate["investor_name_display"],
+                    "classification_status": "failed",
+                    "llm_tier": None,
+                    "llm_reasoning": None,
+                    "llm_model": model,
+                    "llm_prompt_version": PROMPT_VERSION,
+                    "llm_classified_at": now,
+                    "override_tier": None,
+                    "override_notes": None,
+                    "override_at": None,
+                    "first_seen_source": candidate["source"],
+                    "first_seen_news_id": candidate["news_id"],
+                    "load_ts": now,
+                }
+            )
             _record_fallback(
                 "investor_classification_failed",
-                reason="Investor classification LLM call failed for this name; it stays unclassified and can be retried next run.",
+                reason="Investor classification LLM call failed for this name; classification_status='failed' permanently -- requires a manual UPDATE to retry, matching ocr_pipeline.py/structured_extraction.py/llm_triage.py's own established pattern.",
                 error=exc,
                 metadata={"investor_key": candidate["investor_key"]},
             )
@@ -257,6 +297,7 @@ def run_investor_classification(*, limit: int | None = None, model: str = DEFAUL
             {
                 "investor_key": candidate["investor_key"],
                 "investor_name_display": candidate["investor_name_display"],
+                "classification_status": "done",
                 "llm_tier": llm_tier,
                 "llm_reasoning": llm_reasoning,
                 "llm_model": model,

@@ -802,10 +802,21 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }
         )
-        _set_rule_trigger_status(source=event_dict["source"], news_id=event_dict["news_id"], status="alerted")
+        # rule_trigger_status is NOT set to "alerted" here -- see below, after the
+        # batched upsert actually succeeds.
 
     if alert_rows:
         upsert_to_db(pd.DataFrame(alert_rows), RESULTS_TABLE, unique_keys=["source", "news_id", "trigger_type"])
+        # BUG FOUND LIVE 2026-08-15, fixed here: this used to set rule_trigger_status
+        # = "alerted" per-event INSIDE the loop above, each its own committed
+        # transaction, well before this single batched upsert ran. A transient
+        # failure on THIS call would have left every already-processed event in the
+        # batch marked "alerted" with no corresponding fundamentals_l3_alerts row
+        # ever written -- load_candidate_events() only re-selects NULL/pending, so
+        # they'd be permanently suppressed with no retry. Only mark an event
+        # "alerted" once its alert row is confirmed durably written.
+        for row in alert_rows:
+            _set_rule_trigger_status(source=row["source"], news_id=row["news_id"], status="alerted")
 
     return counts
 

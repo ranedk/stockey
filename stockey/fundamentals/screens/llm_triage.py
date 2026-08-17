@@ -270,10 +270,19 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }
         )
-        _set_triage_status(source=event_dict["source"], news_id=event_dict["news_id"], status="flagged")
+        # llm_triage_status is NOT set to "flagged" here -- see below, after the
+        # batched upsert actually succeeds (same bug/fix as l3_triggers.py's own
+        # rule pass, found live 2026-08-15).
 
     if alert_rows:
         upsert_to_db(pd.DataFrame(alert_rows), RESULTS_TABLE, unique_keys=["source", "news_id", "trigger_type"])
+        # Only mark an event "flagged" once its alert row is confirmed durably
+        # written -- a transient failure on this single batched upsert would
+        # otherwise leave every already-processed event in the batch marked
+        # "flagged" with no corresponding fundamentals_l3_alerts row, permanently
+        # suppressed (load_candidate_events_for_triage only re-selects NULL/pending).
+        for row in alert_rows:
+            _set_triage_status(source=row["source"], news_id=row["news_id"], status="flagged")
 
     return {**counts, "blocked": blocked}
 
