@@ -177,12 +177,29 @@ def build_identity_break_events(identity_breaks: pd.DataFrame) -> pd.DataFrame:
     """Write dim_security_review_events rows for symbols whose EQUITY_L.csv ISIN
     disagrees with dim_security's current one -- same event_type and event_key
     scheme data.nseindia.security_history.build_review_events uses, so these land in
-    the one existing manual-review queue rather than a second one."""
+    the one existing manual-review queue rather than a second one.
+
+    BUG FOUND LIVE 2026-08-17: "current" used to mean "whichever row Postgres happened
+    to return last for that symbol" -- SELECT with no ORDER BY, then pandas
+    drop_duplicates(keep="last") over that undefined order. Every sibling query in this
+    module that needs "the current row per symbol" (see backfill_bse_scrip_codes above)
+    already uses DISTINCT ON (...) ORDER BY last_trade_date DESC NULLS LAST,
+    effective_to DESC NULLS LAST to pick deterministically; this one didn't. 20 real
+    symbols have more than one dim_security row and would have been affected -- no
+    wrong review event confirmed yet, but the picked "prior" isin/security_id was
+    exposed to Postgres's own unspecified row order, not the actual current row."""
     if identity_breaks.empty:
         return pd.DataFrame()
 
-    current = sql_to_df("SELECT isin, symbol, series, security_id FROM dim_security WHERE isin IS NOT NULL")
-    current_by_symbol = current.drop_duplicates(subset=["symbol"], keep="last").set_index("symbol")
+    current = sql_to_df(
+        """
+        SELECT DISTINCT ON (symbol) isin, symbol, series, security_id
+        FROM dim_security
+        WHERE isin IS NOT NULL
+        ORDER BY symbol, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST
+        """
+    )
+    current_by_symbol = current.set_index("symbol")
 
     events: list[dict[str, object]] = []
     now = pd.Timestamp.now(tz="UTC")

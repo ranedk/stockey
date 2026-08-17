@@ -8669,6 +8669,39 @@ def test_copy_bse_scrip_code_from_ticker_skips_when_nothing_eligible(monkeypatch
     assert upserts == []
 
 
+def test_build_identity_break_events_returns_empty_for_no_breaks():
+    result = fundamentals_security_master.build_identity_break_events(pd.DataFrame())
+    assert result.empty
+
+
+def test_build_identity_break_events_picks_current_row_deterministically(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: the "current" dim_security row per symbol used to be
+    # picked by pandas drop_duplicates(keep="last") over a SELECT with no ORDER BY --
+    # Postgres's row order without ORDER BY is unspecified, so "last" was effectively
+    # arbitrary. Every sibling query in this module that needs "current row per
+    # symbol" (backfill_bse_scrip_codes) already uses DISTINCT ON (...) ORDER BY
+    # last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST; this pins the
+    # same deterministic query shape here.
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        # Simulate Postgres's own DISTINCT ON already having picked one row per
+        # symbol -- Python-side dedup logic no longer exists to test independently,
+        # so the query text itself is the thing under test.
+        return pd.DataFrame([{"isin": "INE_CURRENT", "symbol": "TEST", "series": "EQ", "security_id": "sec-current"}])
+
+    monkeypatch.setattr(fundamentals_security_master, "sql_to_df", fake_sql_to_df)
+
+    identity_breaks = pd.DataFrame([{"SYMBOL": "TEST", "SERIES": "EQ", "ISIN NUMBER": "INE_NEW"}])
+    result = fundamentals_security_master.build_identity_break_events(identity_breaks)
+
+    assert "DISTINCT ON (symbol)" in captured["query"]
+    assert "ORDER BY symbol, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST" in captured["query"]
+    assert result.iloc[0]["isin"] == "INE_CURRENT"  # the prior isin, from the deterministically-picked row
+    assert result.iloc[0]["related_isin"] == "INE_NEW"
+
+
 # fundamentals/collectors/screenerin.py -- shared screener.in scraping infra (used by L1/L2).
 
 SCREENERIN_FIXTURE_HTML = """
@@ -9162,6 +9195,38 @@ def test_compute_debt_trajectory_matches_hand_computed_values():
         "interest_coverage": 31 / 3,
         "debt_to_ebitda": 3 / 31,
     }
+
+
+def test_compute_debt_trajectory_aligns_pl_to_balance_sheets_own_latest_period():
+    # BUG FOUND LIVE 2026-08-17: operating_profit_latest/interest_latest used to be
+    # the P&L table's own last column unconditionally -- screener.in's P&L table
+    # always carries a trailing TTM column the Balance Sheet table doesn't (confirmed
+    # live for a real company), so the two "latest" lookups could silently land on
+    # different reference dates. Real Reliance figures: Balance Sheet's latest column
+    # was Mar 2026, but P&L's own last column was TTM with a materially different
+    # Operating Profit (60,767 vs the Mar-2026-aligned 54,455). This fixture pins that
+    # exact shape: TTM's Operating Profit/Interest deliberately differ from Mar 2026's.
+    balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
+    profit_loss = fundamentals_l2_state._parse_period_table(
+        _table(
+            "<table><tr><th></th><th>Mar 2025</th><th>Mar 2026</th><th>TTM</th></tr>"
+            "<tr><td>Operating Profit</td><td>32</td><td>31</td><td>99</td></tr>"
+            "<tr><td>Interest</td><td>4</td><td>3</td><td>9</td></tr></table>"
+        )
+    )
+
+    result = fundamentals_l2_state.compute_debt_trajectory(balance_sheet, profit_loss)
+
+    # Balance sheet's own latest column is Mar 2026 (net_debt_rscr=3) -- P&L must be
+    # read at that SAME period (31/3), never TTM's 99/9, however much later TTM ends.
+    assert result["interest_coverage"] == 31 / 3
+    assert result["debt_to_ebitda"] == 3 / 31
+
+
+def test_value_at_period_returns_none_when_period_label_absent():
+    profit_loss = fundamentals_l2_state._parse_period_table(_table(PROFIT_LOSS_FIXTURE_HTML))
+    assert fundamentals_l2_state._value_at_period(profit_loss, "Operating Profit", period_label="Mar 1999") is None
+    assert fundamentals_l2_state._value_at_period(profit_loss, "Operating Profit", period_label=None) is None
 
 
 def test_compute_debt_trajectory_returns_none_ratios_when_interest_is_zero():

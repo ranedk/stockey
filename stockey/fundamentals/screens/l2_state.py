@@ -267,6 +267,26 @@ def _value_at(period_table: dict[str, object], label: str, *, offset: int = 0):
     return values[index]
 
 
+def _value_at_period(period_table: dict[str, object], label: str, *, period_label: str | None):
+    """Same as _value_at, but keyed by an explicit period LABEL (e.g. "Mar 2026")
+    instead of a trailing offset -- for reading one table's column at the SAME
+    reference date as a column already picked from a DIFFERENT table, whose own
+    period list may not line up 1:1. See compute_debt_trajectory's own docstring for
+    why this exists: screener.in's Profit & Loss table always carries a trailing TTM
+    column (confirmed live 2026-08-17) the Balance Sheet table doesn't, so two
+    independent offset=0 lookups can silently land on different dates."""
+    if period_label is None:
+        return None
+    periods = period_table.get("periods", [])
+    values = period_table.get("rows", {}).get(label)
+    if not values or period_label not in periods:
+        return None
+    index = periods.index(period_label)
+    if index >= len(values):
+        return None
+    return values[index]
+
+
 def compute_trend_direction(values: list) -> dict[str, object]:
     """Multi-year trend read over a chronological (oldest-first, matching _value_at's own
     convention) numeric series -- e.g. screener.in's annual Balance Sheet rows, confirmed live
@@ -321,6 +341,17 @@ def compute_trend_direction(values: list) -> dict[str, object]:
 
 
 def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[str, object]) -> dict[str, object]:
+    # net_debt_rscr is GROSS Borrowings, not net of cash & cash equivalents -- BUG
+    # FOUND LIVE 2026-08-17, documented (not fixed by netting) here: screener.in's
+    # condensed Balance Sheet section has no separate Cash/Cash Equivalents row at
+    # all (confirmed live against a real company's rendered table -- Reserves/
+    # Borrowings/Other Liabilities/Fixed Assets/CWIP/Investments/Other Assets is the
+    # full row set, cash is folded into Other Assets with no way to isolate it), so a
+    # true net-of-cash figure isn't derivable from this data source at this level of
+    # detail. Accepted as a documented approximation, not a silent one -- every
+    # consumer (l3_triggers.py, watch_summary.py, l4_thesis.py) reads this as a
+    # directional/trend signal (net_debt_yoy_delta_rscr, trend_direction), never as
+    # an absolute net-debt figure on its own.
     net_debt_latest = _value_at(balance_sheet, "Borrowings")
     net_debt_preceding = _value_at(balance_sheet, "Borrowings", offset=1)
     net_debt_yoy_delta = (
@@ -330,8 +361,20 @@ def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[
     )
     debt_trend = compute_trend_direction(balance_sheet.get("rows", {}).get("Borrowings") or [])
 
-    operating_profit_latest = _value_at(profit_loss, "Operating Profit")
-    interest_latest = _value_at(profit_loss, "Interest")
+    # BUG FOUND LIVE 2026-08-17: operating_profit_latest/interest_latest used to be
+    # _value_at(profit_loss, ..., offset=0) -- the P&L table's OWN last column, which
+    # screener.in always populates as a rolling TTM figure, not the same fiscal-year-
+    # end the Balance Sheet table's own last column (net_debt_latest above) actually
+    # is. Confirmed live for a real company: Balance Sheet's latest column was "Mar
+    # 2026", but P&L's latest column was "TTM" -- a real, later-ending window whose
+    # Operating Profit (60,767) differed materially from the Mar-2026-aligned figure
+    # (54,455), silently understating debt_to_ebitda (3.85 vs the correctly-aligned
+    # 4.30). Now read at the SAME period label as net_debt_latest's own column,
+    # keeping every "latest" figure in this state vector on one consistent date.
+    latest_balance_sheet_period = balance_sheet.get("periods") or [None]
+    latest_balance_sheet_period = latest_balance_sheet_period[-1]
+    operating_profit_latest = _value_at_period(profit_loss, "Operating Profit", period_label=latest_balance_sheet_period)
+    interest_latest = _value_at_period(profit_loss, "Interest", period_label=latest_balance_sheet_period)
     interest_coverage = (
         operating_profit_latest / interest_latest
         if isinstance(operating_profit_latest, (int, float))
