@@ -9879,6 +9879,20 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
         (None, "Allotment of shares on preferential basis to ABC Fund LP", "capital_raise"),
         (None, "Allotment pursuant to Qualified Institutions Placement", "capital_raise"),
         ("General", "Rights Issue - Allotment of Equity Shares", "capital_raise"),
+        # Real (subcategory, headline) pairs, captured live 2026-08-17: forward-
+        # looking capital_raise-shaped filings, nothing actually allotted/raised yet
+        # -- must stay "other", same "Board Meeting" (no "Outcome of") forward-
+        # looking signal the results check above already established, plus a Postal
+        # Ballot notice (seeking approval) and a compliance certificate about a still-
+        # "Proposed" issue. See classify_announcement's own capital_raise comment.
+        ("Board Meeting", "Diamines & Chemicals Ltd-has informed BSE that the meeting of the Board of Directors of the Company is scheduled on 24/03/2026, inter alia, to consider and approve conversion of warrants", "other"),
+        ("Postal Ballot", "Postal Ballot Notice for consider the issue of 1000000 Warrants to Mr. Shailesh Siroya, promoter of the Company on preferential basis", "other"),
+        ("General", "As requested by BSE Listing Team, please find enclosed herewith the Certificate wrt the Proposed Preferential Issue", "other"),
+        # Same "Outcome of Board Meeting" subcategory as the results checks above --
+        # must NOT be caught by the new "board meeting" exclusion (a substring check
+        # would wrongly exclude this genuinely-completed raise; only an EXACT
+        # subcategory match to "board meeting" is excluded).
+        ("Outcome of Board Meeting", "Outcome of Board Meeting held on 29.06.2026 for raising of funds through Rights Issue", "capital_raise"),
         # Real (subcategory, headline) pairs, captured live 2026-08-13 against 40 real
         # companies' 3yr BSE history -- see AUDITOR_CHANGE_KEYWORDS' comment.
         ("Appointment of Statutory Auditor/s", "Resignation of Statutory Auditor.", "auditor_change"),

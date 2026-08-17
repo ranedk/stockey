@@ -138,6 +138,13 @@ CAPITAL_RAISE_KEYWORDS = (
 # of which subcategory the row landed in.
 DEBT_INSTRUMENT_EXCLUSION_KEYWORDS = ("ncd", "non-convertible debenture", "debenture")
 
+# BUG FOUND LIVE 2026-08-17 (see classify_announcement's own capital_raise comment):
+# forward-looking capital_raise-shaped filings -- nothing actually allotted/raised
+# yet -- confirmed against 2 real rows, both a "General"-subcategory compliance
+# certificate about a still-"Proposed Preferential Issue" and an intimation about a
+# rights-issue-committee meeting "scheduled to be held" that was then postponed.
+CAPITAL_RAISE_FORWARD_LOOKING_HEADLINE_KEYWORDS = ("proposed preferential", "scheduled to be held", "is scheduled on")
+
 # L1 universe filter's two DEFERRED_CHECKS (auditor change, RPT) -- 2026-08-13, built
 # once fundamentals/screens/l1_universe.py's own docstring turned out to be checking
 # the wrong source (screener.in has neither; BSE announcements have both). Confirmed
@@ -257,6 +264,25 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
     if any(keyword in subcategory_text for keyword in CAPITAL_RAISE_KEYWORDS) or any(
         keyword in headline_text for keyword in CAPITAL_RAISE_KEYWORDS
     ):
+        # BUG FOUND LIVE 2026-08-17: unlike the sibling `results` check above (which
+        # excludes a plain "Board Meeting" subcategory -- forward-looking, nothing
+        # decided yet -- from a completed "Outcome of Board Meeting"), capital_raise
+        # had no equivalent exclusion at all. Confirmed live: of 29 real capital_raise
+        # rows, 2 were "Board Meeting" subcategory (scheduled, not yet held -- exact
+        # match against subcategory_text, NOT a substring check, since "board
+        # meeting" is also a substring of the genuinely-completed "outcome of board
+        # meeting"), 1 was a "Postal Ballot" notice (seeking shareholder approval,
+        # nothing approved yet), and 1 was a "General"-subcategory compliance
+        # certificate headlined "...wrt the Proposed Preferential Issue" (still
+        # proposed, nothing allotted). None of these four had actually raised
+        # anything -- exactly the "forward-looking agenda, not completed" false
+        # positive the results check next door already guards against.
+        if subcategory_text.strip() == "board meeting":
+            return "other"
+        if subcategory_text.strip() == "postal ballot":
+            return "other"
+        if any(keyword in headline_text for keyword in CAPITAL_RAISE_FORWARD_LOOKING_HEADLINE_KEYWORDS):
+            return "other"
         if not any(keyword in headline_text for keyword in DEBT_INSTRUMENT_EXCLUSION_KEYWORDS):
             return "capital_raise"
 
