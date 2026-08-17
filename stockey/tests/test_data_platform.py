@@ -8959,7 +8959,21 @@ def test_rpt_excludes_only_when_applicable_and_over_threshold():
     assert fundamentals_l1_universe._rpt_excludes([]) is False
 
 
+def _mock_identity_resolution_nse_prefix(monkeypatch):
+    """apply_post_hoc_exclusions now resolves identity via
+    map_company_master_ids_nse_or_bse instead of a naive 'nse:'+ticker string (see
+    its own docstring for the bug this fixes) -- most of these tests aren't
+    exercising that resolution itself, so mock it to the same "nse:"+ticker mapping
+    the tests originally assumed, for continuity."""
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series([f"nse:{t}" for t in tickers], index=tickers.index, dtype="string"),
+    )
+
+
 def test_apply_post_hoc_exclusions_missing_data_never_excludes(monkeypatch):
+    _mock_identity_resolution_nse_prefix(monkeypatch)
     companies = [{"company_id": 1, "name": "No History Co", "ticker": "NOHIST", "url": "", "metrics": {}}]
     monkeypatch.setattr(fundamentals_l1_universe, "load_auditor_rpt_events_for_companies", lambda cmids: pd.DataFrame())
 
@@ -8970,6 +8984,7 @@ def test_apply_post_hoc_exclusions_missing_data_never_excludes(monkeypatch):
 
 
 def test_apply_post_hoc_exclusions_excludes_on_confirmed_auditor_change(monkeypatch):
+    _mock_identity_resolution_nse_prefix(monkeypatch)
     companies = [
         {"company_id": 1, "name": "Changed Auditor Co", "ticker": "CHANGED", "url": "", "metrics": {}},
         {"company_id": 2, "name": "Clean Co", "ticker": "CLEAN", "url": "", "metrics": {}},
@@ -8991,6 +9006,7 @@ def test_apply_post_hoc_exclusions_excludes_on_confirmed_auditor_change(monkeypa
 
 
 def test_apply_post_hoc_exclusions_excludes_on_material_rpt(monkeypatch):
+    _mock_identity_resolution_nse_prefix(monkeypatch)
     companies = [{"company_id": 1, "name": "Big RPT Co", "ticker": "BIGRPT", "url": "", "metrics": {}}]
     events_df = pd.DataFrame(
         [
@@ -9013,6 +9029,40 @@ def test_apply_post_hoc_exclusions_empty_companies_list(monkeypatch):
     survivors, exclusions = fundamentals_l1_universe.apply_post_hoc_exclusions([])
     assert survivors == []
     assert exclusions == {"excluded_auditor_change": [], "excluded_related_party_transaction": []}
+
+
+def test_apply_post_hoc_exclusions_resolves_bse_numeric_ticker_correctly(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: a company whose L1 ticker is actually a
+    # raw BSE numeric scrip code (confirmed live: 22% of the real L1 universe) used
+    # to build company_master_id as the wrong 'nse:<scrip code>' string, so a real
+    # auditor-change/RPT violation for it was silently never found. This pins the
+    # fix: the resolved (not naive) company_master_id is what gets queried.
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series(["nse:ALUFLUOR" if t == "524634" else pd.NA for t in tickers], index=tickers.index, dtype="string"),
+    )
+    companies = [{"company_id": 1, "name": "Alufluoride", "ticker": "524634", "url": "", "metrics": {}}]
+    events_df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:ALUFLUOR", "filing_type": "auditor_change", "disclosure_date": "2026-01-01",
+                "structured_extraction_json": json.dumps({"disclosure_type": "confirmed_change"}),
+            }
+        ]
+    )
+    captured_cmids = []
+    monkeypatch.setattr(
+        fundamentals_l1_universe,
+        "load_auditor_rpt_events_for_companies",
+        lambda cmids: captured_cmids.append(cmids) or events_df,
+    )
+
+    survivors, exclusions = fundamentals_l1_universe.apply_post_hoc_exclusions(companies)
+
+    assert captured_cmids == [["nse:ALUFLUOR"]]  # queried the RESOLVED id, not "nse:524634"
+    assert survivors == []
+    assert exclusions["excluded_auditor_change"] == ["Alufluoride"]
 
 
 # fundamentals/screens/l2_state.py -- L2 watch-state store (step 4).
@@ -9240,7 +9290,12 @@ def test_compute_institutional_stake_empty_shareholding_returns_none_and_false()
     assert result == {"institutional_pct": None, "institutional_stake_direction": None, "institutional_first_entry": False}
 
 
-def test_build_institutional_entry_event_row_shape():
+def test_build_institutional_entry_event_row_shape(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_l2_state,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series([f"nse:{t}" for t in tickers], index=tickers.index, dtype="string"),
+    )
     row = {"ticker": "TESTCO", "institutional_pct": 2.1, "run_date": date(2026, 8, 13)}
     event = fundamentals_l2_state._build_institutional_entry_event_row(row, latest_period="Jun 2026", load_ts=pd.Timestamp("2026-08-13", tz="UTC"))
     assert event["source"] == "l2_state"
@@ -9251,6 +9306,21 @@ def test_build_institutional_entry_event_row_shape():
     assert event["disclosure_date"] == date(2026, 8, 13)
     assert "2.1" in event["headline"]
     assert "re-entry" in event["headline"]  # 2026-08-13: caveat the ~3yr lookback window, not "first ever"
+
+
+def test_build_institutional_entry_event_row_resolves_bse_numeric_ticker_correctly(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: company_master_id used to be built as
+    # the naive f"nse:{ticker}" string -- wrong for a BSE-numeric-scrip-code ticker,
+    # which would silently orphan this synthetic event under an id nothing else in
+    # the pipeline resolves to.
+    monkeypatch.setattr(
+        fundamentals_l2_state,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series(["nse:ALUFLUOR" if t == "524634" else pd.NA for t in tickers], index=tickers.index, dtype="string"),
+    )
+    row = {"ticker": "524634", "institutional_pct": 2.1, "run_date": date(2026, 8, 13)}
+    event = fundamentals_l2_state._build_institutional_entry_event_row(row, latest_period="Jun 2026", load_ts=pd.Timestamp("2026-08-13", tz="UTC"))
+    assert event["company_master_id"] == "nse:ALUFLUOR"  # not the naive "nse:524634"
 
 
 def test_fetch_pledge_levels_builds_dict_keyed_by_company_id(monkeypatch):
@@ -9351,6 +9421,11 @@ def test_fetch_valuation_levels_builds_dict_keyed_by_company_id(monkeypatch):
 
 
 def test_load_sector_codes_for_tickers_strips_nse_prefix(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_l2_state,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series([f"nse:{t}" for t in tickers], index=tickers.index, dtype="string"),
+    )
     df = pd.DataFrame([{"company_master_id": "nse:AAREYDRUGS", "sector_code": "IN01"}])
     captured = {}
 
@@ -9364,6 +9439,32 @@ def test_load_sector_codes_for_tickers_strips_nse_prefix(monkeypatch):
 
     assert result == {"AAREYDRUGS": "IN01"}
     assert captured["params"] == (["nse:AAREYDRUGS"],)
+
+
+def test_load_sector_codes_for_tickers_resolves_bse_numeric_ticker_correctly(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: this used to build company_master_id as
+    # the naive f"nse:{ticker}" string -- wrong for a BSE-numeric-scrip-code ticker.
+    # Confirmed live: ticker "524634" truly resolves to "nse:ALUFLUOR", and the
+    # returned dict is still keyed by the ORIGINAL ticker ("524634"), matching what
+    # compute_valuation_sector_percentiles looks up by (row["ticker"]).
+    monkeypatch.setattr(
+        fundamentals_l2_state,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series(["nse:ALUFLUOR" if t == "524634" else pd.NA for t in tickers], index=tickers.index, dtype="string"),
+    )
+    df = pd.DataFrame([{"company_master_id": "nse:ALUFLUOR", "sector_code": "IN02"}])
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["params"] = params
+        return df
+
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_l2_state.load_sector_codes_for_tickers(["524634"])
+
+    assert result == {"524634": "IN02"}  # keyed by the original ticker, not the resolved id
+    assert captured["params"] == (["nse:ALUFLUOR"],)  # queried the resolved id, not "nse:524634"
 
 
 def test_load_sector_codes_for_tickers_empty_input_skips_query(monkeypatch):
@@ -13153,6 +13254,43 @@ def test_run_sector_reference_refresh_upserts_sector_table(monkeypatch):
 
 
 # fundamentals/screens/sector_cycle.py -- sector capital-cycle aggregation (step 9).
+
+
+def test_load_l1_companies_with_sector_resolves_bse_numeric_ticker_correctly(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: this used to join dim_security on a
+    # naive 'nse:' || ticker SQL string -- wrong for the ~22% of L1 tickers that are
+    # actually raw BSE numeric scrip codes (confirmed live). Two real companies
+    # (KSE/519421, SUPER/512527) were silently dropped from sector aggregation by
+    # this before the fix; this test pins the mechanism, not the live figures.
+    l1_df = pd.DataFrame(
+        [
+            {"company_id": 1, "company_name": "Alufluoride", "ticker": "524634", "metrics_json": json.dumps({"qtr_sales_var_pct": -39.28})},
+            {"company_id": 2, "company_name": "Reliance", "ticker": "RELIANCE", "metrics_json": json.dumps({"qtr_sales_var_pct": 5.0})},
+        ]
+    )
+    sector_df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:ALUFLUOR", "sector_code": "IN02"},
+            {"company_master_id": "nse:RELIANCE", "sector_code": "IN03"},
+        ]
+    )
+    call_count = {"n": 0}
+
+    def fake_sql_to_df(query, **kwargs):
+        call_count["n"] += 1
+        return l1_df if call_count["n"] == 1 else sector_df
+
+    monkeypatch.setattr(fundamentals_sector_cycle, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(
+        fundamentals_sector_cycle,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series(["nse:ALUFLUOR" if t == "524634" else "nse:RELIANCE" for t in tickers], index=tickers.index, dtype="string"),
+    )
+
+    result = fundamentals_sector_cycle.load_l1_companies_with_sector()
+
+    assert dict(zip(result["ticker"], result["sector_code"])) == {"524634": "IN02", "RELIANCE": "IN03"}
+    assert "company_master_id" not in result.columns  # internal-only, same output shape as before the fix
 
 
 def test_classify_phase_expansion_when_capacity_outruns_demand():

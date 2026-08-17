@@ -65,6 +65,7 @@ import json
 import pandas as pd
 
 from fundamentals.collectors.screenerin import build_authenticated_session, run_query
+from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -115,24 +116,43 @@ def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = 
 def load_l1_companies_with_sector() -> pd.DataFrame:
     """Latest L1 universe, joined to dim_security.sector_code (most recent row per
     company) and with qtr_sales_var_pct pulled out of metrics_json -- the demand-side
-    input, already collected by L1's own crawl."""
-    df = sql_to_df(
+    input, already collected by L1's own crawl.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: the join used to build company_master_id
+    as a naive 'nse:' || ticker SQL concatenation. fundamentals_l1_universe.ticker is
+    whatever screener.in's own company-URL slug is -- sometimes a real NSE symbol,
+    sometimes a raw BSE numeric scrip code (confirmed live: 43/192, 22%, of the
+    current L1 universe -- e.g. ticker "524634" truly resolves to company_master_id
+    'nse:ALUFLUOR' via company_master, not the naive 'nse:524634'). The naive join
+    silently found no sector_code for every one of those companies. Resolved the
+    same way every other identity lookup in this codebase already does it
+    (map_company_master_ids_nse_or_bse, NSE-first with a BSE-ticker fallback) instead
+    of a second, incorrect ad-hoc construction."""
+    l1 = sql_to_df(
         """
-        SELECT l1.company_id, l1.company_name, l1.ticker, l1.metrics_json, ds.sector_code
-        FROM fundamentals_l1_universe l1
-        LEFT JOIN LATERAL (
-            SELECT sector_code FROM dim_security
-            WHERE company_master_id = 'nse:' || l1.ticker AND sector_code IS NOT NULL
-            ORDER BY last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST
-            LIMIT 1
-        ) ds ON TRUE
-        WHERE l1.run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
+        SELECT company_id, company_name, ticker, metrics_json
+        FROM fundamentals_l1_universe
+        WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
         """
     )
-    if df.empty:
-        return df
-    df["qtr_sales_var_pct"] = df["metrics_json"].apply(lambda raw: json.loads(raw).get("qtr_sales_var_pct") if raw else None)
-    return df.drop(columns=["metrics_json"])
+    if l1.empty:
+        return l1
+
+    l1["company_master_id"] = map_company_master_ids_nse_or_bse(l1["ticker"])
+
+    sector_df = sql_to_df(
+        """
+        SELECT DISTINCT ON (company_master_id) company_master_id, sector_code
+        FROM dim_security
+        WHERE sector_code IS NOT NULL
+        ORDER BY company_master_id, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST
+        """
+    )
+    sector_by_cmid = dict(zip(sector_df["company_master_id"], sector_df["sector_code"])) if not sector_df.empty else {}
+    l1["sector_code"] = l1["company_master_id"].map(sector_by_cmid)
+
+    l1["qtr_sales_var_pct"] = l1["metrics_json"].apply(lambda raw: json.loads(raw).get("qtr_sales_var_pct") if raw else None)
+    return l1.drop(columns=["metrics_json", "company_master_id"])
 
 
 def fetch_gross_block_data(session=None) -> dict[int, dict[str, float]]:

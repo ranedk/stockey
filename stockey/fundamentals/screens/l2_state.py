@@ -121,6 +121,7 @@ from fundamentals.collectors.events_store import _ensure_events_schema
 from fundamentals.collectors.screenerin import build_authenticated_session, clean_text, run_query
 from fundamentals.collectors.screenerin import to_number as _screenerin_to_number
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
+from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
@@ -479,20 +480,38 @@ def fetch_valuation_levels(session) -> dict[int, dict[str, float]]:
 
 
 def load_sector_codes_for_tickers(tickers: list[str]) -> dict[str, str]:
-    """ticker -> sector_code via dim_security, using the same 'nse:'+ticker identity
-    bridge l2_state.py's own synthetic institutional_entry events already rely on
-    (confirmed live 2026-08-11 against a real company, see module docstring
-    elsewhere). Bulk query, not per-company -- same market-wide-then-dict-lookup
-    pattern fetch_pledge_levels/fetch_valuation_levels already use."""
+    """ticker -> sector_code via dim_security. Bulk query, not per-company -- same
+    market-wide-then-dict-lookup pattern fetch_pledge_levels/fetch_valuation_levels
+    already use.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: this used to build company_master_id as a
+    naive f"nse:{ticker}" string -- fundamentals_l1_universe.ticker is whatever
+    screener.in's own company-URL slug is, sometimes a raw BSE numeric scrip code
+    (confirmed live: 43/192, 22%, of the current L1 universe), which never matches
+    that naive construction. Resolved via map_company_master_ids_nse_or_bse (the
+    same NSE-first/BSE-fallback helper every other identity lookup in this codebase
+    already uses) instead. Still returns a dict keyed by the ORIGINAL ticker string
+    (not company_master_id) -- callers (compute_valuation_sector_percentiles) look
+    it up by row["ticker"], the L1 universe's own value, unchanged."""
     if not tickers:
+        return {}
+    ticker_series = pd.Series(tickers, dtype="string")
+    company_master_ids = map_company_master_ids_nse_or_bse(ticker_series)
+    resolved_ids = company_master_ids.dropna().unique().tolist()
+    if not resolved_ids:
         return {}
     df = sql_to_df(
         "SELECT company_master_id, sector_code FROM dim_security WHERE company_master_id = ANY(%s) AND sector_code IS NOT NULL",
-        params=([f"nse:{t}" for t in tickers],),
+        params=(resolved_ids,),
     )
     if df.empty:
         return {}
-    return {row["company_master_id"].removeprefix("nse:"): row["sector_code"] for row in df.to_dict("records")}
+    sector_by_cmid = dict(zip(df["company_master_id"], df["sector_code"]))
+    return {
+        ticker: sector_by_cmid[cmid]
+        for ticker, cmid in zip(ticker_series, company_master_ids)
+        if pd.notna(cmid) and cmid in sector_by_cmid
+    }
 
 
 def compute_valuation_sector_percentiles(rows: list[dict], sector_codes: dict[str, str]) -> dict[int, float]:
@@ -689,12 +708,23 @@ def build_l2_state_row(
 def _build_institutional_entry_event_row(row: dict[str, object], *, latest_period: str, load_ts) -> dict[str, object]:
     """One synthetic fundamentals_events row for a detected institutional first
     entry -- see module docstring for why this is a synthetic event (no exchange
-    filing exists) and why news_id is keyed on latest_period, not run_date."""
+    filing exists) and why news_id is keyed on latest_period, not run_date.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: company_master_id used to be built as a
+    naive f"nse:{ticker}" string -- wrong for the ~22% of the L1 universe whose
+    ticker is actually a raw BSE numeric scrip code (see load_sector_codes_for_
+    tickers' own docstring for the confirmed-live figure). A wrong company_master_id
+    here means this synthetic event would never join against anything else in the
+    pipeline that resolves identity correctly (l3_triggers.py, signal_pointers.py,
+    watch_summary.py, ...) -- an orphaned row under an id nothing else uses.
+    institutional_first_entry is rare enough that a single-ticker resolution call
+    here (rather than a bulk pass) is fine."""
     ticker = row["ticker"]
+    company_master_id = map_company_master_ids_nse_or_bse(pd.Series([ticker])).iloc[0]
     return {
         "source": "l2_state",
         "news_id": f"institutional_entry:{ticker}:{latest_period}",
-        "company_master_id": f"nse:{ticker}",
+        "company_master_id": company_master_id,
         "isin": None,
         "filing_type": "institutional_entry",
         # Caveat text added 2026-08-13 (gap found auditing the frontend/alert

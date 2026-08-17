@@ -65,6 +65,7 @@ import json
 import pandas as pd
 
 from fundamentals.collectors.screenerin import build_authenticated_session, run_query
+from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -183,11 +184,25 @@ def _rpt_excludes(events: list[dict]) -> bool:
 
 def apply_post_hoc_exclusions(companies: list[dict]) -> tuple[list[dict], dict[str, list[str]]]:
     """Filters screener.in's own candidate list against real auditor-change/RPT
-    events -- see module-level comment above for the exclusion policy. company_master_
-    id is built as 'nse:'+ticker directly (no lookup query needed), the same identity
-    convention fundamentals/screens/l2_state.py's synthetic events and fundamentals/
-    screens/l3_triggers.py's L2-state join both already rely on."""
-    company_master_ids = [f"nse:{c['ticker']}" for c in companies if c.get("ticker")]
+    events -- see module-level comment above for the exclusion policy.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: company_master_id used to be built as a
+    naive 'nse:'+ticker string -- wrong for the ~22% of tickers that are actually
+    raw BSE numeric scrip codes (screener.in's own company-URL slug for some
+    listings), confirmed live via load_sector_codes_for_tickers' own docstring in
+    fundamentals/screens/l2_state.py (same bug, same root cause, fixed there too).
+    A mismatched company_master_id here means load_auditor_rpt_events_for_companies
+    would query the WRONG id and silently find nothing, letting a company that
+    should be excluded for a real auditor-change/RPT violation stay in L1 forever.
+    Resolved via map_company_master_ids_nse_or_bse instead, the same helper every
+    other identity lookup in this codebase already uses."""
+    tickers_with_value = [c["ticker"] for c in companies if c.get("ticker")]
+    cmid_by_ticker: dict[str, str] = {}
+    if tickers_with_value:
+        resolved = map_company_master_ids_nse_or_bse(pd.Series(tickers_with_value, dtype="string"))
+        cmid_by_ticker = {t: cmid for t, cmid in zip(tickers_with_value, resolved) if pd.notna(cmid)}
+
+    company_master_ids = list(dict.fromkeys(cmid_by_ticker.values()))
     events_df = load_auditor_rpt_events_for_companies(company_master_ids)
 
     events_by_company: dict[str, list[dict]] = {}
@@ -201,7 +216,8 @@ def apply_post_hoc_exclusions(companies: list[dict]) -> tuple[list[dict], dict[s
     survivors: list[dict] = []
     for company in companies:
         ticker = company.get("ticker")
-        events = events_by_company.get(f"nse:{ticker}", []) if ticker else []
+        cmid = cmid_by_ticker.get(ticker) if ticker else None
+        events = events_by_company.get(cmid, []) if cmid else []
         auditor_events = [e for e in events if e["filing_type"] == "auditor_change"]
         rpt_events = [e for e in events if e["filing_type"] == "related_party_transaction"]
 
