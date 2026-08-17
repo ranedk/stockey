@@ -189,10 +189,18 @@ RATING_ENRICHMENT_COLUMN_TYPES = {
 }
 
 
-def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
+def _record_fallback(fallback_type: str, *, source: str = "unspecified_agency", reason: str, error, severity: str = "warn", metadata=None) -> None:
+    # BUG FOUND LIVE 2026-08-17: source used to be hardcoded "icra" unconditionally,
+    # regardless of which agency the event was actually about -- every real call site
+    # below is inside the per-agency enrichment loop and already has the true
+    # agency_name in scope. A CRISIL or CARE search failure/circuit-breaker trip would
+    # show up as an ICRA problem in source-grouped monitoring (the true agency was
+    # still recoverable from metadata, just mislabeled on the field monitoring
+    # actually groups by). Every call site now passes its own real source explicitly;
+    # this default only covers a future caller that forgets to.
     record_local_fallback_event(
         module=SYNC_SOURCE_NAME,
-        source="icra",
+        source=source,
         fallback_type=fallback_type,
         severity=severity,
         reason=reason,
@@ -543,6 +551,7 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
         agency_counts = unsupported_rows["_agency"].fillna("unnamed").value_counts().to_dict()
         _record_fallback(
             "rating_enrichment_unsupported_agency",
+            source="unsupported_agency",  # spans potentially several different unplugged agencies -- see agency_counts in metadata for the real breakdown
             reason="Some detected rating_action rows name an agency (or no agency at all) with no enrichment plugin yet.",
             error="no plugin for this agency",
             severity="warn",
@@ -573,6 +582,7 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
                 _set_enrichment_status(source=row["source"], news_id=row["news_id"], status="failed")
                 _record_fallback(
                     "rating_enrichment_search_failed",
+                    source=agency_name,
                     reason=f"{agency_name} rationale search failed for this company; will retry on the next scheduled run.",
                     error=exc,
                     metadata={"company_master_id": row["company_master_id"], "agency": agency_name},
@@ -581,6 +591,7 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
                     any_blocked = True
                     _record_fallback(
                         "rating_enrichment_circuit_breaker_tripped",
+                        source=agency_name,
                         reason=f"{consecutive_failures} consecutive {agency_name} requests failed -- stopping {agency_name} for this run (other agencies unaffected).",
                         error="circuit breaker",
                         severity="error",

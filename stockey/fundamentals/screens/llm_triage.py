@@ -104,10 +104,17 @@ def _bootstrap_triage_column() -> None:
 
 
 def load_candidate_events_for_triage(limit: int | None = None) -> pd.DataFrame:
+    # BUG FOUND LIVE 2026-08-17: rating_agency wasn't selected here -- l3_triggers.py's
+    # own load_candidate_events() got this exact fix on 2026-08-13 (its own module
+    # docstring: "rating_agency is included so evaluate_rating_action_trigger()'s
+    # reasoning can name which agency acted"), but llm_triage.py's sibling query never
+    # did, so the LLM triaging a rating_action event never saw which agency acted --
+    # a real signal (ICRA vs a less-established agency, say) the model has no way to
+    # weigh without it.
     query = """
         SELECT source, news_id, company_master_id, filing_type, headline, subcategory,
-               disclosure_date, rating_action_type, transaction_type, insider_name,
-               quantity, structured_extraction_json
+               disclosure_date, rating_action_type, rating_agency, transaction_type,
+               insider_name, quantity, structured_extraction_json
         FROM fundamentals_events
         WHERE filing_type IN ('rating_action', 'pit_sast', 'results')
           AND (llm_triage_status IS NULL OR llm_triage_status = 'pending')
@@ -164,6 +171,7 @@ def build_evidence_bundle(event: dict, l2_row: dict | None, price_context: dict)
             "subcategory": event.get("subcategory"),
             "disclosure_date": str(event.get("disclosure_date")),
             "rating_action_type": event.get("rating_action_type"),
+            "rating_agency": event.get("rating_agency"),
             "transaction_type": event.get("transaction_type"),
             "insider_name": event.get("insider_name"),
             "quantity": event.get("quantity"),

@@ -11409,6 +11409,40 @@ def test_run_rating_agency_enrichment_trips_circuit_breaker(monkeypatch):
     assert result["blocked"] is True
     assert result["failed"] == fundamentals_rating_agencies.CIRCUIT_BREAKER_THRESHOLD
     assert any(a and a[0] == "rating_enrichment_circuit_breaker_tripped" for a, k in fallback_events)
+    # BUG FOUND LIVE 2026-08-17: _record_fallback used to hardcode source="icra"
+    # regardless of which agency actually failed -- a CRISIL/CARE outage would show
+    # up as an ICRA problem in source-grouped monitoring. This fixture IS icra, but
+    # pin that the real agency_name is now threaded through explicitly, not implicit.
+    search_failed = [k for a, k in fallback_events if a and a[0] == "rating_enrichment_search_failed"]
+    breaker_tripped = [k for a, k in fallback_events if a and a[0] == "rating_enrichment_circuit_breaker_tripped"]
+    assert search_failed and all(k.get("source") == "icra" for k in search_failed)
+    assert breaker_tripped and all(k.get("source") == "icra" for k in breaker_tripped)
+
+
+def test_run_rating_agency_enrichment_fallback_source_matches_the_failing_agency(monkeypatch):
+    # Same bug, proven against a NON-icra agency -- the old hardcoded source="icra"
+    # would have passed the ICRA-only test above by coincidence. A CRISIL failure
+    # must record source="crisil", not "icra".
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": "n1", "company_master_id": "nse:X1", "headline": "CRISIL Downgrades Rating", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)}]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: "Some Company")
+
+    def always_fails(company):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "search_crisil_rationales", always_fails)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    search_failed = [k for a, k in fallback_events if a and a[0] == "rating_enrichment_search_failed"]
+    assert search_failed and all(k.get("source") == "crisil" for k in search_failed)
 
 
 def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkeypatch):
@@ -12945,11 +12979,16 @@ def test_load_price_context_returns_empty_when_no_prior_data(monkeypatch):
 def test_build_evidence_bundle_parses_structured_extraction_json():
     event = {
         "filing_type": "rating_action", "headline": "h", "subcategory": "s", "disclosure_date": date(2026, 8, 4),
-        "rating_action_type": "downgraded", "transaction_type": None, "insider_name": None, "quantity": None,
+        "rating_action_type": "downgraded", "rating_agency": "icra", "transaction_type": None, "insider_name": None, "quantity": None,
         "structured_extraction_json": '{"rating_action": "downgraded"}',
     }
     bundle = fundamentals_llm_triage.build_evidence_bundle(event, {"ticker": "X"}, {"volume_on_event_vs_avg_ratio": 2.0})
     assert bundle["event"]["structured_extraction"] == {"rating_action": "downgraded"}
+    # BUG FOUND LIVE 2026-08-17: l3_triggers.py's sibling evidence-builder got this
+    # exact fix on 2026-08-13 ("rating_agency is included so ... reasoning can name
+    # which agency acted"); llm_triage.py's bundle never carried it, so the LLM
+    # triaging a rating_action event never saw which agency acted.
+    assert bundle["event"]["rating_agency"] == "icra"
     assert bundle["l2_state"] == {"ticker": "X"}
     assert bundle["price_context"] == {"volume_on_event_vs_avg_ratio": 2.0}
 
@@ -12972,6 +13011,7 @@ def test_load_candidate_events_for_triage_queries_expected_filters(monkeypatch):
     fundamentals_llm_triage.load_candidate_events_for_triage()
     assert "'rating_action', 'pit_sast', 'results'" in captured["query"]
     assert "llm_triage_status IS NULL OR llm_triage_status = 'pending'" in captured["query"]
+    assert "rating_agency" in captured["query"]
 
 
 def test_run_llm_triage_returns_early_when_no_candidates(monkeypatch):
