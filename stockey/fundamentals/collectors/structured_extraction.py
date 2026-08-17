@@ -72,7 +72,11 @@ DEFAULT_MODEL = env("STRUCTURED_EXTRACTION_MODEL", "gpt-5.4-mini")
 # "version every signal definition" rule, a later re-read of an old row needs to
 # know which schema shape produced it, and a coarser global version is what this
 # module already committed to rather than something introduced here.
-SCHEMA_VERSION = 2
+# Bumped 2 -> 3 (2026-08-17): RATING_ACTION_SCHEMA's shape changed (instrument_
+# actions/multiple_instruments_covered added, top-level fields' descriptions now
+# pin them to the most-severe instrument) -- see RATING_ACTION_SCHEMA's own
+# docstring. Same global-version convention as the 1->2 bump above.
+SCHEMA_VERSION = 3
 CIRCUIT_BREAKER_THRESHOLD = 3
 # 2026-08-15: raised 50 -> 400 (user request: "pace up so we don't have backlog").
 # This stage is a plain LLM text-extraction call, not an OCR image-render job --
@@ -161,16 +165,65 @@ RESULTS_SCHEMA = {
 # vocabulary -- listed in the prompt as *examples*, not an enum, since a real rationale
 # will name things this list doesn't anticipate; risk_factor_details keeps the actual
 # specifics so a tag alone never has to carry all the nuance.
+# BUG FOUND LIVE 2026-08-17: a single rated_amount_rs_cr/previous_rating/current_
+# rating/rating_action set can't represent a real, common rationale shape -- one
+# filing rating SEVERAL distinct instruments/facilities (e.g. "Long-term Bank
+# Facilities" downgraded alongside "Short-term Bank Facilities" reaffirmed in the
+# same document), each with its own action. Forcing the model to pick just one
+# action risked silently masking a real downgrade whenever a filing's OTHER
+# instrument happened to be reaffirmed/upgraded -- a genuine problem given
+# l3_triggers.py's evaluate_rating_action_trigger() treats "downgraded" as always
+# alert-worthy regardless of prior state (fundamentals/screens/l3_triggers.py's own
+# module docstring): a missed downgrade here is a silently missed alert, not a
+# cosmetic gap.
+#
+# instrument_actions is the full per-instrument breakdown (one entry per rated
+# instrument/facility actually named in the text, even if the filing only covers
+# one -- consumers wanting per-instrument detail read this). The top-level
+# instrument_description/rated_amount_rs_cr/previous_rating/current_rating/
+# rating_action fields stay (existing consumers, notably l3_triggers.py's
+# _resolve_rating_action_type, read rating_action alone) but are now explicitly
+# defined to describe the MOST SEVERE instrument when actions differ, per the
+# severity order in rating_action's own description below -- never an arbitrary or
+# first-listed instrument, so the always-alert-on-downgrade rule can't be defeated
+# by a mixed-action filing.
 RATING_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
         "company_name": {"type": ["string", "null"]},
         "rating_agency": {"type": ["string", "null"]},
-        "instrument_description": {"type": ["string", "null"]},
-        "rated_amount_rs_cr": {"type": ["number", "null"]},
-        "previous_rating": {"type": ["string", "null"]},
-        "current_rating": {"type": ["string", "null"]},
-        "rating_action": {"type": ["string", "null"], "description": "upgraded / downgraded / reaffirmed / withdrawn / assigned / suspended / placed_on_watch"},
+        "instrument_description": {"type": ["string", "null"], "description": "the instrument/facility for the MOST SEVERE action (see rating_action) -- if only one instrument is covered, describes that one"},
+        "rated_amount_rs_cr": {"type": ["number", "null"], "description": "amount for that same most-severe instrument, not a total across instruments"},
+        "previous_rating": {"type": ["string", "null"], "description": "that same most-severe instrument's previous rating"},
+        "current_rating": {"type": ["string", "null"], "description": "that same most-severe instrument's current rating"},
+        "rating_action": {
+            "type": ["string", "null"],
+            "description": (
+                "upgraded / downgraded / reaffirmed / withdrawn / assigned / suspended / placed_on_watch. "
+                "If this filing covers multiple instruments/facilities with DIFFERENT actions, set this to "
+                "the MOST SEVERE action present, using this order (most to least severe): downgraded > "
+                "placed_on_watch > suspended > withdrawn > assigned > reaffirmed > upgraded. Never collapse a "
+                "mix of actions into 'reaffirmed' or 'upgraded' when ANY covered instrument was downgraded -- "
+                "see instrument_actions for the full per-instrument breakdown."
+            ),
+        },
+        "instrument_actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "instrument_description": {"type": ["string", "null"]},
+                    "rated_amount_rs_cr": {"type": ["number", "null"]},
+                    "previous_rating": {"type": ["string", "null"]},
+                    "current_rating": {"type": ["string", "null"]},
+                    "rating_action": {"type": ["string", "null"], "description": "same vocabulary as the top-level rating_action, for this one instrument only"},
+                },
+                "required": ["instrument_description", "rated_amount_rs_cr", "previous_rating", "current_rating", "rating_action"],
+                "additionalProperties": False,
+            },
+            "description": "one entry per instrument/facility actually named in the text -- exactly one entry for a single-instrument filing, several for a multi-instrument one. Empty array only if the filing gives no instrument-level breakdown at all.",
+        },
+        "multiple_instruments_covered": {"type": "boolean", "description": "true if instrument_actions has more than one entry"},
         "outlook_previous": {"type": ["string", "null"]},
         "outlook_current": {"type": ["string", "null"]},
         "rationale_summary": {"type": "string", "description": "2-3 sentence summary of why the agency took this action"},
@@ -181,7 +234,8 @@ RATING_ACTION_SCHEMA = {
     },
     "required": [
         "company_name", "rating_agency", "instrument_description", "rated_amount_rs_cr",
-        "previous_rating", "current_rating", "rating_action", "outlook_previous", "outlook_current",
+        "previous_rating", "current_rating", "rating_action", "instrument_actions",
+        "multiple_instruments_covered", "outlook_previous", "outlook_current",
         "rationale_summary", "positive_factor_tags", "risk_factor_tags", "risk_factor_details",
         "confidence_notes",
     ],

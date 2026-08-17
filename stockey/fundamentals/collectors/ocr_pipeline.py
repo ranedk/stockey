@@ -36,6 +36,7 @@ failures against either source stop that source's batch immediately.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import tempfile
@@ -53,7 +54,7 @@ from utils.blob_store import metadata_to_row, put_text_blob
 from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
-from utils.ocr.llm_ocr import ocr_pdf_with_local
+from utils.ocr.llm_ocr import ocr_page_with_local, render_pdf_pages
 from utils.store import save_file_content
 
 env = Env()
@@ -82,6 +83,23 @@ DEFAULT_BATCH_LIMIT = 200
 # consuming the entire run. Any row not reached before the cutoff stays pending and
 # is picked up next run -- safe, idempotent, no partial/lost work.
 MAX_RUNTIME_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_RUNTIME_SECONDS", 3 * 60 * 60)
+# BUG FOUND LIVE 2026-08-17: MAX_RUNTIME_SECONDS above is only checked BETWEEN rows
+# in run_ocr_pipeline's loop -- a single document's OCR (ocr_pdf_bytes, page-by-page
+# below) had no internal bound at all, so one large multi-page document, or one page
+# the local model got stuck on, could consume the entire run's wall-clock budget (and
+# run well past it) before the next between-row check ever got a chance to fire.
+# Two bounds now apply within a single document:
+# - PER_PAGE_OCR_TIMEOUT_SECONDS: each page's OCR call runs in a worker thread with a
+#   hard result() timeout -- generous relative to the observed 95-290s/page so normal
+#   pages are unaffected, but a genuinely stuck page no longer blocks the row forever.
+#   The stuck worker thread itself can't be killed (transformers' generate() is a
+#   blocking call), so it's abandoned (executor.shutdown(wait=False)) rather than
+#   joined -- it still holds CPU until its own max_new_tokens bound lets it finish,
+#   but the pipeline moves on instead of waiting on it.
+# - MAX_DOCUMENT_OCR_SECONDS: checked between pages, bounds a many-page document's
+#   TOTAL OCR time even when every individual page finishes within its own timeout.
+PER_PAGE_OCR_TIMEOUT_SECONDS = env.int("FUNDAMENTALS_OCR_PAGE_TIMEOUT_SECONDS", 900)
+MAX_DOCUMENT_OCR_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_DOCUMENT_SECONDS", 1800)
 
 OCR_COLUMN_TYPES = {
     "ocr_status": "TEXT",
@@ -144,6 +162,13 @@ class DocumentFetchError(RuntimeError):
     count it towards that source's circuit breaker rather than crashing the run."""
 
 
+class OcrTimeoutError(RuntimeError):
+    """Raised when a single page's OCR exceeds PER_PAGE_OCR_TIMEOUT_SECONDS, or a
+    document's total page-by-page OCR exceeds MAX_DOCUMENT_OCR_SECONDS -- caught by
+    the same per-row except block as DocumentFetchError, so it counts towards that
+    source's circuit breaker rather than blocking the run."""
+
+
 def fetch_document_bytes(url: str, *, domain: str) -> bytes:
     headers = ICRA_PDF_HEADERS if domain == "icra" else BSE_PDF_HEADERS
     with exchange_request_gate(domain=domain):
@@ -170,11 +195,31 @@ def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
 
 def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     """Render every page of a PDF (already-downloaded bytes) and OCR each one through
-    the local provider, joined into one document's worth of text."""
+    the local provider, joined into one document's worth of text. See
+    PER_PAGE_OCR_TIMEOUT_SECONDS/MAX_DOCUMENT_OCR_SECONDS above for why each page runs
+    with its own bounded timeout instead of one unbounded per-document call."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as handle:
         Path(handle.name).write_bytes(pdf_bytes)
-        pages = ocr_pdf_with_local(handle.name)
-    return "\n\n".join(pages[page_number] for page_number in sorted(pages))
+        rendered_pages = render_pdf_pages(handle.name)
+
+    texts: dict[int, str] = {}
+    document_started = time.monotonic()
+    for page_number, image in rendered_pages:
+        if time.monotonic() - document_started >= MAX_DOCUMENT_OCR_SECONDS:
+            raise OcrTimeoutError(
+                f"document OCR exceeded MAX_DOCUMENT_OCR_SECONDS ({MAX_DOCUMENT_OCR_SECONDS}s) "
+                f"with {len(texts)}/{len(rendered_pages)} pages done"
+            )
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(ocr_page_with_local, image)
+        try:
+            texts[page_number] = future.result(timeout=PER_PAGE_OCR_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError as exc:
+            executor.shutdown(wait=False)
+            raise OcrTimeoutError(f"page {page_number} OCR exceeded PER_PAGE_OCR_TIMEOUT_SECONDS ({PER_PAGE_OCR_TIMEOUT_SECONDS}s)") from exc
+        executor.shutdown(wait=False)
+
+    return "\n\n".join(texts[page_number] for page_number in sorted(texts))
 
 
 def _set_ocr_result(*, source: str, news_id: str, status: str, fields: dict | None = None) -> None:

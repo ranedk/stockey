@@ -10,6 +10,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 import types
 from datetime import date
 from datetime import datetime
@@ -11661,18 +11662,56 @@ def test_fetch_document_bytes_returns_content_on_success(monkeypatch):
 def test_ocr_pdf_bytes_writes_temp_file_and_joins_pages(monkeypatch):
     captured = {}
 
-    def fake_ocr_pdf_with_local(path):
+    def fake_render_pdf_pages(path, pages="all"):
         captured["path_exists"] = Path(path).exists()
         captured["path_suffix"] = Path(path).suffix
-        return {2: "page two", 1: "page one"}
+        return [(2, "image-2"), (1, "image-1")]  # deliberately out of order
 
-    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_with_local", fake_ocr_pdf_with_local)
+    def fake_ocr_page_with_local(image, **kwargs):
+        return {"image-1": "page one", "image-2": "page two"}[image]
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", fake_render_pdf_pages)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", fake_ocr_page_with_local)
 
     result = fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
 
-    assert result == "page one\n\npage two"  # sorted by page number, not dict order
+    assert result == "page one\n\npage two"  # sorted by page number, not render order
     assert captured["path_exists"] is True
     assert captured["path_suffix"] == ".pdf"
+
+
+def test_ocr_pdf_bytes_raises_on_page_timeout(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: a single page's OCR call had no timeout at all --
+    # only checked between ROWS in run_ocr_pipeline, never within one document. A page
+    # that hangs past PER_PAGE_OCR_TIMEOUT_SECONDS must raise (and let the caller move
+    # on to the next row) rather than block forever.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", lambda path, pages="all": [(1, "image-1")])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "PER_PAGE_OCR_TIMEOUT_SECONDS", 0.05)
+
+    def slow_ocr_page(image, **kwargs):
+        time.sleep(1.0)
+        return "too slow"
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", slow_ocr_page)
+
+    with pytest.raises(fundamentals_ocr_pipeline.OcrTimeoutError, match="PER_PAGE_OCR_TIMEOUT_SECONDS"):
+        fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
+
+
+def test_ocr_pdf_bytes_raises_on_document_timeout_between_pages(monkeypatch):
+    # A many-page document must be bounded even when every individual page finishes
+    # within its own PER_PAGE_OCR_TIMEOUT_SECONDS -- MAX_DOCUMENT_OCR_SECONDS caps the
+    # document's TOTAL OCR time, checked between pages.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", lambda path, pages="all": [(1, "image-1"), (2, "image-2")])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", lambda image, **kwargs: "text")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "MAX_DOCUMENT_OCR_SECONDS", 100)
+    # monotonic() called once for document_started, then once per page's budget check --
+    # page 1's check is within budget, page 2's check is past it.
+    clock = iter([0, 0, 200])
+    monkeypatch.setattr(fundamentals_ocr_pipeline.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(fundamentals_ocr_pipeline.OcrTimeoutError, match="MAX_DOCUMENT_OCR_SECONDS"):
+        fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
 
 
 def test_load_pending_ocr_targets_queries_expected_filters(monkeypatch):
@@ -11869,6 +11908,37 @@ def test_capital_raise_schema_requires_investor_names_array():
     schema = fundamentals_structured_extraction.CAPITAL_RAISE_SCHEMA
     assert "investor_names" in schema["required"]
     assert schema["properties"]["investor_names"]["type"] == "array"
+
+
+def test_rating_action_schema_can_represent_mixed_instrument_actions():
+    # BUG FOUND LIVE 2026-08-17: a single rated_amount_rs_cr/previous_rating/current_
+    # rating/rating_action set can't represent a filing that rates several distinct
+    # instruments with DIFFERENT actions (e.g. long-term downgraded, short-term
+    # reaffirmed in the same rationale) -- l3_triggers.py's evaluate_rating_action_
+    # trigger() treats "downgraded" as always alert-worthy regardless of prior state,
+    # so silently collapsing a mixed filing into "reaffirmed" would be a missed alert,
+    # not a cosmetic gap. instrument_actions carries the full per-instrument
+    # breakdown; the top-level rating_action must be pinned (by schema description,
+    # verified live against the real model) to the most severe action present.
+    schema = fundamentals_structured_extraction.RATING_ACTION_SCHEMA
+    assert "instrument_actions" in schema["properties"]
+    assert "instrument_actions" in schema["required"]
+    assert schema["properties"]["instrument_actions"]["type"] == "array"
+    item_schema = schema["properties"]["instrument_actions"]["items"]
+    for field in ("instrument_description", "rated_amount_rs_cr", "previous_rating", "current_rating", "rating_action"):
+        assert field in item_schema["properties"]
+        assert field in item_schema["required"]
+    assert item_schema["additionalProperties"] is False
+    assert "multiple_instruments_covered" in schema["required"]
+    assert schema["properties"]["multiple_instruments_covered"]["type"] == "boolean"
+    # "downgraded" must be named as the most-severe action, ahead of reaffirmed/upgraded,
+    # in the explicit severity-order clause -- not left to the model to infer. Sliced
+    # to the severity-order clause specifically since "downgraded"/"upgraded" also
+    # appear earlier in the description as plain enum members, in enum order.
+    action_description = schema["properties"]["rating_action"]["description"]
+    severity_clause = action_description[action_description.index("most to least severe"):]
+    assert severity_clause.index("downgraded") < severity_clause.index("reaffirmed")
+    assert severity_clause.index("downgraded") < severity_clause.index("upgraded")
 
 
 @pytest.mark.parametrize(
