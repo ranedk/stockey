@@ -574,6 +574,20 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
 BACKFILL_PROGRESS_TABLE = "fundamentals_bse_backfill_progress"
 # ~3 years, matches fundamentals/screens/l1_universe.py's AUDITOR_CHANGE_LOOKBACK_YEARS.
 BACKFILL_LOOKBACK_DAYS = 1095
+# BUG FOUND LIVE 2026-08-17: run_auditor_rpt_backfill() reused build_announcement_row()
+# unfiltered, so it classified and stored EVERY L3 filing_type found in the 3yr window,
+# not just the two this backfill exists for. Confirmed live: of the 1,094 rows this
+# backfill wrote on 2026-08-13, only 20 were actually auditor_change/related_party_
+# transaction -- the other 1,074 were pit_sast/results/rating_action/capital_raise
+# rows up to 3 years old that the regular 7-day daily crawl (run_bse_l3_detection) was
+# always meant to be the sole source for. Those stale rows then queued into
+# ocr_pipeline.py alongside fresh detections; live-tested 9 of the oldest-loaded
+# pending OCR rows and 8 were already-404 (BSE's AttachLive endpoint doesn't retain
+# attachments indefinitely) -- a contiguous run of these can trip ocr_pipeline.py's
+# CIRCUIT_BREAKER_THRESHOLD=3 before any genuinely fresh, still-fetchable row behind
+# them in the FIFO queue ever gets attempted (see load_pending_ocr_targets's own
+# ordering fix in ocr_pipeline.py for the other half of this fix).
+BACKFILL_FILING_TYPES = ("auditor_change", "related_party_transaction")
 
 _BACKFILL_PROGRESS_TABLE_STATEMENT = """
     CREATE TABLE IF NOT EXISTS fundamentals_bse_backfill_progress (
@@ -633,7 +647,12 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
     circuit-breaker machinery, differing only in WHICH companies get scanned
     (not-yet-backfilled, tracked here) and HOW FAR BACK (3yr, not 7 days). A company
     is marked backfilled only after a SUCCESSFUL fetch -- a failed/circuit-broken
-    company stays eligible for retry next invocation, never silently marked done."""
+    company stays eligible for retry next invocation, never silently marked done.
+
+    Filtered to BACKFILL_FILING_TYPES only (see that constant's own comment) -- every
+    other filing_type build_announcement_row can return is discarded here, same as
+    "other" already is, since only auditor_change/related_party_transaction actually
+    need 3 years of lookback; everything else is the daily crawl's job."""
     universe = load_companies_needing_backfill(limit)
     if universe.empty:
         return {"rows": 0, "companies_scanned": 0, "companies_remaining": 0, "failed_companies": [], "blocked": False}
@@ -647,6 +666,7 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
     consecutive_failures = 0
     blocked = False
     companies_scanned = 0
+    off_target_discarded = 0
 
     for _, company in universe.iterrows():
         scrip_code = str(int(company["bse_scrip_code"]))
@@ -679,8 +699,12 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
         newly_backfilled.append(company_master_id)
         for raw in raw_rows:
             row = build_announcement_row(scrip_code, company_master_id, isin, raw)
-            if row is not None:
-                rows.append(row)
+            if row is None:
+                continue
+            if row["filing_type"] not in BACKFILL_FILING_TYPES:
+                off_target_discarded += 1
+                continue
+            rows.append(row)
 
     if rows:
         upsert_events_with_dedup(rows)
@@ -691,6 +715,7 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
         "companies_scanned": companies_scanned,
         "companies_remaining": len(load_companies_needing_backfill(None)),
         "failed_companies": failed_companies,
+        "off_target_discarded": off_target_discarded,
         "blocked": blocked,
     }
 

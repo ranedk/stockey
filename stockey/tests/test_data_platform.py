@@ -10232,7 +10232,11 @@ def test_run_auditor_rpt_backfill_marks_only_successful_companies(monkeypatch):
 
     call_order = iter([combined, pd.DataFrame()])  # first call: work batch; second (companies_remaining recompute): none left
     monkeypatch.setattr(fundamentals_bse_announcements, "load_companies_needing_backfill", lambda limit=None: next(call_order))
-    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "x"}])
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "fetch_company_announcements",
+        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Resignation of Statutory Auditors", "HEADLINE": "x"}],
+    )
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     marked = []
     monkeypatch.setattr(fundamentals_bse_announcements, "_mark_backfilled", lambda cmids: marked.append(cmids))
@@ -10243,7 +10247,45 @@ def test_run_auditor_rpt_backfill_marks_only_successful_companies(monkeypatch):
     assert result["companies_scanned"] == 2
     assert result["companies_remaining"] == 0
     assert result["blocked"] is False
+    assert result["rows"] == 2  # one auditor_change row per company, both in scope
+    assert result["off_target_discarded"] == 0
     assert set(marked[0]) == {"nse:TICK1", "nse:TICK2"}
+
+
+def test_run_auditor_rpt_backfill_discards_off_target_filing_types(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: this backfill exists only for auditor_change/
+    # related_party_transaction (L1's post-hoc exclusion needs 3yr history for those
+    # two, unlike everything else). It used to store EVERY filing_type
+    # build_announcement_row could classify -- confirmed live, 1,074 of 1,094 rows one
+    # real run wrote were off-target (pit_sast/results/rating_action/capital_raise),
+    # up to 3 years old, queuing ahead of fresh detections in ocr_pipeline.py and
+    # mostly already 404 by the time OCR reached them.
+    universe = _bse_universe_df(1)
+    identity = _bse_identity_df(universe["ticker"], ["111111"])
+    combined = universe.join(identity)
+    call_order = iter([combined, pd.DataFrame()])
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_companies_needing_backfill", lambda limit=None: next(call_order))
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "fetch_company_announcements",
+        lambda scrip, **k: [
+            {"NEWSID": "n1", "SUBCATNAME": "Resignation of Statutory Auditors", "HEADLINE": "auditor change"},  # in scope
+            {"NEWSID": "n2", "SUBCATNAME": "Credit Rating", "HEADLINE": "rating action"},  # off-target
+            {"NEWSID": "n3", "SUBCATNAME": "Financial Results", "HEADLINE": "results"},  # off-target
+            {"NEWSID": "n4", "SUBCATNAME": "General", "HEADLINE": "unrelated notice"},  # "other" -- already discarded upstream
+        ],
+    )
+    upserted = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: upserted.append(rows) or {"inserted": len(rows), "merged": 0})
+    monkeypatch.setattr(fundamentals_bse_announcements, "_mark_backfilled", lambda cmids: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_bse_announcements.run_auditor_rpt_backfill(limit=1)
+
+    assert result["rows"] == 1
+    assert result["off_target_discarded"] == 2  # n2 (rating_action) + n3 (results); n4 was already "other"
+    assert len(upserted) == 1 and len(upserted[0]) == 1
+    assert upserted[0][0]["filing_type"] == "auditor_change"
 
 
 def test_run_auditor_rpt_backfill_does_not_mark_failed_companies(monkeypatch):
@@ -11725,6 +11767,10 @@ def test_load_pending_ocr_targets_queries_expected_filters(monkeypatch):
     fundamentals_ocr_pipeline.load_pending_ocr_targets()
     assert "ocr_status IS NULL OR ocr_status = 'pending'" in captured["query"]
     assert "attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL" in captured["query"]
+    # BUG FOUND LIVE 2026-08-17: plain load_ts ASC let a huge glut of old, mostly-
+    # already-404 rows (see bse_announcements.py's BACKFILL_FILING_TYPES fix) starve
+    # fresh detections behind them via the circuit breaker. Freshest filing first now.
+    assert "ORDER BY disclosure_date DESC NULLS LAST, load_ts ASC NULLS LAST" in captured["query"]
 
 
 def test_run_ocr_pipeline_returns_early_when_nothing_pending(monkeypatch):

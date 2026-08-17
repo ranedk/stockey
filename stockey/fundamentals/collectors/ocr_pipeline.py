@@ -181,12 +181,24 @@ def fetch_document_bytes(url: str, *, domain: str) -> bytes:
 
 
 def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
+    # BUG FOUND LIVE 2026-08-17: plain load_ts ASC processes strictly oldest-inserted-
+    # first, with no regard for how old the FILING itself is. bse_announcements.py's
+    # 3yr auditor/RPT backfill (fixed the same day -- see BACKFILL_FILING_TYPES there)
+    # had queued 1,074 off-target rows up to 3 years old ahead of every fresh daily-
+    # crawl detection in this FIFO order; live-tested 9 of the oldest and 8 were
+    # already-404 (BSE doesn't retain AttachLive documents indefinitely). A contiguous
+    # run of those would trip CIRCUIT_BREAKER_THRESHOLD before any fresh, still-
+    # fetchable row behind them was ever attempted -- silently starving genuinely
+    # timely detections every single run. disclosure_date DESC prioritizes the
+    # freshest filings first (also the ones most likely to still have a live
+    # attachment); load_ts ASC is only the tiebreaker within same-day filings now,
+    # not the primary order.
     query = """
         SELECT source, news_id, company_master_id, filing_type, attachment_name, rationale_pdf_url
         FROM fundamentals_events
         WHERE (ocr_status IS NULL OR ocr_status = 'pending')
           AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
-        ORDER BY load_ts ASC NULLS LAST
+        ORDER BY disclosure_date DESC NULLS LAST, load_ts ASC NULLS LAST
     """
     if limit:
         query += f" LIMIT {int(limit)}"
