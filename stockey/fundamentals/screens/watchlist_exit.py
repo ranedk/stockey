@@ -110,10 +110,10 @@ def load_watchlist_for_exit_evaluation() -> pd.DataFrame:
         """
         SELECT w.company_master_id, w.first_seen_price, w.first_seen_at, w.last_alert_at,
                w.suggested_watch_until, w.narrative_generated_at,
-               tech.close AS current_price
+               tech.close AS current_price, tech.price_data_stale
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
-            SELECT close FROM fundamentals_technicals
+            SELECT close, price_data_stale FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
@@ -161,10 +161,21 @@ def _check_invalidated(trigger_history: list[dict]) -> str | None:
     return None
 
 
-def _check_price_flagged(first_seen_price, current_price) -> str | None:
+def _check_price_flagged(first_seen_price, current_price, *, price_data_stale=False) -> str | None:
     """None if not flagged, else a human-readable reason. None (not a guessed 0%)
     when either price is missing -- same discipline every price computation in this
-    pipeline already applies."""
+    pipeline already applies.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: current_price used to be trusted at face
+    value even when fundamentals_technicals.price_data_stale says the underlying
+    price feed hasn't updated in weeks (or, in one real case, years) -- confirmed
+    live, a stale current_price anchored to an old value made a real price move look
+    like ~0% change, masking exactly the "look again" signal this check exists to
+    raise. A stale price can't be trusted to judge a real move either way, so this
+    now declines to flag OR clear a flag from it -- same as the existing
+    missing-price case just above, not a new failure mode."""
+    if price_data_stale:
+        return None
     if not isinstance(first_seen_price, (int, float)) or not isinstance(current_price, (int, float)) or first_seen_price == 0:
         return None
     change_pct = round((current_price - first_seen_price) / abs(first_seen_price) * 100, 2)
@@ -203,7 +214,7 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
     if invalidated_reason:
         return "invalidated", invalidated_reason
 
-    price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"))
+    price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"), price_data_stale=bool(row.get("price_data_stale")))
     if price_reason:
         return "price_flagged", price_reason
 

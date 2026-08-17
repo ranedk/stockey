@@ -91,6 +91,20 @@ def load_existing_watchlist() -> pd.DataFrame:
     return sql_to_df("SELECT company_master_id, first_seen_at, first_seen_price FROM fundamentals_watchlist")
 
 
+def _record_first_seen_corrected_fallback(company_master_id: str, *, old_first_seen_at, new_first_seen_at) -> None:
+    _record_fallback(
+        "watchlist_first_seen_at_corrected",
+        reason=(
+            "A newly-visible alert (usually an identity-resolution backfill on an "
+            "older fundamentals_l3_alerts row) is earlier than this company's "
+            "previously-frozen first_seen_at -- corrected backward to the true "
+            "earliest alert date, never forward."
+        ),
+        error="first_seen_at moved earlier",
+        metadata={"company_master_id": company_master_id, "old_first_seen_at": str(old_first_seen_at), "new_first_seen_at": str(new_first_seen_at)},
+    )
+
+
 def load_price_near(company_master_id: str, as_of_date) -> float | None:
     """Close price on or before as_of_date -- adjusted series preferred, raw
     nseindia_ohlcv as fallback, None if neither has anything that early (never
@@ -132,11 +146,29 @@ def sync_watchlist_from_alerts() -> dict[str, object]:
 
     for _, alert_row in alert_summary.iterrows():
         company_master_id = alert_row["company_master_id"]
+        true_first_alert_date = alert_row["first_alert_date"]
         if company_master_id in existing.index:
-            first_seen_at = existing.loc[company_master_id, "first_seen_at"]
-            first_seen_price = existing.loc[company_master_id, "first_seen_price"]
+            stored_first_seen_at = existing.loc[company_master_id, "first_seen_at"]
+            # BUG FOUND LIVE 2026-08-15, fixed here: first_seen_at used to be frozen
+            # forever once a watchlist row existed, with no re-check against the
+            # freshly-recomputed aggregate. fundamentals_l3_alerts.company_master_id
+            # can be backfilled onto an OLDER alert row after this company's
+            # watchlist row was already created (an identity-resolution fix landing
+            # after the fact) -- MIN(alert_date) then reveals a genuinely earlier
+            # true first alert that this row's frozen value never reflected.
+            # Confirmed live: 9/38 watchlist rows had first_seen_at == last_alert_at
+            # (i.e. frozen at the MOST RECENT alert, not the first) -- one case
+            # (AAREYDRUGS) was off by over a year. Only ever corrected BACKWARD
+            # (earlier) when true history surfaces, never moved forward.
+            if pd.notna(stored_first_seen_at) and true_first_alert_date < stored_first_seen_at:
+                first_seen_at = true_first_alert_date
+                first_seen_price = load_price_near(company_master_id, first_seen_at)
+                _record_first_seen_corrected_fallback(company_master_id, old_first_seen_at=stored_first_seen_at, new_first_seen_at=first_seen_at)
+            else:
+                first_seen_at = stored_first_seen_at
+                first_seen_price = existing.loc[company_master_id, "first_seen_price"]
         else:
-            first_seen_at = alert_row["first_alert_date"]
+            first_seen_at = true_first_alert_date
             first_seen_price = load_price_near(company_master_id, first_seen_at)
             new_candidates.append(company_master_id)
             if first_seen_price is None:

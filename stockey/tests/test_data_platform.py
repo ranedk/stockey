@@ -13538,7 +13538,7 @@ def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
 
     result = fundamentals_technicals.run_technicals_refresh()
 
-    assert result == {"companies": 0, "no_history": 0}
+    assert result == {"companies": 0, "no_history": 0, "stale_price": 0}
     assert any(a and a[0] == "technicals_no_l1_universe" for a, k in fallback_events)
 
 
@@ -13547,7 +13547,10 @@ def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypat
     tickers = pd.DataFrame([{"ticker": "AAA", "company_name": "A Co"}, {"ticker": "BBB", "company_name": "B Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
 
-    full_history = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=260, freq="D"), "adj_close": [100.0] * 260})
+    # AAA's history ends "today" (not stale) -- isolates this test to the
+    # insufficient-history behavior it's actually about, independent of the
+    # separate price_data_stale check (covered by its own tests below).
+    full_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=260, freq="D"), "adj_close": [100.0] * 260})
     thin_history = pd.DataFrame({"date": pd.date_range("2026-07-01", periods=5, freq="D"), "adj_close": [50.0] * 5})
 
     def fake_history(ticker, **kwargs):
@@ -13561,13 +13564,68 @@ def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypat
 
     result = fundamentals_technicals.run_technicals_refresh()
 
-    assert result == {"companies": 2, "no_history": 1}
+    assert result["companies"] == 2
+    assert result["no_history"] == 1
     assert len(upserts) == 1
     assert upserts[0][1] == fundamentals_technicals.RESULTS_TABLE
     assert upserts[0][2]["unique_keys"] == ["company_master_id", "run_date"]
     written = upserts[0][0]
     assert set(written["company_master_id"]) == {"nse:AAA", "nse:BBB"}
     assert any(a and a[0] == "technicals_insufficient_history" for a, k in fallback_events)
+    aaa_row = written[written["ticker"] == "AAA"].iloc[0]
+    assert bool(aaa_row["price_data_stale"]) is False
+
+
+def test_run_technicals_refresh_flags_and_records_stale_price_series(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: the "latest row on or before today"
+    # lookup used to happily return a months-old row with no indication it's stale
+    # -- confirmed live, 32% of the whole price table affected, one real watchlist
+    # company's "today's close" silently frozen for weeks with zero fallback event.
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    tickers = pd.DataFrame([{"ticker": "STALECO", "company_name": "Stale Co"}, {"ticker": "FRESHCO", "company_name": "Fresh Co"}])
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+
+    fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
+    # last row is 30 days old -- past STALE_PRICE_THRESHOLD_DAYS (7)
+    stale_end = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=30)
+    stale_history = pd.DataFrame({"date": pd.date_range(end=stale_end, periods=25, freq="D"), "adj_close": [50.0] * 25})
+
+    def fake_history(ticker, **kwargs):
+        return stale_history if ticker == "STALECO" else fresh_history
+
+    monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", fake_history)
+    upserts = []
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_technicals.run_technicals_refresh()
+
+    assert result["stale_price"] == 1
+    written = upserts[0][0]
+    stale_row = written[written["ticker"] == "STALECO"].iloc[0]
+    fresh_row = written[written["ticker"] == "FRESHCO"].iloc[0]
+    assert bool(stale_row["price_data_stale"]) is True
+    assert bool(fresh_row["price_data_stale"]) is False
+    stale_event = next(e for a, k in fallback_events for e in [k] if a and a[0] == "technicals_stale_price_series")
+    assert stale_event["metadata"]["count"] == 1
+    assert "STALECO" in stale_event["metadata"]["sample_tickers"]
+
+
+def test_run_technicals_refresh_no_stale_prices_skips_fallback_event(monkeypatch):
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    tickers = pd.DataFrame([{"ticker": "FRESHCO", "company_name": "Fresh Co"}])
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+    fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
+    monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: fresh_history)
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_technicals.run_technicals_refresh()
+
+    assert result["stale_price"] == 0
+    assert not any(a and a[0] == "technicals_stale_price_series" for a, k in fallback_events)
 
 
 def test_load_price_near_prefers_adjusted_falls_back_to_raw(monkeypatch):
@@ -13657,6 +13715,58 @@ def test_sync_watchlist_from_alerts_existing_company_keeps_first_seen_updates_la
     assert written["first_seen_price"] == 100.0
     assert written["last_alert_at"] == pd.Timestamp("2026-08-05")
     assert written["alert_count"] == 3
+
+
+def test_sync_watchlist_from_alerts_corrects_first_seen_at_backward_when_earlier_history_surfaces(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed here: first_seen_at used to be frozen forever
+    # once a watchlist row existed. An identity-resolution backfill landing on an
+    # OLDER fundamentals_l3_alerts row (after this company's watchlist row was
+    # already created) can reveal a genuinely earlier true first alert -- confirmed
+    # live, 9/38 real watchlist rows affected, one off by over a year. Must correct
+    # BACKWARD when this happens.
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    alert_summary = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2025-05-23"), "last_alert_date": pd.Timestamp("2026-08-05"), "alert_count": 4}]
+    )
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
+    # existing row was frozen at 2026-08-06 -- LATER than the true first alert date
+    # now visible above (2025-05-23), exactly the drift found live.
+    existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-06"), "first_seen_price": 90.51}])
+    monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: existing)
+    monkeypatch.setattr(fundamentals_watchlist, "load_price_near", lambda cid, date: 42.0)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_watchlist, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+    upserts = []
+    monkeypatch.setattr(fundamentals_watchlist, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    written = upserts[0][0].iloc[0]
+    assert written["first_seen_at"] == pd.Timestamp("2025-05-23")  # corrected backward
+    assert written["first_seen_price"] == 42.0  # re-derived for the corrected date, not left at 90.51
+    assert any(a and a[0] == "watchlist_first_seen_at_corrected" for a, k in fallback_events)
+    assert result["new_candidates"] == 0  # still not treated as a brand-new candidate
+
+
+def test_sync_watchlist_from_alerts_never_moves_first_seen_at_forward(monkeypatch):
+    # the mirror case: the aggregate's first_alert_date must never push first_seen_at
+    # LATER than what's already stored, even if it happens to differ.
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    alert_summary = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-10"), "last_alert_date": pd.Timestamp("2026-08-10"), "alert_count": 1}]
+    )
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
+    existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
+    monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: existing)
+    monkeypatch.setattr(fundamentals_watchlist, "load_price_near", lambda cid, date: (_ for _ in ()).throw(AssertionError("must not be called")))
+    upserts = []
+    monkeypatch.setattr(fundamentals_watchlist, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    written = upserts[0][0].iloc[0]
+    assert written["first_seen_at"] == pd.Timestamp("2026-08-01")  # unchanged, not pushed to 08-10
+    assert written["first_seen_price"] == 100.0
 
 
 def test_sync_watchlist_from_alerts_flags_missing_price_without_failing(monkeypatch):
@@ -15509,6 +15619,17 @@ def test_check_price_flagged_none_when_price_missing():
     assert fundamentals_watchlist_exit._check_price_flagged(0, 110.0) is None
 
 
+def test_check_price_flagged_declines_to_judge_stale_price_data():
+    # BUG FOUND LIVE 2026-08-15, fixed here: a stale current_price (the feed hasn't
+    # updated in weeks/years) used to be trusted at face value -- a real price move
+    # would look like ~0% change against the frozen value, masking exactly the
+    # "look again" signal this check exists to raise. Confirmed live for
+    # AAREYDRUGS/BAFNAPH. A +60% move that would normally flag must NOT flag when
+    # the underlying price data is known stale.
+    assert fundamentals_watchlist_exit._check_price_flagged(100.0, 160.0, price_data_stale=True) is None
+    assert fundamentals_watchlist_exit._check_price_flagged(100.0, 160.0, price_data_stale=False) is not None  # unaffected when fresh
+
+
 def test_check_stale_true_when_watch_until_passed_and_nothing_new():
     reason = fundamentals_watchlist_exit._check_stale(
         date(2026, 8, 1), pd.Timestamp("2026-07-01", tz="UTC"), pd.Timestamp("2026-07-15", tz="UTC"), today=date(2026, 8, 13)
@@ -15558,6 +15679,20 @@ def test_evaluate_exit_status_active_when_nothing_fires():
     status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
     assert status == "active"
     assert reason is None
+
+
+def test_evaluate_exit_status_stale_price_data_falls_through_to_next_check_not_masked():
+    # BUG FOUND LIVE 2026-08-15, fixed here: a real +60% move would normally trigger
+    # price_flagged (see test_evaluate_exit_status_priority_price_over_stale above),
+    # but when the underlying price feed is known stale, this must not decide
+    # "no move happened" from it -- it correctly falls through to the next
+    # (weaker-evidence) check instead of silently landing on 'active'.
+    row = {
+        "first_seen_price": 100.0, "current_price": 160.0, "price_data_stale": True,
+        "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None,
+    }
+    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    assert status == "stale"  # not "price_flagged" (masked) and not "active" (silently fine)
 
 
 def test_load_trigger_type_history_by_company_groups_by_company(monkeypatch):

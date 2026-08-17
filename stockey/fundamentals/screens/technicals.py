@@ -56,6 +56,14 @@ DMA_WINDOWS = (50, 200)
 # empty row is still written, with a fallback event, so the gap is visible rather than
 # the company just silently missing from the table).
 MIN_HISTORY_ROWS = 20
+# BUG FOUND LIVE 2026-08-15: load_adjusted_price_history()'s "latest row on or before
+# today" query happily returns a months-old row with no indication it's stale --
+# confirmed live, 1,255/3,979 symbols (32%) in advisory_adjusted_ohlcv_daily hadn't
+# updated since before 2026-08-10, and one real watchlist company's "today's close"
+# (shown in the digest email and used by watchlist_exit.py's price-move check) had
+# been silently frozen at an April value for weeks. 7 calendar days tolerates a
+# weekend/holiday lag without flagging every minor delay as stale.
+STALE_PRICE_THRESHOLD_DAYS = 7
 
 
 def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
@@ -165,11 +173,12 @@ def run_technicals_refresh() -> dict[str, object]:
             reason="No fundamentals_l1_universe rows to compute technicals for.",
             error="empty L1 universe",
         )
-        return {"companies": 0, "no_history": 0}
+        return {"companies": 0, "no_history": 0, "stale_price": 0}
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     rows = []
     no_history = 0
+    stale_tickers: list[str] = []
     for _, row in tickers.iterrows():
         ticker = row["ticker"]
         history = load_adjusted_price_history(ticker)
@@ -183,6 +192,24 @@ def run_technicals_refresh() -> dict[str, object]:
                 metadata={"ticker": ticker, "rows_available": stats["data_points_available"]},
             )
 
+        # price_data_stale: the latest available row is more than STALE_PRICE_
+        # THRESHOLD_DAYS behind this run -- the price feed itself has stopped
+        # updating for this ticker, distinct from "insufficient history" above
+        # (which is about too FEW rows ever existing, not the latest one being old).
+        # Surfaced as its own column (not just a fallback event) so downstream
+        # consumers -- the digest email, watchlist_exit.py's price-move check -- can
+        # tell "today's close" apart from a stale, months-old value silently served
+        # as if current.
+        price_data_stale = False
+        as_of_date = stats.get("as_of_date")
+        if as_of_date is not None:
+            as_of_ts = pd.Timestamp(as_of_date)
+            if as_of_ts.tzinfo is None:
+                as_of_ts = as_of_ts.tz_localize("UTC")
+            if (run_date - as_of_ts).days > STALE_PRICE_THRESHOLD_DAYS:
+                price_data_stale = True
+                stale_tickers.append(ticker)
+
         rows.append(
             {
                 "company_master_id": f"nse:{ticker}",
@@ -190,13 +217,25 @@ def run_technicals_refresh() -> dict[str, object]:
                 "run_date": run_date,
                 **{k: v for k, v in stats.items() if k != "data_points_available"},
                 "data_points_available": stats["data_points_available"],
+                "price_data_stale": price_data_stale,
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }
         )
 
+    if stale_tickers:
+        # One aggregate event, not one per ticker -- confirmed live this can affect
+        # a third of the whole universe, and a fallback event per ticker at that
+        # scale would itself be a form of noise (buries the signal, not surfaces it).
+        _record_fallback(
+            "technicals_stale_price_series",
+            reason=f"{len(stale_tickers)} tickers' latest available price row is more than {STALE_PRICE_THRESHOLD_DAYS} days old -- price_data_stale=True written for each, not silently served as current.",
+            error="stale price series",
+            metadata={"count": len(stale_tickers), "sample_tickers": stale_tickers[:20]},
+        )
+
     result_df = pd.DataFrame(rows)
     upsert_to_db(result_df, RESULTS_TABLE, unique_keys=["company_master_id", "run_date"])
-    return {"companies": int(len(result_df)), "no_history": no_history}
+    return {"companies": int(len(result_df)), "no_history": no_history, "stale_price": len(stale_tickers)}
 
 
 def main() -> int:
@@ -207,7 +246,8 @@ def main() -> int:
         "rows": result["companies"],
         "rows_written": result["companies"],
         "no_history": result["no_history"],
-        "fallback_used": result["no_history"] > 0,
+        "stale_price": result["stale_price"],
+        "fallback_used": result["no_history"] > 0 or result["stale_price"] > 0,
         "state_advanced": result["companies"] > 0,
         "status": "ok",
     }
