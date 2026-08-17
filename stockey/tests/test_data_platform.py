@@ -8757,8 +8757,10 @@ def test_metric_key_normalizes_labels():
 
 
 def test_run_query_stops_after_a_short_final_page(monkeypatch):
-    # page_size=2 for pages 1-2, page 3 comes back short (1 row) -- must fetch page 3
-    # then stop, not loop forever or drop the short page.
+    # SCREENER_PAGE_SIZE monkeypatched to 2 so a small fixture can still exercise the
+    # multi-page loop: pages 1-2 come back full (2 rows), page 3 comes back short (1
+    # row) -- must fetch page 3, include it, then stop (not loop forever, not drop it).
+    monkeypatch.setattr(fundamentals_screenerin, "SCREENER_PAGE_SIZE", 2)
     pages = {
         1: ("url?page=1", [{"company_id": 1}, {"company_id": 2}]),
         2: ("url?page=2", [{"company_id": 3}, {"company_id": 4}]),
@@ -8779,13 +8781,35 @@ def test_run_query_stops_after_a_short_final_page(monkeypatch):
     assert [c["company_id"] for c in companies] == [1, 2, 3, 4, 5]
 
 
-def test_run_query_small_first_page_fetches_one_confirming_empty_page(monkeypatch):
-    # run_query has no fixed page-size constant to compare against (screener.in's real
-    # limit, 50, is never hardcoded) -- it infers "full page" from len(first_page), so
-    # a first page smaller than the true limit still triggers one extra page fetch to
-    # confirm there's nothing more. That confirming page must come back empty and the
-    # loop must stop there, not treat "still short" as "keep going".
-    pages = {1: ("url?page=1", [{"company_id": 1}]), 2: ("url?page=2", [])}
+def test_run_query_short_first_page_never_fetches_a_second_page(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15 (fixed in run_query): a first page shorter than the
+    # real, fixed SCREENER_PAGE_SIZE IS the complete result set -- screener.in never
+    # serves a genuine page 2 in that case, and the old self-referential
+    # `page_size = len(first_page)` comparison used to trigger a wasted, duplicate-
+    # producing extra fetch here. A short first page must not fetch page 2 at all.
+    pages = {1: ("url?page=1", [{"company_id": 1}]), 2: ("url?page=2", [{"company_id": 999}])}
+    calls = []
+
+    def fake_fetch(session, query_text, *, page):
+        calls.append(page)
+        return pages[page]
+
+    monkeypatch.setattr(fundamentals_screenerin, "_fetch_query_page", fake_fetch)
+
+    _, companies = fundamentals_screenerin.run_query(object(), "some query")
+
+    assert calls == [1]
+    assert [c["company_id"] for c in companies] == [1]
+
+
+def test_run_query_reserved_page_stops_without_duplicating(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15: for an out-of-range page, screener.in doesn't return
+    # fewer/empty results -- it silently RE-SERVES the previous page's own content. A
+    # full first page (== SCREENER_PAGE_SIZE) must still stop, via the company_id-set
+    # backstop, rather than looping to max_pages and duplicating every company.
+    monkeypatch.setattr(fundamentals_screenerin, "SCREENER_PAGE_SIZE", 2)
+    first_page = [{"company_id": 1}, {"company_id": 2}]
+    pages = {1: ("url?page=1", first_page), 2: ("url?page=2", list(first_page))}
     calls = []
 
     def fake_fetch(session, query_text, *, page):
@@ -8797,7 +8821,7 @@ def test_run_query_small_first_page_fetches_one_confirming_empty_page(monkeypatc
     _, companies = fundamentals_screenerin.run_query(object(), "some query")
 
     assert calls == [1, 2]
-    assert [c["company_id"] for c in companies] == [1]
+    assert [c["company_id"] for c in companies] == [1, 2]
 
 
 def test_run_query_zero_results_does_not_fetch_a_second_page(monkeypatch):

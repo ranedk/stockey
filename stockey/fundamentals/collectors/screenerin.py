@@ -209,25 +209,47 @@ def _fetch_query_page(session: requests.Session, query_text: str, *, page: int) 
     return screener_url, parse_screener_results(response.text)
 
 
+# Confirmed live 2026-08-10 (module docstring's own basis for run_query's pagination
+# loop). A fixed expectation, not re-derived from the first page's own length -- see
+# run_query's docstring for why that self-referential comparison was the bug.
+SCREENER_PAGE_SIZE = 50
+
+
 def run_query(
     session: requests.Session, query_text: str, *, max_pages: int = 100
 ) -> tuple[str, list[dict[str, object]]]:
-    """Fetch every page of results (screener.in paginates at 50/page, confirmed live
-    2026-08-10 -- a single-page fetch silently truncates a screen with more than 50
-    matches). Loops until a page comes back short of a full page (the natural end of
-    results), capped at max_pages as a safety backstop against an unbounded loop from
-    a parsing bug rather than a genuine 5000+ match screen."""
+    """Fetch every page of results (screener.in paginates at SCREENER_PAGE_SIZE/page).
+    Loops only while the most recently fetched page was actually FULL (a short first
+    page means there's nothing more to fetch, full stop), capped at max_pages as a
+    safety backstop against a genuine 5000+ match screen.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: the entry/continue condition used to
+    compare `len(first_page) == page_size`, where `page_size` was itself just
+    `len(first_page)` from the very first fetch -- trivially true on the very first
+    check, so the loop always attempted a page 2 fetch even when page 1 already had
+    fewer than SCREENER_PAGE_SIZE results (i.e. was already the complete set).
+    Confirmed live: a real 4-company query issued a wasted page-2 request and
+    screener.in, for an out-of-range page, does NOT return fewer/empty results --
+    it silently RE-SERVES page 1's own content again, so the old `len(page_companies)
+    < page_size` break condition (comparing two equal-length pages) never fired
+    either, looping all the way to max_pages issuing up to 99 unnecessary requests
+    and duplicating every company in the result. Fixed two ways: (1) the loop only
+    continues when the LAST fetched page was genuinely full (SCREENER_PAGE_SIZE
+    items), so a short-first-page query never even attempts page 2; (2) a
+    company_id-set comparison against the previous page as a backstop, catching the
+    remaining edge case of a query with an exact multiple of SCREENER_PAGE_SIZE
+    total matches (page 1 full, but no real page 2 either)."""
     first_url, first_page = _fetch_query_page(session, query_text, page=1)
     all_companies = list(first_page)
-    page_size = len(first_page)
 
     page = 1
-    while page_size > 0 and len(first_page) == page_size and page < max_pages:
+    last_page = first_page
+    while len(last_page) == SCREENER_PAGE_SIZE and page < max_pages:
         page += 1
         _, page_companies = _fetch_query_page(session, query_text, page=page)
+        if {c.get("company_id") for c in page_companies} == {c.get("company_id") for c in last_page}:
+            break  # screener.in re-served the same page -- no real next page exists
         all_companies.extend(page_companies)
-        if len(page_companies) < page_size:
-            break
-        first_page = page_companies  # reuse as "last page fetched" for the loop condition
+        last_page = page_companies
 
     return first_url, all_companies
