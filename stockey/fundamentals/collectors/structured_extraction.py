@@ -135,11 +135,24 @@ RESULTS_SCHEMA = {
         "period_type": {"type": ["string", "null"], "description": "Q1/Q2/Q3/Q4/H1/H2/9M/Annual, inferred from the period label -- H1/H2 for a half-yearly (SME-platform) filer, not every company reports quarterly"},
         "consolidated_or_standalone": {"type": ["string", "null"]},
         "revenue_current_rs_lakh": {"type": ["number", "null"]},
-        "revenue_qoq_rs_lakh": {"type": ["number", "null"], "description": "revenue for the immediately preceding reporting period (preceding quarter, or preceding half-year for an H1/H2 filer) -- null if that column isn't shown"},
-        "revenue_yoy_rs_lakh": {"type": ["number", "null"], "description": "revenue for the same reporting period one year earlier -- null if that column isn't shown"},
+        "revenue_qoq_rs_lakh": {
+            "type": ["number", "null"],
+            "description": (
+                "revenue for the immediately preceding reporting period (preceding quarter, or preceding "
+                "half-year for an H1/H2 filer), TRANSCRIBED LITERALLY from that period's own column in the "
+                "table -- null if that column isn't shown. Never compute/derive this from a stated growth "
+                "percentage or any other math; a real filing confirmed this live -- a computed figure differed "
+                "from the actual printed column by a small but real amount (0.06%). If in doubt whether a "
+                "number is the literal column value or something you calculated, use null instead."
+            ),
+        },
+        "revenue_yoy_rs_lakh": {
+            "type": ["number", "null"],
+            "description": "revenue for the same reporting period one year earlier, TRANSCRIBED LITERALLY from that period's own column -- null if that column isn't shown. Same never-compute rule as revenue_qoq_rs_lakh.",
+        },
         "pat_current_rs_lakh": {"type": ["number", "null"]},
-        "pat_qoq_rs_lakh": {"type": ["number", "null"]},
-        "pat_yoy_rs_lakh": {"type": ["number", "null"]},
+        "pat_qoq_rs_lakh": {"type": ["number", "null"], "description": "same never-compute, transcribe-literally rule as revenue_qoq_rs_lakh, for PAT's own preceding-period column"},
+        "pat_yoy_rs_lakh": {"type": ["number", "null"], "description": "same never-compute, transcribe-literally rule as revenue_qoq_rs_lakh, for PAT's own year-ago column"},
         "eps_basic_current": {"type": ["number", "null"]},
         "finance_costs_current_rs_lakh": {"type": ["number", "null"], "description": "the 'Finance Costs' P&L line item for the current period, if shown -- used to derive operating margin (no EBITDA/operating-profit line is disclosed directly)"},
         "depreciation_amortisation_current_rs_lakh": {"type": ["number", "null"], "description": "the 'Depreciation and amortisation expense' P&L line item for the current period, if shown -- same purpose as finance_costs_current_rs_lakh"},
@@ -274,15 +287,27 @@ PIT_SAST_SCHEMA = {
 # not a single field: a preferential allotment/QIP routinely allots to several
 # entities in one filing, and each named investor feeds
 # fundamentals/screens/investor_classification.py independently. Numeric/named-entity
-# fields here (amount, price, share count, names) are the reliable case per this
-# module's own docstring -- no boolean-plus-quote hedging needed, unlike audit_opinion.
+# fields here (amount, price, share count, names) are mostly the reliable case per
+# this module's own docstring -- no boolean-plus-quote hedging needed, unlike
+# audit_opinion -- EXCEPT price_per_share_rs (see its own description below), found
+# live 2026-08-17 not to always reconcile with total_amount_rs_cr/number_of_shares.
 CAPITAL_RAISE_SCHEMA = {
     "type": "object",
     "properties": {
         "company_name": {"type": ["string", "null"]},
         "instrument_type": {"type": ["string", "null"], "description": "preferential_allotment / qip / rights_issue / warrants / fccb / other"},
         "total_amount_rs_cr": {"type": ["number", "null"]},
-        "price_per_share_rs": {"type": ["number", "null"]},
+        "price_per_share_rs": {
+            "type": ["number", "null"],
+            "description": (
+                "the price per share literally stated in the text (e.g. an allotment/issue price). NOT "
+                "guaranteed to equal total_amount_rs_cr / number_of_shares -- a real warrant-conversion filing "
+                "confirmed this live (issue price 63.8 vs 47.85 implied by total/shares, due to a multi-tranche "
+                "payment structure the text explained but this field alone can't carry). If the text explicitly "
+                "reconciles a difference between the stated price and the total/shares math, say so in "
+                "confidence_notes rather than silently picking one number."
+            ),
+        },
         "number_of_shares": {"type": ["number", "null"]},
         "investor_names": {"type": "array", "items": {"type": "string"}, "description": "every named allottee/investor actually stated in the text -- empty array if none named, never invented"},
         "purpose_summary": {"type": ["string", "null"], "description": "stated use of proceeds, if disclosed"},
