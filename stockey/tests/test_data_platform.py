@@ -2876,6 +2876,96 @@ def test_ensure_bse_view_creates_ohlcv_table_first(monkeypatch):
     assert calls == ["ohlcv", "factors", "view"]
 
 
+# scripts/dedupe_fundamentals_events.py -- one-time remediation for the in-batch
+# dedup gap (2026-08-17). Only merges a group when every row's headline matches
+# exactly; groups with differing headlines are genuinely different real disclosures
+# that share the dedup key by the module's own documented accepted tradeoff, and
+# must not be merged -- confirmed live 2026-08-17 that 54/73 "duplicate" groups
+# were actually this case (e.g. 4 distinct real filings for 2 different named
+# individuals sharing one isin/filing_type/date).
+
+
+def test_is_true_duplicate_group_requires_identical_headline_on_every_row():
+    from scripts.dedupe_fundamentals_events import _is_true_duplicate_group
+
+    identical = [{"headline": "Same filing text"}, {"headline": "Same filing text"}]
+    assert _is_true_duplicate_group(identical) is True
+
+    differing = [{"headline": "Disclosure for Himanshu Kanakia"}, {"headline": "Disclosure for Rasesh Kanakia"}]
+    assert _is_true_duplicate_group(differing) is False
+
+
+def test_dedupe_group_skips_groups_with_differing_headlines(monkeypatch):
+    import scripts.dedupe_fundamentals_events as dedupe_script
+
+    rows = [
+        {"source": "bse", "news_id": "a", "headline": "Disclosure for Himanshu Kanakia", "quantity": None, "insider_name": None, "transaction_type": None, "announcement_timestamp": None, "sources": "bse", "load_ts": None},
+        {"source": "bse", "news_id": "b", "headline": "Disclosure for Rasesh Kanakia", "quantity": None, "insider_name": None, "transaction_type": None, "announcement_timestamp": None, "sources": "bse", "load_ts": None},
+    ]
+    monkeypatch.setattr(dedupe_script, "load_group_rows", lambda isin, ft, d: rows)
+    apply_calls = []
+    monkeypatch.setattr(dedupe_script, "_apply_merge", lambda **k: apply_calls.append(k))
+    delete_calls = []
+    monkeypatch.setattr(dedupe_script, "_delete_row", lambda **k: delete_calls.append(k))
+
+    result = dedupe_script.dedupe_group("INE704H01022", "pit_sast", date(2026, 2, 25), dry_run=False)
+
+    assert result["canonical"] is None
+    assert result["removed"] == []
+    assert "differ" in result["skipped_reason"]
+    assert apply_calls == [] and delete_calls == []  # nothing touched
+
+
+def test_dedupe_group_merges_true_duplicates_and_cleans_up_orphaned_alerts(monkeypatch):
+    import scripts.dedupe_fundamentals_events as dedupe_script
+
+    rows = [
+        {"source": "bse", "news_id": "a", "headline": "Same real filing", "quantity": None, "insider_name": None, "transaction_type": None, "announcement_timestamp": None, "sources": "bse", "load_ts": "2026-08-01T00:00:00"},
+        {"source": "bse", "news_id": "b", "headline": "Same real filing", "quantity": 40000, "insider_name": "Sonitron Limited", "transaction_type": "buy", "announcement_timestamp": None, "sources": "bse", "load_ts": "2026-08-01T00:01:00"},
+    ]
+    monkeypatch.setattr(dedupe_script, "load_group_rows", lambda isin, ft, d: rows)
+    apply_calls = []
+    monkeypatch.setattr(dedupe_script, "_apply_merge", lambda **k: apply_calls.append(k))
+    delete_row_calls = []
+    monkeypatch.setattr(dedupe_script, "_delete_row", lambda **k: delete_row_calls.append(k))
+    monkeypatch.setattr(dedupe_script, "_count_orphaned_alerts", lambda source, news_id: 1 if news_id == "b" else 0)
+    delete_alert_calls = []
+    monkeypatch.setattr(dedupe_script, "_delete_orphaned_alerts", lambda **k: delete_alert_calls.append(k))
+
+    result = dedupe_script.dedupe_group("INE111", "pit_sast", date(2026, 8, 1), dry_run=False)
+
+    assert result["canonical"] == ["bse", "a"]  # earliest-loaded row's identity wins
+    assert result["removed"] == [["bse", "b"]]
+    assert result["orphaned_alerts_removed"] == 1
+    assert len(apply_calls) == 1
+    assert apply_calls[0]["merged_fields"]["quantity"] == 40000  # filled in from sibling "b"
+    assert delete_alert_calls == [{"source": "bse", "news_id": "b"}]
+    assert delete_row_calls == [{"source": "bse", "news_id": "b"}]
+
+
+def test_dedupe_group_dry_run_never_calls_apply_or_delete(monkeypatch):
+    import scripts.dedupe_fundamentals_events as dedupe_script
+
+    rows = [
+        {"source": "bse", "news_id": "a", "headline": "Same real filing", "quantity": None, "insider_name": None, "transaction_type": None, "announcement_timestamp": None, "sources": "bse", "load_ts": "2026-08-01T00:00:00"},
+        {"source": "bse", "news_id": "b", "headline": "Same real filing", "quantity": 40000, "insider_name": "Sonitron Limited", "transaction_type": "buy", "announcement_timestamp": None, "sources": "bse", "load_ts": "2026-08-01T00:01:00"},
+    ]
+    monkeypatch.setattr(dedupe_script, "load_group_rows", lambda isin, ft, d: rows)
+    monkeypatch.setattr(dedupe_script, "_count_orphaned_alerts", lambda source, news_id: 0)
+
+    def _fail(*a, **k):
+        raise AssertionError("dry_run must not call this")
+
+    monkeypatch.setattr(dedupe_script, "_apply_merge", _fail)
+    monkeypatch.setattr(dedupe_script, "_delete_row", _fail)
+    monkeypatch.setattr(dedupe_script, "_delete_orphaned_alerts", _fail)
+
+    result = dedupe_script.dedupe_group("INE111", "pit_sast", date(2026, 8, 1), dry_run=True)
+
+    assert result["canonical"] == ["bse", "a"]  # plan is still computed and reported
+    assert result["removed"] == [["bse", "b"]]
+
+
 def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
     # Operator decision: core numerical bhavcopy data must never be archived out of the live DB. The
     # legacy-archival tool must skip every protected table by default, and only proceed under an
@@ -10245,6 +10335,80 @@ def test_upsert_events_with_dedup_empty_rows_is_a_noop(monkeypatch):
     assert calls == []
 
 
+def test_upsert_events_with_dedup_merges_sibling_rows_within_the_same_batch(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15: find_dedup_candidate only ever queries the DB, so two
+    # rows sharing a dedup key WITHIN one batch (neither flushed to the DB yet) both
+    # independently found "no match" and both got inserted -- confirmed live, 167
+    # orphaned duplicate rows across 73 groups. This pins the fix: they must merge
+    # into ONE staged row instead of becoming two inserts.
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda isin, ft, d: None)  # nothing in the DB yet
+    monkeypatch.setattr(fundamentals_events_store, "_ensure_events_schema", lambda: None)
+    upsert_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "upsert_to_db", lambda df, table, **k: upsert_calls.append((df, table, k)))
+
+    row_a = {"source": "bse", "news_id": "bse-1", "isin": "INE111", "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1), "quantity": None, "insider_name": None, "sources": "bse"}
+    row_b = {"source": "nse", "news_id": "nse-1", "isin": "INE111", "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1), "quantity": 25000, "insider_name": "Jane Promoter", "sources": "nse"}
+
+    result = fundamentals_events_store.upsert_events_with_dedup([row_a, row_b])
+
+    assert result == {"inserted": 1, "merged": 1}  # ONE row written, not two
+    df, table, kwargs = upsert_calls[0]
+    assert len(df) == 1
+    merged_row = df.iloc[0]
+    assert merged_row["source"] == "bse" and merged_row["news_id"] == "bse-1"  # first-staged row's identity wins
+    assert merged_row["quantity"] == 25000  # filled in from the second row
+    assert merged_row["insider_name"] == "Jane Promoter"
+    assert merged_row["sources"] == "bse,nse"
+
+
+def test_upsert_events_with_dedup_batch_merge_handles_three_sibling_rows(monkeypatch):
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda isin, ft, d: None)
+    monkeypatch.setattr(fundamentals_events_store, "_ensure_events_schema", lambda: None)
+    upsert_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "upsert_to_db", lambda df, table, **k: upsert_calls.append((df, table, k)))
+
+    rows = [
+        {"source": "bse", "news_id": f"bse-{i}", "isin": "INE111", "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1)}
+        for i in range(3)
+    ]
+
+    result = fundamentals_events_store.upsert_events_with_dedup(rows)
+
+    assert result == {"inserted": 1, "merged": 2}
+    assert len(upsert_calls[0][0]) == 1
+
+
+def test_upsert_events_with_dedup_does_not_merge_rows_lacking_a_dedup_key(monkeypatch):
+    # rows without a resolvable isin skip dedup entirely (module docstring) -- must
+    # not be accidentally merged together in-batch just because they share (None,
+    # None, None).
+    monkeypatch.setattr(fundamentals_events_store, "find_dedup_candidate", lambda isin, ft, d: None)
+    monkeypatch.setattr(fundamentals_events_store, "_ensure_events_schema", lambda: None)
+    upsert_calls = []
+    monkeypatch.setattr(fundamentals_events_store, "upsert_to_db", lambda df, table, **k: upsert_calls.append((df, table, k)))
+
+    rows = [
+        {"source": "bse", "news_id": "bse-1", "isin": None, "filing_type": "results", "disclosure_date": date(2026, 8, 1)},
+        {"source": "bse", "news_id": "bse-2", "isin": None, "filing_type": "results", "disclosure_date": date(2026, 8, 1)},
+    ]
+
+    result = fundamentals_events_store.upsert_events_with_dedup(rows)
+
+    assert result == {"inserted": 2, "merged": 0}
+    assert len(upsert_calls[0][0]) == 2
+
+
+def test_dedup_key_normalizes_disclosure_date_as_text():
+    row = {"isin": "INE111", "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1)}
+    assert fundamentals_events_store._dedup_key(row) == ("INE111", "pit_sast", "2026-08-01")
+
+
+def test_dedup_key_none_when_missing_isin_or_filing_type_or_date():
+    assert fundamentals_events_store._dedup_key({"isin": None, "filing_type": "pit_sast", "disclosure_date": date(2026, 8, 1)}) is None
+    assert fundamentals_events_store._dedup_key({"isin": "INE111", "filing_type": None, "disclosure_date": date(2026, 8, 1)}) is None
+    assert fundamentals_events_store._dedup_key({"isin": "INE111", "filing_type": "pit_sast", "disclosure_date": None}) is None
+
+
 # fundamentals/collectors/nse_pit.py -- L3 detection, NSE half (step 5).
 # Rewritten 2026-08-15 for NSE's corporates-pit -> corporates-pit-gg migration (see
 # module docstring): the endpoint's list rows no longer carry flat acquirer/quantity
@@ -10790,12 +10954,81 @@ def test_load_pending_rating_actions_queries_expected_filters(monkeypatch):
 
     def fake_sql_to_df(query, **kwargs):
         captured["query"] = query
+        captured["kwargs"] = kwargs
         return pd.DataFrame()
 
     monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", fake_sql_to_df)
     fundamentals_rating_agencies.load_pending_rating_actions()
     assert "filing_type = 'rating_action'" in captured["query"]
     assert "enrichment_status = 'pending'" in captured["query"]
+    # BUG FOUND LIVE 2026-08-15, fixed 2026-08-17: no_match/failed rows must also be
+    # eligible for retry (fundamental_basic_goal.md sec 3.3: "retry tomorrow") --
+    # previously only 'pending' was ever selected, permanently excluding them.
+    assert "no_match" in captured["query"] and "failed" in captured["query"]
+    assert "enrichment_attempted_at" in captured["query"]
+    assert len(captured["kwargs"]["params"]) == 1  # the retry cutoff timestamp
+
+
+def test_load_pending_rating_actions_includes_stale_no_match_and_failed_rows(monkeypatch):
+    # Live behavior check (not just query text): a no_match row whose last attempt
+    # is older than RETRY_AFTER must come back; nothing here mocks sql_to_df itself,
+    # so this exercises the query against a fake in-memory frame via a stub that
+    # actually applies the same WHERE-clause semantics.
+    old_attempt = pd.Timestamp.now(tz="UTC") - fundamentals_rating_agencies.RETRY_AFTER - pd.Timedelta(hours=1)
+    recent_attempt = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=1)
+    rows = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": "stale-no-match", "enrichment_status": "no_match", "enrichment_attempted_at": old_attempt},
+            {"source": "bse", "news_id": "fresh-no-match", "enrichment_status": "no_match", "enrichment_attempted_at": recent_attempt},
+            {"source": "bse", "news_id": "stale-failed", "enrichment_status": "failed", "enrichment_attempted_at": old_attempt},
+            {"source": "bse", "news_id": "never-attempted", "enrichment_status": "no_match", "enrichment_attempted_at": None},
+            {"source": "bse", "news_id": "fresh-pending", "enrichment_status": "pending", "enrichment_attempted_at": None},
+        ]
+    )
+
+    def fake_sql_to_df(query, params=None):
+        cutoff = params[0]
+        eligible = rows[
+            (rows["enrichment_status"] == "pending")
+            | (
+                rows["enrichment_status"].isin(["no_match", "failed"])
+                & (rows["enrichment_attempted_at"].isna() | (rows["enrichment_attempted_at"] < cutoff))
+            )
+        ]
+        return eligible
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "sql_to_df", fake_sql_to_df)
+    result = fundamentals_rating_agencies.load_pending_rating_actions()
+
+    news_ids = set(result["news_id"])
+    assert news_ids == {"stale-no-match", "stale-failed", "never-attempted", "fresh-pending"}
+    assert "fresh-no-match" not in news_ids  # too recent -- not yet eligible for retry
+
+
+def test_set_enrichment_status_always_stamps_enrichment_attempted_at(monkeypatch):
+    captured = {}
+
+    def fake_op(op, *, operation_name):
+        op()  # run it against a fake cursor to capture what would be executed
+
+    class _FakeCursor:
+        def execute(self, query, params):
+            captured["query"] = query
+            captured["params"] = params
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, _FakeCursor()
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "execute_db_operation", fake_op)
+    monkeypatch.setattr(fundamentals_rating_agencies, "db_session", fake_db_session)
+
+    fundamentals_rating_agencies._set_enrichment_status(source="bse", news_id="n1", status="no_match")
+
+    assert "enrichment_attempted_at" in captured["query"]
+    assert captured["params"][0] == "no_match"
 
 
 def test_run_rating_agency_enrichment_returns_early_when_nothing_pending(monkeypatch):
@@ -12484,6 +12717,7 @@ def test_run_llm_triage_trips_circuit_breaker(monkeypatch):
 
 def test_create_thesis_requires_prediction_text(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
         fundamentals_l4_thesis.create_thesis(
             company_master_id="nse:X", prediction_text="  ", target_date=date(2027, 1, 1),
@@ -12493,6 +12727,7 @@ def test_create_thesis_requires_prediction_text(monkeypatch):
 
 def test_create_thesis_requires_target_date(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
         fundamentals_l4_thesis.create_thesis(
             company_master_id="nse:X", prediction_text="p", target_date=None,
@@ -12502,6 +12737,7 @@ def test_create_thesis_requires_target_date(monkeypatch):
 
 def test_create_thesis_requires_invalidation_criteria(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
         fundamentals_l4_thesis.create_thesis(
             company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
@@ -12511,6 +12747,7 @@ def test_create_thesis_requires_invalidation_criteria(monkeypatch):
 
 def test_create_thesis_requires_valid_origin_tag(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
         fundamentals_l4_thesis.create_thesis(
             company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
@@ -12520,6 +12757,7 @@ def test_create_thesis_requires_valid_origin_tag(monkeypatch):
 
 def test_create_thesis_requires_valid_metric_operator(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
         fundamentals_l4_thesis.create_thesis(
             company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
@@ -12529,6 +12767,7 @@ def test_create_thesis_requires_valid_metric_operator(monkeypatch):
 
 def test_create_thesis_builds_expected_row(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     upserts = []
     monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
 
@@ -12559,6 +12798,7 @@ def test_create_thesis_builds_expected_row(monkeypatch):
 
 def test_create_thesis_without_source_alert_is_ad_hoc(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
     monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: None)
     row = fundamentals_l4_thesis.create_thesis(
         company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
@@ -12566,6 +12806,41 @@ def test_create_thesis_without_source_alert_is_ad_hoc(monkeypatch):
     )
     assert row["source_alert_source"] is None
     assert row["source_alert_news_id"] is None
+
+
+def test_create_thesis_refuses_to_overwrite_an_already_resolved_thesis(monkeypatch):
+    # BUG FOUND LIVE 2026-08-15, fixed 2026-08-17: thesis_id is deterministic on
+    # (company_master_id, prediction_text, created_date) -- re-submitting identical
+    # inputs (e.g. a retried API call) used to silently wipe a real resolution back
+    # to open/None. Reproduced live with a disposable test row before fixing.
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "resolved"}]))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError, match="already resolved"):
+        fundamentals_l4_thesis.create_thesis(
+            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+            invalidation_criteria="x", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
+        )
+    assert upserts == []  # nothing was written -- the resolution stays intact
+
+
+def test_create_thesis_allows_resubmitting_an_open_thesis(monkeypatch):
+    # a re-submit of an OPEN (not yet resolved) thesis with identical inputs is
+    # harmless -- same thesis_id, same data, just re-upserted. Only a RESOLVED
+    # thesis is protected.
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "open"}]))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    row = fundamentals_l4_thesis.create_thesis(
+        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+        invalidation_criteria="x", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
+    )
+    assert row["status"] == "open"
+    assert len(upserts) == 1
 
 
 def test_resolve_thesis_requires_failure_attribution_when_false(monkeypatch):

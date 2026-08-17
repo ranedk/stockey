@@ -208,25 +208,61 @@ def _apply_merge(*, source: str, news_id: str, merged_fields: dict) -> None:
     execute_db_operation(_update, operation_name="fundamentals_events:merge_update")
 
 
+def _dedup_key(row: dict) -> tuple | None:
+    """Same (isin, filing_type, disclosure_date) match key find_dedup_candidate uses
+    against the DB, normalized the same way (disclosure_date as text -- see that
+    function's docstring) -- None if this row can't participate in dedup at all
+    (matches find_dedup_candidate's own isin/filing_type/disclosure_date gate)."""
+    isin, filing_type, disclosure_date = row.get("isin"), row.get("filing_type"), row.get("disclosure_date")
+    if not isin or not filing_type or disclosure_date is None:
+        return None
+    return (isin, filing_type, str(disclosure_date))
+
+
 def upsert_events_with_dedup(rows: list[dict]) -> dict[str, int]:
     """Insert new fundamentals_events rows, merging into an existing cross-source match
     instead of inserting a duplicate -- see module docstring. Rows without an isin
-    (identity couldn't be resolved) skip dedup matching entirely and just insert."""
+    (identity couldn't be resolved) skip dedup matching entirely and just insert.
+
+    BUG FOUND LIVE 2026-08-15, fixed here: find_dedup_candidate() only ever queries
+    the DB, so two rows sharing a dedup key WITHIN one call's own `rows` batch (a
+    company filing the same disclosure twice in one day, or two collectors both
+    picking up the same event in one run) each independently found no DB match
+    (neither had been flushed yet) and both got inserted separately -- confirmed
+    live: 167 orphaned duplicate rows across 73 (isin, filing_type, disclosure_date)
+    groups, ~14% of all BSE-sourced events. staged_by_key tracks rows already
+    decided as new-inserts EARLIER IN THIS SAME BATCH so a later row in the batch
+    merges into the staged row instead of becoming a second insert."""
     if not rows:
         return {"inserted": 0, "merged": 0}
 
     _ensure_events_schema()
 
-    to_insert = []
+    to_insert: list[dict] = []
+    staged_by_key: dict[tuple, int] = {}
     merged = 0
+
     for row in rows:
         candidate = find_dedup_candidate(row.get("isin"), row.get("filing_type"), row.get("disclosure_date"))
         if candidate is not None and (candidate["source"], candidate["news_id"]) != (row["source"], row["news_id"]):
             merged_fields = _merge_row_fields(candidate, row)
             _apply_merge(source=candidate["source"], news_id=candidate["news_id"], merged_fields=merged_fields)
             merged += 1
-        else:
-            to_insert.append(row)
+            continue
+
+        key = _dedup_key(row)
+        staged_idx = staged_by_key.get(key) if key is not None else None
+        if staged_idx is not None:
+            staged_row = to_insert[staged_idx]
+            if (staged_row["source"], staged_row["news_id"]) != (row["source"], row["news_id"]):
+                merged_fields = _merge_row_fields(staged_row, row)
+                to_insert[staged_idx] = {**staged_row, **merged_fields}
+                merged += 1
+                continue
+
+        to_insert.append(row)
+        if key is not None:
+            staged_by_key[key] = len(to_insert) - 1
 
     if to_insert:
         upsert_to_db(pd.DataFrame(to_insert), RESULTS_TABLE, unique_keys=["source", "news_id"])

@@ -162,6 +162,18 @@ CIRCUIT_BREAKER_THRESHOLD = 3
 # (filing timing vs. agency publish timing don't always align to the minute) --
 # matching within this window still counts as the same disclosure.
 MATCH_DATE_TOLERANCE_DAYS = 2
+# fundamental_basic_goal.md sec 3.3: "enrichment may fail silently and retry
+# tomorrow." BUG FOUND LIVE 2026-08-15, fixed here: load_pending_rating_actions()
+# only ever selected enrichment_status='pending' -- nothing anywhere ever reset a
+# 'no_match'/'failed' row back to pending, so despite this module's own docstring
+# and this exact spec line promising a next-day retry, a row that missed on its
+# first attempt was permanently excluded from every future run. Confirmed live: a
+# real 'no_match' row (a CRISIL upgrade) sat unchanged across at least one full
+# pipeline cycle. RETRY_AFTER is the "tomorrow" in the spec -- a no_match/failed row
+# is eligible again once this much time has passed since its last attempt, so a
+# same-day re-run (or a re-run within one cron cycle) doesn't hammer the same
+# not-yet-indexed rationale twice.
+RETRY_AFTER = pd.Timedelta(days=1)
 
 # Extra columns rating-agency enrichment needs on the shared fundamentals_events table
 # -- added to events_store's own bootstrap list rather than a second competing
@@ -173,6 +185,7 @@ RATING_ENRICHMENT_COLUMN_TYPES = {
     "rationale_id": "TEXT",
     "rationale_url": "TEXT",
     "rationale_pdf_url": "TEXT",
+    "enrichment_attempted_at": "TIMESTAMPTZ",
 }
 
 
@@ -461,19 +474,31 @@ AGENCY_PLUGINS = {
 
 
 def load_pending_rating_actions(limit: int | None = None) -> pd.DataFrame:
+    """Fresh 'pending' rows, PLUS 'no_match'/'failed' rows whose last attempt is at
+    least RETRY_AFTER old -- see that constant's docstring for the bug this fixes.
+    Fresh pending rows sort first (CASE ... END) so a batch/rate limit always
+    prioritizes never-yet-tried detections over a retry of one that already missed
+    once."""
     query = """
-        SELECT source, news_id, company_master_id, headline, subcategory, disclosure_date
+        SELECT source, news_id, company_master_id, headline, subcategory, disclosure_date, enrichment_status
         FROM fundamentals_events
-        WHERE filing_type = 'rating_action' AND enrichment_status = 'pending'
-        ORDER BY load_ts ASC NULLS LAST
+        WHERE filing_type = 'rating_action'
+          AND (
+            enrichment_status = 'pending'
+            OR (
+              enrichment_status IN ('no_match', 'failed')
+              AND (enrichment_attempted_at IS NULL OR enrichment_attempted_at < %s)
+            )
+          )
+        ORDER BY CASE WHEN enrichment_status = 'pending' THEN 0 ELSE 1 END, load_ts ASC NULLS LAST
     """
     if limit:
         query += f" LIMIT {int(limit)}"
-    return sql_to_df(query)
+    return sql_to_df(query, params=(pd.Timestamp.now(tz="UTC") - RETRY_AFTER,))
 
 
 def _set_enrichment_status(*, source: str, news_id: str, status: str, fields: dict | None = None) -> None:
-    fields = fields or {}
+    fields = {**(fields or {}), "enrichment_attempted_at": pd.Timestamp.now(tz="UTC")}
     set_columns = ["enrichment_status = %s"] + [f"{col} = %s" for col in fields]
     params = [status, *fields.values(), source, news_id]
 

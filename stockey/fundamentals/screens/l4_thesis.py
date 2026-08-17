@@ -129,6 +129,30 @@ def create_thesis(
     thesis_id = _make_thesis_id(company_master_id, prediction_text, created_date)
     source_alert = source_alert or {}
 
+    # BUG FOUND LIVE 2026-08-15, fixed here: thesis_id is a deterministic hash of
+    # (company_master_id, prediction_text, created_date) only, and this used to
+    # upsert unconditionally -- a re-submission with IDENTICAL inputs (e.g. a
+    # retried API call after a network blip) would silently overwrite status/
+    # resolved_true/resolution_date/resolution_notes/failure_attribution back to
+    # blank, wiping a real forecast outcome from the scoring ledger this whole
+    # module exists to keep honest. Reproduced live: create -> resolve(False,
+    # thesis_wrong) -> create again with the same inputs silently reverted the row
+    # to status=open, resolved_true=None. A resolved thesis is now immutable via
+    # this path -- resolve_thesis() is the only way to change it further, matching
+    # "resolution is always a separate, explicit human call" from the module
+    # docstring.
+    existing = sql_to_df(
+        "SELECT status FROM fundamentals_l4_thesis WHERE thesis_id = %s",
+        params=(thesis_id,),
+    )
+    if not existing.empty and existing.iloc[0]["status"] == "resolved":
+        raise ThesisValidationError(
+            f"thesis {thesis_id!r} is already resolved -- re-submitting identical "
+            "(company_master_id, prediction_text, created_date) would silently wipe "
+            "its resolution; if you meant a new thesis, change the prediction text "
+            "or created_date so it gets a distinct id"
+        )
+
     row = {
         "thesis_id": thesis_id,
         "company_master_id": company_master_id,
