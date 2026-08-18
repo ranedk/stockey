@@ -9296,6 +9296,28 @@ def test_parse_period_table_handles_missing_table():
     assert fundamentals_l2_state._parse_period_table(None) == {"periods": [], "rows": {}}
 
 
+def test_ensure_l2_valuation_columns_are_numeric_migration_uses_schema_registry(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): pe/valuation_vs_own_history_ratio/
+    # valuation_sector_percentile were always None before VALUATION_QUERY existed
+    # (added 2026-08-13) -- upsert_to_db inferred TEXT from that all-null column on
+    # first write, and ADD COLUMN IF NOT EXISTS never widens an existing column's
+    # type, so they've stayed TEXT ever since despite now genuinely holding floats.
+    # Confirmed live via information_schema: all 3 columns are still "text".
+    calls = []
+    monkeypatch.setattr(fundamentals_l2_state, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    fundamentals_l2_state.ensure_l2_valuation_columns_are_numeric()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == "20260818_l2_state_valuation_columns_to_double_precision"
+    assert call["metadata"]["tables"] == ["fundamentals_l2_state"]
+    ddl = "\n".join(call["statements"])
+    assert "ALTER COLUMN pe TYPE DOUBLE PRECISION" in ddl
+    assert "ALTER COLUMN valuation_vs_own_history_ratio TYPE DOUBLE PRECISION" in ddl
+    assert "ALTER COLUMN valuation_sector_percentile TYPE DOUBLE PRECISION" in ddl
+
+
 def test_compute_debt_trajectory_matches_hand_computed_values():
     balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
     profit_loss = fundamentals_l2_state._parse_period_table(_table(PROFIT_LOSS_FIXTURE_HTML))
@@ -9343,6 +9365,59 @@ def test_value_at_period_returns_none_when_period_label_absent():
     profit_loss = fundamentals_l2_state._parse_period_table(_table(PROFIT_LOSS_FIXTURE_HTML))
     assert fundamentals_l2_state._value_at_period(profit_loss, "Operating Profit", period_label="Mar 1999") is None
     assert fundamentals_l2_state._value_at_period(profit_loss, "Operating Profit", period_label=None) is None
+
+
+def test_value_at_period_right_aligns_a_row_with_fewer_values_than_periods():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this used to index `values` by
+    # period_label's ABSOLUTE position in `periods`, but _value_at (the sibling
+    # lookup) indexes `values` from the END -- screener.in right-aligns a row's own
+    # value list to its most recent period when that row's earliest years are
+    # missing, not left-aligned to the header. 3 periods, but this row is only
+    # populated for the 2 most recent -- Mar 2024 (oldest) has no value at all.
+    period_table = {
+        "periods": ["Mar 2024", "Mar 2025", "Mar 2026"],
+        "rows": {"Operating Profit": [40, 31]},  # right-aligned: index 0 -> Mar 2025, index 1 -> Mar 2026
+    }
+    # Old absolute-index code silently returned the WRONG value here (40, Mar 2024's
+    # slot) for Mar 2025 -- not just None, an actively wrong figure.
+    assert fundamentals_l2_state._value_at_period(period_table, "Operating Profit", period_label="Mar 2025") == 40
+    assert fundamentals_l2_state._value_at_period(period_table, "Operating Profit", period_label="Mar 2026") == 31
+    # Mar 2024 has no value at all for this row (right-aligned means it fell off the front).
+    assert fundamentals_l2_state._value_at_period(period_table, "Operating Profit", period_label="Mar 2024") is None
+
+
+def test_compute_debt_trajectory_records_fallback_when_pl_lacks_bs_latest_period(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): _value_at_period() returning None when
+    # the Balance Sheet's latest period isn't in the P&L's own period list is
+    # correct (refusing to guess), but was silent -- a real coverage regression vs.
+    # the pre-fix (misaligned) behavior. Must now be visible via fallback telemetry.
+    balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))  # latest period: Mar 2026
+    profit_loss = fundamentals_l2_state._parse_period_table(
+        _table("<table><tr><th></th><th>Mar 2024</th><th>Mar 2025</th></tr>"
+               "<tr><td>Operating Profit</td><td>30</td><td>32</td></tr>"
+               "<tr><td>Interest</td><td>3</td><td>4</td></tr></table>")
+    )
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_l2_state, "record_local_fallback_event", lambda **k: fallback_events.append(k))
+
+    result = fundamentals_l2_state.compute_debt_trajectory(balance_sheet, profit_loss, ticker="TESTCO")
+
+    assert result["interest_coverage"] is None
+    assert result["debt_to_ebitda"] is None
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["fallback_type"] == "l2_bs_pl_period_misaligned"
+    assert fallback_events[0]["metadata"] == {"ticker": "TESTCO", "latest_balance_sheet_period": "Mar 2026", "pl_periods": ["Mar 2024", "Mar 2025"]}
+
+
+def test_compute_debt_trajectory_no_fallback_when_periods_align(monkeypatch):
+    balance_sheet = fundamentals_l2_state._parse_period_table(_table(BALANCE_SHEET_FIXTURE_HTML))
+    profit_loss = fundamentals_l2_state._parse_period_table(_table(PROFIT_LOSS_FIXTURE_HTML))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_l2_state, "record_local_fallback_event", lambda **k: fallback_events.append(k))
+
+    fundamentals_l2_state.compute_debt_trajectory(balance_sheet, profit_loss, ticker="TESTCO")
+
+    assert fallback_events == []
 
 
 def test_compute_debt_trajectory_returns_none_ratios_when_interest_is_zero():
@@ -9720,6 +9795,7 @@ def test_compute_valuation_sector_percentiles_skips_missing_sector_or_pe():
 
 
 def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     universe = pd.DataFrame(
         [
             {"company_id": 1, "company_name": "Aarey Drugs", "ticker": "AAREYDRUGS"},
@@ -9774,6 +9850,7 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
 
 
 def test_run_l2_state_refresh_does_not_mark_crawled_when_the_batched_upsert_fails(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     # BUG FOUND LIVE 2026-08-15, fixed here: _mark_crawled used to be called
     # per-company INSIDE the fetch loop, well before the single batched
     # fundamentals_l2_state upsert ran -- a transient failure on that upsert would
@@ -9807,6 +9884,7 @@ def test_run_l2_state_refresh_does_not_mark_crawled_when_the_batched_upsert_fail
 
 
 def test_run_l2_state_refresh_isolates_one_market_wide_query_failure(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     # 2026-08-15 bug found live: fetch_pledge_levels/fetch_valuation_levels ran back-to-back with
     # no isolation -- either one raising took down the ENTIRE L2 step, before any per-company
     # detail fetch even started. Confirmed live: fetch_valuation_levels (added 2026-08-13) failing
@@ -9847,6 +9925,7 @@ def test_run_l2_state_refresh_isolates_one_market_wide_query_failure(monkeypatch
 
 
 def test_run_l2_state_refresh_writes_synthetic_event_on_institutional_first_entry(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     universe = pd.DataFrame([{"company_id": 1, "company_name": "Entry Co", "ticker": "ENTRYCO"}])
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
@@ -9884,6 +9963,7 @@ def test_run_l2_state_refresh_writes_synthetic_event_on_institutional_first_entr
 
 
 def test_run_l2_state_refresh_no_synthetic_event_when_no_first_entry(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     universe = pd.DataFrame([{"company_id": 1, "company_name": "No Entry Co", "ticker": "NOENTRY"}])
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
@@ -9908,6 +9988,7 @@ def test_run_l2_state_refresh_no_synthetic_event_when_no_first_entry(monkeypatch
 
 
 def test_run_l2_state_refresh_skips_a_company_whose_detail_fetch_fails(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     universe = pd.DataFrame(
         [
             {"company_id": 1, "company_name": "Good Co", "ticker": "GOOD"},
@@ -9948,6 +10029,7 @@ def test_run_l2_state_refresh_skips_a_company_whose_detail_fetch_fails(monkeypat
 
 
 def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: pd.DataFrame())
     upserts = []
     monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda *a, **k: upserts.append((a, k)))

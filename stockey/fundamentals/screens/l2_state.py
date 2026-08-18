@@ -125,6 +125,7 @@ from utils.company_master import build_l1_ticker_by_company_master_id, map_compa
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
+from utils.schema_migrations import apply_schema_migration
 
 SYNC_SOURCE_NAME = "fundamentals.screens.l2_state"
 RESULTS_TABLE = "fundamentals_l2_state"
@@ -203,6 +204,28 @@ def _record_no_universe_fallback() -> None:
     )
 
 
+def _record_bs_pl_period_misaligned_fallback(ticker: str | None, *, latest_balance_sheet_period: str, pl_periods: list) -> None:
+    # BUG FOUND LIVE 2026-08-18 (re-audit): _value_at_period() returning None when
+    # the Balance Sheet's latest period isn't in the Profit & Loss table's own period
+    # list is CORRECT (refusing to guess across a genuine reporting-date skew), but
+    # was silent -- a real coverage regression vs. the pre-fix behavior (which read
+    # P&L's own latest column regardless of alignment, wrong but non-null). Visible
+    # now so a persistent/growing rate of these is distinguishable from one-off
+    # screener.in data gaps.
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        source="screenerin",
+        fallback_type="l2_bs_pl_period_misaligned",
+        severity="warn",
+        reason=(
+            "Balance Sheet's latest period isn't present in the Profit & Loss table's own period "
+            "list -- interest_coverage/debt_to_ebitda left None rather than reading a mismatched period."
+        ),
+        error="period not found in profit_loss periods",
+        metadata={"ticker": ticker, "latest_balance_sheet_period": latest_balance_sheet_period, "pl_periods": pl_periods},
+    )
+
+
 def _record_market_wide_query_fallback(query_name: str, error: Exception) -> None:
     # 2026-08-15 found live: fetch_pledge_levels/fetch_valuation_levels ran back-to-back with no
     # isolation between them -- either one's failure took down the ENTIRE L2 step (192 companies'
@@ -274,15 +297,27 @@ def _value_at_period(period_table: dict[str, object], label: str, *, period_labe
     period list may not line up 1:1. See compute_debt_trajectory's own docstring for
     why this exists: screener.in's Profit & Loss table always carries a trailing TTM
     column (confirmed live 2026-08-17) the Balance Sheet table doesn't, so two
-    independent offset=0 lookups can silently land on different dates."""
+    independent offset=0 lookups can silently land on different dates.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): this used to index `values` by
+    period_label's ABSOLUTE position in `periods` (periods.index(period_label)), but
+    _value_at (the sibling lookup every OTHER field in this module uses) indexes
+    `values` from the END -- screener.in right-aligns a row's own value list to its
+    most recent period when that specific metric's earliest years are missing, not
+    left-aligned to the table's period header. If a row has fewer values than
+    periods, the two conventions silently disagree. Fixed by computing period_label's
+    offset FROM THE END of `periods`, then applying that same trailing offset to
+    `values` -- identical result to the old absolute-index lookup when a row's value
+    count matches the header's, but no longer silently misaligned when it doesn't."""
     if period_label is None:
         return None
     periods = period_table.get("periods", [])
     values = period_table.get("rows", {}).get(label)
     if not values or period_label not in periods:
         return None
-    index = periods.index(period_label)
-    if index >= len(values):
+    offset_from_end = len(periods) - 1 - periods.index(period_label)
+    index = len(values) - 1 - offset_from_end
+    if index < 0:
         return None
     return values[index]
 
@@ -340,7 +375,7 @@ def compute_trend_direction(values: list) -> dict[str, object]:
     return {"consecutive_declining_periods": consecutive_declining, "trend_direction": trend_direction}
 
 
-def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[str, object]) -> dict[str, object]:
+def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[str, object], *, ticker: str | None = None) -> dict[str, object]:
     # net_debt_rscr is GROSS Borrowings, not net of cash & cash equivalents -- BUG
     # FOUND LIVE 2026-08-17, documented (not fixed by netting) here: screener.in's
     # condensed Balance Sheet section has no separate Cash/Cash Equivalents row at
@@ -373,6 +408,9 @@ def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[
     # keeping every "latest" figure in this state vector on one consistent date.
     latest_balance_sheet_period = balance_sheet.get("periods") or [None]
     latest_balance_sheet_period = latest_balance_sheet_period[-1]
+    pl_periods = profit_loss.get("periods", [])
+    if latest_balance_sheet_period is not None and latest_balance_sheet_period not in pl_periods:
+        _record_bs_pl_period_misaligned_fallback(ticker, latest_balance_sheet_period=latest_balance_sheet_period, pl_periods=pl_periods)
     operating_profit_latest = _value_at_period(profit_loss, "Operating Profit", period_label=latest_balance_sheet_period)
     interest_latest = _value_at_period(profit_loss, "Interest", period_label=latest_balance_sheet_period)
     interest_coverage = (
@@ -760,7 +798,7 @@ def build_l2_state_row(
         "company_id": company["company_id"],
         "company_name": company["company_name"],
         "ticker": company["ticker"],
-        **compute_debt_trajectory(detail["balance_sheet"], detail["profit_loss"]),
+        **compute_debt_trajectory(detail["balance_sheet"], detail["profit_loss"], ticker=company["ticker"]),
         **compute_cwip_ratio(detail["balance_sheet"]),
         "pledge_pct": pledge_levels.get(company["company_id"], 0.0),
         **compute_promoter_stake(detail["shareholding"]),
@@ -829,6 +867,30 @@ def _build_institutional_entry_event_row(row: dict[str, object], *, latest_perio
     }
 
 
+def ensure_l2_valuation_columns_are_numeric() -> None:
+    """One-time migration (re-audit 2026-08-18): pe/valuation_vs_own_history_ratio/
+    valuation_sector_percentile were always None before VALUATION_QUERY existed
+    (added 2026-08-13) -- upsert_to_db's dtype-to-column-type inference saw an
+    all-null/object-dtype pandas column on first write and created them as TEXT.
+    ADD COLUMN IF NOT EXISTS never widens an existing column's type, so they've
+    stayed TEXT ever since despite now genuinely holding floats; bounded only
+    because nothing reads them yet (see build_l2_state_row's own comment) -- would
+    silently mistype the moment a consumer expects a number. Converts in place;
+    build_l2_state_row already writes Python floats, so this doesn't need to
+    change to keep it from drifting back."""
+    apply_schema_migration(
+        migration_id="20260818_l2_state_valuation_columns_to_double_precision",
+        description=f"{RESULTS_TABLE}.pe/valuation_vs_own_history_ratio/valuation_sector_percentile: TEXT -> DOUBLE PRECISION.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN pe TYPE DOUBLE PRECISION USING NULLIF(pe, '')::DOUBLE PRECISION",
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN valuation_vs_own_history_ratio TYPE DOUBLE PRECISION USING NULLIF(valuation_vs_own_history_ratio, '')::DOUBLE PRECISION",
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN valuation_sector_percentile TYPE DOUBLE PRECISION USING NULLIF(valuation_sector_percentile, '')::DOUBLE PRECISION",
+        ],
+    )
+
+
 def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str, object]:
     """Build one L2 state row per DUE L1-universe company, keyed by (company_id,
     run_date, state_vector_version) -- append-only across refreshes (docs/
@@ -839,6 +901,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     docstring) ended once the universe grows toward the source PRD's own ~500-700
     estimate. limit is applied AFTER the due-filter, not before, so a caller asking
     for N companies gets N genuinely-due ones, not N that might all be skipped."""
+    ensure_l2_valuation_columns_are_numeric()
     universe = load_l1_universe()
     if universe.empty:
         _record_no_universe_fallback()
