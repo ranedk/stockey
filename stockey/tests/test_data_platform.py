@@ -14695,6 +14695,27 @@ def test_load_adjusted_price_history_falls_back_to_bse_view_when_nse_empty(monke
     assert any("bse_advisory_adjusted_ohlcv_daily" in q for q in calls)
 
 
+def test_load_adjusted_price_history_falls_back_to_nse_be_series_when_eq_empty(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): series='EQ' hardcode drops BE-series
+    # (trade-to-trade / restricted-segment) companies the adjusted view actually
+    # covers -- live, VHLTD has 531 real BE-series rows spanning 2 years and zero
+    # EQ rows, yet showed close=NULL purely because of this filter.
+    be_rows = pd.DataFrame({"date": pd.to_datetime(["2026-08-13", "2026-08-14"]), "adj_close": [10.5, 11.0]})
+
+    def fake_sql_to_df(query, params=None):
+        if "series = 'EQ'" in query:
+            return pd.DataFrame(columns=["date", "adj_close"])
+        if "series = 'BE'" in query:
+            return be_rows
+        raise AssertionError("should not fall through to the BSE view when NSE BE has data")
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_technicals.load_adjusted_price_history("VHLTD")
+
+    assert result["adj_close"].tolist() == [10.5, 11.0]
+
+
 def test_load_adjusted_price_history_uses_nse_view_when_available(monkeypatch):
     nse_rows = pd.DataFrame({"date": pd.to_datetime(["2026-08-14"]), "adj_close": [100.0]})
     monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, params=None: nse_rows)
@@ -14888,7 +14909,7 @@ def test_load_price_near_prefers_adjusted_falls_back_to_raw(monkeypatch):
     def fake_sql_to_df(query, params=None):
         calls.append(query)
         if "advisory_adjusted_ohlcv_daily" in query:
-            return pd.DataFrame()  # no adjusted data -- forces fallback
+            return pd.DataFrame()  # no adjusted data (EQ or BE) -- forces fallback
         return pd.DataFrame([{"close": 42.5}])
 
     monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
@@ -14896,7 +14917,24 @@ def test_load_price_near_prefers_adjusted_falls_back_to_raw(monkeypatch):
     price = fundamentals_watchlist.load_price_near("nse:FOO", "2026-08-01")
 
     assert price == 42.5
-    assert len(calls) == 2  # tried adjusted first, then raw
+    assert len(calls) == 3  # tried EQ, then BE, then raw
+    assert "series = 'EQ'" in calls[0]
+    assert "series = 'BE'" in calls[1]
+
+
+def test_load_price_near_falls_back_to_be_series_when_eq_empty(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): series='EQ' hardcode drops BE-series
+    # companies the adjusted view actually covers -- live, VHLTD has 531 real
+    # BE-series rows and zero EQ rows.
+    def fake_sql_to_df(query, params=None):
+        if "series = 'EQ'" in query:
+            return pd.DataFrame()
+        if "series = 'BE'" in query:
+            return pd.DataFrame([{"adj_close": 12.34}])
+        raise AssertionError("should not fall through to the raw table when BE has data")
+
+    monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
+    assert fundamentals_watchlist.load_price_near("nse:VHLTD", "2026-08-01") == 12.34
 
 
 def test_load_price_near_returns_none_when_no_source_has_data(monkeypatch):

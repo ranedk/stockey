@@ -147,6 +147,17 @@ def load_price_near(company_master_id: str, as_of_date) -> float | None:
     if not adjusted.empty:
         return float(adjusted.iloc[0]["adj_close"])
 
+    # BUG FOUND LIVE 2026-08-18 (re-audit): series='EQ' hardcode drops BE-series
+    # (trade-to-trade / restricted-segment) companies the adjusted view actually
+    # covers -- same fix as technicals.py's load_adjusted_price_history, see its own
+    # comment for the live-confirmed VHLTD example (531 real BE-series rows, zero EQ).
+    adjusted_be = sql_to_df(
+        "SELECT adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s AND series = 'BE' AND date <= %s ORDER BY date DESC LIMIT 1",
+        params=(ticker, as_of_date),
+    )
+    if not adjusted_be.empty:
+        return float(adjusted_be.iloc[0]["adj_close"])
+
     raw = sql_to_df(
         "SELECT close FROM nseindia_ohlcv WHERE company_master_id = %s AND date <= %s ORDER BY date DESC LIMIT 1",
         params=(company_master_id, as_of_date),

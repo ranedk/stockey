@@ -167,6 +167,26 @@ def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.
     if not nse_history.empty:
         return nse_history.sort_values("date").reset_index(drop=True)
 
+    # BUG FOUND LIVE 2026-08-18 (re-audit): series='EQ' hardcode drops BE-series
+    # (trade-to-trade / restricted-segment) companies the adjusted view actually
+    # covers -- confirmed live, VHLTD has 531 real BE-series rows spanning 2 years
+    # and zero EQ rows, yet showed close=NULL, a misleading insufficient-history
+    # event, and a permanently-inert exit price check purely because of this filter
+    # (10 of 192 latest technicals rows had NULL close, all traced to this). Same
+    # NSE-primary/next-source fallback chain shape as the BSE fallback below.
+    nse_be_history = sql_to_df(
+        """
+        SELECT date, adj_close
+        FROM advisory_adjusted_ohlcv_daily
+        WHERE symbol = %s AND series = 'BE'
+        ORDER BY date DESC
+        LIMIT %s
+        """,
+        params=(ticker, lookback_days),
+    )
+    if not nse_be_history.empty:
+        return nse_be_history.sort_values("date").reset_index(drop=True)
+
     # BSE-only-company fallback -- see module docstring. `ticker` here is already the
     # BSE scrip code for these companies, matching bse_advisory_adjusted_ohlcv_daily's
     # own scrip_code key directly.
