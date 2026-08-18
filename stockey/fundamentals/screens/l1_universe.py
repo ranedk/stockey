@@ -127,6 +127,10 @@ AUDITOR_CHANGE_LOOKBACK_YEARS = 3
 # reused here rather than inventing a new number, since fundamental_basic_goal.md's
 # own L1 table doesn't specify one.
 RPT_PCT_OF_REVENUE_THRESHOLD = 10.0
+# Same 3yr window as AUDITOR_CHANGE_LOOKBACK_YEARS above -- both filing types come
+# from the same BSE backfill scope (re-audit 2026-08-18: _rpt_excludes previously had
+# no date bound at all, unlike its auditor-change sibling).
+RPT_LOOKBACK_YEARS = 3
 
 
 def load_auditor_rpt_events_for_companies(company_master_ids: list[str]) -> pd.DataFrame:
@@ -196,14 +200,26 @@ def rpt_is_material(extracted: dict) -> tuple[bool, str]:
     return False, "unknown"
 
 
-def _rpt_excludes(events: list[dict]) -> bool:
+def _rpt_excludes(events: list[dict], *, as_of: pd.Timestamp) -> bool:
+    # BUG FOUND LIVE 2026-08-18 (re-audit): no date bound at all, unlike
+    # _auditor_change_excludes' own AUDITOR_CHANGE_LOOKBACK_YEARS cutoff -- a single
+    # material RPT disclosure from years ago would exclude a company from L1
+    # permanently. Both events come from the same 3yr BSE backfill
+    # (fundamentals/collectors/bse_announcements.py's BACKFILL_FILING_TYPES covers
+    # auditor_change and related_party_transaction together), so the same lookback
+    # window applies here too.
+    cutoff = as_of - pd.DateOffset(years=RPT_LOOKBACK_YEARS)
     for event in events:
         try:
             extracted = json.loads(event["structured_extraction_json"])
         except (TypeError, ValueError):
             continue
         material, _basis = rpt_is_material(extracted)
-        if material:
+        if not material:
+            continue
+        # utc=True: see _auditor_change_excludes' own comment on the same conversion.
+        disclosure_date = pd.to_datetime(event.get("disclosure_date"), errors="coerce", utc=True)
+        if pd.notna(disclosure_date) and disclosure_date >= cutoff:
             return True
     return False
 
@@ -250,7 +266,7 @@ def apply_post_hoc_exclusions(companies: list[dict]) -> tuple[list[dict], dict[s
         if _auditor_change_excludes(auditor_events, as_of=as_of):
             excluded_auditor_change.append(company["name"])
             continue
-        if _rpt_excludes(rpt_events):
+        if _rpt_excludes(rpt_events, as_of=as_of):
             excluded_related_party_transaction.append(company["name"])
             continue
         survivors.append(company)

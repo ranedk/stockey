@@ -9158,16 +9158,17 @@ def test_auditor_change_excludes_skips_unparseable_json():
 
 
 def test_rpt_excludes_only_when_applicable_and_over_threshold():
-    non_applicable = {"structured_extraction_json": json.dumps({"is_applicable": False, "pct_of_revenue": None})}
-    applicable_under = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 5.0})}
-    applicable_over = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 15.0})}
-    applicable_no_pct = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None})}
+    as_of = pd.Timestamp("2026-08-13", tz="UTC")
+    non_applicable = {"structured_extraction_json": json.dumps({"is_applicable": False, "pct_of_revenue": None}), "disclosure_date": "2026-01-01"}
+    applicable_under = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 5.0}), "disclosure_date": "2026-01-01"}
+    applicable_over = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 15.0}), "disclosure_date": "2026-01-01"}
+    applicable_no_pct = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None}), "disclosure_date": "2026-01-01"}
 
-    assert fundamentals_l1_universe._rpt_excludes([non_applicable]) is False
-    assert fundamentals_l1_universe._rpt_excludes([applicable_under]) is False
-    assert fundamentals_l1_universe._rpt_excludes([applicable_over]) is True
-    assert fundamentals_l1_universe._rpt_excludes([applicable_no_pct]) is False  # no guessed 0%/100%
-    assert fundamentals_l1_universe._rpt_excludes([]) is False
+    assert fundamentals_l1_universe._rpt_excludes([non_applicable], as_of=as_of) is False
+    assert fundamentals_l1_universe._rpt_excludes([applicable_under], as_of=as_of) is False
+    assert fundamentals_l1_universe._rpt_excludes([applicable_over], as_of=as_of) is True
+    assert fundamentals_l1_universe._rpt_excludes([applicable_no_pct], as_of=as_of) is False  # no guessed 0%/100%
+    assert fundamentals_l1_universe._rpt_excludes([], as_of=as_of) is False
 
 
 def test_rpt_excludes_falls_back_to_amount_when_no_percentage_stated():
@@ -9177,10 +9178,23 @@ def test_rpt_excludes_falls_back_to_amount_when_no_percentage_stated():
     # instead, and this used to silently never exclude those. Falls back to
     # "material because we can't rule it out" -- any positive amount with no stated
     # percentage counts, matching rpt_is_material's own docstring.
-    amount_only = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 120.0})}
-    zero_amount = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 0})}
-    assert fundamentals_l1_universe._rpt_excludes([amount_only]) is True
-    assert fundamentals_l1_universe._rpt_excludes([zero_amount]) is False
+    as_of = pd.Timestamp("2026-08-13", tz="UTC")
+    amount_only = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 120.0}), "disclosure_date": "2026-01-01"}
+    zero_amount = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 0}), "disclosure_date": "2026-01-01"}
+    assert fundamentals_l1_universe._rpt_excludes([amount_only], as_of=as_of) is True
+    assert fundamentals_l1_universe._rpt_excludes([zero_amount], as_of=as_of) is False
+
+
+def test_rpt_excludes_respects_lookback_window():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): no date bound at all, unlike
+    # _auditor_change_excludes' own AUDITOR_CHANGE_LOOKBACK_YEARS cutoff -- a single
+    # material RPT disclosure from years ago would exclude a company from L1
+    # permanently.
+    as_of = pd.Timestamp("2026-08-13", tz="UTC")
+    recent = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 15.0}), "disclosure_date": "2026-01-01"}
+    old = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": 15.0}), "disclosure_date": "2020-01-01"}
+    assert fundamentals_l1_universe._rpt_excludes([recent], as_of=as_of) is True
+    assert fundamentals_l1_universe._rpt_excludes([old], as_of=as_of) is False  # older than RPT_LOOKBACK_YEARS
 
 
 def test_rpt_is_material_reports_which_basis_decided_it():
