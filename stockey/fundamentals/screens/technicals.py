@@ -66,6 +66,34 @@ MIN_HISTORY_ROWS = 20
 STALE_PRICE_THRESHOLD_DAYS = 7
 
 
+def check_bse_price_pipeline_freshness(run_date) -> bool:
+    """One aggregate check, not per-company -- distinguishes "the whole BSE OHLCV/
+    adjustment pipeline (data/bseindia/bhavcopy.py + price_adjustment.py, both
+    separate pure-TA cron jobs -- see stockey/CLAUDE.md's cron job 4,
+    all_price_adjustment.sh) hasn't run recently" from "this one company genuinely
+    lacks history", which the per-ticker technicals_insufficient_history event below
+    can't distinguish on its own -- a company with data_points_available=0 reads
+    identically whether IT has no listing history or the ENTIRE upstream table is
+    empty/stale.
+
+    BUG FOUND LIVE 2026-08-17 (structural, no live incident yet -- fundamentals/
+    run_pipeline.py's own STEPS has no step that refreshes BSE OHLCV/adjustment
+    data at all, an implicit dependency on a separate cron job): the fundamentals
+    screener's own cron (all_fundamentals_screener.sh, 19:15 UTC) happens to run
+    after all_price_adjustment.sh (18:50 UTC) today, but that ordering lives in two
+    separate crontab lines, not any explicit dependency this module enforces or even
+    checks -- a manual run of this pipeline, a future reordering, or a skipped
+    upstream run would silently read whatever stale/empty BSE data exists with no
+    distinct signal that upstream hasn't run."""
+    df = sql_to_df("SELECT MAX(date) AS latest FROM bseindia_ohlcv")
+    if df.empty or pd.isna(df.iloc[0]["latest"]):
+        return False
+    latest = pd.Timestamp(df.iloc[0]["latest"])
+    if latest.tzinfo is None:
+        latest = latest.tz_localize("UTC")
+    return (run_date - latest).days <= STALE_PRICE_THRESHOLD_DAYS
+
+
 def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
     record_local_fallback_event(
         module=SYNC_SOURCE_NAME,
@@ -176,6 +204,18 @@ def run_technicals_refresh() -> dict[str, object]:
         return {"companies": 0, "no_history": 0, "stale_price": 0}
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
+    if not check_bse_price_pipeline_freshness(run_date):
+        _record_fallback(
+            "technicals_bse_price_pipeline_stale_or_never_run",
+            reason=(
+                "bseindia_ohlcv has no row within STALE_PRICE_THRESHOLD_DAYS (or is entirely empty) -- "
+                "the separate pure-TA BSE OHLCV/adjustment cron (stockey/CLAUDE.md cron job 4) looks like "
+                "it hasn't run recently. Every BSE-only company's technicals_insufficient_history event "
+                "below may really be this, not a per-company gap."
+            ),
+            error="bseindia_ohlcv stale or empty",
+        )
+
     rows = []
     no_history = 0
     stale_tickers: list[str] = []

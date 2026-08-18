@@ -45,7 +45,27 @@ in the JSON summary, and the pipeline continues to the next step -- matching the
 "non-critical failure is visible, not fatal" philosophy download_runner.py applies to
 its own non-market-data steps. The process exit code is only non-zero if EVERY step
 failed (a likely-systemic issue, e.g. the DB being down), not on an individual flaky
-source."""
+source.
+
+IMPLICIT CROSS-PIPELINE DEPENDENCY (documented 2026-08-17, not fixed by adding a
+step here -- see rationale below): technicals.py's BSE-only-company fallback reads
+bse_advisory_adjusted_ohlcv_daily, which is populated by data/bseindia/bhavcopy.py +
+data/bseindia/price_adjustment.py -- both PURE-TA cron jobs (stockey/CLAUDE.md's
+core 7, specifically job 4 / all_price_adjustment.sh, 18:50 UTC), not steps in this
+STEPS list. all_fundamentals_screener.sh happens to run after all_price_adjustment.sh
+today (19:15 UTC), but that ordering lives entirely in two separate crontab lines,
+not anything this module enforces or checks -- a manual `python -m
+fundamentals.run_pipeline` invocation, or any future crontab reordering, has no
+guarantee that BSE price data is fresh when technicals.py runs. Deliberately NOT
+fixed by adding a bhavcopy/price-adjustment step here: that would duplicate
+collection work the pure-TA pipeline already does and blur the pure-TA/fundamentals
+boundary stockey/CLAUDE.md establishes ("screens/ modules stay independent of data/
+collection logic, not the reverse"). Instead, technicals.py's own
+check_bse_price_pipeline_freshness() records a distinct
+technicals_bse_price_pipeline_stale_or_never_run fallback event when the whole
+bseindia_ohlcv table looks stale/empty, so this gap is visible in telemetry rather
+than silently indistinguishable from any one company's own insufficient-history
+gap."""
 
 from __future__ import annotations
 

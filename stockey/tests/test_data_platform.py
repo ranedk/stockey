@@ -13899,6 +13899,7 @@ def test_load_adjusted_price_history_uses_nse_view_when_available(monkeypatch):
 
 def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
     monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: pd.DataFrame())
     fallback_events = []
     monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
@@ -13911,6 +13912,7 @@ def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
 
 def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypatch):
     monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "AAA", "company_name": "A Co"}, {"ticker": "BBB", "company_name": "B Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
 
@@ -13949,6 +13951,7 @@ def test_run_technicals_refresh_flags_and_records_stale_price_series(monkeypatch
     # -- confirmed live, 32% of the whole price table affected, one real watchlist
     # company's "today's close" silently frozen for weeks with zero fallback event.
     monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "STALECO", "company_name": "Stale Co"}, {"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
 
@@ -13979,8 +13982,51 @@ def test_run_technicals_refresh_flags_and_records_stale_price_series(monkeypatch
     assert "STALECO" in stale_event["metadata"]["sample_tickers"]
 
 
+def test_check_bse_price_pipeline_freshness_true_when_recent(monkeypatch):
+    run_date = pd.Timestamp.now(tz="UTC").normalize()
+    monkeypatch.setattr(
+        fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"latest": run_date - pd.Timedelta(days=1)}])
+    )
+    assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is True
+
+
+def test_check_bse_price_pipeline_freshness_false_when_stale_or_empty(monkeypatch):
+    run_date = pd.Timestamp.now(tz="UTC").normalize()
+    stale = run_date - pd.Timedelta(days=fundamentals_technicals.STALE_PRICE_THRESHOLD_DAYS + 5)
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"latest": stale}]))
+    assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"latest": None}]))
+    assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame())
+    assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
+
+
+def test_run_technicals_refresh_records_fallback_when_bse_pipeline_looks_stale(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17 (structural): fundamentals/run_pipeline.py's own
+    # STEPS has no step that refreshes BSE OHLCV/adjustment data -- an implicit
+    # dependency on a separate pure-TA cron job. A company with zero history reads
+    # identically whether IT genuinely lacks a listing or the WHOLE upstream table
+    # is stale/empty; this event distinguishes the latter.
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: False)
+    tickers = pd.DataFrame([{"ticker": "FRESHCO", "company_name": "Fresh Co"}])
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+    fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
+    monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: fresh_history)
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    fundamentals_technicals.run_technicals_refresh()
+
+    assert any(a and a[0] == "technicals_bse_price_pipeline_stale_or_never_run" for a, k in fallback_events)
+
+
 def test_run_technicals_refresh_no_stale_prices_skips_fallback_event(monkeypatch):
     monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
     fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
