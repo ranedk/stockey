@@ -13373,6 +13373,34 @@ def test_check_structured_prediction_returns_none_when_value_is_null(monkeypatch
     assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
 
 
+def test_check_structured_prediction_returns_none_for_non_numeric_metric_name(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: metric_name is free text a human types when creating
+    # a thesis -- nothing stops it from naming a non-numeric fundamentals_l2_state
+    # column (trend_direction, company_name, ticker, ...). Used to raise an uncaught
+    # TypeError from `value < threshold` (str vs number) instead of returning None
+    # like every other "can't evaluate this" branch in this function.
+    monkeypatch.setattr(
+        fundamentals_l4_thesis,
+        "sql_to_df",
+        lambda query, params=None: pd.DataFrame([{"net_debt_trend_direction": "accelerating_decline"}]),
+    )
+    thesis_row = {"company_master_id": "nse:X", "metric_name": "net_debt_trend_direction", "metric_operator": "<", "metric_threshold": 45.0}
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+
+
+def test_check_structured_prediction_handles_numpy_numeric_dtypes(monkeypatch):
+    # A real DataFrame column reads back as numpy.int64/float64, neither a Python
+    # int/float subclass -- must still evaluate correctly (not be rejected as
+    # "non-numeric" by an overly-strict isinstance-only guard).
+    monkeypatch.setattr(
+        fundamentals_l4_thesis,
+        "sql_to_df",
+        lambda query, params=None: pd.DataFrame([{"net_debt_consecutive_declining_years": 3}]),  # pandas infers int64
+    )
+    thesis_row = {"company_master_id": "nse:X", "metric_name": "net_debt_consecutive_declining_years", "metric_operator": ">=", "metric_threshold": 2.0}
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is True
+
+
 def test_compute_quarterly_scoring_with_no_theses(monkeypatch):
     monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, **k: pd.DataFrame())
     result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 8, 11))

@@ -233,6 +233,24 @@ def check_structured_prediction(thesis_row: dict) -> bool | None:
     value = df.iloc[0][metric_name]
     if value is None or pd.isna(value):
         return None
+    # BUG FOUND LIVE 2026-08-17: metric_name is a free-text column name a human
+    # types when creating a thesis (create_thesis()'s metric_name/metric_operator/
+    # metric_threshold args) -- nothing validates it actually names a NUMERIC L2
+    # state column. fundamentals_l2_state has plenty of non-numeric columns
+    # (trend_direction, company_name, ticker, ...); picking one of those here used
+    # to raise an uncaught TypeError from `value < threshold` (str vs number)
+    # instead of the graceful "can't evaluate this" None every other branch of this
+    # function already returns. Currently dead code (no caller yet), but the crash
+    # was real and reproducible. float(value) (not isinstance(value, (int, float)))
+    # deliberately -- a real L2 numeric column can come back as numpy.int64/float64
+    # from the DataFrame, neither of which is a Python int/float subclass, so an
+    # isinstance check alone would wrongly reject genuinely numeric values too.
+    if isinstance(value, (bool, str)):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
 
     if operator == "<":
         return bool(value < threshold)
