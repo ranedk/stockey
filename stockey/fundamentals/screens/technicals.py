@@ -67,6 +67,14 @@ MIN_HISTORY_ROWS = 20
 STALE_PRICE_THRESHOLD_DAYS = 7
 
 
+# Confirmed live 2026-08-18: a genuinely healthy day carries ~4,100-4,150 rows in
+# bse_advisory_adjusted_ohlcv_daily (out of ~4,325 distinct scrip_codes ever seen).
+# Set well below that real range but comfortably above "one stray row from an
+# unrelated backfill" -- the exact ambiguity check_bse_price_pipeline_freshness's
+# own docstring already flagged MAX(date) alone couldn't resolve.
+MIN_BSE_PIPELINE_COVERAGE_ROWS = 500
+
+
 def check_bse_price_pipeline_freshness(run_date) -> bool:
     """One aggregate check, not per-company -- distinguishes "the whole BSE OHLCV/
     adjustment pipeline (data/bseindia/bhavcopy.py + price_adjustment.py, both
@@ -85,14 +93,42 @@ def check_bse_price_pipeline_freshness(run_date) -> bool:
     separate crontab lines, not any explicit dependency this module enforces or even
     checks -- a manual run of this pipeline, a future reordering, or a skipped
     upstream run would silently read whatever stale/empty BSE data exists with no
-    distinct signal that upstream hasn't run."""
-    df = sql_to_df("SELECT MAX(date) AS latest FROM bseindia_ohlcv")
-    if df.empty or pd.isna(df.iloc[0]["latest"]):
+    distinct signal that upstream hasn't run.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): the first version of this check only
+    queried bseindia_ohlcv (cron job 1, the raw bhavcopy) and only checked
+    MAX(date) -- both gaps missed the exact live scenario it exists to catch.
+    bseindia_ohlcv is written by job 1; bse_advisory_adjusted_ohlcv_daily (what
+    load_adjusted_price_history() actually reads) is an INNER JOIN against
+    bseindia_adjustment_factors, written by job 4 -- if job 4 fails or is skipped,
+    bseindia_ohlcv stays fresh, the old check returned True, and every new date
+    silently drops out of the joined view anyway. Separately, MAX(date) alone
+    can't tell "a genuinely healthy day" from "one stray row from an unrelated
+    backfill." Confirmed live: on the actual 2026-08-17 production run,
+    bseindia_ohlcv held only 3 days of history total (the 365-day backfill has
+    never completed), but those 3 days were recent enough that the old check
+    returned True and recorded zero fallback events that day, while 43 of 53 real
+    technicals_insufficient_history events were the exact BSE-only cohort this
+    check exists to distinguish. Now checks the joined VIEW itself (so a stalled
+    job 4 is caught, not just a stalled job 1) and requires real row coverage on
+    the latest date, not just its existence."""
+    df = sql_to_df(
+        """
+        SELECT date, COUNT(*) AS n
+        FROM bse_advisory_adjusted_ohlcv_daily
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    )
+    if df.empty:
         return False
-    latest = pd.Timestamp(df.iloc[0]["latest"])
+    latest = pd.Timestamp(df.iloc[0]["date"])
     if latest.tzinfo is None:
         latest = latest.tz_localize("UTC")
-    return (run_date - latest).days <= STALE_PRICE_THRESHOLD_DAYS
+    if (run_date - latest).days > STALE_PRICE_THRESHOLD_DAYS:
+        return False
+    return int(df.iloc[0]["n"]) >= MIN_BSE_PIPELINE_COVERAGE_ROWS
 
 
 def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:

@@ -14319,10 +14319,12 @@ def test_run_technicals_refresh_flags_and_records_stale_price_series(monkeypatch
     assert "STALECO" in stale_event["metadata"]["sample_tickers"]
 
 
-def test_check_bse_price_pipeline_freshness_true_when_recent(monkeypatch):
+def test_check_bse_price_pipeline_freshness_true_when_recent_and_well_covered(monkeypatch):
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     monkeypatch.setattr(
-        fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"latest": run_date - pd.Timedelta(days=1)}])
+        fundamentals_technicals,
+        "sql_to_df",
+        lambda query, **k: pd.DataFrame([{"date": run_date - pd.Timedelta(days=1), "n": 4100}]),
     )
     assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is True
 
@@ -14330,13 +14332,41 @@ def test_check_bse_price_pipeline_freshness_true_when_recent(monkeypatch):
 def test_check_bse_price_pipeline_freshness_false_when_stale_or_empty(monkeypatch):
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     stale = run_date - pd.Timedelta(days=fundamentals_technicals.STALE_PRICE_THRESHOLD_DAYS + 5)
-    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"latest": stale}]))
-    assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
-
-    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"latest": None}]))
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame([{"date": stale, "n": 4100}]))
     assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
 
     monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: pd.DataFrame())
+    assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
+
+
+def test_check_bse_price_pipeline_freshness_checks_the_joined_view_not_the_raw_table(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the first version only queried
+    # bseindia_ohlcv (cron job 1) -- if job 4 (price_adjustment, which writes
+    # bseindia_adjustment_factors) failed or was skipped, bseindia_ohlcv stayed
+    # fresh and this check returned True even though the joined view technicals
+    # actually reads had nothing for the new date.
+    captured = {}
+
+    def fake_sql_to_df(query, **k):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", fake_sql_to_df)
+    fundamentals_technicals.check_bse_price_pipeline_freshness(pd.Timestamp.now(tz="UTC"))
+    assert "bse_advisory_adjusted_ohlcv_daily" in captured["query"]
+    assert "bseindia_ohlcv" not in captured["query"]
+
+
+def test_check_bse_price_pipeline_freshness_false_when_recent_but_thin_coverage(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): MAX(date) alone can't tell "a
+    # genuinely healthy day" (~4,100+ rows, confirmed live) from "one stray row
+    # from an unrelated backfill" landing on a recent date.
+    run_date = pd.Timestamp.now(tz="UTC").normalize()
+    monkeypatch.setattr(
+        fundamentals_technicals,
+        "sql_to_df",
+        lambda query, **k: pd.DataFrame([{"date": run_date - pd.Timedelta(days=1), "n": 3}]),
+    )
     assert fundamentals_technicals.check_bse_price_pipeline_freshness(run_date) is False
 
 
