@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+import numpy as np
 import pandas as pd
 
 from utils.company_master import build_l1_ticker_by_company_master_id
@@ -95,8 +96,25 @@ def _ensure_thesis_table() -> None:
     execute_db_operation(_op, operation_name="fundamentals_l4_thesis:ensure_table")
 
 
-def _make_thesis_id(company_master_id: str, prediction_text: str, created_date) -> str:
-    digest = hashlib.sha256(f"{company_master_id}|{prediction_text}|{created_date}".encode("utf-8")).hexdigest()[:16]
+def _make_thesis_id(
+    company_master_id: str,
+    prediction_text: str,
+    created_date,
+    target_date,
+    invalidation_criteria: str,
+) -> str:
+    # BUG FOUND LIVE 2026-08-18 (re-audit): hashing only (company, prediction_text,
+    # created_date) meant two same-day theses on the same company with identical
+    # prediction wording but a different target_date or invalidation_criteria
+    # collided on thesis_id and silently overwrote each other via create_thesis's
+    # upsert -- a real distinct forecast (e.g. "beats guidance by Q2" vs "beats
+    # guidance by Q4", or two different pre-committed invalidation triggers)
+    # vanishes without error. target_date/invalidation_criteria folded into the
+    # key so they disambiguate; a genuine retry with identical inputs on all five
+    # fields still hashes to the same id, preserving create_thesis's own
+    # idempotency guard above.
+    key = f"{company_master_id}|{prediction_text}|{created_date}|{target_date}|{invalidation_criteria}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return f"thesis:{digest}"
 
 
@@ -127,7 +145,9 @@ def create_thesis(
 
     _ensure_thesis_table()
     created_date = created_date or pd.Timestamp.now(tz="UTC").date()
-    thesis_id = _make_thesis_id(company_master_id, prediction_text, created_date)
+    thesis_id = _make_thesis_id(
+        company_master_id, prediction_text, created_date, target_date, invalidation_criteria.strip()
+    )
     source_alert = source_alert or {}
 
     # BUG FOUND LIVE 2026-08-15, fixed here: thesis_id is a deterministic hash of
@@ -197,6 +217,25 @@ def resolve_thesis(
     if resolved_true and failure_attribution is not None:
         raise ThesisValidationError("failure_attribution must be None when resolved_true is True")
 
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this never checked the thesis exists or
+    # isn't already resolved -- a typo'd thesis_id silently succeeded (UPDATE ...
+    # WHERE thesis_id = %s matches zero rows, no error raised, no rowcount check),
+    # and a second resolve_thesis() call on an already-resolved thesis freely
+    # overwrote the first resolution -- exactly the outcome create_thesis()'s own
+    # "already resolved" guard above exists to prevent, just reachable from the
+    # other function. Same guard here.
+    existing = sql_to_df(
+        "SELECT status FROM fundamentals_l4_thesis WHERE thesis_id = %s",
+        params=(thesis_id,),
+    )
+    if existing.empty:
+        raise ThesisValidationError(f"thesis {thesis_id!r} does not exist -- nothing to resolve")
+    if existing.iloc[0]["status"] == "resolved":
+        raise ThesisValidationError(
+            f"thesis {thesis_id!r} is already resolved -- resolving it again would silently "
+            "overwrite the first resolution; a resolution is a one-time, immutable act"
+        )
+
     resolution_date = resolution_date or pd.Timestamp.now(tz="UTC").date()
 
     def _update() -> None:
@@ -252,7 +291,17 @@ def check_structured_prediction(thesis_row: dict) -> bool | None:
     # deliberately -- a real L2 numeric column can come back as numpy.int64/float64
     # from the DataFrame, neither of which is a Python int/float subclass, so an
     # isinstance check alone would wrongly reject genuinely numeric values too.
-    if isinstance(value, (bool, str)):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this bool guard leaked numpy.bool_ --
+    # isinstance(v, bool) is False for numpy's own boolean scalar type (confirmed
+    # live: np.bool_(True) is not a bool instance, but float(np.bool_(True))
+    # succeeds and returns 1.0), so an L2 state column that comes back as a pandas
+    # boolean dtype would sail past this guard, get silently coerced to 1.0/0.0,
+    # and compared against threshold as if it were a real metric value -- nonsense,
+    # not the graceful None every other branch here returns. np.bool_ added
+    # explicitly; float/int numpy scalars are still meant to pass through to the
+    # float(value) conversion below, same as this function's own comment already
+    # explains for why isinstance(value, (int, float)) alone isn't used instead.
+    if isinstance(value, (bool, str, np.bool_)):
         return None
     try:
         value = float(value)

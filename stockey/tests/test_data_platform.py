@@ -14620,6 +14620,35 @@ def test_create_thesis_allows_resubmitting_an_open_thesis(monkeypatch):
     assert len(upserts) == 1
 
 
+def test_create_thesis_id_disambiguates_same_day_theses_by_target_date_and_invalidation(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): thesis_id used to hash only (company,
+    # prediction_text, created_date) -- two same-day theses on the same company
+    # with identical wording but a different target_date or invalidation
+    # criteria collided on thesis_id and silently overwrote each other via
+    # create_thesis's upsert.
+    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: None)
+
+    row_a = fundamentals_l4_thesis.create_thesis(
+        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+        invalidation_criteria="misses Q2", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
+    )
+    row_b = fundamentals_l4_thesis.create_thesis(
+        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 6, 30),
+        invalidation_criteria="misses Q4", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
+    )
+    assert row_a["thesis_id"] != row_b["thesis_id"]
+
+    # a genuine retry with identical inputs on all five fields still collides,
+    # preserving create_thesis's own idempotency guard.
+    row_a_retry = fundamentals_l4_thesis.create_thesis(
+        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
+        invalidation_criteria="misses Q2", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
+    )
+    assert row_a_retry["thesis_id"] == row_a["thesis_id"]
+
+
 def test_resolve_thesis_requires_failure_attribution_when_false(monkeypatch):
     with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
         fundamentals_l4_thesis.resolve_thesis(thesis_id="thesis:x", resolved_true=False)
@@ -14642,6 +14671,7 @@ def test_resolve_thesis_writes_expected_update(monkeypatch):
         yield None, FakeCursor()
 
     monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "open"}]))
 
     fundamentals_l4_thesis.resolve_thesis(
         thesis_id="thesis:x", resolved_true=False, failure_attribution="thesis_wrong",
@@ -14654,8 +14684,82 @@ def test_resolve_thesis_writes_expected_update(monkeypatch):
     assert params == (False, date(2026, 12, 31), "note", "thesis_wrong", "thesis:x")
 
 
+def test_resolve_thesis_raises_when_thesis_does_not_exist(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): a typo'd thesis_id used to silently
+    # succeed (UPDATE ... WHERE thesis_id = %s matches zero rows, no error).
+    executed = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, FakeCursor()
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
+
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError, match="does not exist"):
+        fundamentals_l4_thesis.resolve_thesis(
+            thesis_id="thesis:typo", resolved_true=True,
+        )
+    assert executed == []  # nothing was written
+
+
+def test_resolve_thesis_raises_when_already_resolved(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): resolve_thesis used to freely
+    # overwrite an existing resolution -- exactly what create_thesis's own
+    # already-resolved guard exists to prevent, just reachable from this path.
+    executed = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, FakeCursor()
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "resolved"}]))
+
+    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError, match="already resolved"):
+        fundamentals_l4_thesis.resolve_thesis(
+            thesis_id="thesis:x", resolved_true=True,
+        )
+    assert executed == []  # nothing was written
+
+
 def test_check_structured_prediction_returns_none_without_metric_fields():
     assert fundamentals_l4_thesis.check_structured_prediction({"company_master_id": "nse:X"}) is None
+
+
+def test_check_structured_prediction_treats_numpy_bool_as_non_numeric(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): isinstance(v, bool) is False for
+    # numpy's own boolean scalar type -- confirmed live: np.bool_(True) is not a
+    # bool instance, but float(np.bool_(True)) succeeds and returns 1.0. An L2
+    # state column arriving as pandas boolean dtype would sail past the old
+    # `isinstance(value, (bool, str))` guard, get silently coerced to a float,
+    # and compared against threshold as a real metric value instead of the
+    # graceful None every other non-numeric branch here returns.
+    import numpy as np
+
+    thesis = {
+        "company_master_id": "nse:X",
+        "metric_name": "flag_col",
+        "metric_operator": ">",
+        "metric_threshold": 0.5,
+    }
+    monkeypatch.setattr(
+        fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"}
+    )
+    monkeypatch.setattr(
+        fundamentals_l4_thesis,
+        "sql_to_df",
+        lambda q, **k: pd.DataFrame([{"flag_col": np.bool_(True)}]),
+    )
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis) is None
 
 
 def test_check_structured_prediction_evaluates_against_l2_state(monkeypatch):
