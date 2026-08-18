@@ -105,18 +105,31 @@ def load_watchlist_for_exit_evaluation() -> pd.DataFrame:
     date strictly before the event -- current_price picks that up immediately,
     the frozen first_seen_price does not, silently producing a wrong change_pct
     (and therefore a wrong/missed price_flagged exit) the first time this happens
-    to any watchlisted name."""
+    to any watchlisted name.
+
+    latest_alert_load_ts (2026-08-18 re-audit fix) is the wall-clock time the most
+    recent alert was actually WRITTEN (fundamentals_l3_alerts.load_ts), for
+    _check_stale's own "has a fresher alert landed since the narrative" guard --
+    see that function's docstring for why comparing it against last_alert_at (a
+    filing's disclosure date) instead was the same event-date-vs-processing-time
+    bug watch_summary.py's narrative refresh gate had."""
     return sql_to_df(
         """
         SELECT w.company_master_id, w.first_seen_price, w.first_seen_at, w.last_alert_at,
                w.suggested_watch_until, w.narrative_generated_at,
-               tech.close AS current_price, tech.price_data_stale
+               tech.close AS current_price, tech.price_data_stale,
+               a.latest_alert_load_ts
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT close, price_data_stale FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT MAX(load_ts) AS latest_alert_load_ts
+            FROM fundamentals_l3_alerts
+            WHERE company_master_id = w.company_master_id
+        ) a ON TRUE
         """
     )
 
@@ -186,23 +199,33 @@ def _check_price_flagged(first_seen_price, current_price, *, price_data_stale=Fa
     return None
 
 
-def _check_stale(suggested_watch_until, last_alert_at, narrative_generated_at, *, today) -> str | None:
+def _check_stale(suggested_watch_until, latest_alert_load_ts, narrative_generated_at, *, today) -> str | None:
     """None if not stale, else a human-readable reason. "Nothing new since" is
-    checked as last_alert_at <= narrative_generated_at's own date -- if a fresh
-    alert had landed after the narrative that produced this suggested_watch_until,
+    checked as latest_alert_load_ts <= narrative_generated_at -- if a fresh alert
+    had landed after the narrative that produced this suggested_watch_until,
     watch_summary.py's own regeneration condition would already have refreshed the
     narrative (and pushed suggested_watch_until forward) before this ever runs, so
     this guard is mostly redundant with that mechanism, not a separate assumption --
     kept explicit anyway rather than relying on ordering between two different
-    modules holding forever."""
+    modules holding forever.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): used to compare last_alert_at (a filing's
+    disclosure date, from fundamentals_watchlist) against narrative_generated_at
+    (a wall-clock processing timestamp) -- the same event-date-vs-processing-time
+    mismatch watch_summary.py's own narrative refresh gate had (alert_date lags
+    real alert creation by a median of 15 days), which defeated the "mostly
+    redundant" assumption above: the upstream gate wasn't actually catching this
+    before it got here. Now compares latest_alert_load_ts (fundamentals_l3_
+    alerts.load_ts, the wall-clock time the alert was actually written) against
+    narrative_generated_at -- both processing timestamps."""
     if suggested_watch_until is None:
         return None
     watch_until = pd.to_datetime(suggested_watch_until, errors="coerce")
     if pd.isna(watch_until) or watch_until.date() >= today:
         return None
     generated_at = pd.to_datetime(narrative_generated_at, errors="coerce")
-    last_alert = pd.to_datetime(last_alert_at, errors="coerce")
-    if pd.notna(generated_at) and pd.notna(last_alert) and last_alert.date() > generated_at.date():
+    latest_alert = pd.to_datetime(latest_alert_load_ts, errors="coerce")
+    if pd.notna(generated_at) and pd.notna(latest_alert) and latest_alert > generated_at:
         return None  # a fresher alert exists than the narrative that set this timeout -- not actually stale
     return f"Suggested watch window ended {suggested_watch_until} with no new alert since."
 
@@ -218,7 +241,7 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
     if price_reason:
         return "price_flagged", price_reason
 
-    stale_reason = _check_stale(row.get("suggested_watch_until"), row.get("last_alert_at"), row.get("narrative_generated_at"), today=today)
+    stale_reason = _check_stale(row.get("suggested_watch_until"), row.get("latest_alert_load_ts"), row.get("narrative_generated_at"), today=today)
     if stale_reason:
         return "stale", stale_reason
 

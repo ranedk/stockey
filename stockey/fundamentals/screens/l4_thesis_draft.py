@@ -162,13 +162,28 @@ def _ensure_draft_table() -> None:
 def load_companies_needing_draft_refresh(limit: int | None = None) -> pd.DataFrame:
     """Only ACTIVE watchlist companies whose alert history moved since their last
     draft -- same staleness gate as watch_summary.load_companies_needing_narrative_
-    refresh, see module docstring."""
+    refresh, see module docstring.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): had the byte-identical bug fixed the same
+    day in that sibling gate -- w.last_alert_at (a filing's disclosure date) was
+    compared against d.generated_at (a wall-clock processing timestamp), an event
+    date vs. a processing time. alert_date lags real alert creation by a median of
+    15 days, so this gate would have stopped firing after the first draft for
+    nearly every company -- masked only because fundamentals_l4_thesis_draft is
+    still empty in production (this step has never completed a real run since it
+    was added 2026-08-15). Same fix: compare MAX(fundamentals_l3_alerts.load_ts)
+    against generated_at, both processing timestamps."""
     query = """
         SELECT w.company_master_id, w.last_alert_at, w.narrative_text
         FROM fundamentals_watchlist w
         LEFT JOIN fundamentals_l4_thesis_draft d ON d.company_master_id = w.company_master_id
+        LEFT JOIN LATERAL (
+            SELECT MAX(load_ts) AS latest_alert_load_ts
+            FROM fundamentals_l3_alerts
+            WHERE company_master_id = w.company_master_id
+        ) a ON TRUE
         WHERE w.status = 'active'
-          AND (d.generated_at IS NULL OR w.last_alert_at > d.generated_at::date)
+          AND (d.generated_at IS NULL OR a.latest_alert_load_ts > d.generated_at)
         ORDER BY w.last_alert_at ASC NULLS LAST
     """
     if limit:

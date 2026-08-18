@@ -14558,6 +14558,30 @@ def test_build_company_evidence_bundle_empty_alerts():
     assert bundle["signal_pointers"] == []  # defaults to [] when the caller omits it (old 5-arg call shape)
 
 
+def test_load_companies_needing_narrative_refresh_compares_processing_timestamps(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): used to compare last_alert_at (a
+    # filing's disclosure date) against narrative_generated_at (a wall-clock
+    # processing timestamp) -- alert_date lags real alert creation by a median of
+    # 15 days, so the gate stopped firing after the first narrative for nearly
+    # every company. Confirmed live: 38/39 watchlisted companies permanently
+    # gated out. Now compares MAX(fundamentals_l3_alerts.load_ts) -- both
+    # processing timestamps.
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_watch_summary, "sql_to_df", fake_sql_to_df)
+    fundamentals_watch_summary.load_companies_needing_narrative_refresh()
+    query = captured["query"]
+    assert "MAX(load_ts) AS latest_alert_load_ts" in query
+    assert "FROM fundamentals_l3_alerts" in query
+    assert "a.latest_alert_load_ts > w.narrative_generated_at" in query
+    # not the old event-date comparison
+    assert "last_alert_at > narrative_generated_at::date" not in query
+
+
 def test_run_watch_summary_refresh_returns_early_when_no_candidates(monkeypatch):
     monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
     monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: pd.DataFrame())
@@ -14724,6 +14748,25 @@ def test_run_watch_summary_refresh_handles_malformed_llm_response(monkeypatch):
 
 # fundamentals/screens/l4_thesis_draft.py -- L4 thesis DRAFTING, step 11.5 (2026-08-15).
 # Never writes fundamentals_l4_thesis -- see module docstring guardrail.
+
+
+def test_load_companies_needing_draft_refresh_compares_processing_timestamps(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): byte-identical bug to watch_summary.py's
+    # narrative refresh gate, fixed the same day -- w.last_alert_at (disclosure
+    # date) compared against d.generated_at (wall-clock), masked only because
+    # fundamentals_l4_thesis_draft is still empty in production.
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_l4_thesis_draft, "sql_to_df", fake_sql_to_df)
+    fundamentals_l4_thesis_draft.load_companies_needing_draft_refresh()
+    query = captured["query"]
+    assert "MAX(load_ts) AS latest_alert_load_ts" in query
+    assert "a.latest_alert_load_ts > d.generated_at" in query
+    assert "w.last_alert_at > d.generated_at::date" not in query
 
 
 def test_run_l4_thesis_drafting_returns_early_when_no_candidates(monkeypatch):
@@ -16542,6 +16585,24 @@ def test_get_stock_signal_pointers_insider_transaction_omitted_when_no_name_reco
 # fundamentals/screens/watchlist_exit.py -- watchlist exit signals (step 10.5).
 
 
+def test_load_watchlist_for_exit_evaluation_selects_latest_alert_load_ts(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): _check_stale's own guard used to
+    # compare last_alert_at (a filing's disclosure date) against
+    # narrative_generated_at (a wall-clock timestamp) -- the same event-date-vs-
+    # processing-time mismatch watch_summary.py's narrative refresh gate had.
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_watchlist_exit, "sql_to_df", fake_sql_to_df)
+    fundamentals_watchlist_exit.load_watchlist_for_exit_evaluation()
+    query = captured["query"]
+    assert "MAX(load_ts) AS latest_alert_load_ts" in query
+    assert "FROM fundamentals_l3_alerts" in query
+
+
 def test_check_invalidated_finds_contradicting_later_trigger():
     history = [
         {"trigger_type": "rating_confirms_deleveraging", "alert_date": date(2026, 8, 1)},
@@ -16619,8 +16680,8 @@ def test_check_stale_none_when_watch_until_not_yet_passed():
 
 
 def test_check_stale_none_when_fresher_alert_exists_than_narrative():
-    # last_alert_at is AFTER narrative_generated_at -- a fresh alert exists that
-    # hasn't been synthesized into a new narrative yet, not actually stale.
+    # latest_alert_load_ts is AFTER narrative_generated_at -- a fresh alert exists
+    # that hasn't been synthesized into a new narrative yet, not actually stale.
     reason = fundamentals_watchlist_exit._check_stale(
         date(2026, 8, 1), pd.Timestamp("2026-08-10", tz="UTC"), pd.Timestamp("2026-07-15", tz="UTC"), today=date(2026, 8, 13)
     )

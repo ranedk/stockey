@@ -132,13 +132,33 @@ def _bootstrap_narrative_columns() -> None:
 
 def load_companies_needing_narrative_refresh(limit: int | None = None) -> pd.DataFrame:
     """Only companies whose alert history moved since their last narrative -- a
-    company with no new alert has nothing new to synthesize, see module docstring."""
+    company with no new alert has nothing new to synthesize, see module docstring.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): the gate used to compare last_alert_at
+    (fundamentals_watchlist.last_alert_at = MAX(alert_date), the underlying
+    FILING's disclosure date) against narrative_generated_at (a wall-clock
+    processing timestamp) -- an event date compared to a processing time.
+    alert_date lags real alert creation by a median of 15 days (0 of 60 sampled
+    alerts were same-day), so a freshly-created alert almost never has an
+    alert_date LATER than the day the narrative was already written -- the gate
+    stopped firing permanently after the first generation for nearly every
+    company. Confirmed live: 38 of 39 watchlisted companies were permanently
+    gated out, with 7 companies' alerts (11 total) created strictly AFTER their
+    stored narrative but never reflected in it. Now compares like-with-like:
+    MAX(fundamentals_l3_alerts.load_ts) -- the wall-clock time an alert was
+    actually written -- against narrative_generated_at, both processing
+    timestamps."""
     query = """
-        SELECT company_master_id, last_alert_at, narrative_generated_at, narrative_text
-        FROM fundamentals_watchlist
-        WHERE narrative_generated_at IS NULL
-           OR last_alert_at > narrative_generated_at::date
-        ORDER BY last_alert_at ASC NULLS LAST
+        SELECT w.company_master_id, w.last_alert_at, w.narrative_generated_at, w.narrative_text
+        FROM fundamentals_watchlist w
+        LEFT JOIN LATERAL (
+            SELECT MAX(load_ts) AS latest_alert_load_ts
+            FROM fundamentals_l3_alerts
+            WHERE company_master_id = w.company_master_id
+        ) a ON TRUE
+        WHERE w.narrative_generated_at IS NULL
+           OR a.latest_alert_load_ts > w.narrative_generated_at
+        ORDER BY w.last_alert_at ASC NULLS LAST
     """
     if limit:
         query += f" LIMIT {int(limit)}"
