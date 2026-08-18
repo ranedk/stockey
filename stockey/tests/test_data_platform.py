@@ -9496,6 +9496,21 @@ def test_compute_institutional_stake_empty_shareholding_returns_none_and_false()
     assert result == {"institutional_pct": None, "institutional_stake_direction": None, "institutional_first_entry": False}
 
 
+def test_compute_institutional_stake_treats_missing_dii_row_as_zero():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): screener.in omits a holder-class row
+    # ENTIRELY (not zeros) when that class has never held the stock -- zip()
+    # against an empty list used to produce zero pairs, silently returning None
+    # even with real FII data present. Confirmed live: 5/18 real L1 companies had
+    # exactly this shape.
+    result = fundamentals_l2_state.compute_institutional_stake({"rows": {"FIIs": [1.0, 2.0, 3.0]}})
+    assert result["institutional_pct"] == 3.0  # 3.0 (FII) + 0 (DII, treated as absent-means-zero)
+
+
+def test_compute_institutional_stake_treats_missing_fii_row_as_zero():
+    result = fundamentals_l2_state.compute_institutional_stake({"rows": {"DIIs": [4.0, 5.0]}})
+    assert result["institutional_pct"] == 5.0
+
+
 def test_build_institutional_entry_event_row_shape(monkeypatch):
     monkeypatch.setattr(
         fundamentals_l2_state,

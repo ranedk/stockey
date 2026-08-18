@@ -447,9 +447,25 @@ def compute_promoter_stake(shareholding: dict[str, object]) -> dict[str, object]
 def compute_institutional_stake(shareholding: dict[str, object]) -> dict[str, object]:
     """FII + DII combined, matching L1_QUERY's own "FII holding + DII holding"
     convention -- see module docstring for the first-entry definition and its
-    trailing-~12-quarter-window caveat."""
+    trailing-~12-quarter-window caveat.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit, pre-existing): screener.in OMITS a
+    holder-class row ENTIRELY (not zeros) when that class has never held the
+    stock -- zip(fii_raw, dii_raw) against an empty list then produces zero
+    pairs, so institutional_pct/direction/institutional_first_entry all silently
+    become None/False even when the OTHER class has real data. Confirmed live
+    against 18 real L1 company pages: 5 (28%) have exactly one row missing and
+    returned None despite real institutional holdings on the page.
+    L1_QUERY's own "FII holding + DII holding" convention this docstring already
+    cites treats an absent class as 0; padding the missing side to the present
+    side's length (same period count, since both rows share the same table)
+    applies that identical rule here instead of dropping the signal entirely."""
     fii_raw = shareholding.get("rows", {}).get("FIIs") or []
     dii_raw = shareholding.get("rows", {}).get("DIIs") or []
+    if fii_raw and not dii_raw:
+        dii_raw = [0] * len(fii_raw)
+    elif dii_raw and not fii_raw:
+        fii_raw = [0] * len(dii_raw)
     combined: list[float | None] = []
     for fii, dii in zip(fii_raw, dii_raw):
         if isinstance(fii, (int, float)) and isinstance(dii, (int, float)):
