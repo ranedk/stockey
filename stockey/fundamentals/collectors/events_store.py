@@ -55,9 +55,14 @@ _DEDUP_COLUMN_TYPES = {
     "sources": "TEXT",
     # Also missing from the original table (found in the same live pass): the row
     # builders never included it, so find_dedup_candidate's "earliest-loaded"
-    # ORDER BY load_ts had nothing to sort on. Existing rows get NULL here (sorts
-    # first in ASC order) -- harmless, load_ts only breaks ties among matches, it
-    # isn't part of the match itself.
+    # ORDER BY load_ts had nothing to sort on. Existing rows get NULL here.
+    # CORRECTED 2026-08-18 (re-audit): this comment used to claim NULL "sorts first
+    # in ASC order" -- live-verified against Postgres's real behavior (ORDER BY x
+    # ASC over (1, NULL, 2) returns 1, 2, NULL), Postgres actually sorts NULL LAST
+    # in ASC order (NULLS FIRST is the DESC default, not ASC). Still harmless either
+    # way -- load_ts only breaks ties among matches, it isn't part of the match
+    # itself -- but the old comment's reasoning would have misled the next reader
+    # into expecting the opposite tie-breaking preference.
     "load_ts": "TIMESTAMPTZ",
 }
 
