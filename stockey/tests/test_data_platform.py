@@ -15949,6 +15949,7 @@ def test_get_watchlist_attaches_strategies_per_company(monkeypatch):
         return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise", "rating_downgrade"]})
 
     result = fundamentals_api_queries.get_watchlist()
@@ -15968,6 +15969,7 @@ def test_get_watchlist_attaches_draft_thesis_per_company(monkeypatch):
         return draft_df if "fundamentals_l4_thesis_draft" in q else watchlist_df
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
 
     result = fundamentals_api_queries.get_watchlist()
@@ -15988,6 +15990,7 @@ def test_get_watchlist_selects_price_data_stale(monkeypatch):
         return pd.DataFrame()
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     fundamentals_api_queries.get_watchlist()
     assert "tech.price_data_stale" in captured["query"]
     assert "SELECT close, price_data_stale FROM fundamentals_technicals" in captured["query"]
@@ -16009,6 +16012,7 @@ def test_get_watchlist_company_with_no_strategies_gets_empty_list(monkeypatch):
         return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
 
     result = fundamentals_api_queries.get_watchlist()
@@ -16032,6 +16036,7 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
     calls = {"watchlist": watchlist_df, "alerts": alerts_df, "thesis": thesis_df, "draft": draft_df}
     call_order = iter(["watchlist", "alerts", "thesis", "draft"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: {"ticker": "FOO"})
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: {"close": 100})
     monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: {"sector_code": "IN01"})
@@ -16058,6 +16063,7 @@ def test_get_watchlist_detail_draft_thesis_none_when_no_draft(monkeypatch):
     calls = {"watchlist": watchlist_df, "alerts": pd.DataFrame(), "thesis": pd.DataFrame(), "draft": pd.DataFrame()}
     call_order = iter(["watchlist", "alerts", "thesis", "draft"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: None)
@@ -16079,17 +16085,64 @@ def test_get_draft_theses_returns_active_watchlist_drafts(monkeypatch):
         return pd.DataFrame([{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 80}])
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
 
     result = fundamentals_api_queries.get_draft_theses()
 
     assert result == [{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 80}]
     assert "fundamentals_l4_thesis_draft" in captured["query"]
     assert "w.status = 'active'" in captured["query"]
+    # BUG FOUND LIVE 2026-08-18 (re-audit): no ORDER BY at all -- the only
+    # list-producing query in this module without one, would reshuffle between
+    # calls as Postgres reorders the heap after upserts.
+    assert "ORDER BY d.generated_at DESC" in captured["query"]
 
 
 def test_get_draft_theses_empty_when_none(monkeypatch):
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     assert fundamentals_api_queries.get_draft_theses() == []
+
+
+def test_get_draft_theses_calls_ensure_draft_table_first(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this used to query fundamentals_l4_
+    # thesis_draft directly with no _ensure_draft_table() call first -- the
+    # screens-side reader this was copied from calls it; this one didn't. Verified
+    # live by monkeypatching the table name: /api/watchlist, /api/drafts, and
+    # /api/watchlist/{id} all 500'd on a fresh DB.
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: calls.append(True))
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+
+    fundamentals_api_queries.get_draft_theses()
+
+    assert calls == [True]
+
+
+def test_get_watchlist_shows_draft_thesis_for_a_non_active_row(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): draft_thesis was silently absent on
+    # every non-active row in the list view -- _load_draft_theses_by_company()
+    # unconditionally gated on w.status='active' regardless of the `status` this
+    # function was actually called with, inconsistent with get_watchlist_detail()'s
+    # own deliberately-unstatus-gated draft lookup.
+    watchlist_df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2, "status": "invalidated"}])
+    draft_df = pd.DataFrame([{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 55}])
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        if "fundamentals_l4_thesis_draft" in q:
+            captured["draft_query"] = q
+            return draft_df
+        return watchlist_df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist(status="invalidated")
+
+    assert result[0]["draft_thesis"]["prediction_text"] == "p"
+    assert "w.status = 'active'" not in captured["draft_query"]
 
 
 def test_api_drafts_route_returns_queries_result(monkeypatch):

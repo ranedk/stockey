@@ -30,6 +30,7 @@ from fundamentals.collectors.rating_agencies import get_unsupported_rating_agenc
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
 from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
+from fundamentals.screens.l4_thesis_draft import _ensure_draft_table
 from fundamentals.screens.signal_pointers import get_stock_signal_pointers, load_satisfied_strategies_by_company
 from fundamentals.screens.watch_summary import (
     load_latest_l2_state_for_company,
@@ -138,26 +139,53 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     # this API -- the frontend had no way to show what the email already tells a
     # human. CANDIDATE ONLY, same as the email: never implies anything was saved to
     # fundamentals_l4_thesis.
-    drafts_by_company = _load_draft_theses_by_company()
+    # BUG FOUND LIVE 2026-08-18 (re-audit): draft_thesis was silently absent on
+    # every non-active row in this list view -- _load_draft_theses_by_company()
+    # unconditionally gated on w.status='active' regardless of the `status` param
+    # this function was actually called with, unlike get_watchlist_detail() below,
+    # which deliberately does NOT status-gate its own draft lookup (a company that
+    # has since left the active watchlist still shows its alerts/portfolio there,
+    # so its draft shouldn't disappear either -- same reasoning applies here).
+    # active_only=False when status != "active": for status="active" itself the
+    # gate is a no-op anyway (every row in `watchlist` already IS active), so this
+    # only changes behavior for status=None/"stale"/"invalidated"/"price_flagged".
+    drafts_by_company = _load_draft_theses_by_company(active_only=(status == "active"))
     for row in watchlist:
         row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
         row["draft_thesis"] = drafts_by_company.get(row["company_master_id"])
     return watchlist
 
 
-def _load_draft_theses_by_company() -> dict[str, dict]:
+def _load_draft_theses_by_company(*, active_only: bool = True) -> dict[str, dict]:
     """JSON-safe (see module docstring's _clean_records rationale -- confidence_score/
     target_date/generated_at can round-trip as NaN/Timestamp otherwise) draft L4
-    theses for every currently-active watchlist company, keyed by company_master_id.
-    Same join fundamentals/screens/l4_thesis_draft.py's own load_current_drafts_by_
-    company() uses for the digest email; not reused directly here because that
-    function's raw .to_dict("records") isn't run through _clean_records()."""
+    theses, keyed by company_master_id. active_only=True (the default, and
+    get_draft_theses()'s own always-on scope: "every draft for a CURRENTLY-ACTIVE
+    watchlist company") restricts to companies whose fundamentals_watchlist.status
+    is 'active'; get_watchlist() passes active_only=False whenever it itself isn't
+    scoped to status="active", so a non-active row's real draft isn't silently
+    hidden (see its own call site comment). Same join fundamentals/screens/
+    l4_thesis_draft.py's own load_current_drafts_by_company() uses for the digest
+    email; not reused directly here because that function's raw .to_dict("records")
+    isn't run through _clean_records().
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): this used to query fundamentals_l4_
+    thesis_draft directly with no _ensure_draft_table() call first -- the screens-
+    side reader this was copied from calls it; this one didn't. Verified live by
+    monkeypatching the table name: /api/watchlist, /api/drafts, and
+    /api/watchlist/{id} all 500'd on a fresh DB that had never run l4_thesis_
+    draft.py's own step yet. Before this fix, get_watchlist() never touched this
+    table at all, so the regression was invisible until this endpoint was actually
+    exercised against a DB missing the table."""
+    _ensure_draft_table()
+    active_filter = "WHERE w.status = 'active'" if active_only else ""
     df = sql_to_df(
-        """
+        f"""
         SELECT d.* FROM fundamentals_l4_thesis_draft d
         JOIN fundamentals_watchlist w ON w.company_master_id = d.company_master_id
-        WHERE w.status = 'active'
-        """
+        {active_filter}
+        ORDER BY d.generated_at DESC NULLS LAST
+        """  # noqa: S608 -- active_filter is a fixed internal string, no user input
     )
     return {record["company_master_id"]: record for record in _clean_records(df)}
 
@@ -201,6 +229,9 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
     # view's own draft lookup is (this is a single-company detail page: a company
     # that has since left the active watchlist still shows its alerts/portfolio here,
     # so its draft shouldn't disappear either).
+    # BUG FOUND LIVE 2026-08-18 (re-audit): same missing _ensure_draft_table() call
+    # as _load_draft_theses_by_company() -- see its own docstring.
+    _ensure_draft_table()
     draft_df = sql_to_df("SELECT * FROM fundamentals_l4_thesis_draft WHERE company_master_id = %s", params=(company_master_id,))
     draft_records = _clean_records(draft_df)
 
