@@ -57,6 +57,7 @@ from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.screens.investor_classification import effective_tier, normalize_investor_key
 from fundamentals.screens.l1_universe import RPT_PCT_OF_REVENUE_THRESHOLD
+from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -755,6 +756,15 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
 
     l2_state = load_latest_l2_state()
     l2_by_ticker = {row["ticker"]: row for row in l2_state.to_dict("records")}
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") below only recovers
+    # the correct fundamentals_l2_state.ticker when the company IS its own NSE
+    # symbol -- wrong for the ~22% BSE-only cohort. Confirmed live: 44/196 (22%)
+    # of L2 tickers resolve to a different canonical company_master_id, so every
+    # corroboration-gated trigger (deleveraging confirmation, results-confirms-
+    # turnaround, insider-sell-surprise) could never evaluate its L2 gate for
+    # them. Built once per run (not per event) since it's the same reverse map
+    # for every event in this batch.
+    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id()
 
     tiers_df = load_investor_tiers()
     tiers_by_key = {row["investor_key"]: row for row in tiers_df.to_dict("records")} if not tiers_df.empty else {}
@@ -764,8 +774,8 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
 
     for _, event in events.iterrows():
         event_dict = event.to_dict()
-        ticker = str(event_dict.get("company_master_id") or "").removeprefix("nse:")
-        l2_row = l2_by_ticker.get(ticker)
+        ticker = l1_ticker_by_cmid.get(event_dict.get("company_master_id"))
+        l2_row = l2_by_ticker.get(ticker) if ticker is not None else None
         if l2_row is None:
             counts["no_l2_state"] += 1
             _record_fallback(

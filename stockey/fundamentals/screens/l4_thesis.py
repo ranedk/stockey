@@ -43,6 +43,7 @@ import json
 
 import pandas as pd
 
+from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 
 SYNC_SOURCE_NAME = "fundamentals.screens.l4_thesis"
@@ -223,7 +224,13 @@ def check_structured_prediction(thesis_row: dict) -> bool | None:
     if not metric_name or not operator or threshold is None:
         return None
 
-    ticker = str(thesis_row.get("company_master_id") or "").removeprefix("nse:")
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") only recovers the
+    # correct fundamentals_l2_state.ticker when the company IS its own NSE symbol
+    # -- wrong for the ~22% BSE-only cohort. Same recurring mistake fixed
+    # elsewhere via build_l1_ticker_by_company_master_id() (see its own docstring).
+    ticker = build_l1_ticker_by_company_master_id().get(thesis_row.get("company_master_id"))
+    if ticker is None:
+        return None
     df = sql_to_df(
         "SELECT * FROM fundamentals_l2_state WHERE ticker = %s ORDER BY run_date DESC LIMIT 1",
         params=(ticker,),

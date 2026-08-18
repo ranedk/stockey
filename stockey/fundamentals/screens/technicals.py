@@ -42,6 +42,7 @@ import json
 import pandas as pd
 
 from data.bseindia.price_adjustment import ensure_view as ensure_bse_view
+from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -216,11 +217,23 @@ def run_technicals_refresh() -> dict[str, object]:
             error="bseindia_ohlcv stale or empty",
         )
 
+    # BUG FOUND LIVE 2026-08-18: the 4th file the ae8ff4b identity-resolution fix
+    # missed (that commit fixed the same naive f"nse:{ticker}" construction in
+    # l1_universe.py/l2_state.py/sector_cycle.py, but not here) -- ~22% of L1
+    # tickers are raw BSE scrip codes, not NSE symbols, so f"nse:{ticker}" landed
+    # every BSE-only company's technicals row under an id nothing else in the
+    # pipeline uses. Resolved via map_company_master_ids_nse_or_bse instead, same
+    # helper every other fixed call site already uses.
+    tickers["company_master_id"] = map_company_master_ids_nse_or_bse(tickers["ticker"])
+
     rows = []
     no_history = 0
     stale_tickers: list[str] = []
     for _, row in tickers.iterrows():
         ticker = row["ticker"]
+        company_master_id = row["company_master_id"]
+        if pd.isna(company_master_id):
+            continue  # unresolved -- map_company_master_ids_nse_or_bse already recorded its own fallback event
         history = load_adjusted_price_history(ticker)
         stats = compute_technicals(history)
         if stats["data_points_available"] < MIN_HISTORY_ROWS:
@@ -252,7 +265,7 @@ def run_technicals_refresh() -> dict[str, object]:
 
         rows.append(
             {
-                "company_master_id": f"nse:{ticker}",
+                "company_master_id": company_master_id,
                 "ticker": ticker,
                 "run_date": run_date,
                 **{k: v for k, v in stats.items() if k != "data_points_available"},

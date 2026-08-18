@@ -295,6 +295,45 @@ def map_company_master_ids_nse_or_bse(tickers: Iterable[object]) -> pd.Series:
     return resolved
 
 
+def build_l1_ticker_by_company_master_id() -> dict[str, str]:
+    """Reverse of map_company_master_ids_nse_or_bse: given a company_master_id, what
+    fundamentals_l1_universe.ticker (screener.in's own slug -- the NSE symbol for
+    most companies, but a raw BSE numeric scrip code for the ~22% BSE-only cohort)
+    does it correspond to?
+
+    BUG FOUND LIVE 2026-08-18: naive `company_master_id.removeprefix("nse:")` only
+    recovers the correct L1 ticker when the company IS its own NSE symbol -- it's
+    wrong for any BSE-only company, whose canonical company_master_id (e.g.
+    "nse:ALUFLUOR" -- "nse:" is a namespace prefix on every company_master_id, not a
+    literal NSE-listing claim) is NOT the same string as its L1-universe slug (e.g.
+    "524634", the BSE scrip code screener.in uses as that company's own URL slug).
+    Confirmed live: this exact naive-removeprefix mistake recurred independently
+    across watch_summary.py, l3_triggers.py, llm_triage.py, l4_thesis.py,
+    signal_pointers.py, and l2_state.py's pull_crawl_forward (plus the reverse
+    construction mistake, f"nse:{ticker}", in technicals.py) -- the SAME bug
+    ae8ff4b fixed by name in 3 OTHER files earlier the same session, missed here
+    because each of these reads FROM a canonical id looking for the L1 ticker,
+    while ae8ff4b's sites all went the other direction. One shared, correct
+    resolver instead of ad-hoc string surgery at every call site: builds the
+    reverse map by resolving the whole L1 universe forward (same machinery
+    map_company_master_ids_nse_or_bse already uses) and inverting it. Cheap
+    (L1 universe is ~200 rows) -- call fresh per use, no caller-managed cache."""
+    tickers_df = sql_to_df(
+        """
+        SELECT ticker
+        FROM fundamentals_l1_universe
+        WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
+        """
+    )
+    if tickers_df.empty:
+        return {}
+    resolved = map_company_master_ids_nse_or_bse(tickers_df["ticker"])
+    # last-wins on a genuine collision (two L1 tickers resolving to the same
+    # company_master_id) is the same tradeoff the forward direction already
+    # accepts elsewhere in this module -- rare enough not to warrant its own event.
+    return {cmid: ticker for cmid, ticker in zip(resolved, tickers_df["ticker"]) if pd.notna(cmid)}
+
+
 def load_company_master_records(ticker: str, exchanges: Optional[Sequence[str]] = None) -> pd.DataFrame:
     clean_ticker = _clean_scalar(ticker)
     if clean_ticker is None:

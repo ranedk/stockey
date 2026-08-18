@@ -45,6 +45,7 @@ from openai import OpenAI
 
 from fundamentals.screens.signal_pointers import get_stock_signal_pointers
 from fundamentals.screens.watchlist import _ensure_watchlist_table
+from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -157,7 +158,16 @@ def load_company_alerts(company_master_id: str) -> pd.DataFrame:
 
 
 def load_latest_l2_state_for_company(company_master_id: str) -> dict | None:
-    ticker = str(company_master_id or "").removeprefix("nse:")
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") only recovers the
+    # correct fundamentals_l2_state.ticker when the company IS its own NSE symbol
+    # -- wrong for the ~22% BSE-only cohort, whose L2 ticker is a raw BSE scrip
+    # code, not the symbol in their canonical company_master_id. Left this
+    # function's evidence bundle silently missing L2 state for that cohort's
+    # watchlisted companies, exactly the gap signal_pointers.py was built to
+    # close for other fields.
+    ticker = build_l1_ticker_by_company_master_id().get(company_master_id)
+    if ticker is None:
+        return None
     df = sql_to_df(
         """
         SELECT ticker, company_name, net_debt_rscr, net_debt_yoy_delta_rscr,

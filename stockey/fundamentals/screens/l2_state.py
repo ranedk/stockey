@@ -121,7 +121,7 @@ from fundamentals.collectors.events_store import _ensure_events_schema
 from fundamentals.collectors.screenerin import build_authenticated_session, clean_text, run_query
 from fundamentals.collectors.screenerin import to_number as _screenerin_to_number
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
-from utils.company_master import map_company_master_ids_nse_or_bse
+from utils.company_master import build_l1_ticker_by_company_master_id, map_company_master_ids_nse_or_bse
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
@@ -697,7 +697,19 @@ def pull_crawl_forward(company_master_ids: list[str]) -> dict[str, object]:
     if not company_master_ids:
         return {"pulled_forward": 0}
     _ensure_crawl_state_table()
-    tickers = [cmid.removeprefix("nse:") for cmid in company_master_ids]
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") only recovers the
+    # correct fundamentals_l1_universe.ticker when the company IS its own NSE
+    # symbol -- wrong for the ~22% BSE-only cohort whose L1 slug is a raw BSE
+    # scrip code, not the symbol embedded in their company_master_id. This is the
+    # sole mechanism coupling BSE results detection back into L2's re-crawl
+    # schedule, and it silently returned 0 rows for every BSE-only company (the
+    # caller discards this function's return value, so the failure was invisible).
+    # build_l1_ticker_by_company_master_id() is the shared, correct reverse
+    # resolver (built for this exact recurring mistake -- see its own docstring).
+    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id()
+    tickers = [l1_ticker_by_cmid[cmid] for cmid in company_master_ids if cmid in l1_ticker_by_cmid]
+    if not tickers:
+        return {"pulled_forward": 0}
     universe = sql_to_df(
         """
         SELECT company_id, ticker FROM fundamentals_l1_universe

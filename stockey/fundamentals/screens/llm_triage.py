@@ -35,6 +35,7 @@ from openai import OpenAI
 from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.screens.l3_triggers import RESULTS_TABLE, _ensure_alerts_table, load_latest_l2_state
+from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -216,6 +217,11 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
 
     l2_state = load_latest_l2_state()
     l2_by_ticker = {row["ticker"]: row for row in l2_state.to_dict("records")}
+    # BUG FOUND LIVE 2026-08-18: same naive removeprefix("nse:") mistake fixed in
+    # l3_triggers.py's sibling loop -- wrong for the ~22% BSE-only cohort whose
+    # fundamentals_l2_state.ticker isn't their own company_master_id's symbol.
+    # Built once per run, same reverse map every other fixed call site uses.
+    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id()
 
     counts = {"flagged": 0, "not_interesting": 0, "failed": 0}
     consecutive_failures = 0
@@ -226,8 +232,8 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
         if blocked:
             continue
         event_dict = event.to_dict()
-        ticker = str(event_dict.get("company_master_id") or "").removeprefix("nse:")
-        l2_row = l2_by_ticker.get(ticker)
+        ticker = l1_ticker_by_cmid.get(event_dict.get("company_master_id"))
+        l2_row = l2_by_ticker.get(ticker) if ticker is not None else None
         price_context = load_price_context(event_dict.get("company_master_id"), event_dict.get("disclosure_date"))
         evidence_bundle = build_evidence_bundle(event_dict, l2_row, price_context)
 

@@ -29,7 +29,9 @@ import pandas as pd
 
 from fundamentals.screens.investor_classification import effective_tier, normalize_investor_key
 from fundamentals.screens.l1_universe import RPT_PCT_OF_REVENUE_THRESHOLD
+from fundamentals.screens.l3_triggers import _resolve_pit_transaction_fields
 from fundamentals.screens.sector_cycle import classify_growth
+from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import sql_to_df
 
 SYNC_SOURCE_NAME = "fundamentals.screens.signal_pointers"
@@ -52,7 +54,15 @@ def _resolve_rating_action(event: dict) -> str | None:
 
 
 def load_l2_signals_for_company(company_master_id: str) -> dict | None:
-    ticker = str(company_master_id or "").removeprefix("nse:")
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") only recovers the
+    # correct fundamentals_l2_state.ticker when the company IS its own NSE symbol
+    # -- wrong for the ~22% BSE-only cohort. Live-confirmed: get_stock_signal_
+    # pointers() returned [] for a real BSE-only company's canonical id and real
+    # data for its L1 ticker. Same recurring mistake fixed elsewhere via
+    # build_l1_ticker_by_company_master_id() (see its own docstring).
+    ticker = build_l1_ticker_by_company_master_id().get(company_master_id)
+    if ticker is None:
+        return None
     df = sql_to_df(
         """
         SELECT promoter_pct, promoter_stake_direction, institutional_pct,
@@ -89,19 +99,61 @@ def load_latest_insider_transaction_for_company(company_master_id: str) -> dict 
     rating_action and investor_entry each got a dedicated, structured pointer type,
     but insider buys/sells only ever showed up as a generic strategy_satisfied badge
     with no name/quantity/direction, even though fundamentals_events already has all
-    three columns."""
+    three columns.
+
+    BUG FOUND LIVE 2026-08-18: this pointer was structurally dead -- it filtered on
+    the flat transaction_type column only, which BSE-sourced pit_sast rows (100% of
+    the 602 in production) always write NULL (the real detail lives only in
+    structured_extraction_json, extracted separately). l3_triggers.py's own
+    evaluate_pit_sast_trigger got the identical fallback fix on 2026-08-15
+    (_resolve_pit_transaction_fields) for the exact same reason -- this module's own
+    docstring above claims to keep a twin copy of that resolution logic, but this
+    specific twin was never written. Reuses l3_triggers.py's resolver directly
+    (screens/ modules already share within screens/, no circular import) instead of
+    a third copy of the same fallback."""
     df = sql_to_df(
         """
-        SELECT insider_name, quantity, transaction_type, disclosure_date, load_ts
+        SELECT insider_name, quantity, transaction_type, disclosure_date, load_ts, structured_extraction_json
         FROM fundamentals_events
         WHERE company_master_id = %s AND filing_type = 'pit_sast'
-          AND transaction_type IS NOT NULL AND transaction_type != ''
         ORDER BY load_ts DESC
-        LIMIT 1
+        LIMIT 20
         """,
         params=(company_master_id,),
     )
-    return df.iloc[0].to_dict() if not df.empty else None
+    if df.empty:
+        return None
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        transaction_type, insider_name = _resolve_pit_transaction_fields(row_dict)
+        if not transaction_type:
+            continue
+        quantity = row_dict.get("quantity")
+        if quantity is None or pd.isna(quantity):
+            quantity = _resolve_pit_quantity(row_dict)
+        return {
+            "insider_name": insider_name,
+            "quantity": quantity,
+            "transaction_type": transaction_type,
+            "disclosure_date": row_dict.get("disclosure_date"),
+            "load_ts": row_dict.get("load_ts"),
+        }
+    return None
+
+
+def _resolve_pit_quantity(event: dict) -> object:
+    """quantity_shares from structured_extraction_json -- the flat `quantity` column
+    is, like transaction_type/insider_name, only ever populated by NSE's structured
+    feed; BSE-detected rows carry it only in the extraction JSON, under a different
+    field name (quantity_shares, per structured_extraction.py's PIT_SAST_SCHEMA)."""
+    raw_json = event.get("structured_extraction_json")
+    if not raw_json:
+        return None
+    try:
+        extracted = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return None
+    return extracted.get("quantity_shares")
 
 
 def load_latest_confirmed_auditor_change_for_company(company_master_id: str) -> dict | None:

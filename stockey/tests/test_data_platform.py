@@ -1106,6 +1106,42 @@ def test_company_master_records_fallback_on_duplicate_ticker_collision(monkeypat
     assert events[0]["metadata"]["tickers"] == ["DUP"]
 
 
+def test_build_l1_ticker_by_company_master_id_inverts_the_forward_resolution(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18: naive company_master_id.removeprefix("nse:") only
+    # recovers the correct fundamentals_l1_universe.ticker when the company IS its
+    # own NSE symbol -- wrong for the ~22% BSE-only cohort, whose L1 slug is a raw
+    # BSE scrip code (e.g. "524634" for nse:ALUFLUOR). This is the shared reverse
+    # resolver that recurred as a naive-removeprefix mistake in 6+ files this
+    # session; pins it in isolation.
+    tickers_df = pd.DataFrame([{"ticker": "RELIANCE"}, {"ticker": "524634"}])
+    monkeypatch.setattr(company_master_utils, "sql_to_df", lambda *a, **k: tickers_df)
+    monkeypatch.setattr(
+        company_master_utils,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series(["nse:RELIANCE", "nse:ALUFLUOR"], index=tickers.index, dtype="string"),
+    )
+
+    result = company_master_utils.build_l1_ticker_by_company_master_id()
+
+    assert result == {"nse:RELIANCE": "RELIANCE", "nse:ALUFLUOR": "524634"}
+
+
+def test_build_l1_ticker_by_company_master_id_empty_universe(monkeypatch):
+    monkeypatch.setattr(company_master_utils, "sql_to_df", lambda *a, **k: pd.DataFrame())
+    assert company_master_utils.build_l1_ticker_by_company_master_id() == {}
+
+
+def test_build_l1_ticker_by_company_master_id_drops_unresolved_tickers(monkeypatch):
+    tickers_df = pd.DataFrame([{"ticker": "RELIANCE"}, {"ticker": "UNKNOWNCODE"}])
+    monkeypatch.setattr(company_master_utils, "sql_to_df", lambda *a, **k: tickers_df)
+    monkeypatch.setattr(
+        company_master_utils,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series(["nse:RELIANCE", pd.NA], index=tickers.index, dtype="string"),
+    )
+    assert company_master_utils.build_l1_ticker_by_company_master_id() == {"nse:RELIANCE": "RELIANCE"}
+
+
 def test_company_master_preserves_index_for_non_contiguous_series(monkeypatch):
     """Regression test: map_company_master_ids() used to do list(tickers) internally,
     discarding the caller's index in favor of a fresh 0-based RangeIndex. A caller doing
@@ -12958,6 +12994,7 @@ def test_run_l3_rule_triggers_writes_an_alert_for_a_downgrade(monkeypatch):
     l2_state = pd.DataFrame([{"ticker": "X", "company_name": "X Ltd", "net_debt_yoy_delta_rscr": 3, "run_date": date(2026, 7, 1)}])
     monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: l2_state)
     monkeypatch.setattr(fundamentals_l3_triggers, "load_investor_tiers", lambda: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_l3_triggers, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
 
     upserts = []
     monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
@@ -13488,6 +13525,7 @@ def test_check_structured_prediction_returns_none_without_metric_fields():
 
 
 def test_check_structured_prediction_evaluates_against_l2_state(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:CINELINE": "CINELINE"})
     monkeypatch.setattr(
         fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": 50.73}])
     )
@@ -13499,12 +13537,27 @@ def test_check_structured_prediction_evaluates_against_l2_state(monkeypatch):
 
 
 def test_check_structured_prediction_returns_none_when_no_l2_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame())
     thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
     assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
 
 
+def test_check_structured_prediction_returns_none_when_ticker_unresolved(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") used to always "succeed"
+    # (wrongly, for the ~22% BSE-only cohort) -- now a genuinely-unresolvable
+    # company_master_id correctly short-circuits to None rather than querying L2
+    # state under a wrong/empty ticker.
+    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {})
+    calls = []
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: calls.append(1) or pd.DataFrame())
+    thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
+    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+    assert calls == []  # never even queried L2 state for an unresolvable company
+
+
 def test_check_structured_prediction_returns_none_when_value_is_null(monkeypatch):
+    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(
         fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": None}])
     )
@@ -13518,6 +13571,7 @@ def test_check_structured_prediction_returns_none_for_non_numeric_metric_name(mo
     # column (trend_direction, company_name, ticker, ...). Used to raise an uncaught
     # TypeError from `value < threshold` (str vs number) instead of returning None
     # like every other "can't evaluate this" branch in this function.
+    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(
         fundamentals_l4_thesis,
         "sql_to_df",
@@ -13531,6 +13585,7 @@ def test_check_structured_prediction_handles_numpy_numeric_dtypes(monkeypatch):
     # A real DataFrame column reads back as numpy.int64/float64, neither a Python
     # int/float subclass -- must still evaluate correctly (not be rejected as
     # "non-numeric" by an overly-strict isinstance-only guard).
+    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(
         fundamentals_l4_thesis,
         "sql_to_df",
@@ -13974,6 +14029,7 @@ def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypat
     monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "AAA", "company_name": "A Co"}, {"ticker": "BBB", "company_name": "B Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+    monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
 
     # AAA's history ends "today" (not stale) -- isolates this test to the
     # insufficient-history behavior it's actually about, independent of the
@@ -14013,6 +14069,7 @@ def test_run_technicals_refresh_flags_and_records_stale_price_series(monkeypatch
     monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "STALECO", "company_name": "Stale Co"}, {"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+    monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
 
     fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
     # last row is 30 days old -- past STALE_PRICE_THRESHOLD_DAYS (7)
@@ -14088,6 +14145,7 @@ def test_run_technicals_refresh_no_stale_prices_skips_fallback_event(monkeypatch
     monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+    monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
     fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
     monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: fresh_history)
     monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: None)
@@ -14096,6 +14154,7 @@ def test_run_technicals_refresh_no_stale_prices_skips_fallback_event(monkeypatch
 
     result = fundamentals_technicals.run_technicals_refresh()
 
+    assert result["companies"] == 1
     assert result["stale_price"] == 0
     assert not any(a and a[0] == "technicals_stale_price_series" for a, k in fallback_events)
 
@@ -15851,18 +15910,33 @@ def test_resolve_rating_action_none_when_neither_present():
     assert fundamentals_signal_pointers._resolve_rating_action({"rating_action_type": None, "structured_extraction_json": None}) is None
 
 
-def test_load_l2_signals_for_company_strips_nse_prefix_and_returns_row(monkeypatch):
+def test_load_l2_signals_for_company_resolves_l1_ticker_and_returns_row(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18: naive removeprefix("nse:") only recovers the
+    # correct fundamentals_l2_state.ticker when the company IS its own NSE symbol
+    # -- wrong for the ~22% BSE-only cohort, whose L2 ticker is a raw BSE scrip
+    # code. This test used to name and assert the naive behavior directly; now
+    # pins the real resolution via build_l1_ticker_by_company_master_id(), which
+    # can map a company_master_id to an L1 ticker that DOESN'T just strip "nse:".
     captured = {}
 
     def fake_sql_to_df(q, params=None):
         captured["params"] = params
         return pd.DataFrame([{"promoter_pct": 55.0, "promoter_stake_direction": "increasing", "institutional_pct": 3.0, "institutional_stake_direction": "increasing", "institutional_first_entry": False, "run_date": date(2026, 8, 1)}])
 
+    monkeypatch.setattr(fundamentals_signal_pointers, "build_l1_ticker_by_company_master_id", lambda: {"nse:ALUFLUOR": "524634"})
     monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", fake_sql_to_df)
-    result = fundamentals_signal_pointers.load_l2_signals_for_company("nse:ABC")
+    result = fundamentals_signal_pointers.load_l2_signals_for_company("nse:ALUFLUOR")
 
-    assert captured["params"] == ("ABC",)
+    assert captured["params"] == ("524634",)  # the L1 slug, not a naive "ALUFLUOR" strip
     assert result["promoter_pct"] == 55.0
+
+
+def test_load_l2_signals_for_company_none_when_unresolved(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fundamentals_signal_pointers, "build_l1_ticker_by_company_master_id", lambda: {})
+    monkeypatch.setattr(fundamentals_signal_pointers, "sql_to_df", lambda q, params=None: calls.append(1) or pd.DataFrame())
+    assert fundamentals_signal_pointers.load_l2_signals_for_company("nse:UNKNOWN") is None
+    assert calls == []  # never queried L2 state for an unresolvable company
 
 
 def test_load_l2_signals_for_company_none_when_empty(monkeypatch):
