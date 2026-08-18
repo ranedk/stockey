@@ -165,6 +165,26 @@ def load_companies_needing_narrative_refresh(limit: int | None = None) -> pd.Dat
     return sql_to_df(query)
 
 
+def _count_companies_needing_narrative_refresh() -> int:
+    """Same eligibility condition as load_companies_needing_narrative_refresh(), unbounded --
+    used only to size the backlog so a per-run limit smaller than it can be surfaced instead
+    of silently dropping the overflow, see run_watch_summary_refresh()."""
+    df = sql_to_df(
+        """
+        SELECT COUNT(*) AS n
+        FROM fundamentals_watchlist w
+        LEFT JOIN LATERAL (
+            SELECT MAX(load_ts) AS latest_alert_load_ts
+            FROM fundamentals_l3_alerts
+            WHERE company_master_id = w.company_master_id
+        ) a ON TRUE
+        WHERE w.narrative_generated_at IS NULL
+           OR a.latest_alert_load_ts > w.narrative_generated_at
+        """
+    )
+    return int(df.iloc[0]["n"]) if not df.empty else 0
+
+
 def load_company_alerts(company_master_id: str) -> pd.DataFrame:
     return sql_to_df(
         """
@@ -296,9 +316,36 @@ def _update_narrative(*, company_master_id: str, narrative_text: str, model: str
 def run_watch_summary_refresh(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> dict[str, object]:
     _bootstrap_narrative_columns()
 
-    candidates = load_companies_needing_narrative_refresh(limit or DEFAULT_BATCH_LIMIT)
+    effective_limit = limit or DEFAULT_BATCH_LIMIT
+    # BUG FOUND LIVE 2026-08-18 (re-audit): candidates are ordered oldest-alert-
+    # first (see load_companies_needing_narrative_refresh's own docstring) with a
+    # fixed per-run limit and no visibility into whether the backlog exceeds it --
+    # if the backlog keeps growing faster than each run drains the oldest slice,
+    # or a single company at the front keeps failing generate_watch_summary and
+    # never clears narrative_generated_at (see the except branch below: it stays
+    # eligible for retry, unchanged), it perpetually re-occupies a slot at the
+    # front of this FIFO and companies behind it can starve indefinitely with no
+    # signal that it's happening. Surfaced via fallback telemetry rather than
+    # silently truncating, per this repo's no-silent-fallback rule.
+    backlog_size = _count_companies_needing_narrative_refresh()
+    if backlog_size > effective_limit:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="postgres",
+            fallback_type="narrative_refresh_backlog_exceeds_limit",
+            severity="warn",
+            reason=(
+                f"{backlog_size} companies need a narrative refresh but only {effective_limit} run this "
+                "pass; the oldest-alert-first ordering means the same overflow companies could starve "
+                "across runs if the backlog keeps growing this fast."
+            ),
+            error=None,
+            metadata={"backlog_size": backlog_size, "limit": effective_limit, "deferred": backlog_size - effective_limit},
+        )
+
+    candidates = load_companies_needing_narrative_refresh(effective_limit)
     if candidates.empty:
-        return {"generated": 0, "failed": 0, "blocked": False, "narrative_events": []}
+        return {"generated": 0, "failed": 0, "blocked": False, "narrative_events": [], "backlog_size": backlog_size}
 
     counts = {"generated": 0, "failed": 0}
     consecutive_failures = 0
@@ -311,7 +358,17 @@ def run_watch_summary_refresh(*, limit: int | None = None, model: str = DEFAULT_
             continue
         company_master_id = candidate["company_master_id"]
         old_narrative_text = candidate.get("narrative_text")
-        is_new_candidate = candidate.get("narrative_generated_at") is None
+        # BUG FOUND LIVE 2026-08-18 (re-audit): narrative_generated_at is a
+        # TIMESTAMPTZ column read back through sql_to_df -- once any row in the
+        # result has a real timestamp, pandas gives the whole column a
+        # datetime64[ns, UTC] dtype and a SQL NULL comes back as pd.NaT, not
+        # None. `NaT is None` is False, so a genuinely brand-new candidate (no
+        # prior narrative) was misclassified as "not new", which flows into
+        # narrative_changed = is_new_candidate or (text != old_text) -- with
+        # old_narrative_text also None/NaN, a company whose first-ever narrative
+        # happened to text-equal something falsy would report narrative_changed
+        # incorrectly. pd.isna() handles NaT/None/NaN uniformly.
+        is_new_candidate = pd.isna(candidate.get("narrative_generated_at"))
 
         alerts = load_company_alerts(company_master_id)
         l2_state = load_latest_l2_state_for_company(company_master_id)
@@ -369,7 +426,7 @@ def run_watch_summary_refresh(*, limit: int | None = None, model: str = DEFAULT_
             }
         )
 
-    return {**counts, "blocked": blocked, "narrative_events": narrative_events}
+    return {**counts, "blocked": blocked, "narrative_events": narrative_events, "backlog_size": backlog_size}
 
 
 def main() -> int:

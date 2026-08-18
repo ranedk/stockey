@@ -15702,10 +15702,11 @@ def test_load_companies_needing_narrative_refresh_compares_processing_timestamps
 def test_run_watch_summary_refresh_returns_early_when_no_candidates(monkeypatch):
     monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
     monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_watch_summary, "_count_companies_needing_narrative_refresh", lambda: 0)
 
     result = fundamentals_watch_summary.run_watch_summary_refresh()
 
-    assert result == {"generated": 0, "failed": 0, "blocked": False, "narrative_events": []}
+    assert result == {"generated": 0, "failed": 0, "blocked": False, "narrative_events": [], "backlog_size": 0}
 
 
 def _patch_watch_summary_evidence_loaders(monkeypatch):
@@ -15714,6 +15715,62 @@ def _patch_watch_summary_evidence_loaders(monkeypatch):
     monkeypatch.setattr(fundamentals_watch_summary, "load_latest_technicals_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_watch_summary, "load_sector_context_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_watch_summary, "get_stock_signal_pointers", lambda cmid: [])
+    monkeypatch.setattr(fundamentals_watch_summary, "_count_companies_needing_narrative_refresh", lambda: 0)
+
+
+def test_count_companies_needing_narrative_refresh_mirrors_eligibility_condition(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame([{"n": 7}])
+
+    monkeypatch.setattr(fundamentals_watch_summary, "sql_to_df", fake_sql_to_df)
+    assert fundamentals_watch_summary._count_companies_needing_narrative_refresh() == 7
+    query = captured["query"]
+    assert "COUNT(*)" in query
+    assert "w.narrative_generated_at IS NULL" in query
+    assert "a.latest_alert_load_ts > w.narrative_generated_at" in query
+
+
+def test_run_watch_summary_refresh_records_fallback_when_backlog_exceeds_limit(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): candidates are ordered oldest-alert-
+    # first with a fixed per-run limit and no visibility into whether the
+    # backlog exceeds it -- a persistently-failing company at the front of the
+    # queue (or backlog growth outpacing the limit) could starve companies
+    # behind it indefinitely with no signal. Now surfaced via fallback telemetry.
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_watch_summary, "_count_companies_needing_narrative_refresh", lambda: 120)
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: pd.DataFrame())
+    events = []
+    monkeypatch.setattr(
+        fundamentals_watch_summary,
+        "record_local_fallback_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh(limit=50)
+
+    assert result["backlog_size"] == 120
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "narrative_refresh_backlog_exceeds_limit"
+    assert events[0]["metadata"] == {"backlog_size": 120, "limit": 50, "deferred": 70}
+
+
+def test_run_watch_summary_refresh_no_fallback_when_backlog_within_limit(monkeypatch):
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_watch_summary, "_count_companies_needing_narrative_refresh", lambda: 3)
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: pd.DataFrame())
+    events = []
+    monkeypatch.setattr(
+        fundamentals_watch_summary,
+        "record_local_fallback_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    fundamentals_watch_summary.run_watch_summary_refresh(limit=50)
+
+    assert events == []
 
 
 def test_run_watch_summary_refresh_new_candidate_marks_narrative_changed(monkeypatch):
@@ -15740,6 +15797,39 @@ def test_run_watch_summary_refresh_new_candidate_marks_narrative_changed(monkeyp
     assert len(updates) == 1
     assert updates[0]["company_master_id"] == "nse:X"
     assert updates[0]["model"] == "test-model"
+
+
+def test_run_watch_summary_refresh_treats_nat_narrative_generated_at_as_new_candidate(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): narrative_generated_at is a
+    # TIMESTAMPTZ column read through sql_to_df -- once ANY row in the result
+    # has a real timestamp, pandas gives the whole column a datetime64[ns, UTC]
+    # dtype and a SQL NULL comes back as pd.NaT, not None. The old
+    # `candidate.get("narrative_generated_at") is None` check is False for NaT,
+    # so a genuinely brand-new candidate sitting in the same batch as an
+    # existing candidate was misclassified as "not new".
+    monkeypatch.setattr(fundamentals_watch_summary, "_bootstrap_narrative_columns", lambda: None)
+    candidates = pd.DataFrame(
+        [
+            {"company_master_id": "nse:OLD", "last_alert_at": date(2026, 8, 1), "narrative_generated_at": pd.Timestamp("2026-08-01", tz="UTC"), "narrative_text": "old"},
+            {"company_master_id": "nse:NEW", "last_alert_at": date(2026, 8, 5), "narrative_generated_at": None, "narrative_text": None},
+        ]
+    )
+    # mixing a real timestamp with None in the same column promotes it to
+    # datetime64[ns, UTC], turning the None into pd.NaT -- exactly the live shape.
+    assert pd.api.types.is_datetime64_any_dtype(candidates["narrative_generated_at"])
+    assert candidates.iloc[1]["narrative_generated_at"] is pd.NaT
+    monkeypatch.setattr(fundamentals_watch_summary, "load_companies_needing_narrative_refresh", lambda limit=None: candidates)
+    _patch_watch_summary_evidence_loaders(monkeypatch)
+    monkeypatch.setattr(
+        fundamentals_watch_summary, "generate_watch_summary", lambda bundle, **k: {"narrative": "n", "suggested_watch_duration_days": 30, "confidence": "high"}
+    )
+    monkeypatch.setattr(fundamentals_watch_summary, "_update_narrative", lambda **kwargs: None)
+
+    result = fundamentals_watch_summary.run_watch_summary_refresh()
+
+    events_by_company = {e["company_master_id"]: e for e in result["narrative_events"]}
+    assert events_by_company["nse:OLD"]["is_new_candidate"] is False
+    assert events_by_company["nse:NEW"]["is_new_candidate"] is True
 
 
 def test_run_watch_summary_refresh_passes_signal_pointers_into_evidence_bundle(monkeypatch):
