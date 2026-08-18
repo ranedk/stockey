@@ -129,7 +129,22 @@ def load_candidate_events(limit: int | None = None) -> pd.DataFrame:
     fallback -- see that function's docstring. rating_agency is included so
     evaluate_rating_action_trigger()'s reasoning can name which agency acted (2026-
     08-13 fix -- previously loaded but never selected here, so every rating alert's
-    reasoning read identically regardless of ICRA/CRISIL/CARE/India Ratings)."""
+    reasoning read identically regardless of ICRA/CRISIL/CARE/India Ratings).
+
+    BUG FOUND LIVE 2026-08-18: this used to select every candidate the moment it
+    was detected, regardless of whether OCR/structured extraction had actually run
+    yet -- 6 of 7 evaluators return None (no evidence) when structured_extraction_
+    json is still NULL, and that None gets written as a TERMINAL rule_trigger_
+    status='not_alert_worthy' with nothing ever resetting it once real extraction
+    data lands weeks later (the OCR backlog only drains ~18-37 items/day).
+    Confirmed live: 1,037 of the 1,042-row OCR backlog already had a terminal
+    rule_trigger_status while ocr_status was still NULL -- including all 18
+    auditor_change events, a trigger this module's own docstring calls "always
+    alert-worthy". Now only selects a candidate once its own enrichment path has
+    genuinely concluded (rating_action/pit_sast rows with real flat data from
+    their OWN dedicated feeds are unaffected -- those never needed the generic OCR
+    pipeline in the first place; capital_raise/institutional_entry are unaffected
+    too, per this module's own existing "alerts unconditionally" design)."""
     placeholders = ",".join(f"'{ft}'" for ft in SUPPORTED_FILING_TYPES)
     query = f"""
         SELECT source, news_id, company_master_id, filing_type, headline,
@@ -138,6 +153,14 @@ def load_candidate_events(limit: int | None = None) -> pd.DataFrame:
         FROM fundamentals_events
         WHERE filing_type IN ({placeholders})
           AND (rule_trigger_status IS NULL OR rule_trigger_status = 'pending')
+          AND (
+                (filing_type = 'rating_action' AND rating_action_type IS NOT NULL)
+             OR (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
+             OR filing_type IN ('capital_raise', 'institutional_entry')
+             OR (attachment_name IS NULL AND rationale_pdf_url IS NULL)
+             OR (ocr_status IN ('done', 'failed', 'no_document')
+                 AND (structured_extraction_status IS NULL OR structured_extraction_status != 'pending'))
+          )
         ORDER BY load_ts ASC NULLS LAST
     """  # noqa: S608 -- placeholders built from SUPPORTED_FILING_TYPES, a fixed internal constant, never user input
     if limit:

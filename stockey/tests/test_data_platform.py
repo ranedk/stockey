@@ -13050,6 +13050,38 @@ def test_run_l3_rule_triggers_returns_early_when_no_candidates(monkeypatch):
     assert result == {"alerted": 0, "not_alert_worthy": 0, "no_l2_state": 0}
 
 
+def test_load_candidate_events_gates_on_enrichment_readiness(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18: this used to select every candidate the moment it
+    # was detected, regardless of whether OCR/structured extraction had run yet --
+    # 6 of 7 evaluators return None (no evidence) when structured_extraction_json
+    # is still NULL, and that None got written as a TERMINAL rule_trigger_status=
+    # 'not_alert_worthy' that nothing ever resets. Confirmed live: 1,037 of 1,042
+    # backlog rows already had a terminal status while ocr_status was still NULL.
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", fake_sql_to_df)
+    fundamentals_l3_triggers.load_candidate_events()
+    query = captured["query"]
+    # rating_action/pit_sast rows with real flat data from their OWN dedicated
+    # feeds (ICRA enrichment / NSE PIT) are ready regardless of the generic OCR
+    # pipeline -- unaffected by the gate.
+    assert "rating_action_type IS NOT NULL" in query
+    assert "transaction_type IS NOT NULL AND transaction_type != ''" in query
+    # capital_raise/institutional_entry alert unconditionally per this module's
+    # own existing design -- never blocked on extraction.
+    assert "filing_type IN ('capital_raise', 'institutional_entry')" in query
+    # no document at all -- nothing to wait for.
+    assert "attachment_name IS NULL AND rationale_pdf_url IS NULL" in query
+    # OCR concluded one way or another AND extraction also concluded (or was
+    # never attempted because OCR itself never produced text to extract from).
+    assert "ocr_status IN ('done', 'failed', 'no_document')" in query
+    assert "structured_extraction_status != 'pending'" in query
+
+
 def test_run_l3_rule_triggers_writes_an_alert_for_a_downgrade(monkeypatch):
     monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
     monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
@@ -13274,6 +13306,12 @@ def test_load_candidate_events_for_triage_queries_expected_filters(monkeypatch):
     assert "'rating_action', 'pit_sast', 'results'" in captured["query"]
     assert "llm_triage_status IS NULL OR llm_triage_status = 'pending'" in captured["query"]
     assert "rating_agency" in captured["query"]
+    # BUG FOUND LIVE 2026-08-18: this used to triage a candidate the moment it was
+    # detected, before OCR/extraction had run -- results events (which need
+    # structured_extraction_json entirely for the evidence bundle) got LLM-judged
+    # on category alone. Pins the readiness gate is actually in the query.
+    assert "ocr_status IN ('done', 'failed', 'no_document')" in captured["query"]
+    assert "structured_extraction_status != 'pending'" in captured["query"]
 
 
 def test_run_llm_triage_returns_early_when_no_candidates(monkeypatch):

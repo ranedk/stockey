@@ -112,6 +112,15 @@ def load_candidate_events_for_triage(limit: int | None = None) -> pd.DataFrame:
     # did, so the LLM triaging a rating_action event never saw which agency acted --
     # a real signal (ICRA vs a less-established agency, say) the model has no way to
     # weigh without it.
+    #
+    # BUG FOUND LIVE 2026-08-18: same readiness gap l3_triggers.py's sibling query
+    # got fixed the same day -- this used to triage a candidate the moment it was
+    # detected, before OCR/extraction had run, so `results` events (which need
+    # structured_extraction_json entirely for the evidence bundle) got LLM-judged
+    # on category alone and burned a real API call for a permanent `flagged`/
+    # `not_interesting` verdict with no evidence behind it. Confirmed live: 16 of
+    # 30 stored llm_flagged alerts have "structured_extraction": null in their own
+    # persisted evidence bundle. Same readiness gate as l3_triggers.py's fix.
     query = """
         SELECT source, news_id, company_master_id, filing_type, headline, subcategory,
                disclosure_date, rating_action_type, rating_agency, transaction_type,
@@ -119,6 +128,13 @@ def load_candidate_events_for_triage(limit: int | None = None) -> pd.DataFrame:
         FROM fundamentals_events
         WHERE filing_type IN ('rating_action', 'pit_sast', 'results')
           AND (llm_triage_status IS NULL OR llm_triage_status = 'pending')
+          AND (
+                (filing_type = 'rating_action' AND rating_action_type IS NOT NULL)
+             OR (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
+             OR (attachment_name IS NULL AND rationale_pdf_url IS NULL)
+             OR (ocr_status IN ('done', 'failed', 'no_document')
+                 AND (structured_extraction_status IS NULL OR structured_extraction_status != 'pending'))
+          )
         ORDER BY load_ts ASC NULLS LAST
     """
     if limit:
