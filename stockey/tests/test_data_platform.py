@@ -9034,14 +9034,36 @@ def test_parse_screener_results_raises_when_table_missing():
         fundamentals_screenerin.parse_screener_results("<div>no results table here</div>")
 
 
-def test_parse_screener_results_skips_rows_without_company_id():
+def test_parse_screener_results_skips_rows_without_company_id(monkeypatch):
+    # MEDIUM FINDING (re-audit 2026-08-18): a skipped/unparseable row used to be
+    # silent -- if it happened on an otherwise-full page, run_query()'s pagination
+    # loop (which decides "was this page full" purely from len(companies) ==
+    # SCREENER_PAGE_SIZE) would wrongly treat a genuinely-full page as the final
+    # one and silently drop every company on every subsequent page. Must now be
+    # visible via fallback telemetry.
     html = """
     <div data-page-results><table>
     <tr><th><a>Name</a></th></tr>
     <tr><td>not a data row</td></tr>
     </table></div>
     """
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_screenerin, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
     assert fundamentals_screenerin.parse_screener_results(html) == []
+
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["fallback_type"] == "screenerin_query_rows_skipped_during_parse"
+    assert fallback_events[0]["metadata"]["skipped_row_count"] == 1
+
+
+def test_parse_screener_results_no_fallback_when_every_row_parses(monkeypatch):
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_screenerin, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    fundamentals_screenerin.parse_screener_results(SCREENERIN_FIXTURE_HTML)
+
+    assert fallback_events == []
 
 
 @pytest.mark.parametrize(

@@ -159,6 +159,16 @@ def parse_screener_results(html: str) -> list[dict[str, object]]:
 
     headers: list[str] = []
     companies: list[dict[str, object]] = []
+    # MEDIUM FINDING (re-audit 2026-08-18): run_query()'s pagination loop decides
+    # "was the last page genuinely full" purely from len(companies) == SCREENER_
+    # PAGE_SIZE -- if a single row on an otherwise-full page fails to parse here
+    # (missing data-row-company-id, or fewer than 2 <td>s -- an unexpected HTML
+    # shape, not the header row, which is already excluded by the `if ths` branch
+    # above), the returned count silently comes back short with no signal, and
+    # run_query would wrongly treat a genuinely-full page as the final one,
+    # dropping every company on every page after it. Tracked here and surfaced via
+    # fallback telemetry so this is visible rather than a silent undercount.
+    skipped_row_count = 0
     for tr in table.select("tr"):
         ths = tr.find_all("th")
         if ths:
@@ -167,9 +177,11 @@ def parse_screener_results(html: str) -> list[dict[str, object]]:
 
         company_id = tr.get("data-row-company-id")
         if not company_id:
+            skipped_row_count += 1
             continue
         tds = tr.find_all("td")
         if len(tds) < 2:
+            skipped_row_count += 1
             continue
 
         name_link = tds[1].find("a")
@@ -192,6 +204,19 @@ def parse_screener_results(html: str) -> list[dict[str, object]]:
                 "ticker": ticker,
                 "metrics": metrics,
             }
+        )
+    if skipped_row_count:
+        _record_fallback(
+            "screenerin_query_rows_skipped_during_parse",
+            reason=(
+                f"{skipped_row_count} <tr> row(s) in this page's results table had neither a "
+                "data-row-company-id attribute nor >=2 <td>s -- excluded from the returned company "
+                "list. If this page was otherwise full, run_query()'s pagination loop may wrongly "
+                "treat it as the final page (len(companies) came back short of SCREENER_PAGE_SIZE) "
+                "and silently drop every company on every subsequent page."
+            ),
+            error="unparseable row(s) in results table",
+            metadata={"skipped_row_count": skipped_row_count, "parsed_row_count": len(companies)},
         )
     return companies
 
@@ -228,17 +253,29 @@ def run_query(
     `len(first_page)` from the very first fetch -- trivially true on the very first
     check, so the loop always attempted a page 2 fetch even when page 1 already had
     fewer than SCREENER_PAGE_SIZE results (i.e. was already the complete set).
-    Confirmed live: a real 4-company query issued a wasted page-2 request and
-    screener.in, for an out-of-range page, does NOT return fewer/empty results --
-    it silently RE-SERVES page 1's own content again, so the old `len(page_companies)
-    < page_size` break condition (comparing two equal-length pages) never fired
-    either, looping all the way to max_pages issuing up to 99 unnecessary requests
-    and duplicating every company in the result. Fixed two ways: (1) the loop only
-    continues when the LAST fetched page was genuinely full (SCREENER_PAGE_SIZE
-    items), so a short-first-page query never even attempts page 2; (2) a
-    company_id-set comparison against the previous page as a backstop, catching the
-    remaining edge case of a query with an exact multiple of SCREENER_PAGE_SIZE
-    total matches (page 1 full, but no real page 2 either)."""
+    Confirmed live: a real 4-company query issued a wasted page-2 request, and the
+    old `len(page_companies) < page_size` break condition (comparing two equal-
+    length pages) never fired either, looping all the way to max_pages issuing up
+    to 99 unnecessary requests and duplicating every company in the result. Fixed
+    two ways: (1) the loop only continues when the LAST fetched page was genuinely
+    full (SCREENER_PAGE_SIZE items), so a short-first-page query never even
+    attempts page 2; (2) a company_id-set comparison against the previous page as a
+    backstop, catching the remaining edge case of a query with an exact multiple of
+    SCREENER_PAGE_SIZE total matches (page 1 full, but no real page 2 either).
+
+    CORRECTED 2026-08-18 (re-audit): the comment above used to claim screener.in
+    "silently RE-SERVES page 1's own content again" for an out-of-range page --
+    live re-tested against a real multi-page query (Market Cap > 1000, true last
+    page = page 40 with 38 results) and requesting pages 60/80/100 all returned
+    page 40's own content, NOT page 1's -- screener.in actually CLAMPS TO THE LAST
+    VALID PAGE, not page 1 specifically. This loop's own behavior is unaffected by
+    the correction (it never requests more than one page past the last full one,
+    so the two hypotheses were indistinguishable from this function's own call
+    pattern -- fix (2) above's company_id-set backstop still works correctly under
+    the true "clamps to last valid page" behavior, since for THIS loop the "last
+    valid page" and "page 1" happen to be the same page whenever the exact-multiple
+    edge case fires), but the old comment's reasoning would have misled the next
+    reader who tried to reason about a DIFFERENT out-of-range page pattern."""
     first_url, first_page = _fetch_query_page(session, query_text, page=1)
     all_companies = list(first_page)
 
