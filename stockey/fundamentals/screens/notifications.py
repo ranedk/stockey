@@ -187,15 +187,45 @@ def _fmt_plain(value) -> str:
     return "n/a" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
 
 
+def _price_change_pct(first_seen_price, current_price) -> float | None:
+    """Shared by both the HTML and plain-text renderers -- BUG FOUND LIVE
+    2026-08-17: plain-text used to print only the two raw prices with no pct change
+    at all, an inconsistency with the HTML table cell right next to it (which always
+    computed one). Factored out so the two bodies can't silently re-diverge again."""
+    if first_seen_price is None or current_price is None or pd.isna(first_seen_price) or pd.isna(current_price) or first_seen_price == 0:
+        return None
+    return (current_price - first_seen_price) / first_seen_price * 100
+
+
 def _price_change_cell_html(first_seen_price, current_price) -> str:
     from_str = _fmt_price(first_seen_price)
     to_str = _fmt_price(current_price)
-    if from_str == "n/a" or to_str == "n/a" or first_seen_price == 0:
+    pct = _price_change_pct(first_seen_price, current_price)
+    if pct is None:
         return f"{from_str} &rarr; {to_str}"
-    pct = (current_price - first_seen_price) / first_seen_price * 100
     css_class = "pos" if pct >= 0 else "neg"
     sign = "+" if pct >= 0 else ""
     return f'{from_str} &rarr; {to_str} <span class="{css_class}">({sign}{pct:.1f}%)</span>'
+
+
+def _price_change_text(first_seen_price, current_price) -> str:
+    from_str = _fmt_price(first_seen_price)
+    to_str = _fmt_price(current_price)
+    pct = _price_change_pct(first_seen_price, current_price)
+    if pct is None:
+        return f"{from_str} -> {to_str}"
+    sign = "+" if pct >= 0 else ""
+    return f"{from_str} -> {to_str} ({sign}{pct:.1f}%)"
+
+
+def _confidence_label(confidence_score) -> str:
+    """Shared by both renderers -- BUG FOUND LIVE 2026-08-17: the HTML side already
+    guarded a null confidence_score ("n/a"), but the plain-text side interpolated it
+    directly, so a draft with no score printed the literal string "confidence
+    None/100" instead."""
+    if confidence_score is None or (isinstance(confidence_score, float) and pd.isna(confidence_score)):
+        return "n/a"
+    return f"{confidence_score}/100"
 
 
 _DIGEST_HTML_STYLE = (
@@ -226,6 +256,7 @@ _DIGEST_HTML_STYLE = (
     ".draft-confidence.low{background:#fee2e2;color:#991b1b}"
     ".draft-prediction{font-size:13px;color:#0f172a;margin-top:6px}"
     ".draft-meta{font-size:12px;color:#64748b;margin-top:4px}"
+    ".draft-rationale{font-size:12px;color:#334155;margin-top:6px}"
     ".draft-invalidation{font-size:12px;color:#94a3b8;margin-top:4px;font-style:italic}"
 )
 
@@ -294,8 +325,8 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
 
         text_lines.append(f"--- {ticker} ({company_name}) ---")
         text_lines.append(
-            f"Watching since {_fmt_plain(row.get('first_seen_at'))} at {_fmt_price(row.get('first_seen_price'))}, "
-            f"today's close {_fmt_price(row.get('current_price'))} -- {row.get('alert_count') or 0} event(s)."
+            f"Watching since {_fmt_plain(row.get('first_seen_at'))} at "
+            f"{_price_change_text(row.get('first_seen_price'), row.get('current_price'))} today -- {row.get('alert_count') or 0} event(s)."
         )
         if strategies:
             text_lines.append(f"Strategies: {', '.join(_strategy_label(s) for s in strategies)}")
@@ -304,10 +335,11 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
             text_lines.append(f"Suggested watch until: {row['suggested_watch_until']}")
         if draft:
             text_lines.append(
-                f"[DRAFT L4 thesis, NOT SAVED, confidence {draft.get('confidence_score')}/100] {draft.get('prediction_text')} "
-                f"(by {draft.get('target_date')})"
+                f"[DRAFT L4 thesis, NOT SAVED, confidence {_confidence_label(draft.get('confidence_score'))}] "
+                f"{draft.get('prediction_text')} (by {draft.get('target_date')})"
             )
-            text_lines.append(f"  Invalidation: {draft.get('invalidation_criteria')}")
+            text_lines.append(f"  Rationale: {_fmt_plain(draft.get('rationale'))}")
+            text_lines.append(f"  Invalidation: {_fmt_plain(draft.get('invalidation_criteria'))}")
         text_lines.append("")
 
         strategy_badges_html = "".join(f'<span class="strategy-badge">{html.escape(_strategy_label(s))}</span>' for s in strategies)
@@ -332,14 +364,20 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         if draft:
             confidence_score = draft.get("confidence_score")
             confidence_class = _confidence_css_class(confidence_score)
-            confidence_label = f"{confidence_score}/100" if confidence_score is not None else "n/a"
+            confidence_label = _confidence_label(confidence_score)
             draft_blocks_html.append(
                 '<div class="draft-block">'
                 f'<span class="draft-ticker">{html.escape(ticker)}</span>'
                 f'<span class="draft-confidence {confidence_class}">confidence {html.escape(confidence_label)}</span>'
                 f'<div class="draft-prediction">{html.escape(str(draft.get("prediction_text") or ""))}</div>'
                 f'<div class="draft-meta">Target: {html.escape(_fmt_plain(draft.get("target_date")))}</div>'
-                f'<div class="draft-invalidation">Invalidation: {html.escape(str(draft.get("invalidation_criteria") or ""))}</div>'
+                # BUG FOUND LIVE 2026-08-17: the LLM's own rationale field
+                # (fundamentals_l4_thesis_draft.rationale, already selected by
+                # load_current_drafts_by_company()'s SELECT d.*) was never rendered
+                # here at all -- a human reviewing a draft to commit/discard saw the
+                # prediction and confidence score but not WHY the model made the call.
+                f'<div class="draft-rationale">{html.escape(_fmt_plain(draft.get("rationale")))}</div>'
+                f'<div class="draft-invalidation">Invalidation: {html.escape(_fmt_plain(draft.get("invalidation_criteria")))}</div>'
                 "</div>"
             )
 

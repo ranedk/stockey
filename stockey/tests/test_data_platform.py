@@ -15215,6 +15215,67 @@ def test_build_daily_digest_content_renders_draft_thesis_with_confidence(monkeyp
     assert "Net debt/RSCR falls below 45 by Q2 FY27." in html_body
 
 
+def test_build_daily_digest_content_renders_rationale_in_both_bodies():
+    # BUG FOUND LIVE 2026-08-17: fundamentals_l4_thesis_draft.rationale is already
+    # selected (load_current_drafts_by_company()'s SELECT d.*) but was never
+    # rendered anywhere -- a human reviewing a draft to commit/discard saw the
+    # prediction and confidence score but not WHY the model made the call.
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {
+                "prediction_text": "p", "target_date": date(2026, 11, 15), "invalidation_criteria": "i",
+                "confidence_score": 72, "rationale": "Because leverage keeps falling and margins are expanding.",
+            },
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "Because leverage keeps falling and margins are expanding." in text_body
+    assert "Because leverage keeps falling and margins are expanding." in html_body
+
+
+def test_build_daily_digest_content_missing_rationale_shows_na_not_none():
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {"prediction_text": "p", "target_date": date(2026, 11, 15), "invalidation_criteria": "i", "confidence_score": 72},
+        }
+    ]
+    _, text_body, _ = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "Rationale: n/a" in text_body
+    assert "Rationale: None" not in text_body
+
+
+def test_build_daily_digest_content_null_confidence_shows_na_not_none_in_text():
+    # BUG FOUND LIVE 2026-08-17: the HTML side already guarded a null confidence_score
+    # ("n/a"), but plain-text interpolated it directly -- literally printed "confidence
+    # None/100" for a draft with no score.
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {"prediction_text": "p", "target_date": date(2026, 11, 15), "invalidation_criteria": "i", "confidence_score": None},
+        }
+    ]
+    _, text_body, _ = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "confidence n/a" in text_body
+    assert "None/100" not in text_body
+
+
+def test_build_daily_digest_content_text_shows_price_change_pct():
+    # BUG FOUND LIVE 2026-08-17: plain-text used to print only the two raw prices
+    # with no pct change at all, an inconsistency with the HTML table cell right
+    # next to it (which always computed one).
+    rows = [{"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}]
+    _, text_body, _ = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "(+10.0%)" in text_body
+
+
 def test_build_daily_digest_content_low_confidence_gets_low_css_class():
     rows = [
         {
