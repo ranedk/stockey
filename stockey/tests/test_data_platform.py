@@ -11879,6 +11879,24 @@ def test_detect_agency_from_headline(keyword_text, expected):
     assert fundamentals_rating_agencies.detect_agency(keyword_text, None) == expected
 
 
+def test_detect_agency_falls_back_gracefully_when_keyword_lists_drift(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): _AGENCY_CANONICAL_NAMES[keyword] was an
+    # unguarded dict lookup -- RATING_AGENCY_KEYWORDS (bse_announcements.py) and
+    # _AGENCY_CANONICAL_NAMES (this module) are two separately-maintained
+    # structures that currently happen to have the same keys; a future edit to one
+    # without the other would raise KeyError and crash this whole enrichment step.
+    monkeypatch.setattr(fundamentals_rating_agencies, "RATING_AGENCY_KEYWORDS", ("newagency",))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_rating_agencies.detect_agency("NewAgency Ratings downgrades", None)
+
+    assert result == "newagency"  # falls back to the raw keyword, doesn't crash
+    assert len(fallback_events) == 1
+    assert fallback_events[0][0][0] == "rating_agency_keyword_missing_canonical_name"
+    assert fallback_events[0][1]["metadata"]["keyword"] == "newagency"
+
+
 @pytest.mark.parametrize(
     "headline,expected",
     [
@@ -12061,7 +12079,7 @@ def test_run_rating_agency_enrichment_returns_early_when_nothing_pending(monkeyp
 
     result = fundamentals_rating_agencies.run_rating_agency_enrichment()
 
-    assert result == {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0, "blocked": False}
+    assert result == {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0, "blocked": False, "time_budget_exceeded": False}
 
 
 def test_run_rating_agency_enrichment_routes_non_icra_rows_as_unsupported(monkeypatch):
@@ -12203,6 +12221,9 @@ def test_run_rating_agency_enrichment_fallback_source_matches_the_failing_agency
 
 
 def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this was the only failure path in the
+    # loop with no _record_fallback call -- a company whose issuer name couldn't be
+    # resolved just permanently failed enrichment with no trace.
     monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
     pending = pd.DataFrame(
@@ -12212,11 +12233,61 @@ def test_run_rating_agency_enrichment_fails_row_with_no_resolvable_issuer(monkey
     monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: None)
     status_calls = []
     monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: status_calls.append(kwargs))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
 
     result = fundamentals_rating_agencies.run_rating_agency_enrichment()
 
     assert result["failed"] == 1
     assert status_calls == [{"source": "bse", "news_id": "n1", "status": "failed"}]
+    matches = [k for a, k in fallback_events if a and a[0] == "rating_enrichment_issuer_resolution_failed"]
+    assert len(matches) == 1
+    assert matches[0]["metadata"]["company_master_id"] == "nse:UNKNOWN"
+
+
+def test_run_rating_agency_enrichment_respects_default_batch_limit(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): neither a batch cap nor a wall-clock
+    # budget -- main() calls this with limit=None, so every run processed the
+    # entire pending backlog. The eligible set grows monotonically (RETRY_AFTER
+    # re-admits a no_match/failed row daily) at a >=10s/domain rate-gate floor.
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    captured = {}
+
+    def fake_load_pending(limit=None):
+        captured["limit"] = limit
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", fake_load_pending)
+
+    fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert captured["limit"] == fundamentals_rating_agencies.DEFAULT_BATCH_LIMIT
+
+
+def test_run_rating_agency_enrichment_stops_at_time_budget(monkeypatch):
+    monkeypatch.setattr(fundamentals_rating_agencies, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_bootstrap_rating_columns", lambda: None)
+    pending = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": "n1", "company_master_id": "nse:X1", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)},
+            {"source": "bse", "news_id": "n2", "company_master_id": "nse:X2", "headline": "Reaffirmation of Credit Ratings by ICRA", "subcategory": "Credit Rating", "disclosure_date": date(2026, 8, 4)},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_rating_agencies, "load_pending_rating_actions", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_resolve_issuer_name", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_set_enrichment_status", lambda **kwargs: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "_record_fallback", lambda *a, **k: None)
+    monkeypatch.setattr(fundamentals_rating_agencies, "MAX_RUNTIME_SECONDS", 100)
+    # monotonic() called once for run_started, then once per row's own budget check --
+    # row 1's check is within budget, row 2's check is past it.
+    clock = iter([0, 0, 200])
+    monkeypatch.setattr(fundamentals_rating_agencies.time, "monotonic", lambda: next(clock))
+
+    result = fundamentals_rating_agencies.run_rating_agency_enrichment()
+
+    assert result["time_budget_exceeded"] is True
+    assert result["failed"] == 1  # only n1 was processed
 
 
 def test_agency_plugins_registry_covers_icra_india_ratings_crisil_care():

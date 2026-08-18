@@ -121,11 +121,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from urllib.parse import quote
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from environs import Env
 from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.collectors.bse_announcements import RATING_AGENCY_KEYWORDS
@@ -134,6 +136,9 @@ from fundamentals.collectors.security_master import UA
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
+
+env = Env()
+env.read_env()
 
 SYNC_SOURCE_NAME = "fundamentals.collectors.rating_agencies"
 STOCKEY_RUN_STATE: dict[str, object] = {}
@@ -174,6 +179,23 @@ MATCH_DATE_TOLERANCE_DAYS = 2
 # same-day re-run (or a re-run within one cron cycle) doesn't hammer the same
 # not-yet-indexed rationale twice.
 RETRY_AFTER = pd.Timedelta(days=1)
+
+# BUG FOUND LIVE 2026-08-18 (re-audit): run_rating_agency_enrichment() had neither
+# a batch cap nor a wall-clock budget -- main() calls it with limit=None, so every
+# run processes the ENTIRE pending backlog. The eligible set grows monotonically
+# (RETRY_AFTER re-admits a no_match/failed row daily, on top of genuinely new
+# rating_action detections) at a >=10s/domain rate-gate floor, so an unbounded run
+# risked the same "one step eats the whole complete_data.sh/fundamentals cron
+# budget" failure mode already fixed elsewhere in this pipeline (ocr_pipeline.py's
+# DEFAULT_BATCH_LIMIT/MAX_RUNTIME_SECONDS, bse_announcements.py's backfill cap).
+# Same dual-bound shape here. A separate give-up counter for perpetually-no_match
+# rows (so they stop being retried daily forever) is NOT added here -- it needs a
+# real new column (a "first attempted at" timestamp; enrichment_attempted_at is
+# overwritten on every attempt, so there's no way to tell how long a row has been
+# retrying from what's already stored) and is a bigger schema change than this
+# pass's own batch/runtime-bound fix, not attempted opportunistically alongside it.
+DEFAULT_BATCH_LIMIT = env.int("RATING_ENRICHMENT_DEFAULT_BATCH_LIMIT", 200)
+MAX_RUNTIME_SECONDS = env.int("RATING_ENRICHMENT_MAX_RUNTIME_SECONDS", 3 * 60 * 60)
 
 # Extra columns rating-agency enrichment needs on the shared fundamentals_events table
 # -- added to events_store's own bootstrap list rather than a second competing
@@ -232,11 +254,30 @@ def detect_agency(headline: str | None, subcategory: str | None) -> str | None:
     keyword list bse_announcements.py used to classify it as rating_action in the
     first place -- returns the canonical agency name ("icra", "crisil", ...) or None
     if no agency name is mentioned at all (classified by the generic "credit rating"/
-    "rating action" phrase instead)."""
+    "rating action" phrase instead).
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): _AGENCY_CANONICAL_NAMES[keyword] was an
+    unguarded dict lookup -- RATING_AGENCY_KEYWORDS (bse_announcements.py) and
+    _AGENCY_CANONICAL_NAMES (this module) are two separately-maintained structures
+    that currently happen to have the same keys; a future edit to one list without
+    the other would raise KeyError and crash this whole enrichment step the moment
+    the drifted keyword matched a real headline. Falls back to the raw keyword
+    itself (still a usable, if non-canonical, agency label) and records fallback
+    telemetry so the drift is visible and fixable rather than silently mislabeling
+    forever."""
     text = f"{subcategory or ''} {headline or ''}".lower()
     for keyword in RATING_AGENCY_KEYWORDS:
         if keyword in text:
-            return _AGENCY_CANONICAL_NAMES[keyword]
+            canonical = _AGENCY_CANONICAL_NAMES.get(keyword)
+            if canonical is None:
+                _record_fallback(
+                    "rating_agency_keyword_missing_canonical_name",
+                    reason="A RATING_AGENCY_KEYWORDS entry has no matching _AGENCY_CANONICAL_NAMES mapping -- the two lists have drifted out of sync. Using the raw keyword as a non-canonical fallback.",
+                    error="keyword not in _AGENCY_CANONICAL_NAMES",
+                    metadata={"keyword": keyword},
+                )
+                return keyword
+            return canonical
     return None
 
 
@@ -523,19 +564,30 @@ def _set_enrichment_status(*, source: str, news_id: str, status: str, fields: di
 def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, object]:
     """Loops every registered agency (AGENCY_PLUGINS) over its own pending rows.
     Each agency gets its own circuit breaker -- a block against one agency's site
-    must not stop trying the others, see module docstring."""
+    must not stop trying the others, see module docstring.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): see DEFAULT_BATCH_LIMIT/MAX_RUNTIME_
+    SECONDS' own comment -- this used to have neither, so main()'s limit=None call
+    processed the entire pending backlog every run with no bound. effective_limit
+    defaults to DEFAULT_BATCH_LIMIT when the caller passes nothing; MAX_RUNTIME_
+    SECONDS is checked between rows (any row not reached before the cutoff stays
+    pending, picked up next run -- safe and idempotent, same shape ocr_pipeline.py
+    already established)."""
     _ensure_events_schema()
     _bootstrap_rating_columns()
 
-    pending = load_pending_rating_actions(limit)
+    effective_limit = limit or DEFAULT_BATCH_LIMIT
+    pending = load_pending_rating_actions(effective_limit)
     if pending.empty:
-        return {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0, "blocked": False}
+        return {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0, "blocked": False, "time_budget_exceeded": False}
 
     pending = pending.copy()
     pending["_agency"] = pending.apply(lambda row: detect_agency(row["headline"], row["subcategory"]), axis=1)
 
     counts = {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0}
     any_blocked = False
+    run_started = time.monotonic()
+    time_budget_exceeded = False
 
     unsupported_rows = pending[~pending["_agency"].isin(AGENCY_PLUGINS.keys())]
     if not unsupported_rows.empty:
@@ -564,13 +616,31 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
         if agency_rows.empty:
             continue
 
+        if time_budget_exceeded:
+            break
+
         session_state = None
         consecutive_failures = 0
         for _, row in agency_rows.iterrows():
+            if time.monotonic() - run_started >= MAX_RUNTIME_SECONDS:
+                time_budget_exceeded = True
+                break
+
             issuer = _resolve_issuer_name(row["company_master_id"])
             if not issuer:
+                # BUG FOUND LIVE 2026-08-18 (re-audit): the only failure path in this
+                # loop with no _record_fallback call -- every other failure branch
+                # here does. Silent otherwise: a company whose issuer name can't be
+                # resolved just permanently fails enrichment with no trace.
                 counts["failed"] += 1
                 _set_enrichment_status(source=row["source"], news_id=row["news_id"], status="failed")
+                _record_fallback(
+                    "rating_enrichment_issuer_resolution_failed",
+                    source=agency_name,
+                    reason="Could not resolve an issuer name for this company_master_id; rating enrichment search was never attempted.",
+                    error="no issuer name resolved",
+                    metadata={"company_master_id": row["company_master_id"], "news_id": row["news_id"]},
+                )
                 continue
             try:
                 if session_state is None:
@@ -631,7 +701,7 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
                 },
             )
 
-    return {**counts, "blocked": any_blocked}
+    return {**counts, "blocked": any_blocked, "time_budget_exceeded": time_budget_exceeded}
 
 
 def _bootstrap_rating_columns() -> None:
@@ -749,6 +819,7 @@ def main() -> int:
         "unsupported_agency": result["unsupported_agency"],
         "failed": result["failed"],
         "blocked": result["blocked"],
+        "time_budget_exceeded": result["time_budget_exceeded"],
         "rows_written": result["matched"],
         "fallback_used": bool(result["unsupported_agency"] or result["failed"] or result["blocked"]),
         "state_advanced": result["matched"] > 0,
