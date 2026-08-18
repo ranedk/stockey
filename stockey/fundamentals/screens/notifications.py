@@ -349,12 +349,24 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         if row.get("suggested_watch_until"):
             text_lines.append(f"Suggested watch until: {row['suggested_watch_until']}")
         if draft:
+            # BUG FOUND LIVE 2026-08-18 (re-audit): dbd861c routed confidence_score
+            # through the new null-safe _confidence_label() helper on this same line
+            # but left prediction_text/target_date interpolated raw -- a draft with
+            # either field null (schema allows it; nothing enforces non-null before
+            # this render) printed the literal string "None (by None)" instead of
+            # the "n/a" every other field on this digest already falls back to.
             text_lines.append(
                 f"[DRAFT L4 thesis, NOT SAVED, confidence {_confidence_label(draft.get('confidence_score'))}] "
-                f"{draft.get('prediction_text')} (by {draft.get('target_date')})"
+                f"{_fmt_plain(draft.get('prediction_text'))} (by {_fmt_plain(draft.get('target_date'))})"
             )
             text_lines.append(f"  Rationale: {_fmt_plain(draft.get('rationale'))}")
             text_lines.append(f"  Invalidation: {_fmt_plain(draft.get('invalidation_criteria'))}")
+            # BUG FOUND LIVE 2026-08-18 (re-audit): generated_at is already selected
+            # by load_current_drafts_by_company()'s SELECT d.* but was never rendered
+            # anywhere -- a draft is emailed in every digest until a human commits or
+            # discards it (never auto-expires, see module docstring), so with no age
+            # shown a week-old un-reviewed draft looked identical to a fresh one.
+            text_lines.append(f"  Drafted: {_fmt_plain(draft.get('generated_at'))}")
         text_lines.append("")
 
         strategy_badges_html = "".join(f'<span class="strategy-badge">{html.escape(_strategy_label(s))}</span>' for s in strategies)
@@ -385,7 +397,10 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
                 f'<span class="draft-ticker">{html.escape(ticker)}</span>'
                 f'<span class="draft-confidence {confidence_class}">confidence {html.escape(confidence_label)}</span>'
                 f'<div class="draft-prediction">{html.escape(str(draft.get("prediction_text") or ""))}</div>'
-                f'<div class="draft-meta">Target: {html.escape(_fmt_plain(draft.get("target_date")))}</div>'
+                f'<div class="draft-meta">Target: {html.escape(_fmt_plain(draft.get("target_date")))} '
+                # BUG FOUND LIVE 2026-08-18 (re-audit): generated_at was selected but
+                # never rendered -- see the matching plain-text fix above.
+                f'&middot; Drafted: {html.escape(_fmt_plain(draft.get("generated_at")))}</div>'
                 # BUG FOUND LIVE 2026-08-17: the LLM's own rationale field
                 # (fundamentals_l4_thesis_draft.rationale, already selected by
                 # load_current_drafts_by_company()'s SELECT d.*) was never rendered
@@ -458,24 +473,29 @@ def send_daily_digest() -> dict[str, object]:
 
 
 def run_watchlist_notification_pipeline() -> dict[str, object]:
-    """Chains watchlist sync -> narrative regen -> L4 THESIS DRAFTING -> exit status
-    evaluation -> daily digest, in that order. watchlist_exit runs right after
+    """Chains watchlist sync -> narrative regen -> exit status evaluation -> L4
+    THESIS DRAFTING -> daily digest, in that order. watchlist_exit runs right after
     narrative regen (2026-08-13, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md's "we will
     crowd the watchlist" gap fix) so it evaluates against a freshly-updated
     suggested_watch_until/narrative_generated_at, and before the digest so
     send_daily_digest's own default active-only filter reflects this run's status,
-    not last run's. L4 thesis drafting (2026-08-15) sits between narrative regen and
-    exit evaluation -- after narrative regen so it can read the freshly-generated
-    narrative_text as part of its own evidence bundle (see l4_thesis_draft.py's
-    docstring), before exit evaluation/digest so a newly-drafted thesis shows up in
-    the SAME run's email rather than one run behind. (Until 2026-08-14 this also ran
-    notify_watchlist_events between exit evaluation and the digest, sending one email
-    per changed company; removed so a run with several changes sends only the one
-    consolidated digest -- see module docstring.)"""
+    not last run's.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): L4 thesis drafting used to sit BEFORE exit
+    evaluation instead of after. load_companies_needing_draft_refresh() only drafts
+    for w.status = 'active' -- with drafting running first, that filter reflected
+    LAST run's status, so a company exit evaluation was about to invalidate/flag
+    stale THIS run still got a paid LLM draft call, immediately wasted the moment
+    exit evaluation ran right after it and hid the company from the digest's
+    active-only view. Moving drafting after exit evaluation costs nothing on the
+    "same-run email" requirement the old order was written to satisfy -- the digest
+    still runs after both either way -- while letting the active-company filter see
+    this run's real status instead of last run's.
+    """
     sync_result = sync_watchlist_from_alerts()
     summary_result = run_watch_summary_refresh()
-    draft_result = run_l4_thesis_drafting()
     exit_result = run_watchlist_exit_evaluation()
+    draft_result = run_l4_thesis_drafting()
     digest_result = send_daily_digest()
     return {
         "watchlist_companies": sync_result["companies"],

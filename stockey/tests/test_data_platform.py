@@ -16135,31 +16135,37 @@ def test_send_email_returns_none_when_disabled(monkeypatch):
 
 
 def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
+    call_order = []
     monkeypatch.setattr(
-        fundamentals_notifications, "sync_watchlist_from_alerts", lambda: {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0}
+        fundamentals_notifications,
+        "sync_watchlist_from_alerts",
+        lambda: call_order.append("sync") or {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0},
     )
     narrative_events = [{"company_master_id": "nse:A", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
     monkeypatch.setattr(
-        fundamentals_notifications, "run_watch_summary_refresh", lambda: {"generated": 1, "failed": 0, "blocked": False, "narrative_events": narrative_events}
+        fundamentals_notifications,
+        "run_watch_summary_refresh",
+        lambda: call_order.append("narrative") or {"generated": 1, "failed": 0, "blocked": False, "narrative_events": narrative_events},
     )
-    draft_calls = []
     monkeypatch.setattr(
         fundamentals_notifications,
         "run_l4_thesis_drafting",
-        lambda: draft_calls.append(1) or {"drafted": 1, "failed": 0, "blocked": False},
+        lambda: call_order.append("draft") or {"drafted": 1, "failed": 0, "blocked": False},
     )
-    exit_calls = []
     monkeypatch.setattr(
         fundamentals_notifications,
         "run_watchlist_exit_evaluation",
-        lambda: exit_calls.append(1) or {"companies": 5, "active": 4, "invalidated": 1, "price_flagged": 0, "stale": 0},
+        lambda: call_order.append("exit") or {"companies": 5, "active": 4, "invalidated": 1, "price_flagged": 0, "stale": 0},
     )
-    digest_calls = []
     # NOTE: send_daily_digest must always be mocked in tests that exercise the full
     # pipeline -- it reads the real WATCHLIST_ALERT_EMAIL_* config and would attempt
     # a real SES send against the real watchlist otherwise (this config is enabled
     # in production .env, not just a test fixture).
-    monkeypatch.setattr(fundamentals_notifications, "send_daily_digest", lambda: digest_calls.append(1) or {"sent": 1, "skipped_disabled": 0, "failed": 0})
+    monkeypatch.setattr(
+        fundamentals_notifications,
+        "send_daily_digest",
+        lambda: call_order.append("digest") or {"sent": 1, "skipped_disabled": 0, "failed": 0},
+    )
 
     result = fundamentals_notifications.run_watchlist_notification_pipeline()
 
@@ -16170,9 +16176,12 @@ def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
     assert result["watchlist_active"] == 4
     assert result["watchlist_invalidated"] == 1
     assert result["digest_sent"] == 1
-    assert digest_calls == [1]
-    assert draft_calls == [1]
-    assert exit_calls == [1]
+    # BUG FOUND LIVE 2026-08-18 (re-audit): drafting used to run BEFORE exit
+    # evaluation -- load_companies_needing_draft_refresh()'s `WHERE w.status =
+    # 'active'` filter then reflected last run's status, so a company exit
+    # evaluation was about to invalidate/flag stale this run still got a paid
+    # LLM draft call that was immediately wasted. exit must now run before draft.
+    assert call_order == ["sync", "narrative", "exit", "draft", "digest"]
     assert "emails_sent" not in result  # per-addition notifications removed 2026-08-14 -- digest only
 
 
@@ -17161,6 +17170,60 @@ def test_build_daily_digest_content_null_confidence_shows_na_not_none_in_text():
     _, text_body, _ = fundamentals_notifications.build_daily_digest_content(rows)
     assert "confidence n/a" in text_body
     assert "None/100" not in text_body
+
+
+def test_build_daily_digest_content_null_prediction_and_target_date_show_na_not_none_in_text():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): dbd861c routed confidence_score through
+    # the null-safe _confidence_label() helper on this same line but left
+    # prediction_text/target_date interpolated raw -- a draft with either field
+    # null printed the literal string "None (by None)".
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {"prediction_text": None, "target_date": None, "invalidation_criteria": "i", "confidence_score": 72},
+        }
+    ]
+    _, text_body, _ = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "n/a (by n/a)" in text_body
+    assert "None (by None)" not in text_body
+
+
+def test_build_daily_digest_content_renders_draft_generated_at_in_both_bodies():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): generated_at is already selected by
+    # load_current_drafts_by_company()'s SELECT d.* but was never rendered -- a
+    # draft is emailed in every digest until a human commits or discards it
+    # (never auto-expires), so with no age shown a week-old un-reviewed draft
+    # looked identical to a fresh one.
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {
+                "prediction_text": "p", "target_date": date(2026, 11, 15), "invalidation_criteria": "i",
+                "confidence_score": 72, "generated_at": date(2026, 8, 1),
+            },
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "Drafted: 2026-08-01" in text_body
+    assert "Drafted: 2026-08-01" in html_body
+
+
+def test_build_daily_digest_content_missing_generated_at_shows_na_not_none():
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None,
+            "draft_thesis": {"prediction_text": "p", "target_date": date(2026, 11, 15), "invalidation_criteria": "i", "confidence_score": 72},
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "Drafted: n/a" in text_body
+    assert "Drafted: n/a" in html_body
 
 
 def test_build_daily_digest_content_text_shows_price_change_pct():
