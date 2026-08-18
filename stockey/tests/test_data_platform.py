@@ -10004,9 +10004,24 @@ def test_run_l2_state_refresh_returns_early_when_l1_universe_is_empty(monkeypatc
         # bond isn't the equity-investor-entry signal this trigger is for). See
         # DEBT_INSTRUMENT_EXCLUSION_KEYWORDS.
         ("Allotment of Equity Shares", "Allotment of NCDs to Clover Technologies Private Limited", "other"),
-        # Real subcategory, captured live 2026-08-12: employee stock options are not
-        # third-party investor capital -- must stay "other".
-        ("Allotment of ESOP / ESPS", "The Board allotted shares under ESOS 2022", "other"),
+        # Real (subcategory, headline) pair, captured live 2026-08-18: employee stock
+        # options are not third-party investor capital -- must stay "other". Headline
+        # (unlike a fabricated one that never tripped CAPITAL_RAISE_KEYWORDS at all)
+        # genuinely matches "allotment of equity share", so this exercises the real
+        # CAPITAL_RAISE_NON_EVENT_HEADLINE_KEYWORDS exclusion, not a no-op.
+        ("Allotment of ESOP / ESPS", "Intimation for allotment of equity shares pursuant to exercise of options under Employee Stock option", "other"),
+        # Real (subcategory, headline) pairs, captured live 2026-08-18 via a full
+        # 24-row audit of stored capital_raise rows -- see CAPITAL_RAISE_NON_EVENT_
+        # HEADLINE_KEYWORDS' comment for the false-positive shapes these pin down.
+        ("General", "This is to inform that BSE and NSE vide their respective letters dated July 23, 2026, have granted ''in-principle'' approvals for preferential issue of 3,38,030 convertible warrants of the Company", "other"),
+        ("Preferential Issue", "Receipt of Trading Approval", "other"),
+        ("General", "We submit herewith Trading approval received for 2,69,402 equity shares of Rs. 10/- each allotted pursuant to conversion of warrants issued on Preferential basis from NSE & BSE.", "other"),
+        ("General", "Intimation under Regulation 30 of SEBI (LODR) regarding receipt of Listing Approval of 23180000 equity shares of Rs. 10/- each allotted on preferential basis attached.", "other"),
+        ("General", "Attached disclosure of Closure of Rights issue of the Company.", "other"),
+        ("General", "Intimation of International Securities Identification Number (\"ISIN) for the rights entitlements to be credited for the purpose of Rights issue of the Company.", "other"),
+        ("General", "Utilization of funds raised through preferential allotment is fully complete as of this date.", "other"),
+        ("Reg. 32 (1), (3) - Statement of Deviation & Variation", "Utilization of Proceeds of Preferential Issue of Shares for the period ended March 31, 2026 is attached", "other"),
+        ("Allotment of Warrants", "The Board of Directors has approved the proposal of appointment of Cameo Corporate Services Limited as new RTA in place of MUFG Intime India Private Limited, the existing RTA as per details attached", "other"),
         (None, "Allotment of shares on preferential basis to ABC Fund LP", "capital_raise"),
         (None, "Allotment pursuant to Qualified Institutions Placement", "capital_raise"),
         ("General", "Rights Issue - Allotment of Equity Shares", "capital_raise"),

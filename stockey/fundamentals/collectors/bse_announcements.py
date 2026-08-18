@@ -145,6 +145,46 @@ DEBT_INSTRUMENT_EXCLUSION_KEYWORDS = ("ncd", "non-convertible debenture", "deben
 # rights-issue-committee meeting "scheduled to be held" that was then postponed.
 CAPITAL_RAISE_FORWARD_LOOKING_HEADLINE_KEYWORDS = ("proposed preferential", "scheduled to be held", "is scheduled on")
 
+# BUG FOUND LIVE 2026-08-18: re-audit of all 24 stored capital_raise rows found at
+# least 10 false positives the checks above miss, in three distinct shapes -- none
+# of these represent money actually changing hands from a new investor:
+#  1. Forward-looking, different wording than CAPITAL_RAISE_FORWARD_LOOKING_HEADLINE_
+#     KEYWORDS above: an "in-principle" listing approval is exchange sign-off to
+#     proceed, not an actual allotment (real row: BSE/NSE "have granted 'in-principle'
+#     approvals for preferential issue of ... convertible warrants").
+#  2. Administrative follow-ups to an allotment already captured under its own,
+#     separate row: trading-approval receipt, listing-approval receipt, a rights-
+#     issue closure notice, ISIN intimation for rights entitlements, and a proceeds-
+#     utilization statement (including one filed under BSE's own "Reg. 32 (1),(3) --
+#     Statement of Deviation & Variation" subcategory, which is itself specifically
+#     about how ALREADY-raised proceeds are being spent, not a new raise) all
+#     mention CAPITAL_RAISE_KEYWORDS phrases (a prior allotment's "preferential
+#     basis"/"conversion of warrant" wording is quoted back in the follow-up text)
+#     without describing a new one.
+#  3. An RTA (registrar and transfer agent) re-appointment notice, real row: BSE
+#     filed it under the "Allotment of Warrants" subcategory despite the headline
+#     being entirely about appointing a new RTA -- unrelated to any raise.
+#  4. Employee stock option exercises: real row's headline ("...allotment of equity
+#     shares pursuant to exercise of options under Employee Stock option") matches
+#     CAPITAL_RAISE_KEYWORDS' "allotment of equity share" phrase, but an employee
+#     exercising options already granted is not the external-investor-entry signal
+#     this trigger is for (compare CAPITAL_RAISE_KEYWORDS' own docstring: "high
+#     quality investor INVESTING").
+CAPITAL_RAISE_NON_EVENT_HEADLINE_KEYWORDS = (
+    "in-principle",
+    "in principle",
+    "trading approval",
+    "listing approval",
+    "closure of rights issue",
+    "for the rights entitlement",
+    "utilization of proceeds",
+    "utilization of fund",
+    "employee stock option",
+    "registrar and transfer agent",
+    "registrar and share transfer agent",
+    "new rta",
+)
+
 # L1 universe filter's two DEFERRED_CHECKS (auditor change, RPT) -- 2026-08-13, built
 # once fundamentals/screens/l1_universe.py's own docstring turned out to be checking
 # the wrong source (screener.in has neither; BSE announcements have both). Confirmed
@@ -246,7 +286,10 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
     real warrant-conversion allotment landed under a generic 'Outcome without
     intimation' bucket) -- and excludes debt-instrument headlines (NCD/debenture)
     even on a subcategory match, see CAPITAL_RAISE_KEYWORDS/
-    DEBT_INSTRUMENT_EXCLUSION_KEYWORDS.
+    DEBT_INSTRUMENT_EXCLUSION_KEYWORDS. Also excludes forward-looking/non-event
+    headlines (in-principle approvals, post-allotment administrative follow-ups,
+    RTA-appointment notices, ESOP exercises) even on a keyword match -- see
+    CAPITAL_RAISE_NON_EVENT_HEADLINE_KEYWORDS.
     """
     subcategory_text = (subcategory or "").lower()
     headline_text = (headline or "").lower()
@@ -282,6 +325,8 @@ def classify_announcement(subcategory: str | None, headline: str | None) -> str:
         if subcategory_text.strip() == "postal ballot":
             return "other"
         if any(keyword in headline_text for keyword in CAPITAL_RAISE_FORWARD_LOOKING_HEADLINE_KEYWORDS):
+            return "other"
+        if any(keyword in headline_text for keyword in CAPITAL_RAISE_NON_EVENT_HEADLINE_KEYWORDS):
             return "other"
         if not any(keyword in headline_text for keyword in DEBT_INSTRUMENT_EXCLUSION_KEYWORDS):
             return "capital_raise"
