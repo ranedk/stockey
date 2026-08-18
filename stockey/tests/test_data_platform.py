@@ -2770,6 +2770,66 @@ def test_collect_range_trips_circuit_breaker(monkeypatch):
     assert any(a and a[0] == "bse_bhavcopy_circuit_breaker_tripped" for a, k in fallback_events)
 
 
+def test_collect_dates_parse_failure_on_one_date_does_not_abort_the_batch(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: parse_bhavcopy/attach_identity/upsert_to_db used to
+    # sit OUTSIDE any try/except, unlike fetch_bhavcopy_csv's own guard right above --
+    # a bad CSV/identity/DB error on ANY single date raised uncaught out of the whole
+    # function, aborting every remaining date instead of being recorded and skipped
+    # like a fetch failure already is.
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_bhavcopy, "fetch_bhavcopy_csv", lambda d, session=None: _BSE_UDIFF_CSV)
+
+    real_parse_bhavcopy = bse_bhavcopy.parse_bhavcopy
+
+    def flaky_parse(csv_bytes):
+        # First call (the failing date, sorted first) raises; the rest succeed.
+        if not flaky_parse.calls:
+            flaky_parse.calls.append(1)
+            raise ValueError("BSE changed a column name")
+        return real_parse_bhavcopy(csv_bytes)
+
+    flaky_parse.calls = []
+    monkeypatch.setattr(bse_bhavcopy, "parse_bhavcopy", flaky_parse)
+    monkeypatch.setattr(bse_bhavcopy, "attach_identity", lambda df: df.assign(company_master_id="nse:X"))
+    upserts = []
+    monkeypatch.setattr(bse_bhavcopy, "upsert_to_db", lambda df, table, **k: upserts.append(df))
+    fallback_events = []
+    monkeypatch.setattr(bse_bhavcopy, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    dates = [date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 12)]
+    result = bse_bhavcopy.collect_dates(dates)
+
+    assert result["blocked"] is False
+    assert result["failed_days"] == ["2026-08-10"]
+    assert result["days_written"] == 2  # the 2 dates AFTER the failing one still succeeded
+    assert len(upserts) == 2
+    assert any(a and a[0] == "bse_bhavcopy_parse_or_upsert_failed" for a, k in fallback_events)
+
+
+def test_collect_dates_trips_parse_circuit_breaker_separately_from_fetch(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_bhavcopy, "fetch_bhavcopy_csv", lambda d, session=None: _BSE_UDIFF_CSV)
+
+    def always_fails(csv_bytes):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(bse_bhavcopy, "parse_bhavcopy", always_fails)
+    monkeypatch.setattr(bse_bhavcopy, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(bse_bhavcopy, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    dates = [date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 12), date(2026, 8, 13), date(2026, 8, 14)]
+    result = bse_bhavcopy.collect_dates(dates)
+
+    assert result["blocked"] is True
+    assert len(result["failed_days"]) == 3  # stopped after 3 consecutive parse failures, not all 5 dates
+    assert any(a and a[0] == "bse_bhavcopy_parse_circuit_breaker_tripped" for a, k in fallback_events)
+
+
 def test_run_bse_bhavcopy_collection_returns_early_when_fully_caught_up(monkeypatch):
     from data.bseindia import bhavcopy as bse_bhavcopy
 

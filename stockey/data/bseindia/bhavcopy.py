@@ -248,6 +248,18 @@ def collect_dates(dates: list[date], *, dry_run: bool = False) -> dict[str, obje
     non_trading_days = 0
     failed_days: list[str] = []
     consecutive_failures = 0
+    # BUG FOUND LIVE 2026-08-17: parse_bhavcopy/attach_identity/upsert_to_db below
+    # sat OUTSIDE any try/except, unlike fetch_bhavcopy_csv's own guard right above
+    # them -- a BSE-side CSV schema change, a bad row, or a transient DB error on
+    # ANY single date would raise uncaught out of this whole function, aborting every
+    # remaining date in the batch rather than being recorded and skipped like a fetch
+    # failure is. Own circuit-breaker counter, separate from consecutive_failures
+    # above: a parse/upsert failure is a different signal from "BSE may be blocking
+    # us" (stopping fetches wouldn't fix a bad CSV column, and one date's CSV shape
+    # doesn't reliably predict another's) -- but a schema change would still fail
+    # identically for every remaining date, so it still needs its own bound rather
+    # than looping through the whole batch recording one fallback event per date.
+    consecutive_parse_failures = 0
     blocked = False
 
     for d in sorted(dates):
@@ -280,12 +292,34 @@ def collect_dates(dates: list[date], *, dry_run: bool = False) -> dict[str, obje
             continue
 
         consecutive_failures = 0
-        parsed = parse_bhavcopy(csv_bytes)
+        try:
+            parsed = parse_bhavcopy(csv_bytes)
+            if not parsed.empty:
+                parsed = attach_identity(parsed)
+                parsed["load_ts"] = pd.Timestamp.now(tz="UTC")
+                if not dry_run:
+                    upsert_to_db(parsed[[*OUT_COLS, "company_master_id"]], RESULTS_TABLE, unique_keys=["date", "scrip_code", "series"])
+        except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
+            consecutive_parse_failures += 1
+            failed_days.append(str(d))
+            _record_fallback(
+                "bse_bhavcopy_parse_or_upsert_failed",
+                reason="BSE bhavcopy was fetched but parsing/identity-resolution/upsert failed for this date; it stays missing and is retried on the next run.",
+                error=exc,
+                metadata={"date": str(d)},
+            )
+            if consecutive_parse_failures >= 3:
+                blocked = True
+                _record_fallback(
+                    "bse_bhavcopy_parse_circuit_breaker_tripped",
+                    reason="3 consecutive BSE bhavcopy parse/upsert failures -- stopping this run (likely a BSE-side CSV schema change, not a per-date fluke).",
+                    error="circuit breaker",
+                    severity="error",
+                )
+            continue
+
+        consecutive_parse_failures = 0
         if not parsed.empty:
-            parsed = attach_identity(parsed)
-            parsed["load_ts"] = pd.Timestamp.now(tz="UTC")
-            if not dry_run:
-                upsert_to_db(parsed[[*OUT_COLS, "company_master_id"]], RESULTS_TABLE, unique_keys=["date", "scrip_code", "series"])
             days_written += 1
             rows_written += len(parsed)
 
