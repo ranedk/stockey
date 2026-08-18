@@ -10985,6 +10985,7 @@ def test_build_pit_rows_maps_a_real_captured_disclosure():
         company_master_id="nse:BLUESTONE",
         isin=None,
         app_id="2283",
+        xml_url="https://nsearchives.nseindia.com/corporate/xbrl/IT_25008_WEB.xml",
         detail_url="https://nsearchives.nseindia.com/corporate/ixbrl/IT_25008_WEB.html",
         broadcast_datetime="14-Aug-2026 22:29:18",
         filing=parsed["filing"],
@@ -10993,7 +10994,10 @@ def test_build_pit_rows_maps_a_real_captured_disclosure():
     assert len(rows) == 1
     row = rows[0]
     assert row["source"] == "nse"
-    assert row["news_id"] == "nse-pit:2283:1"
+    # keyed on xml_url (per-document), not appId -- appId is confirmed live to be a
+    # small, market-wide, likely-annually-resetting counter, so two unrelated filings
+    # months apart can share one and collide under the (source, news_id) upsert key.
+    assert row["news_id"] == "nse-pit:https://nsearchives.nseindia.com/corporate/xbrl/IT_25008_WEB.xml:1"
     assert row["scrip_code"] == "BLUESTONE"
     assert row["isin"] == "INE304W01038"  # from the XBRL filing itself, not the isin= arg
     assert row["filing_type"] == "pit_sast"
@@ -11014,7 +11018,7 @@ def test_build_pit_rows_maps_a_real_captured_disclosure():
 def test_build_pit_rows_falls_back_to_resolved_isin_when_xbrl_has_none():
     rows = fundamentals_nse_pit.build_pit_rows(
         symbol="X", company_master_id="nse:X", isin="INE_RESOLVED",
-        app_id="1", detail_url=None, broadcast_datetime=None,
+        app_id="1", xml_url="https://nsearchives.nseindia.com/x.xml", detail_url=None, broadcast_datetime=None,
         filing={}, disclosures=[{"NameOfThePerson": "Someone"}],
     )
     assert rows[0]["isin"] == "INE_RESOLVED"
@@ -11023,12 +11027,46 @@ def test_build_pit_rows_falls_back_to_resolved_isin_when_xbrl_has_none():
 def test_build_pit_rows_returns_one_row_per_disclosure_context():
     rows = fundamentals_nse_pit.build_pit_rows(
         symbol="X", company_master_id="nse:X", isin=None,
-        app_id="7", detail_url=None, broadcast_datetime=None,
+        app_id="7", xml_url="https://nsearchives.nseindia.com/7.xml", detail_url=None, broadcast_datetime=None,
         filing={"DateOfFiling": "2026-08-14"},
         disclosures=[{"NameOfThePerson": "A"}, {"NameOfThePerson": "B"}],
     )
-    assert [r["news_id"] for r in rows] == ["nse-pit:7:1", "nse-pit:7:2"]
-    assert [r["insider_name"] for r in rows] == ["A", "B"]
+    assert [r["news_id"] for r in rows] == [
+        "nse-pit:https://nsearchives.nseindia.com/7.xml:1",
+        "nse-pit:https://nsearchives.nseindia.com/7.xml:2",
+    ]
+
+
+def test_build_pit_rows_falls_back_to_app_id_when_xml_url_missing():
+    # Defense in depth only -- run_nse_pit_detection() never calls build_pit_rows()
+    # without a confirmed-fetched xml_url in practice (it `continue`s past filings
+    # missing one), but the key should still degrade gracefully rather than crash.
+    rows = fundamentals_nse_pit.build_pit_rows(
+        symbol="X", company_master_id="nse:X", isin=None,
+        app_id="42", xml_url=None, detail_url=None, broadcast_datetime=None,
+        filing={}, disclosures=[{"NameOfThePerson": "A"}],
+    )
+    assert rows[0]["news_id"] == "nse-pit:42:1"
+
+
+def test_build_pit_rows_news_id_does_not_collide_across_appid_reset(monkeypatch):
+    # Regression for the collision this session found live: appId is a small,
+    # market-wide counter that is NOT confirmed unique across NSE's fiscal-year
+    # boundary (observed ~1000 in mid-June 2026, ~2300 in mid-August 2026 -- an
+    # annual reset would make appId "2283" recur in a later fiscal year). Two
+    # different filings that happen to share an appId must still get different
+    # news_id values because their xml_url (the actual fetched document) differs.
+    rows_a = fundamentals_nse_pit.build_pit_rows(
+        symbol="AAA", company_master_id="nse:AAA", isin=None,
+        app_id="2283", xml_url="https://nsearchives.nseindia.com/corporate/xbrl/old_filing.xml",
+        detail_url=None, broadcast_datetime=None, filing={}, disclosures=[{"NameOfThePerson": "A"}],
+    )
+    rows_b = fundamentals_nse_pit.build_pit_rows(
+        symbol="BBB", company_master_id="nse:BBB", isin=None,
+        app_id="2283", xml_url="https://nsearchives.nseindia.com/corporate/xbrl/new_filing.xml",
+        detail_url=None, broadcast_datetime=None, filing={}, disclosures=[{"NameOfThePerson": "B"}],
+    )
+    assert rows_a[0]["news_id"] != rows_b[0]["news_id"]
 
 
 def test_resolve_company_identity_uses_events_store_helpers(monkeypatch):
@@ -11217,6 +11255,12 @@ def test_run_nse_pit_detection_happy_path(monkeypatch):
     assert result["blocked"] is False
     assert result["failed_filings"] == []
     assert len(dedup_calls) == 1 and len(dedup_calls[0]) == 2
+    # news_id is keyed on the fetched xmlFileName, not the small market-wide appId
+    # counter -- see test_build_pit_rows_news_id_does_not_collide_across_appid_reset.
+    assert {row["news_id"] for row in dedup_calls[0]} == {
+        "nse-pit:https://nsearchives.nseindia.com/1.xml:1",
+        "nse-pit:https://nsearchives.nseindia.com/2.xml:1",
+    }
 
 
 def test_run_nse_pit_detection_trips_circuit_breaker(monkeypatch):

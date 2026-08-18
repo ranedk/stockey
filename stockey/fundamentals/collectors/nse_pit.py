@@ -249,7 +249,7 @@ def _parse_nse_pit_timestamp(value: str | None):
     return None
 
 
-def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app_id: str | None, detail_url: str | None, broadcast_datetime: str | None, filing: dict, disclosures: list[dict]) -> list[dict]:
+def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app_id: str | None, xml_url: str | None = None, detail_url: str | None, broadcast_datetime: str | None, filing: dict, disclosures: list[dict]) -> list[dict]:
     """One corporates-pit-gg filing -> one fundamentals_events row per XBRL
     'Disclosure' context (see parse_pit_xbrl). isin prefers the XBRL filing's own
     ISINCode over the L1-identity-resolved one when both are present -- NSE's own
@@ -269,12 +269,21 @@ def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app
         rows.append(
             {
                 "source": "nse",
-                # appId+idx is the new natural key -- the XBRL schema has no did/pid
-                # equivalent (person identity is name-only). A revised filing gets a
-                # new appId (prevAppId points back to the original), so this
-                # correctly treats a resubmission as a distinct disclosure event
-                # rather than colliding with the original.
-                "news_id": f"nse-pit:{app_id}:{idx}",
+                # The XBRL document URL (xmlFileName) is the natural key, not appId:
+                # confirmed live 2026-08-18 that appId is a small, market-wide daily
+                # counter (~19/day, observed ranging ~1000 in mid-June 2026 to ~2300
+                # in mid-August 2026 -- consistent with an annual reset near the
+                # fiscal year boundary) rather than a globally unique document id, so
+                # two unrelated filings months apart can share an appId and silently
+                # overwrite each other under fundamentals_events' (source, news_id)
+                # upsert key. xml_url is per-document (the caller only reaches this
+                # function after successfully fetching that exact document, so it is
+                # always present in practice) and revision-safe the same way appId
+                # was intended to be: a revised filing gets its own xmlFileName just
+                # as it gets its own appId (prevAppId points back to the original).
+                # app_id is kept as a defense-in-depth fallback only, for the
+                # theoretical case xml_url is missing.
+                "news_id": f"nse-pit:{xml_url or app_id}:{idx}",
                 "scrip_code": symbol,
                 "company_master_id": company_master_id,
                 "isin": resolved_isin,
@@ -404,6 +413,7 @@ def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None
                         company_master_id=company_master_id,
                         isin=isin,
                         app_id=filing_meta.get("appId"),
+                        xml_url=xml_url,
                         detail_url=filing_meta.get("ixbrl"),
                         broadcast_datetime=filing_meta.get("broadcastDateTime"),
                         filing=parsed["filing"],
