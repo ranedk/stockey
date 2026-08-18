@@ -12030,6 +12030,24 @@ def test_resolve_document_source_prefers_icra_rationale_over_bse_attachment():
     assert fundamentals_ocr_pipeline.resolve_document_source(row) == ("icra", "https://www.icra.in/Rating/GetRationalReportFilePdf?Id=1")
 
 
+def test_resolve_document_source_detects_care_rationale_by_hostname():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): rationale_pdf_url is written by both
+    # icra.in and careratings.com fetches (rating_agencies.py's ICRA_PDF_URL_TEMPLATE
+    # and CARE_PDF_BASE_URL), but this used to hardcode every non-null
+    # rationale_pdf_url as domain "icra" regardless of which agency actually issued
+    # it -- CARE traffic shared ICRA's rate gate and circuit breaker. Domain must now
+    # come from the URL's own hostname.
+    row = {"attachment_name": None, "rationale_pdf_url": "https://www.careratings.com/upload/CompanyFiles/PR/some-file.pdf"}
+    assert fundamentals_ocr_pipeline.resolve_document_source(row) == ("care", "https://www.careratings.com/upload/CompanyFiles/PR/some-file.pdf")
+
+
+def test_resolve_document_source_falls_back_to_generic_domain_for_unknown_rationale_host():
+    row = {"attachment_name": None, "rationale_pdf_url": "https://www.some-other-agency.example/report.pdf"}
+    domain, url = fundamentals_ocr_pipeline.resolve_document_source(row)
+    assert domain == "rating_agency_other"
+    assert url == "https://www.some-other-agency.example/report.pdf"
+
+
 def test_resolve_document_source_falls_back_to_bse_attachment():
     row = {"attachment_name": "abc-123.pdf", "rationale_pdf_url": None}
     domain, url = fundamentals_ocr_pipeline.resolve_document_source(row)
@@ -12074,6 +12092,27 @@ def test_fetch_document_bytes_returns_content_on_success(monkeypatch):
 
     monkeypatch.setattr(fundamentals_ocr_pipeline.requests, "get", lambda *a, **k: FakeResponse())
     assert fundamentals_ocr_pipeline.fetch_document_bytes("https://example.com/x.pdf", domain="icra") == b"%PDF-1.4 fake pdf bytes"
+
+
+def test_fetch_document_bytes_uses_care_headers_and_gate_for_care_domain(monkeypatch):
+    gate_calls = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "exchange_request_gate", lambda **k: gate_calls.append(k) or contextlib.nullcontext())
+    captured_headers = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b"%PDF-1.4 care pdf"
+
+    def fake_get(url, headers=None, **k):
+        captured_headers.update(headers or {})
+        return FakeResponse()
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline.requests, "get", fake_get)
+    fundamentals_ocr_pipeline.fetch_document_bytes("https://www.careratings.com/upload/CompanyFiles/PR/x.pdf", domain="care")
+
+    assert gate_calls == [{"domain": "care"}]  # its own rate-limiter/circuit-breaker domain, not ICRA's
+    assert captured_headers == fundamentals_ocr_pipeline.CARE_PDF_HEADERS
+    assert "Referer" not in captured_headers  # ICRA's Referer would be wrong against careratings.com
 
 
 def test_ocr_pdf_bytes_writes_temp_file_and_joins_pages(monkeypatch):
@@ -12129,6 +12168,77 @@ def test_ocr_pdf_bytes_raises_on_document_timeout_between_pages(monkeypatch):
 
     with pytest.raises(fundamentals_ocr_pipeline.OcrTimeoutError, match="MAX_DOCUMENT_OCR_SECONDS"):
         fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
+
+
+def test_ocr_pdf_bytes_truncates_when_page_count_exceeds_max(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): render_pdf_pages(path) with the default
+    # pages="all" rasterizes every page into memory up front, before this document's
+    # own MAX_DOCUMENT_OCR_SECONDS timer even starts -- a large scanned filing could
+    # OOM the process before any bound applied. Over MAX_OCR_PAGES, ocr_pdf_bytes must
+    # request only the first MAX_OCR_PAGES (routes render_pdf_pages through its
+    # per-page, bounded-memory loop instead of the eager all-at-once path) and record
+    # a fallback event about the truncation.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "pdfinfo_from_path", lambda path, **k: {"Pages": 100})
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "MAX_OCR_PAGES", 3)
+    captured = {}
+
+    def fake_render_pdf_pages(path, pages="all"):
+        captured["pages"] = pages
+        return [(1, "image-1"), (2, "image-2"), (3, "image-3")]
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", fake_render_pdf_pages)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", lambda image, **kwargs: image)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
+
+    assert captured["pages"] == [1, 2, 3]  # explicit range, not "all" -- forces the bounded per-page loop
+    assert result == "image-1\n\nimage-2\n\nimage-3"
+    assert len(fallback_events) == 1
+    assert fallback_events[0][0][0] == "ocr_pipeline_document_truncated"
+    assert fallback_events[0][1]["metadata"] == {"total_pages": 100, "max_ocr_pages": 3}
+
+
+def test_ocr_pdf_bytes_uses_eager_render_when_page_count_within_max(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "pdfinfo_from_path", lambda path, **k: {"Pages": 2})
+    captured = {}
+
+    def fake_render_pdf_pages(path, pages="all"):
+        captured["pages"] = pages
+        return [(1, "image-1")]
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", fake_render_pdf_pages)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", lambda image, **kwargs: image)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
+
+    assert captured["pages"] == "all"  # under MAX_OCR_PAGES -- eager render, unchanged behavior
+    assert fallback_events == []
+
+
+def test_ocr_pdf_bytes_falls_back_to_eager_render_when_pdfinfo_fails(monkeypatch):
+    # pdfinfo failing (corrupt/unusual PDF) must not block OCR entirely -- fall back to
+    # the pre-existing eager render rather than raising.
+    def raise_pdfinfo(path, **k):
+        raise RuntimeError("pdfinfo failed")
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "pdfinfo_from_path", raise_pdfinfo)
+    captured = {}
+
+    def fake_render_pdf_pages(path, pages="all"):
+        captured["pages"] = pages
+        return [(1, "image-1")]
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", fake_render_pdf_pages)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", lambda image, **kwargs: image)
+
+    result = fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
+
+    assert captured["pages"] == "all"
+    assert result == "image-1"
 
 
 def test_load_pending_ocr_targets_queries_expected_filters(monkeypatch):
@@ -12393,14 +12503,14 @@ def test_run_ocr_pipeline_backlog_fallback_fires_after_a_real_run(monkeypatch):
     monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
     monkeypatch.setattr(
-        fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: fundamentals_ocr_pipeline.BACKLOG_NOT_CLEARING_THRESHOLD + 1
+        fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: fundamentals_ocr_pipeline.DEFAULT_BATCH_LIMIT + 1
     )
     fallback_events = []
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
 
     result = fundamentals_ocr_pipeline.run_ocr_pipeline()
 
-    assert result["backlog_remaining"] == fundamentals_ocr_pipeline.BACKLOG_NOT_CLEARING_THRESHOLD + 1
+    assert result["backlog_remaining"] == fundamentals_ocr_pipeline.DEFAULT_BATCH_LIMIT + 1
     assert any(a and a[0] == "ocr_pipeline_backlog_not_clearing" for a, k in fallback_events)
 
 
@@ -12417,6 +12527,38 @@ def test_run_ocr_pipeline_no_backlog_fallback_when_under_threshold(monkeypatch):
     fundamentals_ocr_pipeline.run_ocr_pipeline()
 
     assert not any(a and a[0] == "ocr_pipeline_backlog_not_clearing" for a, k in fallback_events)
+
+
+def test_run_ocr_pipeline_backlog_fallback_uses_callers_own_limit_not_default(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the backlog-not-clearing check used to
+    # compare against a module-level constant pinned to DEFAULT_BATCH_LIMIT (200),
+    # ignoring whatever limit this specific call actually passed. A caller with a
+    # smaller limit=10 would get "even a full run at DEFAULT_BATCH_LIMIT wouldn't
+    # clear it" style reasoning that doesn't match its own, much smaller cap. Must
+    # compare against THIS call's effective_limit.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": None}])
+    captured_limit = {}
+
+    def fake_load_pending_ocr_targets(limit=None):
+        captured_limit["limit"] = limit
+        return pending
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", fake_load_pending_ocr_targets)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
+    # 15 pending is well under DEFAULT_BATCH_LIMIT (200) but over this call's own limit=10.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 15)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline(limit=10)
+
+    assert captured_limit["limit"] == 10
+    assert result["backlog_remaining"] == 15
+    matches = [k for a, k in fallback_events if a and a[0] == "ocr_pipeline_backlog_not_clearing"]
+    assert len(matches) == 1
+    assert matches[0]["metadata"]["effective_limit"] == 10
 
 
 # fundamentals/collectors/structured_extraction.py -- L3/L4 OCR-text -> typed fields

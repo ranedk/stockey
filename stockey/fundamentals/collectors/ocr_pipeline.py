@@ -42,10 +42,12 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 from environs import Env
+from pdf2image import pdfinfo_from_path
 from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.collectors.events_store import RESULTS_TABLE, _ensure_events_schema
@@ -55,6 +57,7 @@ from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.ocr.llm_ocr import ocr_page_with_local, render_pdf_pages
+from utils.poppler import resolve_poppler_path
 from utils.store import save_file_content
 
 env = Env()
@@ -66,6 +69,20 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 BSE_ATTACHMENT_URL_TEMPLATE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attachment_name}"
 BSE_PDF_HEADERS = {"User-Agent": UA, "Referer": "https://www.bseindia.com/", "Accept": "application/pdf,*/*"}
 ICRA_PDF_HEADERS = {"User-Agent": UA, "Referer": "https://www.icra.in/Rating/AllRatingRationales"}
+# Mirrors rating_agencies.py's own CARE_HEADERS (no Referer -- CARE's PDF endpoint
+# doesn't require one, confirmed live 2026-08-12 there).
+CARE_PDF_HEADERS = {"User-Agent": UA}
+# Hostname -> domain label for resolve_document_source()'s rationale_pdf_url branch.
+# BUG FOUND LIVE 2026-08-18 (re-audit): rationale_pdf_url is written by BOTH icra.in
+# and careratings.com fetches (rating_agencies.py's ICRA_PDF_URL_TEMPLATE and
+# CARE_PDF_BASE_URL both land in this one column), but resolve_document_source()
+# hardcoded every non-null rationale_pdf_url as domain "icra" regardless of which
+# agency actually issued it. That meant CARE traffic shared ICRA's rate-limiter gate
+# and circuit-breaker counter (a run of CARE failures would falsely trip "ICRA is
+# blocking us"), used ICRA's Referer header against a different host, and got
+# mislabeled in telemetry/archival. Now derived from the URL's own hostname instead
+# of assumed.
+RATIONALE_PDF_HOST_DOMAINS = {"www.icra.in": "icra", "icra.in": "icra", "www.careratings.com": "care", "careratings.com": "care"}
 
 CIRCUIT_BREAKER_THRESHOLD = 3
 # 2026-08-15: raised 50 -> 200 (user request: "pace up so we don't have backlog" --
@@ -90,7 +107,13 @@ DEFAULT_BATCH_LIMIT = 200
 # still exceeds it after a run -- i.e. even a full, uninterrupted run at the item cap
 # wouldn't have been enough to clear it -- so this stays a monitorable, visible
 # trend rather than a one-time audit finding nobody re-checks.
-BACKLOG_NOT_CLEARING_THRESHOLD = DEFAULT_BATCH_LIMIT
+#
+# BUG FOUND LIVE 2026-08-18 (re-audit): this check used to compare against a
+# module-level BACKLOG_NOT_CLEARING_THRESHOLD constant pinned to DEFAULT_BATCH_LIMIT,
+# not the CALLER's actual effective limit -- harmless today since main() is the only
+# caller and always uses the default, but wrong the moment a smaller-limit caller
+# exists. run_ocr_pipeline() now compares against its own effective_limit directly
+# instead of a separate constant that could drift out of sync with it.
 # Wall-clock budget for one run, independent of item count -- protects the REST of
 # that day's fundamentals pipeline (L1/L2/L3/watchlist/notifications all run after
 # this step in run_pipeline.py's STEPS) from a bad day of large scanned documents
@@ -125,6 +148,19 @@ PER_PAGE_OCR_TIMEOUT_SECONDS = env.int("FUNDAMENTALS_OCR_PAGE_TIMEOUT_SECONDS", 
 # enough for real documents, still meaningfully short of "one document eats the
 # whole run."
 MAX_DOCUMENT_OCR_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_DOCUMENT_SECONDS", 7200)
+
+# BUG FOUND LIVE 2026-08-18 (re-audit): render_pdf_pages(path) with the default
+# pages="all" calls pdf2image's convert_from_path with no page range, which rasterizes
+# EVERY page into an in-memory PIL Image up front, before ocr_pdf_bytes even starts its
+# MAX_DOCUMENT_OCR_SECONDS timer -- a large scanned filing can OOM the process before
+# any of this module's bounds get a chance to apply. Live: the largest stored filing
+# (24 pages) peaked at 988MB RSS; a 100-page attachment extrapolates to ~3GB in-process
+# alongside the loaded OCR model. Capped well above the observed real max (31 pages,
+# see MAX_DOCUMENT_OCR_SECONDS's own comment) -- ocr_pdf_bytes() below only takes the
+# eager all-at-once render path when the document is at or under this cap; above it, it
+# passes an explicit page range, which routes render_pdf_pages through its per-page loop
+# (one page rasterized at a time, bounded peak memory) and truncates rather than OOMing.
+MAX_OCR_PAGES = env.int("FUNDAMENTALS_OCR_MAX_PAGES", 60)
 
 OCR_COLUMN_TYPES = {
     "ocr_status": "TEXT",
@@ -171,11 +207,15 @@ def _bootstrap_ocr_columns() -> None:
 
 def resolve_document_source(row: dict) -> tuple[str, str] | None:
     """(domain, url) for this row's source filing, or None if it has no resolvable
-    document reference yet -- ICRA checked first since it's a direct, already-verified
-    filing (a matched rating rationale); BSE's attachment covers everything else."""
+    document reference yet -- rationale_pdf_url checked first since it's a direct,
+    already-verified filing (a matched rating rationale); BSE's attachment covers
+    everything else. domain is derived from rationale_pdf_url's own hostname, not
+    assumed to be ICRA -- see RATIONALE_PDF_HOST_DOMAINS' comment."""
     rationale_pdf_url = row.get("rationale_pdf_url")
     if rationale_pdf_url:
-        return "icra", rationale_pdf_url
+        hostname = urlparse(rationale_pdf_url).hostname or ""
+        domain = RATIONALE_PDF_HOST_DOMAINS.get(hostname.lower(), "rating_agency_other")
+        return domain, rationale_pdf_url
     attachment_name = row.get("attachment_name")
     if attachment_name:
         return "bse", BSE_ATTACHMENT_URL_TEMPLATE.format(attachment_name=attachment_name)
@@ -205,7 +245,12 @@ class OcrTimeoutError(RuntimeError):
 
 
 def fetch_document_bytes(url: str, *, domain: str) -> bytes:
-    headers = ICRA_PDF_HEADERS if domain == "icra" else BSE_PDF_HEADERS
+    if domain == "icra":
+        headers = ICRA_PDF_HEADERS
+    elif domain == "care":
+        headers = CARE_PDF_HEADERS
+    else:
+        headers = BSE_PDF_HEADERS
     with exchange_request_gate(domain=domain):
         response = requests.get(url, headers=headers, timeout=60)
     if response.status_code != 200:
@@ -243,7 +288,7 @@ def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
 def count_pending_ocr_targets() -> int:
     """Cheap COUNT(*) mirroring load_pending_ocr_targets()'s own WHERE clause,
     unbounded by DEFAULT_BATCH_LIMIT -- used only to size the true remaining backlog
-    for BACKLOG_NOT_CLEARING_THRESHOLD's own check below, not for selecting rows."""
+    for run_ocr_pipeline()'s own backlog-not-clearing check, not for selecting rows."""
     df = sql_to_df(
         """
         SELECT COUNT(*) AS n
@@ -295,13 +340,36 @@ def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     """Render every page of a PDF (already-downloaded bytes) and OCR each one through
     the local provider, joined into one document's worth of text. See
     PER_PAGE_OCR_TIMEOUT_SECONDS/MAX_DOCUMENT_OCR_SECONDS above for why each page runs
-    with its own bounded timeout instead of one unbounded per-document call."""
+    with its own bounded timeout instead of one unbounded per-document call, and
+    MAX_OCR_PAGES' own comment for why the render itself is bounded too."""
+    document_started = time.monotonic()
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as handle:
         Path(handle.name).write_bytes(pdf_bytes)
-        rendered_pages = render_pdf_pages(handle.name)
+        total_pages = None
+        try:
+            info = pdfinfo_from_path(handle.name, poppler_path=resolve_poppler_path())
+            total_pages = info.get("Pages")
+        except Exception:  # noqa: BLE001 -- pdfinfo failing isn't fatal, fall back to the eager render
+            total_pages = None
+
+        if total_pages is not None and total_pages > MAX_OCR_PAGES:
+            _record_fallback(
+                "ocr_pipeline_document_truncated",
+                source="ocr_pipeline",
+                reason=(
+                    f"Document has {total_pages} pages, over MAX_OCR_PAGES ({MAX_OCR_PAGES}) -- "
+                    "OCR'ing only the first MAX_OCR_PAGES rather than rasterizing the whole document "
+                    "into memory up front."
+                ),
+                error="page count exceeds MAX_OCR_PAGES",
+                severity="warn",
+                metadata={"total_pages": total_pages, "max_ocr_pages": MAX_OCR_PAGES},
+            )
+            rendered_pages = render_pdf_pages(handle.name, pages=list(range(1, MAX_OCR_PAGES + 1)))
+        else:
+            rendered_pages = render_pdf_pages(handle.name)
 
     texts: dict[int, str] = {}
-    document_started = time.monotonic()
     for page_number, image in rendered_pages:
         if time.monotonic() - document_started >= MAX_DOCUMENT_OCR_SECONDS:
             raise OcrTimeoutError(
@@ -335,7 +403,8 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
     _ensure_events_schema()
     _bootstrap_ocr_columns()
 
-    pending = load_pending_ocr_targets(limit or DEFAULT_BATCH_LIMIT)
+    effective_limit = limit or DEFAULT_BATCH_LIMIT
+    pending = load_pending_ocr_targets(effective_limit)
     if pending.empty:
         return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False, "backlog_remaining": 0}
 
@@ -429,18 +498,24 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
         _set_ocr_result(source=row["source"], news_id=row["news_id"], status="done", fields=fields)
 
     backlog_remaining = count_pending_ocr_targets()
-    if backlog_remaining > BACKLOG_NOT_CLEARING_THRESHOLD:
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this used to compare against the module-
+    # level BACKLOG_NOT_CLEARING_THRESHOLD (== DEFAULT_BATCH_LIMIT) regardless of what
+    # limit this particular call actually used -- only main() calls this with no limit
+    # today, so it happened to always match, but a smaller-limit caller would get a
+    # telemetry reason text ("even a full run at DEFAULT_BATCH_LIMIT wouldn't clear
+    # it") that's wrong for its own, smaller effective cap.
+    if backlog_remaining > effective_limit:
         _record_fallback(
             "ocr_pipeline_backlog_not_clearing",
             source="ocr_pipeline",
             reason=(
-                f"{backlog_remaining} rows still pending after this run -- more than BACKLOG_NOT_CLEARING_"
-                f"THRESHOLD ({BACKLOG_NOT_CLEARING_THRESHOLD}), meaning even a full uninterrupted run at "
-                "DEFAULT_BATCH_LIMIT wouldn't clear it. Not necessarily new/getting worse -- see metadata "
-                "for this run's own throughput to judge the trend."
+                f"{backlog_remaining} rows still pending after this run -- more than this run's own "
+                f"effective limit ({effective_limit}), meaning even a full uninterrupted run at that limit "
+                "wouldn't clear it. Not necessarily new/getting worse -- see metadata for this run's own "
+                "throughput to judge the trend."
             ),
             error="backlog exceeds one run's own item cap",
-            metadata={"backlog_remaining": backlog_remaining, "ocred_this_run": counts["ocred"], "failed_this_run": counts["failed"]},
+            metadata={"backlog_remaining": backlog_remaining, "effective_limit": effective_limit, "ocred_this_run": counts["ocred"], "failed_this_run": counts["failed"]},
         )
 
     return {**counts, "blocked": bool(blocked_domains), "time_budget_exceeded": time_budget_exceeded, "backlog_remaining": backlog_remaining}
