@@ -36,10 +36,10 @@ failures against either source stop that source's batch immediately.
 
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
 import json
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -113,7 +113,18 @@ MAX_RUNTIME_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_RUNTIME_SECONDS", 3 * 60 * 6
 # - MAX_DOCUMENT_OCR_SECONDS: checked between pages, bounds a many-page document's
 #   TOTAL OCR time even when every individual page finishes within its own timeout.
 PER_PAGE_OCR_TIMEOUT_SECONDS = env.int("FUNDAMENTALS_OCR_PAGE_TIMEOUT_SECONDS", 900)
-MAX_DOCUMENT_OCR_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_DOCUMENT_SECONDS", 1800)
+# BUG FOUND LIVE 2026-08-18 (re-audit): 1800s was tight enough to permanently fail a
+# real, legitimate document -- a census of the 52 documents already OCR'd
+# successfully in production found a median of 7 pages but up to 31, and one real
+# completed production run measured 73.2s/page overall; at the module's own more
+# pessimistic documented range (95-290s/page), 1800s allows only ~6-19 pages,
+# meaning roughly half of the ALREADY-SUCCEEDED real documents would now hard-fail
+# on a slow day. Raised to comfortably cover the observed max (31 pages) even at a
+# rate well above the real measured 73.2s/page (7200/31 =~ 232s/page), while still
+# capping any single document at 2/3 of MAX_RUNTIME_SECONDS's 3h run budget -- large
+# enough for real documents, still meaningfully short of "one document eats the
+# whole run."
+MAX_DOCUMENT_OCR_SECONDS = env.int("FUNDAMENTALS_OCR_MAX_DOCUMENT_SECONDS", 7200)
 
 OCR_COLUMN_TYPES = {
     "ocr_status": "TEXT",
@@ -178,9 +189,19 @@ class DocumentFetchError(RuntimeError):
 
 class OcrTimeoutError(RuntimeError):
     """Raised when a single page's OCR exceeds PER_PAGE_OCR_TIMEOUT_SECONDS, or a
-    document's total page-by-page OCR exceeds MAX_DOCUMENT_OCR_SECONDS -- caught by
-    the same per-row except block as DocumentFetchError, so it counts towards that
-    source's circuit breaker rather than blocking the run."""
+    document's total page-by-page OCR exceeds MAX_DOCUMENT_OCR_SECONDS.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): used to be caught by the exact same
+    except block as DocumentFetchError -- conflating "our CPU was too slow on a
+    genuinely large document" with "the source is blocking us" (fetch failures).
+    That meant a slow-but-legitimate document permanently failed the row (no
+    automatic retry path exists) AND counted toward the same-domain circuit
+    breaker, so a run of large documents could trip a false "bse/icra is blocking
+    us" block for the REST of that day's batch. Now handled by its own except
+    branch in run_ocr_pipeline() with its own, separate circuit-breaker counter --
+    it's a signal about OUR pipeline's pace, not the source's health, and the row
+    is left pending (not marked permanently failed) so it gets a fresh attempt on
+    a future, hopefully-less-contended run rather than being given up on forever."""
 
 
 def fetch_document_bytes(url: str, *, domain: str) -> bytes:
@@ -234,6 +255,42 @@ def count_pending_ocr_targets() -> int:
     return int(df.iloc[0]["n"]) if not df.empty else 0
 
 
+def _run_with_timeout(fn, args, *, timeout_seconds: float):
+    """Runs fn(*args) with a hard wall-clock timeout, raising TimeoutError if it
+    doesn't finish in time.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): the previous implementation used
+    concurrent.futures.ThreadPoolExecutor, whose worker threads are created
+    WITHOUT daemon=True -- Python's own threading._register_atexit hook joins
+    every one of them at interpreter shutdown regardless of executor.shutdown
+    (wait=False). Since run_pipeline.py runs every fundamentals step IN-PROCESS
+    (importlib + module.main(), not a subprocess), a timed-out OCR page's
+    abandoned worker thread would still be joined at the very end of that whole
+    day's run -- competing for CPU with every later step in the meantime, and
+    delaying the orchestrator process's own exit by however long the stuck
+    generate() call takes to naturally finish. Live-reproduced: a thread
+    "abandoned" via executor.shutdown(wait=False) still added its full runtime to
+    total wall-clock time at process exit. A plain daemon thread has no such
+    hook -- the OS kills it outright when the process exits, so an abandoned OCR
+    call can genuinely never block anything downstream from finishing."""
+    result_box: dict[str, object] = {}
+
+    def _target():
+        try:
+            result_box["value"] = fn(*args)
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the caller via result_box, not swallowed
+            result_box["error"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    if thread.is_alive():
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} exceeded {timeout_seconds}s")
+    if "error" in result_box:
+        raise result_box["error"]
+    return result_box["value"]
+
+
 def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     """Render every page of a PDF (already-downloaded bytes) and OCR each one through
     the local provider, joined into one document's worth of text. See
@@ -251,14 +308,10 @@ def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
                 f"document OCR exceeded MAX_DOCUMENT_OCR_SECONDS ({MAX_DOCUMENT_OCR_SECONDS}s) "
                 f"with {len(texts)}/{len(rendered_pages)} pages done"
             )
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(ocr_page_with_local, image)
         try:
-            texts[page_number] = future.result(timeout=PER_PAGE_OCR_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError as exc:
-            executor.shutdown(wait=False)
+            texts[page_number] = _run_with_timeout(ocr_page_with_local, (image,), timeout_seconds=PER_PAGE_OCR_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
             raise OcrTimeoutError(f"page {page_number} OCR exceeded PER_PAGE_OCR_TIMEOUT_SECONDS ({PER_PAGE_OCR_TIMEOUT_SECONDS}s)") from exc
-        executor.shutdown(wait=False)
 
     return "\n\n".join(texts[page_number] for page_number in sorted(texts))
 
@@ -288,6 +341,12 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
 
     counts = {"ocred": 0, "failed": 0, "no_document": 0}
     consecutive_failures_by_domain: dict[str, int] = {}
+    # BUG FOUND LIVE 2026-08-18 (re-audit): a document-level OCR timeout used to
+    # share consecutive_failures_by_domain with genuine fetch failures -- a run of
+    # large-but-legitimate documents could trip a false "this domain is blocking
+    # us" circuit-breaker block. Separate counter: a timeout means "our pipeline
+    # is slow today," not "the source is unreachable."
+    consecutive_timeouts_by_domain: dict[str, int] = {}
     blocked_domains: set[str] = set()
     run_started = time.monotonic()
     time_budget_exceeded = False
@@ -310,6 +369,30 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
         try:
             pdf_bytes = fetch_document_bytes(url, domain=domain)
             ocr_text = ocr_pdf_bytes(pdf_bytes)
+        except OcrTimeoutError as exc:
+            consecutive_timeouts_by_domain[domain] = consecutive_timeouts_by_domain.get(domain, 0) + 1
+            counts["failed"] += 1
+            # Deliberately NOT _set_ocr_result(status="failed") here -- see
+            # OcrTimeoutError's own docstring for why a timeout stays retryable
+            # (ocr_status untouched, so load_pending_ocr_targets re-selects it on
+            # a future run) rather than being given up on permanently.
+            _record_fallback(
+                "ocr_pipeline_document_timeout",
+                source=domain,
+                reason="OCR'ing this row's source document exceeded its page/document timeout; left ocr_status pending (not permanently failed) so it retries on a future, hopefully-less-contended run.",
+                error=exc,
+                metadata={"news_id": row["news_id"], "url": url},
+            )
+            if consecutive_timeouts_by_domain[domain] >= CIRCUIT_BREAKER_THRESHOLD:
+                blocked_domains.add(domain)
+                _record_fallback(
+                    "ocr_pipeline_timeout_circuit_breaker_tripped",
+                    source=domain,
+                    reason=f"{consecutive_timeouts_by_domain[domain]} consecutive {domain} document timeouts -- stopping this source's batch for the rest of this run (not a source-health signal, just pacing).",
+                    error="circuit breaker",
+                    severity="warn",
+                )
+            continue
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures_by_domain[domain] = consecutive_failures_by_domain.get(domain, 0) + 1
             counts["failed"] += 1
@@ -333,6 +416,7 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
             continue
 
         consecutive_failures_by_domain[domain] = 0
+        consecutive_timeouts_by_domain[domain] = 0
         pdf_key = f"fundamentals/filings/{domain}/{row['news_id']}.pdf"
         save_file_content(pdf_key, pdf_bytes)
         text_key = f"fundamentals/ocr/{domain}/{row['news_id']}.txt"

@@ -145,7 +145,7 @@ def load_full_watchlist() -> list[dict]:
         """
         SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
                w.alert_count, w.narrative_text, w.suggested_watch_until, l1.company_name,
-               tech.close AS current_price
+               tech.close AS current_price, tech.price_data_stale
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
@@ -153,7 +153,7 @@ def load_full_watchlist() -> list[dict]:
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
-            SELECT close FROM fundamentals_technicals
+            SELECT close, price_data_stale FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
@@ -197,9 +197,19 @@ def _price_change_pct(first_seen_price, current_price) -> float | None:
     return (current_price - first_seen_price) / first_seen_price * 100
 
 
-def _price_change_cell_html(first_seen_price, current_price) -> str:
+def _price_change_cell_html(first_seen_price, current_price, *, price_data_stale: bool = False) -> str:
     from_str = _fmt_price(first_seen_price)
     to_str = _fmt_price(current_price)
+    # BUG FOUND LIVE 2026-08-18 (re-audit): watchlist_exit.py was fixed on
+    # 2026-08-15 to refuse judging a price move when price_data_stale is set (a
+    # stale current_price anchored to an old value makes a real move look like
+    # ~0% change, masking exactly the "look again" signal this exists to raise) --
+    # that fix stopped at the status-evaluation layer. This digest column is
+    # literally labeled "Entry -> Today's close" and rendered the raw stale close
+    # at face value with no indication it wasn't actually today's. Confirmed live:
+    # a real watchlist company showed "+66.1%" off a close that was 3.6 months old.
+    if price_data_stale:
+        return f'{from_str} &rarr; {to_str} <span class="stale">(stale price)</span>'
     pct = _price_change_pct(first_seen_price, current_price)
     if pct is None:
         return f"{from_str} &rarr; {to_str}"
@@ -208,9 +218,11 @@ def _price_change_cell_html(first_seen_price, current_price) -> str:
     return f'{from_str} &rarr; {to_str} <span class="{css_class}">({sign}{pct:.1f}%)</span>'
 
 
-def _price_change_text(first_seen_price, current_price) -> str:
+def _price_change_text(first_seen_price, current_price, *, price_data_stale: bool = False) -> str:
     from_str = _fmt_price(first_seen_price)
     to_str = _fmt_price(current_price)
+    if price_data_stale:
+        return f"{from_str} -> {to_str} (stale price, not a real move)"
     pct = _price_change_pct(first_seen_price, current_price)
     if pct is None:
         return f"{from_str} -> {to_str}"
@@ -237,6 +249,7 @@ _DIGEST_HTML_STYLE = (
     "tr:last-child td{border-bottom:none}"
     ".pos{color:#059669;font-weight:600}"
     ".neg{color:#dc2626;font-weight:600}"
+    ".stale{color:#94a3b8;font-style:italic}"
     ".badge{display:inline-block;background:#f1f5f9;color:#475569;border-radius:999px;padding:2px 8px;font-size:11px;white-space:nowrap}"
     ".narrative-block{padding:14px 0;border-bottom:1px solid #f1f5f9}"
     ".narrative-block:last-child{border-bottom:none}"
@@ -323,10 +336,12 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         strategies = row.get("strategies") or []
         draft = row.get("draft_thesis")
 
+        price_data_stale = bool(row.get("price_data_stale"))
         text_lines.append(f"--- {ticker} ({company_name}) ---")
         text_lines.append(
             f"Watching since {_fmt_plain(row.get('first_seen_at'))} at "
-            f"{_price_change_text(row.get('first_seen_price'), row.get('current_price'))} today -- {row.get('alert_count') or 0} event(s)."
+            f"{_price_change_text(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale)} "
+            f"today -- {row.get('alert_count') or 0} event(s)."
         )
         if strategies:
             text_lines.append(f"Strategies: {', '.join(_strategy_label(s) for s in strategies)}")
@@ -349,7 +364,7 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
             f'<span style="color:#64748b;font-size:12px">{html.escape(company_name)}</span>'
             f'<div>{strategy_badges_html}</div></td>'
             f"<td>{html.escape(_fmt_plain(row.get('first_seen_at')))}</td>"
-            f"<td>{_price_change_cell_html(row.get('first_seen_price'), row.get('current_price'))}</td>"
+            f"<td>{_price_change_cell_html(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale)}</td>"
             f'<td><span class="badge">{row.get("alert_count") or 0} events</span></td>'
             f"<td>{html.escape(_fmt_plain(row.get('suggested_watch_until')))}</td>"
             "</tr>"

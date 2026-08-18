@@ -12203,6 +12203,93 @@ def test_run_ocr_pipeline_trips_circuit_breaker_per_domain(monkeypatch):
     assert any(a and a[0] == "ocr_pipeline_circuit_breaker_tripped" for a, k in fallback_events)
 
 
+def test_run_ocr_pipeline_document_timeout_does_not_permanently_fail_or_trip_fetch_breaker(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): OcrTimeoutError used to share the exact
+    # same handling as DocumentFetchError -- a run of large-but-legitimate
+    # documents could permanently fail the row (no automatic retry) AND trip a
+    # false "this domain is blocking us" circuit breaker. A timeout is now its own
+    # branch: no permanent status write, no fetch-failure breaker contribution.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
+    pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "attachment_name": "file1.pdf", "rationale_pdf_url": None}])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", lambda url, **k: b"%PDF-1.4 fake")
+
+    def always_times_out(pdf_bytes):
+        raise fundamentals_ocr_pipeline.OcrTimeoutError("page 1 OCR exceeded PER_PAGE_OCR_TIMEOUT_SECONDS")
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", always_times_out)
+    status_calls = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: status_calls.append(kwargs))
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["failed"] == 1
+    assert status_calls == []  # never marked ocr_status=failed -- stays pending for a future retry
+    assert any(a and a[0] == "ocr_pipeline_document_timeout" for a, k in fallback_events)
+    assert not any(a and a[0] == "ocr_pipeline_document_failed" for a, k in fallback_events)
+    assert not any(a and a[0] == "ocr_pipeline_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_run_ocr_pipeline_timeout_circuit_breaker_is_separate_from_fetch_failures(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
+    pending = pd.DataFrame(
+        [{"source": "bse", "news_id": f"n{i}", "attachment_name": f"file{i}.pdf", "rationale_pdf_url": None} for i in range(5)]
+    )
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", lambda url, **k: b"%PDF-1.4 fake")
+
+    def always_times_out(pdf_bytes):
+        raise fundamentals_ocr_pipeline.OcrTimeoutError("boom")
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", always_times_out)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["blocked"] is True
+    assert result["failed"] == fundamentals_ocr_pipeline.CIRCUIT_BREAKER_THRESHOLD
+    assert any(a and a[0] == "ocr_pipeline_timeout_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_run_with_timeout_returns_result_when_fast_enough():
+    assert fundamentals_ocr_pipeline._run_with_timeout(lambda x: x * 2, (21,), timeout_seconds=5) == 42
+
+
+def test_run_with_timeout_raises_timeout_error_and_thread_is_daemon():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the previous ThreadPoolExecutor-based
+    # implementation's worker threads were joined at interpreter exit regardless
+    # of shutdown(wait=False) -- an abandoned OCR call could still block the whole
+    # in-process pipeline from exiting. A plain daemon thread has no such hook.
+    import threading as _threading
+
+    def slow(seconds):
+        time.sleep(seconds)
+        return "done"
+
+    threads_before = set(_threading.enumerate())
+    with pytest.raises(TimeoutError):
+        fundamentals_ocr_pipeline._run_with_timeout(slow, (0.3,), timeout_seconds=0.05)
+    new_threads = set(_threading.enumerate()) - threads_before
+    assert len(new_threads) == 1
+    assert next(iter(new_threads)).daemon is True
+
+
+def test_run_with_timeout_propagates_the_real_exception():
+    def raises(msg):
+        raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="boom"):
+        fundamentals_ocr_pipeline._run_with_timeout(raises, ("boom",), timeout_seconds=5)
+
+
 def test_count_pending_ocr_targets_mirrors_load_pending_where_clause(monkeypatch):
     captured = {}
 
@@ -14904,6 +14991,23 @@ def test_get_watchlist_attaches_draft_thesis_per_company(monkeypatch):
     assert result[0]["draft_thesis"]["confidence_score"] == 55
 
 
+def test_get_watchlist_selects_price_data_stale(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): current_price used to be selected with
+    # no staleness flag at all -- confirmed live, a real watchlist company showed
+    # a current_price frozen 3.6 months stale under a column callers treat as
+    # "today's close".
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["query"] = q
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    fundamentals_api_queries.get_watchlist()
+    assert "tech.price_data_stale" in captured["query"]
+    assert "SELECT close, price_data_stale FROM fundamentals_technicals" in captured["query"]
+
+
 def test_get_watchlist_empty_watchlist_skips_strategies_query(monkeypatch):
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
     calls = []
@@ -15553,6 +15657,22 @@ def test_load_full_watchlist_missing_draft_thesis_is_none(monkeypatch):
     assert result[0]["draft_thesis"] is None
 
 
+def test_load_full_watchlist_selects_price_data_stale(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): current_price used to be selected with
+    # no staleness flag, so the digest's "Today's close" column rendered a
+    # months-stale value at face value with no indication.
+    captured = {}
+
+    def fake_sql_to_df(q):
+        captured["query"] = q
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_notifications, "sql_to_df", fake_sql_to_df)
+    fundamentals_notifications.load_full_watchlist()
+    assert "tech.price_data_stale" in captured["query"]
+    assert "SELECT close, price_data_stale FROM fundamentals_technicals" in captured["query"]
+
+
 def test_build_daily_digest_content_empty_watchlist():
     subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content([])
     assert "nothing on the watchlist" in subject.lower()
@@ -15616,6 +15736,41 @@ def test_build_daily_digest_content_negative_change_gets_neg_class():
     rows = [{"company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01", "first_seen_price": 100.0, "current_price": 90.0, "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None}]
     _, _, html_body = fundamentals_notifications.build_daily_digest_content(rows)
     assert 'class="neg"' in html_body
+
+
+def test_build_daily_digest_content_stale_price_shows_stale_marker_not_a_pct(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): current_price used to be rendered at
+    # face value with no staleness check at all -- a real watchlist company showed
+    # "+66.1%" off a close that was actually 3.6 months old, under a column
+    # literally labeled "Today's close". watchlist_exit.py already refuses to
+    # judge a price move when price_data_stale is set; this pins the digest doing
+    # the same instead of showing a misleading percentage.
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 54.50, "current_price": 90.51, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None, "price_data_stale": True,
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "stale price" in text_body
+    assert "66.1%" not in text_body
+    assert 'class="stale"' in html_body
+    assert "66.1%" not in html_body
+
+
+def test_build_daily_digest_content_fresh_price_unaffected_by_stale_flag(monkeypatch):
+    rows = [
+        {
+            "company_master_id": "nse:FOO", "company_name": "Foo Co", "first_seen_at": "2026-08-01",
+            "first_seen_price": 100.0, "current_price": 110.0, "alert_count": 1, "narrative_text": "n",
+            "suggested_watch_until": None, "price_data_stale": False,
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "(+10.0%)" in text_body
+    assert 'class="pos"' in html_body
+    assert "stale" not in text_body
 
 
 def test_build_daily_digest_content_escapes_html_special_characters():

@@ -87,7 +87,17 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     Nothing is ever deleted: pass status=None for every row regardless of status, or
     a specific status ('stale'/'invalidated'/'price_flagged') to see just that
     bucket -- fundamentals/screens/watchlist_exit.py's own status/status_reason
-    columns are the source of truth, not re-derived here."""
+    columns are the source of truth, not re-derived here.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): current_price used to be rendered at face
+    value with no indication it could be stale -- watchlist_exit.py was already
+    fixed (2026-08-15) to refuse judging a price move when fundamentals_
+    technicals.price_data_stale is set, but that fix stopped at the status-
+    evaluation layer; this list view (and the digest email's identical join) never
+    selected the flag at all. Confirmed live: a real watchlist company showed a
+    current_price frozen 3.6 months stale with nothing marking it as such. Now
+    selected so callers (the frontend, the digest) can render it distinctly rather
+    than as if it were today's close."""
     params: tuple = ()
     where_clause = ""
     if status is not None:
@@ -97,7 +107,8 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
         f"""
         SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
                w.alert_count, w.narrative_text, w.suggested_watch_until, w.narrative_generated_at,
-               w.status, w.status_reason, l1.company_name, tech.close AS current_price
+               w.status, w.status_reason, l1.company_name, tech.close AS current_price,
+               tech.price_data_stale
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
@@ -105,7 +116,7 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
-            SELECT close FROM fundamentals_technicals
+            SELECT close, price_data_stale FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
