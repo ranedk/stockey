@@ -10381,7 +10381,12 @@ def test_build_announcement_row_builds_expected_fields_for_pit_sast():
     assert row["isin"] == "INE000A01011"
     assert row["filing_type"] == "pit_sast"
     assert row["headline"] == "Closure of trading window"
-    assert row["disclosure_date"] == pd.Timestamp("2026-08-01T10:15:00", tz="UTC").date()
+    assert row["disclosure_date"] == pd.Timestamp("2026-08-01").date()
+    # BUG FOUND LIVE 2026-08-18 (re-audit): DissemDT is IST wall-clock with no
+    # timezone marker of its own -- must be localized to Asia/Kolkata and converted
+    # to UTC (10:15 IST -> 04:45 UTC), not tagged tz="UTC" directly (which would
+    # store it as 10:15 UTC, 5h30m later than the true instant).
+    assert row["announcement_timestamp"] == pd.Timestamp("2026-08-01 04:45:00", tz="UTC")
     assert row["quantity"] is None
     assert row["insider_name"] is None
     assert row["transaction_type"] is None
@@ -10390,6 +10395,23 @@ def test_build_announcement_row_builds_expected_fields_for_pit_sast():
     assert row["enrichment_status"] == "pending"
     assert row["sources"] == "bse"
     assert json.loads(row["raw_json"]) == raw
+
+
+def test_parse_bse_timestamp_converts_ist_to_utc_across_midnight():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the "T" branch used to tag the parsed
+    # value tz="UTC" directly instead of localizing it as IST -- confirmed live, a
+    # real DissemDT of "2025-02-21T17:43:39.95" was being stored as 17:43 UTC
+    # (would be 23:13 IST, implausible for a company's own disclosure timestamp)
+    # instead of the correct 12:13 UTC. A late-evening IST filing crossing midnight
+    # when converted is the clearest proof the conversion (not just a relabel) is
+    # actually happening: 23:50 IST on 2026-08-01 is 18:20 UTC the SAME day (IST is
+    # UTC+5:30 -- only pre-05:30-IST filings would cross into the prior UTC day).
+    result = fundamentals_bse_announcements._parse_bse_timestamp("2026-08-01T23:50:00")
+    assert result == pd.Timestamp("2026-08-01 18:20:00", tz="UTC")
+
+    # A pre-market IST filing (02:00 IST) converts to the PRIOR UTC calendar day.
+    result_crosses_day = fundamentals_bse_announcements._parse_bse_timestamp("2026-08-01T02:00:00")
+    assert result_crosses_day == pd.Timestamp("2026-07-31 20:30:00", tz="UTC")
 
 
 def test_build_announcement_row_handles_missing_timestamp_gracefully():
@@ -10670,8 +10692,68 @@ def test_run_bse_l3_detection_returns_early_on_empty_universe(monkeypatch):
 
     result = fundamentals_bse_announcements.run_bse_l3_detection()
 
-    assert result == {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+    assert result == {
+        "rows": 0, "announcement_rows": 0, "result_calendar_rows": 0, "merged_rows": 0,
+        "companies_scanned": 0, "companies_total": 0, "failed_companies": [], "blocked": False,
+    }
     assert any(e["fallback_type"] == "l3_bse_no_l1_universe" for e in fallback_events)
+
+
+def test_bse_announcements_main_does_not_crash_on_empty_universe(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the empty-universe early return was
+    # missing companies_total, which main() reads unconditionally -- a plain
+    # KeyError, crashing hardest exactly when the upstream L1 step has already
+    # failed that day.
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+    # main() also drives run_auditor_rpt_backfill() now (see its own test below) --
+    # mocked here to an empty-backlog no-op so this test stays scoped to the crash
+    # fix above, not exercising (or hitting live BSE/DB via) the backfill nibble.
+    monkeypatch.setattr(
+        fundamentals_bse_announcements,
+        "run_auditor_rpt_backfill",
+        lambda **k: {"rows": 0, "companies_scanned": 0, "companies_remaining": 0, "failed_companies": [], "blocked": False},
+    )
+
+    assert fundamentals_bse_announcements.main() == 0
+
+
+def test_bse_announcements_main_drives_the_auditor_rpt_backfill_nibble(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): run_auditor_rpt_backfill() was
+    # manual-only -- no reference in run_pipeline.py's STEPS, the crontab, or
+    # docs/DATA_INVENTORY.md -- confirmed live, 0/43 target companies backfilled to
+    # date. main() must now drive it too, bounded to BACKFILL_DAILY_LIMIT.
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
+    backfill_calls = []
+
+    def fake_backfill(**kwargs):
+        backfill_calls.append(kwargs)
+        return {"rows": 12, "companies_scanned": 5, "companies_remaining": 38, "failed_companies": [], "blocked": False}
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "run_auditor_rpt_backfill", fake_backfill)
+
+    result_code = fundamentals_bse_announcements.main()
+
+    assert result_code == 0
+    assert backfill_calls == [{"limit": fundamentals_bse_announcements.BACKFILL_DAILY_LIMIT}]
+    assert fundamentals_bse_announcements.STOCKEY_RUN_STATE["auditor_rpt_backfill"]["companies_scanned"] == 5
+
+
+def test_bse_announcements_main_backfill_failure_does_not_fail_the_run(monkeypatch):
+    # Best-effort: the daily backfill nibble erroring must not take down the
+    # regular crawl's own success -- it has its own resumable progress tracking.
+    monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: pd.DataFrame())
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: fallback_events.append(kwargs))
+
+    def raise_backfill(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "run_auditor_rpt_backfill", raise_backfill)
+
+    assert fundamentals_bse_announcements.main() == 0
+    assert any(e["fallback_type"] == "l3_bse_auditor_rpt_backfill_failed" for e in fallback_events)
 
 
 def test_run_bse_l3_detection_pulls_crawl_forward_for_fresh_results(monkeypatch):
@@ -13067,6 +13149,49 @@ def test_run_structured_extraction_happy_path(monkeypatch):
     assert json.loads(call["fields"]["structured_extraction_json"]) == extracted
     assert call["fields"]["structured_extraction_model"] == "test-model"
     assert call["fields"]["structured_extraction_schema_version"] == fundamentals_structured_extraction.SCHEMA_VERSION
+
+
+def test_run_structured_extraction_skips_paid_call_for_routine_trading_window_closure(monkeypatch):
+    # MEDIUM FINDING (re-audit 2026-08-18): "Closure of Trading Window" is the
+    # dominant pit_sast shape (402 of ~600 real rows) and virtually never carries a
+    # real transaction -- spending a paid gpt-5.4-mini call on every one contradicts
+    # the PRD's own "bounded LLM cost" justification. Must skip the model call and
+    # write the same "no transaction data" result directly.
+    monkeypatch.setattr(fundamentals_structured_extraction, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_structured_extraction, "_bootstrap_extraction_columns", lambda: None)
+    pending = pd.DataFrame(
+        [
+            {"source": "bse", "news_id": "n1", "filing_type": "pit_sast", "subcategory": "Closure of Trading Window", "ocr_text_s3_key": "k1"},
+            # case/whitespace-insensitive match
+            {"source": "bse", "news_id": "n2", "filing_type": "pit_sast", "subcategory": "  CLOSURE OF TRADING WINDOW  ", "ocr_text_s3_key": "k2"},
+            # a genuine SAST disclosure under a DIFFERENT subcategory must still go through the real model
+            {"source": "bse", "news_id": "n3", "filing_type": "pit_sast", "subcategory": "Disclosures under Reg. 29(2) of SEBI (SAST) Regulations, 2011", "ocr_text_s3_key": "k3"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_structured_extraction, "load_pending_extraction_targets", lambda limit=None: pending)
+    model_calls = []
+    monkeypatch.setattr(
+        fundamentals_structured_extraction,
+        "extract_structured_fields",
+        lambda text, filing_type, **k: model_calls.append(True) or {"disclosure_type": "sast_disclosure"},
+    )
+    monkeypatch.setattr(fundamentals_structured_extraction, "get_text_blob", lambda key: "text")
+    status_calls = []
+    monkeypatch.setattr(fundamentals_structured_extraction, "_set_extraction_result", lambda **kwargs: status_calls.append(kwargs))
+
+    result = fundamentals_structured_extraction.run_structured_extraction()
+
+    assert result["routine_pit_sast_skipped"] == 2
+    assert result["extracted"] == 1  # only n3, the genuine SAST row, called the model
+    assert len(model_calls) == 1  # the paid call happened exactly once, not 3 times
+    skipped_calls = [c for c in status_calls if c["news_id"] in ("n1", "n2")]
+    assert len(skipped_calls) == 2
+    for call in skipped_calls:
+        assert call["status"] == "done"
+        payload = json.loads(call["fields"]["structured_extraction_json"])
+        assert payload["disclosure_type"] == "trading_window_notice"
+        assert payload["transaction_type"] is None
+        assert call["fields"]["structured_extraction_model"] == "none_routine_shortcut"
 
 
 def test_run_structured_extraction_trips_circuit_breaker(monkeypatch):

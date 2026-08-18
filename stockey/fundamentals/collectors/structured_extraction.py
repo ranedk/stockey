@@ -261,6 +261,22 @@ RATING_ACTION_SCHEMA = {
 # corporates-pit feed's job (fundamentals/collectors/nse_pit.py), not OCR. This schema
 # exists for the BSE-only/redundant case, and must null out gracefully on the common
 # no-transaction-data path (already confirmed live: no hallucination on a thin notice).
+#
+# MEDIUM FINDING (re-audit 2026-08-18): "Closure of Trading Window" -- added to
+# bse_announcements.py's PIT_SAST_KEYWORDS 2026-08-10 to fix a real recall miss
+# (BSE's own SUBCATNAME for these has no "insider"/"sast" substring at all) -- is by
+# FAR the dominant pit_sast shape (402 of ~600 real rows, confirmed live), and this
+# module's own PIT_SAST_SCHEMA already null-checks confirm virtually none of them
+# ever carry a real transaction. Spending a paid gpt-5.4-mini call on every one of
+# them contradicts docs/FUNDAMENTAL_SCREENER_PRD.md's own "bounded LLM cost"
+# justification for this whole carve-out. The classification itself stays pit_sast
+# (removing the keyword would reopen the original recall gap it was added to close,
+# and evaluate_pit_sast_trigger's own disclosure_type gate already correctly refuses
+# to alert on these regardless), but run_structured_extraction() below now skips the
+# LLM call entirely for the exact-SUBCATNAME shape and writes the same "no
+# transaction data" result directly -- see PIT_SAST_ROUTINE_TRADING_WINDOW_SUBCATEGORY.
+PIT_SAST_ROUTINE_TRADING_WINDOW_SUBCATEGORY = "closure of trading window"
+
 PIT_SAST_SCHEMA = {
     "type": "object",
     "properties": {
@@ -464,7 +480,7 @@ def load_pending_extraction_targets(limit: int | None = None) -> pd.DataFrame:
     # VERSION -- ordered AFTER genuinely-new pending rows so a schema bump's
     # backlog of stale-version re-extractions can never crowd out fresh detections.
     query = """
-        SELECT source, news_id, filing_type, ocr_text_s3_key
+        SELECT source, news_id, filing_type, subcategory, ocr_text_s3_key
         FROM fundamentals_events
         WHERE ocr_status = 'done'
           AND (
@@ -505,7 +521,7 @@ def run_structured_extraction(*, limit: int | None = None, model: str = DEFAULT_
     if pending.empty:
         return {"extracted": 0, "failed": 0, "unsupported_filing_type": 0, "blocked": False}
 
-    counts = {"extracted": 0, "failed": 0, "unsupported_filing_type": 0}
+    counts = {"extracted": 0, "failed": 0, "unsupported_filing_type": 0, "routine_pit_sast_skipped": 0}
     consecutive_failures = 0
     blocked = False
 
@@ -516,6 +532,38 @@ def run_structured_extraction(*, limit: int | None = None, model: str = DEFAULT_
             continue
 
         if blocked:
+            continue
+
+        # MEDIUM FINDING (re-audit 2026-08-18): see PIT_SAST_ROUTINE_TRADING_WINDOW_
+        # SUBCATEGORY's own comment -- skips a paid gpt-5.4-mini call for the
+        # dominant, near-certainly-no-transaction pit_sast shape, writing the same
+        # "no transaction data" result the model would almost always produce anyway.
+        if row["filing_type"] == "pit_sast" and str(row.get("subcategory") or "").strip().lower() == PIT_SAST_ROUTINE_TRADING_WINDOW_SUBCATEGORY:
+            counts["routine_pit_sast_skipped"] += 1
+            synthetic = {
+                "company_name": None,
+                "disclosure_type": "trading_window_notice",
+                "insider_name": None,
+                "insider_category": None,
+                "transaction_type": None,
+                "quantity_shares": None,
+                "pct_of_holding_before": None,
+                "pct_of_holding_after": None,
+                "confidence_notes": (
+                    f"Not model-extracted -- SUBCATNAME exactly '{PIT_SAST_ROUTINE_TRADING_WINDOW_SUBCATEGORY}' "
+                    "skips the paid extraction call, see PIT_SAST_ROUTINE_TRADING_WINDOW_SUBCATEGORY's own comment."
+                ),
+            }
+            _set_extraction_result(
+                source=row["source"],
+                news_id=row["news_id"],
+                status="done",
+                fields={
+                    "structured_extraction_json": json.dumps(synthetic, ensure_ascii=False, default=str),
+                    "structured_extraction_model": "none_routine_shortcut",
+                    "structured_extraction_schema_version": SCHEMA_VERSION,
+                },
+            )
             continue
 
         try:
@@ -563,12 +611,13 @@ def main() -> int:
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "extracted": result["extracted"],
-        "rows_written": result["extracted"],
+        "rows_written": result["extracted"] + result["routine_pit_sast_skipped"],
         "failed": result["failed"],
         "unsupported_filing_type": result["unsupported_filing_type"],
+        "routine_pit_sast_skipped": result["routine_pit_sast_skipped"],
         "blocked": result["blocked"],
         "fallback_used": bool(result["failed"] or result["blocked"]),
-        "state_advanced": result["extracted"] > 0,
+        "state_advanced": result["extracted"] > 0 or result["routine_pit_sast_skipped"] > 0,
         "status": "blocked" if result["blocked"] else "ok",
     }
     print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)

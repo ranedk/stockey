@@ -472,10 +472,23 @@ def fetch_result_calendar() -> list[dict]:
 
 
 def _parse_bse_timestamp(value: str | None):
+    """BUG FOUND LIVE 2026-08-18 (re-audit): the "T" branch used to tag the parsed
+    timestamp tz="UTC" directly, but BSE's DissemDT/NEWS_DT/DT_TM values are IST
+    wall-clock with no timezone marker of their own -- confirmed live, a real
+    DissemDT of "2025-02-21T17:43:39.95" was being stored as 17:43 UTC (would be
+    23:13 IST, implausible for a company's own disclosure timestamp) instead of the
+    correct 12:13 UTC (17:43 IST, an ordinary post-market-hours filing). NSE's own
+    timestamp parsing (nse_pit.py's _parse_nse_pit_timestamp) already localizes to
+    Asia/Kolkata then converts to UTC; this now matches that. The cross-source
+    dedup merge in events_store.py picks the "earliest" announcement_timestamp
+    across sources, which was meaningless while the two sources' clocks disagreed
+    by 5h30m -- disclosure_date's date part (parsed from the same value) survives
+    either way, so this only affects the intraday time-of-day and the dedup
+    ordering that depends on it."""
     if not value:
         return None
     try:
-        return pd.Timestamp(value, tz="UTC") if "T" in value else pd.Timestamp(value)
+        return pd.Timestamp(value, tz="Asia/Kolkata").tz_convert("UTC") if "T" in value else pd.Timestamp(value)
     except (ValueError, TypeError):
         return None
 
@@ -554,7 +567,12 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
             reason="BSE L3 detection found no fundamentals_l1_universe rows to scope the crawl to.",
             error="empty L1 universe",
         )
-        return {"rows": 0, "companies_scanned": 0, "failed_companies": [], "blocked": False}
+        # BUG FOUND LIVE 2026-08-18 (re-audit): this dict was missing companies_total,
+        # which main() reads unconditionally (result["companies_total"]) -- a plain
+        # KeyError, crashing hardest exactly when the upstream L1 step has already
+        # failed that day (the one scenario this early return exists to handle
+        # gracefully). Reproduced live by monkeypatching an empty universe.
+        return {"rows": 0, "announcement_rows": 0, "result_calendar_rows": 0, "merged_rows": 0, "companies_scanned": 0, "companies_total": 0, "failed_companies": [], "blocked": False}
 
     universe = universe.join(resolve_company_identity(universe["ticker"]))
     missing_scrip = universe[universe["bse_scrip_code"].isna()]
@@ -672,13 +690,18 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
 
 # One-time 3yr auditor/RPT backfill (2026-08-13) -- see run_auditor_rpt_backfill's own
 # docstring for why this is separate from run_bse_l3_detection above (same crawl
-# machinery, different lookback and different "which companies" selection). NOT part
-# of fundamentals/run_pipeline.py's STEPS -- invoked via `python -m fundamentals.
-# collectors.bse_announcements --backfill` (see this module's __main__ guard), not
-# main(), specifically so main() stays argparse-free: run_pipeline.py calls main()
-# as a direct Python function call (importlib.import_module + module.main()), not a
-# subprocess, so adding argparse there would parse run_pipeline.py's OWN argv (e.g.
-# its --steps flag) and crash on an unrecognized option.
+# machinery, different lookback and different "which companies" selection). Not its
+# own fundamentals/run_pipeline.py STEPS entry (a module can only have one
+# STEPS-registered main()) -- main() below calls it directly too, bounded to
+# BACKFILL_DAILY_LIMIT (re-audit 2026-08-18: this used to be genuinely manual-only,
+# `python -m fundamentals.collectors.bse_announcements --backfill`, see this
+# module's __main__ guard -- that CLI path still works for an operator wanting to
+# push the backlog faster, but main()'s own daily nibble means it no longer NEEDS
+# to be run manually). main() itself stays argparse-free regardless: run_pipeline.py
+# calls main() as a direct Python function call (importlib.import_module +
+# module.main()), not a subprocess, so adding argparse there would parse
+# run_pipeline.py's OWN argv (e.g. its --steps flag) and crash on an unrecognized
+# option -- the __main__ guard's argparse is for the standalone CLI path only.
 BACKFILL_PROGRESS_TABLE = "fundamentals_bse_backfill_progress"
 # ~3 years, matches fundamentals/screens/l1_universe.py's AUDITOR_CHANGE_LOOKBACK_YEARS.
 BACKFILL_LOOKBACK_DAYS = 1095
@@ -696,6 +719,19 @@ BACKFILL_LOOKBACK_DAYS = 1095
 # them in the FIFO queue ever gets attempted (see load_pending_ocr_targets's own
 # ordering fix in ocr_pipeline.py for the other half of this fix).
 BACKFILL_FILING_TYPES = ("auditor_change", "related_party_transaction")
+# BUG FOUND LIVE 2026-08-18 (re-audit): run_auditor_rpt_backfill() was manual-only
+# -- no reference in run_pipeline.py's STEPS, the crontab, or docs/DATA_INVENTORY.md
+# -- so the 43 BSE-only companies it exists to cover would never finish (confirmed
+# live: 0/43 backfilled to date). run_pipeline.py's STEPS list can only call one
+# main() per module, so this can't be its own STEPS entry without a new module;
+# instead main() below also drives it directly, bounded to a small daily limit --
+# the function's own docstring already establishes it as "resumable-across-
+# invocations", exactly the shape a small-per-day cron nibble needs. At this limit
+# the current 43-company backlog clears in ~9 daily runs; each company costs
+# 1-6 BSE requests at the 10s rate-gate floor (BSE_ANNOUNCEMENTS_PAGE_SIZE
+# pagination over a 3yr window), so 5/day bounds this step's added runtime to
+# roughly 1-5 minutes worst case.
+BACKFILL_DAILY_LIMIT = max(env.int("BSE_AUDITOR_RPT_BACKFILL_DAILY_LIMIT", 5), 1)
 
 _BACKFILL_PROGRESS_TABLE_STATEMENT = """
     CREATE TABLE IF NOT EXISTS fundamentals_bse_backfill_progress (
@@ -831,6 +867,22 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
 def main() -> int:
     global STOCKEY_RUN_STATE
     result = run_bse_l3_detection()
+
+    # BUG FOUND LIVE 2026-08-18 (re-audit): see BACKFILL_DAILY_LIMIT's own comment --
+    # this used to be manual-only and never ran. Best-effort, bounded, and must not
+    # fail the regular daily crawl above if it errors -- the backfill has its own
+    # circuit breaker and resumable progress tracking, so a failure here just means
+    # zero progress this run, not lost state.
+    backfill_result: dict[str, object] = {}
+    try:
+        backfill_result = run_auditor_rpt_backfill(limit=BACKFILL_DAILY_LIMIT)
+    except Exception as exc:  # noqa: BLE001 -- best-effort daily nibble only
+        _record_fallback(
+            "l3_bse_auditor_rpt_backfill_failed",
+            reason="The daily auditor/RPT 3yr backfill nibble failed; progress tracking is resumable, so this just means zero progress this run.",
+            error=exc,
+        )
+
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "rows": result["rows"],
@@ -839,7 +891,8 @@ def main() -> int:
         "companies_total": result["companies_total"],
         "failed_companies": result["failed_companies"],
         "blocked": result["blocked"],
-        "fallback_used": bool(result["failed_companies"]) or result["blocked"],
+        "auditor_rpt_backfill": backfill_result,
+        "fallback_used": bool(result["failed_companies"]) or result["blocked"] or bool(backfill_result.get("failed_companies")) or bool(backfill_result.get("blocked")),
         "state_advanced": result["rows"] > 0,
         # a tripped breaker is a partial-success run, not a failed one -- whatever was
         # collected before the trip is real and already upserted; it just isn't "ok"
