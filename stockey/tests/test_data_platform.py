@@ -11414,6 +11414,39 @@ def test_build_pit_rows_maps_a_real_captured_disclosure():
     assert json.loads(row["raw_json"])["disclosure"]["NameOfThePerson"] == "SUDEEP NAGAR"
 
 
+def test_build_pit_rows_disclosure_date_uses_broadcast_not_intimation_date():
+    # MEDIUM FINDING (re-audit 2026-08-18): disclosure_date used to be
+    # DateOfIntimationToCompany (when the insider told the company about their
+    # trade), while bse_announcements.py's own disclosure_date is DissemDT's date
+    # (when the exchange disseminated the announcement) -- confirmed live to differ
+    # by 3 days on a real filing, so events_store.py's cross-source dedup match key
+    # (isin, filing_type, disclosure_date), an EXACT date match, missed the
+    # intended "BSE detects, NSE fills in quantity" merge. Must now use
+    # announcement_timestamp's own date, matching BSE's semantic -- proven here by
+    # an intimation date that's 3 days earlier than the broadcast date.
+    rows = fundamentals_nse_pit.build_pit_rows(
+        symbol="X", company_master_id="nse:X", isin=None,
+        app_id="1", xml_url="https://nsearchives.nseindia.com/x.xml", detail_url=None,
+        broadcast_datetime="14-Aug-2026 10:00:00",  # dissemination: Aug 14
+        filing={"DateOfFiling": "2026-08-11"},
+        disclosures=[{"NameOfThePerson": "A", "DateOfIntimationToCompany": "2026-08-11"}],  # intimation: Aug 11
+    )
+    # 14-Aug-2026 10:00 IST -> 04:30 UTC, still Aug 14
+    assert rows[0]["disclosure_date"] == date(2026, 8, 14)  # broadcast date, NOT the Aug 11 intimation date
+    # the precise intimation date is preserved, just not as the top-level disclosure_date
+    assert json.loads(rows[0]["raw_json"])["disclosure"]["DateOfIntimationToCompany"] == "2026-08-11"
+
+
+def test_build_pit_rows_disclosure_date_falls_back_to_filing_date_when_no_broadcast():
+    rows = fundamentals_nse_pit.build_pit_rows(
+        symbol="X", company_master_id="nse:X", isin=None,
+        app_id="1", xml_url="https://nsearchives.nseindia.com/x.xml", detail_url=None, broadcast_datetime=None,
+        filing={"DateOfFiling": "2026-08-11"},
+        disclosures=[{"NameOfThePerson": "A", "DateOfIntimationToCompany": "2026-08-09"}],
+    )
+    assert rows[0]["disclosure_date"] == date(2026, 8, 11)  # filing date, not the Aug 9 intimation date
+
+
 def test_build_pit_rows_falls_back_to_resolved_isin_when_xbrl_has_none():
     rows = fundamentals_nse_pit.build_pit_rows(
         symbol="X", company_master_id="nse:X", isin="INE_RESOLVED",
@@ -11660,6 +11693,70 @@ def test_run_nse_pit_detection_happy_path(monkeypatch):
         "nse-pit:https://nsearchives.nseindia.com/1.xml:1",
         "nse-pit:https://nsearchives.nseindia.com/2.xml:1",
     }
+
+
+def test_run_nse_pit_detection_records_fallback_for_empty_market_wide_list(monkeypatch):
+    # MEDIUM FINDING (re-audit 2026-08-18): an empty market-wide list used to report
+    # status:"ok" identically to "real data, nothing matched our universe today" --
+    # nothing distinguished a genuinely healthy zero from NSE's own endpoint
+    # silently regressing to empty (the exact shape this module's own docstring
+    # documents for the pre-migration corporates-pit endpoint's silent deprecation).
+    universe = _nse_universe_df(1)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
+    _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosures", lambda page, **k: [])
+    monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": 0, "merged": 0})
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **k: fallback_events.append(k))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result["rows"] == 0
+    assert any(e["fallback_type"] == "l3_nse_pit_empty_market_wide_list" for e in fallback_events)
+
+
+def test_run_nse_pit_detection_records_fallback_for_missing_xml_url(monkeypatch):
+    universe = _nse_universe_df(1)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
+    _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
+    filings = [{"symbol": "TICK1", "appId": "1", "xmlFileName": None, "ixbrl": "u1", "broadcastDateTime": "01-Aug-2026 10:00"}]
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosures", lambda page, **k: filings)
+    monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": 0, "merged": 0})
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **k: fallback_events.append(k))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result["filings_scanned"] == 0  # skipped, not counted as scanned
+    matches = [e for e in fallback_events if e["fallback_type"] == "l3_nse_pit_missing_xml_url"]
+    assert len(matches) == 1
+    assert matches[0]["metadata"]["ticker"] == "TICK1"
+
+
+def test_run_nse_pit_detection_records_fallback_for_zero_disclosure_contexts(monkeypatch):
+    universe = _nse_universe_df(1)
+    monkeypatch.setattr(fundamentals_nse_pit, "load_l1_universe_tickers", lambda: universe)
+    monkeypatch.setattr(fundamentals_nse_pit, "resolve_company_identity", lambda tickers: _nse_identity_df(tickers))
+    _patch_fake_playwright(monkeypatch, _FakeNsePitPage())
+    filings = [{"symbol": "TICK1", "appId": "1", "xmlFileName": "https://nsearchives.nseindia.com/1.xml", "ixbrl": "u1", "broadcastDateTime": "01-Aug-2026 10:00"}]
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosures", lambda page, **k: filings)
+    monkeypatch.setattr(fundamentals_nse_pit, "fetch_pit_disclosure_xml", lambda page, *, xml_url: xml_url)
+    # A real filing, but zero Disclosure* contexts found -- e.g. a genuinely
+    # disclosure-less filing, or parse_pit_xbrl's regex breaking on a schema change.
+    monkeypatch.setattr(fundamentals_nse_pit, "parse_pit_xbrl", lambda xml_text: {"filing": {"DateOfFiling": "2026-08-01"}, "disclosures": []})
+    monkeypatch.setattr(fundamentals_nse_pit, "upsert_events_with_dedup", lambda rows: {"inserted": 0, "merged": 0})
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_nse_pit, "record_local_fallback_event", lambda **k: fallback_events.append(k))
+
+    result = fundamentals_nse_pit.run_nse_pit_detection()
+
+    assert result["filings_scanned"] == 1  # still counted as scanned -- the fetch succeeded
+    assert result["rows"] == 0
+    matches = [e for e in fallback_events if e["fallback_type"] == "l3_nse_pit_no_disclosure_contexts"]
+    assert len(matches) == 1
+    assert matches[0]["metadata"]["ticker"] == "TICK1"
 
 
 def test_run_nse_pit_detection_trips_circuit_breaker(monkeypatch):

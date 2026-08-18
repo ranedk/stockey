@@ -255,17 +255,29 @@ def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app
     ISINCode over the L1-identity-resolved one when both are present -- NSE's own
     filing is the more authoritative, live source for it."""
     resolved_isin = filing.get("ISINCode") or isin
-    disclosure_date = _parse_nse_pit_date(filing.get("DateOfFiling"))
+    filing_date = _parse_nse_pit_date(filing.get("DateOfFiling"))
     announcement_timestamp = _parse_nse_pit_timestamp(broadcast_datetime)
+    # MEDIUM FINDING (re-audit 2026-08-18): disclosure_date here used to be
+    # DateOfIntimationToCompany (per-disclosure, when the insider told the company
+    # about their trade) while bse_announcements.py's own disclosure_date is
+    # DissemDT's date (when the exchange disseminated/broadcast the announcement) --
+    # two genuinely different dates for the SAME underlying disclosure, confirmed
+    # live to differ by 3 days on a real filing. events_store.py's cross-source
+    # dedup match key is (isin, filing_type, disclosure_date) with EXACT date
+    # equality (see its own docstring on why -- disclosure_date is TEXT, not DATE,
+    # so even a tolerance-window match would need a real migration first), so the
+    # intended "BSE detects, NSE fills in quantity" merge missed in the normal
+    # case. Now uses announcement_timestamp's own date (broadcast/dissemination),
+    # matching BSE's semantic exactly, falling back to the filing's own
+    # DateOfFiling when broadcast_datetime isn't parseable. The more precise
+    # DateOfIntimationToCompany is NOT lost -- it's still in raw_json's own
+    # disclosure dict below for anyone who needs the finer distinction.
+    disclosure_date = (announcement_timestamp.date() if announcement_timestamp is not None else None) or filing_date
     rows = []
     for idx, disclosure in enumerate(disclosures, start=1):
         insider_name = disclosure.get("NameOfThePerson")
         transaction_type = disclosure.get("SecuritiesAcquiredOrDisposedTransactionType")
         quantity_raw = disclosure.get("SecuritiesAcquiredOrDisposedNumberOfSecurity")
-        # DateOfIntimationToCompany is the per-disclosure equivalent of the old
-        # endpoint's `intimDt` (date of intimation to company, distinct from the
-        # filing's own broadcast/exchange-dissemination timestamp).
-        intimation_date = _parse_nse_pit_date(disclosure.get("DateOfIntimationToCompany")) or disclosure_date
         rows.append(
             {
                 "source": "nse",
@@ -290,7 +302,7 @@ def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app
                 "filing_type": "pit_sast",
                 "headline": f"{insider_name or 'Insider'} -- {transaction_type or 'transaction'} of {quantity_raw or '?'} shares",
                 "subcategory": disclosure.get("CategoryOfPerson"),
-                "disclosure_date": intimation_date,
+                "disclosure_date": disclosure_date,
                 "announcement_timestamp": announcement_timestamp,
                 "quantity": to_number(quantity_raw),
                 "insider_name": insider_name,
@@ -365,6 +377,24 @@ def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None
                 )
                 return {"rows": 0, "filings_scanned": 0, "failed_filings": [], "blocked": True}
 
+            # MEDIUM FINDING (re-audit 2026-08-18): an empty market-wide list used to
+            # report status:"ok" identically to "we got real data but nothing matched
+            # our universe today" (both being ordinary, expected outcomes on plenty of
+            # days) -- nothing distinguished a genuinely healthy zero from NSE's own
+            # endpoint silently regressing to empty (the exact pre-migration failure
+            # mode this module's own docstring already documents for the OLD
+            # corporates-pit endpoint). Confirmed live: fundamentals_events has zero
+            # NSE-sourced rows in production to date, so nothing would have caught a
+            # silent regression here yet.
+            if not filings:
+                _record_fallback(
+                    "l3_nse_pit_empty_market_wide_list",
+                    reason="NSE corporates-pit-gg returned zero filings market-wide for this window -- possibly a genuine quiet window, but also the exact shape the old corporates-pit endpoint's silent deprecation looked like.",
+                    error="empty filings list",
+                    severity="warn",
+                    metadata={"from_date": str(from_date.date()), "to_date": str(to_date.date())},
+                )
+
             matched = [f for f in filings if str(f.get("symbol", "")).upper() in universe_by_symbol]
 
             for position, filing_meta in enumerate(matched):
@@ -376,6 +406,17 @@ def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None
                 company_master_id, isin = universe_by_symbol[symbol]
                 xml_url = filing_meta.get("xmlFileName")
                 if not xml_url:
+                    # MEDIUM FINDING (re-audit 2026-08-18): used to skip silently -- a
+                    # matched filing with no xmlFileName at all is unexpected (every
+                    # real filing observed live has had one), worth surfacing rather
+                    # than silently vanishing with no trace in filings_scanned or
+                    # failed_filings.
+                    _record_fallback(
+                        "l3_nse_pit_missing_xml_url",
+                        reason="A matched NSE PIT filing had no xmlFileName in its market-wide list metadata -- skipped, not counted as scanned or failed.",
+                        error="missing xmlFileName",
+                        metadata={"ticker": symbol, "app_id": filing_meta.get("appId")},
+                    )
                     continue
                 try:
                     xml_text = fetch_pit_disclosure_xml(page, xml_url=xml_url)
@@ -407,6 +448,20 @@ def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None
 
                 consecutive_failures = 0
                 filings_scanned += 1
+                # MEDIUM FINDING (re-audit 2026-08-18): a successfully-fetched filing
+                # whose XBRL parsed to zero disclosure contexts used to silently
+                # contribute zero rows with no trace -- could be a genuinely
+                # disclosure-less filing, but could also be parse_pit_xbrl's regex-
+                # based extraction breaking on an NSE XBRL/serialization shape change
+                # (see that function's own docstring on how fragile the Chrome-DOM-
+                # serialization workaround is). Worth surfacing either way.
+                if not parsed["disclosures"]:
+                    _record_fallback(
+                        "l3_nse_pit_no_disclosure_contexts",
+                        reason="A matched, successfully-fetched NSE PIT filing's XBRL parsed to zero Disclosure* contexts -- contributed zero rows.",
+                        error="no disclosure contexts found",
+                        metadata={"ticker": symbol, "app_id": filing_meta.get("appId"), "xml_url": xml_url},
+                    )
                 rows.extend(
                     build_pit_rows(
                         symbol=symbol,
