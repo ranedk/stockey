@@ -451,16 +451,35 @@ def extract_structured_fields(ocr_text: str, filing_type: str, *, model: str = D
 
 
 def load_pending_extraction_targets(limit: int | None = None) -> pd.DataFrame:
+    # BUG FOUND LIVE 2026-08-18: SCHEMA_VERSION bumps (the RESULTS_SCHEMA reshape
+    # 1->2, the mixed-rating-action fix 2->3) had no re-extraction path at all --
+    # this only ever re-selected NULL/pending rows, so an already-'done' row under
+    # an old schema version stayed on that old shape forever. Confirmed live: 42 of
+    # 43 stored `results` extractions were still on the dead v1 field names
+    # (revenue_comparison_rs_lakh, no finance-costs/D&A fields at all) --
+    # evaluate_results_trigger reads the current v3 field names and got nothing,
+    # so the decline/turnaround triggers were structurally dead for 42/43 real
+    # results filings. Now also re-selects a 'done' row whose own recorded
+    # structured_extraction_schema_version is older than the current SCHEMA_
+    # VERSION -- ordered AFTER genuinely-new pending rows so a schema bump's
+    # backlog of stale-version re-extractions can never crowd out fresh detections.
     query = """
         SELECT source, news_id, filing_type, ocr_text_s3_key
         FROM fundamentals_events
         WHERE ocr_status = 'done'
-          AND (structured_extraction_status IS NULL OR structured_extraction_status = 'pending')
-        ORDER BY load_ts ASC NULLS LAST
+          AND (
+                structured_extraction_status IS NULL
+             OR structured_extraction_status = 'pending'
+             OR (structured_extraction_status = 'done'
+                 AND (structured_extraction_schema_version IS NULL OR structured_extraction_schema_version < %s))
+          )
+        ORDER BY
+            CASE WHEN structured_extraction_status IS NULL OR structured_extraction_status = 'pending' THEN 0 ELSE 1 END,
+            load_ts ASC NULLS LAST
     """
     if limit:
         query += f" LIMIT {int(limit)}"
-    return sql_to_df(query)
+    return sql_to_df(query, params=(SCHEMA_VERSION,))
 
 
 def _set_extraction_result(*, source: str, news_id: str, status: str, fields: dict | None = None) -> None:

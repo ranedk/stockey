@@ -12407,12 +12407,36 @@ def test_load_pending_extraction_targets_queries_expected_filters(monkeypatch):
 
     def fake_sql_to_df(query, **kwargs):
         captured["query"] = query
+        captured["params"] = kwargs.get("params")
         return pd.DataFrame()
 
     monkeypatch.setattr(fundamentals_structured_extraction, "sql_to_df", fake_sql_to_df)
     fundamentals_structured_extraction.load_pending_extraction_targets()
     assert "ocr_status = 'done'" in captured["query"]
     assert "structured_extraction_status IS NULL OR structured_extraction_status = 'pending'" in captured["query"]
+    # BUG FOUND LIVE 2026-08-18: SCHEMA_VERSION bumps had no re-extraction path --
+    # an already-'done' row under an old schema version stayed on that shape
+    # forever. Confirmed live: 42/43 stored results extractions were still on the
+    # dead v1 field names.
+    assert "structured_extraction_schema_version IS NULL OR structured_extraction_schema_version < %s" in captured["query"]
+    assert captured["params"] == (fundamentals_structured_extraction.SCHEMA_VERSION,)
+
+
+def test_load_pending_extraction_targets_prioritizes_fresh_pending_over_stale_schema(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_structured_extraction, "sql_to_df", fake_sql_to_df)
+    fundamentals_structured_extraction.load_pending_extraction_targets()
+    # the stale-schema re-extraction branch orders AFTER genuinely-new pending
+    # rows (CASE WHEN ... THEN 0 ELSE 1 END), so a schema bump's re-extraction
+    # backlog can never crowd out fresh detections.
+    assert "CASE WHEN structured_extraction_status IS NULL OR structured_extraction_status = 'pending' THEN 0 ELSE 1 END" in captured["query"]
+    assert captured["params"] == (fundamentals_structured_extraction.SCHEMA_VERSION,)
 
 
 def test_run_structured_extraction_returns_early_when_nothing_pending(monkeypatch):
