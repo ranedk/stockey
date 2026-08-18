@@ -15002,12 +15002,44 @@ def test_sync_watchlist_from_alerts_corrects_first_seen_at_backward_when_earlier
     assert result["new_candidates"] == 0  # still not treated as a brand-new candidate
 
 
-def test_sync_watchlist_from_alerts_never_moves_first_seen_at_forward(monkeypatch):
-    # the mirror case: the aggregate's first_alert_date must never push first_seen_at
-    # LATER than what's already stored, even if it happens to differ.
+def test_sync_watchlist_from_alerts_moves_first_seen_at_forward_when_the_supporting_alert_is_gone(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the original backward-only design
+    # (de4aab6) assumed MIN(alert_date) only ever reveals an earlier true history,
+    # but alert_date is mutable for a fixed (source, news_id, trigger_type) key -- a
+    # later reclassification or deletion (e.g. this session's own capital_raise
+    # false-positive remediation, which deleted spurious alerts) can make the true
+    # earliest SURVIVING alert later than the frozen stored value, with nothing left
+    # to support the old one. Confirmed live: 3 real companies post-remediation. Must
+    # now correct FORWARD too, not stay frozen at an unsupported date, and must be
+    # visible via the same fallback event as the backward case.
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
         [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-10"), "last_alert_date": pd.Timestamp("2026-08-10"), "alert_count": 1}]
+    )
+    monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
+    existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
+    monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: existing)
+    monkeypatch.setattr(fundamentals_watchlist, "load_price_near", lambda cid, date: 55.0)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_watchlist, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+    upserts = []
+    monkeypatch.setattr(fundamentals_watchlist, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_watchlist.sync_watchlist_from_alerts()
+
+    written = upserts[0][0].iloc[0]
+    assert written["first_seen_at"] == pd.Timestamp("2026-08-10")  # corrected forward to the true earliest surviving alert
+    assert written["first_seen_price"] == 55.0  # re-derived for the corrected date, not left at 100.0
+    fallback_calls = [(a, k) for a, k in fallback_events if a and a[0] == "watchlist_first_seen_at_corrected"]
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0][1]["metadata"]["direction"] == "forward"
+    assert result["new_candidates"] == 0  # still not treated as a brand-new candidate
+
+
+def test_sync_watchlist_from_alerts_leaves_first_seen_at_alone_when_unchanged(monkeypatch):
+    monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
+    alert_summary = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
@@ -15019,7 +15051,7 @@ def test_sync_watchlist_from_alerts_never_moves_first_seen_at_forward(monkeypatc
     fundamentals_watchlist.sync_watchlist_from_alerts()
 
     written = upserts[0][0].iloc[0]
-    assert written["first_seen_at"] == pd.Timestamp("2026-08-01")  # unchanged, not pushed to 08-10
+    assert written["first_seen_at"] == pd.Timestamp("2026-08-01")  # true first alert date matches stored -- no correction, no live price lookup
     assert written["first_seen_price"] == 100.0
 
 
@@ -17208,27 +17240,27 @@ def test_check_stale_none_when_no_suggested_watch_until():
 
 
 def test_evaluate_exit_status_priority_invalidated_over_price_and_stale():
-    row = {"first_seen_price": 100.0, "current_price": 160.0, "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
+    row = {"first_seen_price": 100.0, "current_price": 160.0, "technicals_as_of_date": date(2026, 8, 13), "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
     history = [{"trigger_type": "rating_confirms_deleveraging", "alert_date": date(2026, 7, 1)}, {"trigger_type": "rating_downgrade", "alert_date": date(2026, 8, 1)}]
-    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, history, today=date(2026, 8, 13))
+    status, reason, _stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, history, today=date(2026, 8, 13))
     assert status == "invalidated"
 
 
 def test_evaluate_exit_status_priority_price_over_stale():
-    row = {"first_seen_price": 100.0, "current_price": 160.0, "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
-    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    row = {"first_seen_price": 100.0, "current_price": 160.0, "technicals_as_of_date": date(2026, 8, 13), "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
+    status, reason, _stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
     assert status == "price_flagged"
 
 
 def test_evaluate_exit_status_falls_through_to_stale():
-    row = {"first_seen_price": 100.0, "current_price": 110.0, "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
-    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    row = {"first_seen_price": 100.0, "current_price": 110.0, "technicals_as_of_date": date(2026, 8, 13), "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None}
+    status, reason, _stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
     assert status == "stale"
 
 
 def test_evaluate_exit_status_active_when_nothing_fires():
-    row = {"first_seen_price": 100.0, "current_price": 110.0, "suggested_watch_until": date(2026, 12, 1), "last_alert_at": None, "narrative_generated_at": None}
-    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    row = {"first_seen_price": 100.0, "current_price": 110.0, "technicals_as_of_date": date(2026, 8, 13), "suggested_watch_until": date(2026, 12, 1), "last_alert_at": None, "narrative_generated_at": None}
+    status, reason, _stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
     assert status == "active"
     assert reason is None
 
@@ -17240,11 +17272,37 @@ def test_evaluate_exit_status_stale_price_data_falls_through_to_next_check_not_m
     # "no move happened" from it -- it correctly falls through to the next
     # (weaker-evidence) check instead of silently landing on 'active'.
     row = {
-        "first_seen_price": 100.0, "current_price": 160.0, "price_data_stale": True,
+        "first_seen_price": 100.0, "current_price": 160.0, "price_data_stale": True, "technicals_as_of_date": date(2026, 8, 13),
         "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None,
     }
-    status, reason = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    status, reason, stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
     assert status == "stale"  # not "price_flagged" (masked) and not "active" (silently fine)
+    assert stale_skip is True
+
+
+def test_evaluate_exit_status_aged_out_technicals_row_treated_as_stale_even_without_the_flag():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): a company that drops out of the L1
+    # universe stops getting new technicals rows entirely -- its last row's
+    # price_data_stale flag is frozen at whatever it was on its LAST processed run
+    # and never recomputed. A real +60% move must not be trusted off a technicals
+    # row that's 22 days old, even though price_data_stale itself is False/absent.
+    row = {
+        "first_seen_price": 100.0, "current_price": 160.0, "technicals_as_of_date": date(2026, 7, 22),
+        "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None,
+    }
+    status, reason, stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    assert status == "stale"  # not "price_flagged" -- the aged-out row must not be trusted
+    assert stale_skip is True
+
+
+def test_evaluate_exit_status_missing_technicals_row_treated_as_stale():
+    row = {
+        "first_seen_price": 100.0, "current_price": 160.0, "technicals_as_of_date": None,
+        "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None,
+    }
+    status, reason, stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
+    assert status == "stale"
+    assert stale_skip is True
 
 
 def test_load_trigger_type_history_by_company_groups_by_company(monkeypatch):
@@ -17270,15 +17328,16 @@ def test_run_watchlist_exit_evaluation_empty_watchlist(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
     monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: pd.DataFrame())
     result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
-    assert result == {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0}
+    assert result == {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "price_data_stale_skips": 0}
 
 
 def test_run_watchlist_exit_evaluation_upserts_status_per_company(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    today = pd.Timestamp.now(tz="UTC").date()
     watchlist = pd.DataFrame(
         [
-            {"company_master_id": "nse:FOO", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 110.0},
-            {"company_master_id": "nse:BAR", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 200.0},
+            {"company_master_id": "nse:FOO", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 110.0, "technicals_as_of_date": today},
+            {"company_master_id": "nse:BAR", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 200.0, "technicals_as_of_date": today},
         ]
     )
     monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: watchlist)
@@ -17291,11 +17350,37 @@ def test_run_watchlist_exit_evaluation_upserts_status_per_company(monkeypatch):
     assert result["companies"] == 2
     assert result["active"] == 1
     assert result["price_flagged"] == 1
+    assert result["price_data_stale_skips"] == 0
     df, table, kwargs = calls[0]
     assert table == "fundamentals_watchlist"
     assert kwargs["unique_keys"] == ["company_master_id"]
     statuses = dict(zip(df["company_master_id"], df["status"]))
     assert statuses == {"nse:FOO": "active", "nse:BAR": "price_flagged"}
+
+
+def test_run_watchlist_exit_evaluation_records_fallback_and_count_for_stale_price_skips(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): a stale-price skip used to be completely
+    # silent -- no telemetry at all, and main() hardcoded fallback_used: False
+    # regardless of what actually happened.
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    watchlist = pd.DataFrame(
+        [
+            {"company_master_id": "nse:FOO", "first_seen_price": 100.0, "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None, "current_price": 160.0, "technicals_as_of_date": None},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: watchlist)
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_trigger_type_history_by_company", lambda: {})
+    monkeypatch.setattr(fundamentals_watchlist_exit, "upsert_to_db", lambda df, table, **k: None)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
+
+    assert result["price_data_stale_skips"] == 1
+    assert result["price_flagged"] == 0  # a real +60% move, but must not be trusted off no technicals row
+    assert len(fallback_events) == 1
+    assert fallback_events[0][0][0] == "watchlist_exit_price_check_skipped_stale_data"
+    assert fallback_events[0][1]["metadata"]["company_master_ids"] == ["nse:FOO"]
 
 
 def test_run_watchlist_exit_evaluation_uses_live_first_seen_price_not_frozen_column(monkeypatch):
@@ -17314,7 +17399,7 @@ def test_run_watchlist_exit_evaluation_uses_live_first_seen_price_not_frozen_col
             {
                 "company_master_id": "nse:FOO", "first_seen_price": 40.0, "first_seen_at": "2026-01-01",
                 "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None,
-                "current_price": 110.0,
+                "current_price": 110.0, "technicals_as_of_date": pd.Timestamp.now(tz="UTC").date(),
             },
         ]
     )
@@ -17339,6 +17424,35 @@ def test_run_watchlist_exit_evaluation_uses_live_first_seen_price_not_frozen_col
     assert df.iloc[0]["status"] == "active"  # not price_flagged -- proves the live 95.0 was used, not 40.0
 
 
+def test_run_watchlist_exit_evaluation_writes_live_first_seen_price_back_to_the_table(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the live-re-derived first_seen_price (this
+    # function's own 2026-08-15 fix for split/bonus drift) was only ever used
+    # in-memory to decide this function's own status -- never written back, so
+    # notifications.py's digest and api/queries.py (both reading the stored column
+    # directly) kept showing the stale, un-corrected value. Live: BLKASHYAP showed
+    # -4.0% in the digest vs -1.5% in this evaluator for the same two prices.
+    monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
+    watchlist = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:FOO", "first_seen_price": 40.0, "first_seen_at": "2026-01-01",
+                "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None,
+                "current_price": 110.0, "technicals_as_of_date": pd.Timestamp.now(tz="UTC").date(),
+            },
+        ]
+    )
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: watchlist)
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_trigger_type_history_by_company", lambda: {})
+    monkeypatch.setattr(fundamentals_watchlist_exit, "load_price_near", lambda *_a, **_k: 95.0)
+    calls = []
+    monkeypatch.setattr(fundamentals_watchlist_exit, "upsert_to_db", lambda df, table, **k: calls.append((df, table, k)))
+
+    fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
+
+    df, _table, _kwargs = calls[0]
+    assert df.iloc[0]["first_seen_price"] == 95.0  # the live value, not the stale stored 40.0
+
+
 def test_run_watchlist_exit_evaluation_falls_back_to_stored_price_when_live_lookup_empty(monkeypatch):
     # load_price_near returning None (no price history that early) must fall back to the stored column,
     # not silently treat the company as having no first_seen_price at all.
@@ -17348,7 +17462,7 @@ def test_run_watchlist_exit_evaluation_falls_back_to_stored_price_when_live_look
             {
                 "company_master_id": "nse:FOO", "first_seen_price": 100.0, "first_seen_at": "2026-01-01",
                 "last_alert_at": None, "suggested_watch_until": None, "narrative_generated_at": None,
-                "current_price": 200.0,
+                "current_price": 200.0, "technicals_as_of_date": pd.Timestamp.now(tz="UTC").date(),
             },
         ]
     )

@@ -7,12 +7,15 @@ decision (no separate human "promote to watchlist" step) -- distinct from
 fundamentals_l4_thesis (l4_thesis.py), which stays the deliberate, human-only
 "portfolio" act (create_thesis/resolve_thesis) this table never touches or implies.
 
-sync_watchlist_from_alerts() is idempotent and non-destructive: first_seen_at/
-first_seen_price are set once, the first time a company appears, and never
-overwritten on later syncs (re-running this after new alerts land must not rewrite
-"when/at what price did we start watching this" -- that's the whole point of the
-field). last_alert_at and alert_count are recomputed fresh from
-fundamentals_l3_alerts every run, so they can never drift from the alert table itself.
+sync_watchlist_from_alerts() is idempotent: first_seen_at/first_seen_price are set
+once, the first time a company appears, and normally never overwritten on later
+syncs (re-running this after new alerts land must not rewrite "when/at what price
+did we start watching this" -- that's the whole point of the field) -- EXCEPT when
+the true earliest alert has moved (either direction, see
+_record_first_seen_corrected_fallback's own docstring), in which case it's
+corrected and the correction is recorded as a fallback event, never silent.
+last_alert_at and alert_count are recomputed fresh from fundamentals_l3_alerts
+every run, so they can never drift from the alert table itself.
 
 first_seen_price prefers advisory_adjusted_ohlcv_daily (stockey's own adjusted
 PRIMARY series, keyed by bare ticker -- see fundamentals/screens/technicals.py's own
@@ -91,17 +94,41 @@ def load_existing_watchlist() -> pd.DataFrame:
     return sql_to_df("SELECT company_master_id, first_seen_at, first_seen_price FROM fundamentals_watchlist")
 
 
-def _record_first_seen_corrected_fallback(company_master_id: str, *, old_first_seen_at, new_first_seen_at) -> None:
-    _record_fallback(
-        "watchlist_first_seen_at_corrected",
-        reason=(
+def _record_first_seen_corrected_fallback(company_master_id: str, *, old_first_seen_at, new_first_seen_at, direction: str) -> None:
+    if direction == "backward":
+        reason = (
             "A newly-visible alert (usually an identity-resolution backfill on an "
             "older fundamentals_l3_alerts row) is earlier than this company's "
             "previously-frozen first_seen_at -- corrected backward to the true "
-            "earliest alert date, never forward."
-        ),
-        error="first_seen_at moved earlier",
-        metadata={"company_master_id": company_master_id, "old_first_seen_at": str(old_first_seen_at), "new_first_seen_at": str(new_first_seen_at)},
+            "earliest alert date."
+        )
+        error = "first_seen_at moved earlier"
+    else:
+        # BUG FOUND LIVE 2026-08-18 (re-audit): the original backward-only design
+        # (de4aab6) deliberately never moved first_seen_at forward, reasoning that
+        # MIN(alert_date) only ever reveals a genuinely EARLIER true history (an
+        # identity backfill attaching an older alert). But alert_date is mutable for
+        # a fixed (source, news_id, trigger_type) key -- a later reclassification or
+        # deletion of the alert that originally justified first_seen_at (e.g. this
+        # session's own capital_raise classifier false-positive remediation, which
+        # deleted 10 spurious alerts) can make the true earliest SURVIVING alert
+        # later than the frozen stored value, with no alert left to support it.
+        # Confirmed live: 3 real companies (post-remediation) now predate every
+        # alert that still exists. Allowed forward now too -- staying frozen at a
+        # date nothing supports anymore is worse than moving to the true earliest
+        # remaining alert -- but always via this fallback event, never silently.
+        reason = (
+            "The true earliest alert for this company is now LATER than the "
+            "previously-frozen first_seen_at -- the alert that originally justified "
+            "it no longer exists (reclassified or deleted), most likely by a data "
+            "remediation. Corrected forward to the true earliest surviving alert."
+        )
+        error = "first_seen_at moved later"
+    _record_fallback(
+        "watchlist_first_seen_at_corrected",
+        reason=reason,
+        error=error,
+        metadata={"company_master_id": company_master_id, "old_first_seen_at": str(old_first_seen_at), "new_first_seen_at": str(new_first_seen_at), "direction": direction},
     )
 
 
@@ -159,11 +186,14 @@ def sync_watchlist_from_alerts() -> dict[str, object]:
             # Confirmed live: 9/38 watchlist rows had first_seen_at == last_alert_at
             # (i.e. frozen at the MOST RECENT alert, not the first) -- one case
             # (AAREYDRUGS) was off by over a year. Only ever corrected BACKWARD
-            # (earlier) when true history surfaces, never moved forward.
-            if pd.notna(stored_first_seen_at) and true_first_alert_date < stored_first_seen_at:
+            # (earlier) when true history surfaces -- see _record_first_seen_
+            # corrected_fallback's own docstring for the forward direction, added
+            # 2026-08-18, and why it's needed too now.
+            if pd.notna(stored_first_seen_at) and true_first_alert_date != stored_first_seen_at:
                 first_seen_at = true_first_alert_date
                 first_seen_price = load_price_near(company_master_id, first_seen_at)
-                _record_first_seen_corrected_fallback(company_master_id, old_first_seen_at=stored_first_seen_at, new_first_seen_at=first_seen_at)
+                direction = "backward" if true_first_alert_date < stored_first_seen_at else "forward"
+                _record_first_seen_corrected_fallback(company_master_id, old_first_seen_at=stored_first_seen_at, new_first_seen_at=first_seen_at, direction=direction)
             else:
                 first_seen_at = stored_first_seen_at
                 first_seen_price = existing.loc[company_master_id, "first_seen_price"]

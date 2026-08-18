@@ -47,11 +47,25 @@ import json
 
 import pandas as pd
 
+from fundamentals.screens.technicals import STALE_PRICE_THRESHOLD_DAYS
 from fundamentals.screens.watchlist import _ensure_watchlist_table, load_price_near
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.fallback_telemetry import record_local_fallback_event
 
 SYNC_SOURCE_NAME = "fundamentals.screens.watchlist_exit"
 STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        source="fundamentals_technicals",
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 # Direct contradictions only -- deliberately NOT exhaustive. A trigger_type not
 # listed here (institutional_first_entry, capital_raise, auditor_change,
@@ -117,11 +131,11 @@ def load_watchlist_for_exit_evaluation() -> pd.DataFrame:
         """
         SELECT w.company_master_id, w.first_seen_price, w.first_seen_at, w.last_alert_at,
                w.suggested_watch_until, w.narrative_generated_at,
-               tech.close AS current_price, tech.price_data_stale,
+               tech.close AS current_price, tech.price_data_stale, tech.as_of_date AS technicals_as_of_date,
                a.latest_alert_load_ts
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
-            SELECT close, price_data_stale FROM fundamentals_technicals
+            SELECT close, price_data_stale, as_of_date FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
@@ -174,6 +188,31 @@ def _check_invalidated(trigger_history: list[dict]) -> str | None:
     return None
 
 
+def _price_data_is_effectively_stale(price_data_stale, technicals_as_of_date, *, today) -> bool:
+    """True if fundamentals_technicals.price_data_stale itself says so, OR the
+    underlying technicals row is too old to trust regardless of what the flag says.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): the flag alone is defeated two ways --
+    (1) 572 fundamentals_technicals rows written before price_data_stale existed at
+    all have it NULL; bool(None) is False, silently read as "not stale". (2) a
+    company that drops out of the L1 universe stops getting new technicals rows
+    entirely (run_technicals_refresh only processes the current universe), so its
+    latest row's flag value is frozen at whatever it was on its LAST processed run
+    and never recomputed as more time passes -- confirmed live, a real watchlisted
+    company's exit evaluator was treating a 22-day-old close as current. Falls back
+    to checking the row's own as_of_date (the actual price date, not when the job
+    ran) against STALE_PRICE_THRESHOLD_DAYS -- the same threshold technicals.py's
+    own freshness check uses -- so an old row is caught even when its flag is stale
+    or missing. No technicals row at all (as_of_date is NaT) is also treated as
+    stale -- can't judge freshness without one."""
+    if price_data_stale:
+        return True
+    as_of = pd.to_datetime(technicals_as_of_date, errors="coerce")
+    if pd.isna(as_of):
+        return True
+    return (pd.Timestamp(today) - as_of.normalize()).days > STALE_PRICE_THRESHOLD_DAYS
+
+
 def _check_price_flagged(first_seen_price, current_price, *, price_data_stale=False) -> str | None:
     """None if not flagged, else a human-readable reason. None (not a guessed 0%)
     when either price is missing -- same discipline every price computation in this
@@ -186,7 +225,11 @@ def _check_price_flagged(first_seen_price, current_price, *, price_data_stale=Fa
     like ~0% change, masking exactly the "look again" signal this check exists to
     raise. A stale price can't be trusted to judge a real move either way, so this
     now declines to flag OR clear a flag from it -- same as the existing
-    missing-price case just above, not a new failure mode."""
+    missing-price case just above, not a new failure mode.
+
+    price_data_stale here is expected to already be _price_data_is_effectively_
+    stale()'s result, not the raw column -- see that function's own docstring for
+    why the raw flag alone isn't enough."""
     if price_data_stale:
         return None
     if not isinstance(first_seen_price, (int, float)) or not isinstance(current_price, (int, float)) or first_seen_price == 0:
@@ -230,22 +273,28 @@ def _check_stale(suggested_watch_until, latest_alert_load_ts, narrative_generate
     return f"Suggested watch window ended {suggested_watch_until} with no new alert since."
 
 
-def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tuple[str, str | None]:
-    """(status, reason) for one company -- 'active' with reason=None unless one of
-    the three conditions fires, checked in priority order (see module docstring)."""
+def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tuple[str, str | None, bool]:
+    """(status, reason, price_data_stale_skip) for one company -- 'active' with
+    reason=None unless one of the three conditions fires, checked in priority order
+    (see module docstring). price_data_stale_skip is True whenever the price check
+    was declined because the price data is effectively stale (see
+    _price_data_is_effectively_stale) -- surfaced so the batch caller can record
+    fallback telemetry for a condition that used to be entirely silent (re-audit
+    2026-08-18)."""
     invalidated_reason = _check_invalidated(trigger_history)
     if invalidated_reason:
-        return "invalidated", invalidated_reason
+        return "invalidated", invalidated_reason, False
 
-    price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"), price_data_stale=bool(row.get("price_data_stale")))
+    price_data_stale = _price_data_is_effectively_stale(row.get("price_data_stale"), row.get("technicals_as_of_date"), today=today)
+    price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"), price_data_stale=price_data_stale)
     if price_reason:
-        return "price_flagged", price_reason
+        return "price_flagged", price_reason, False
 
     stale_reason = _check_stale(row.get("suggested_watch_until"), row.get("latest_alert_load_ts"), row.get("narrative_generated_at"), today=today)
     if stale_reason:
-        return "stale", stale_reason
+        return "stale", stale_reason, price_data_stale
 
-    return "active", None
+    return "active", None, price_data_stale
 
 
 def run_watchlist_exit_evaluation() -> dict[str, object]:
@@ -253,7 +302,7 @@ def run_watchlist_exit_evaluation() -> dict[str, object]:
 
     watchlist = load_watchlist_for_exit_evaluation()
     if watchlist.empty:
-        return {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0}
+        return {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "price_data_stale_skips": 0}
 
     trigger_history_by_company = load_trigger_type_history_by_company()
     today = pd.Timestamp.now(tz="UTC").date()
@@ -261,6 +310,7 @@ def run_watchlist_exit_evaluation() -> dict[str, object]:
 
     rows = []
     counts = {"active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0}
+    price_data_stale_skips: list[str] = []
     for _, row in watchlist.iterrows():
         row_dict = row.to_dict()
         company_master_id = row_dict["company_master_id"]
@@ -271,19 +321,44 @@ def run_watchlist_exit_evaluation() -> dict[str, object]:
         live_first_seen_price = load_price_near(company_master_id, row_dict.get("first_seen_at"))
         if live_first_seen_price is not None:
             row_dict["first_seen_price"] = live_first_seen_price
-        status, reason = evaluate_exit_status(row_dict, trigger_history_by_company.get(company_master_id, []), today=today)
+        status, reason, price_data_stale_skip = evaluate_exit_status(row_dict, trigger_history_by_company.get(company_master_id, []), today=today)
         counts[status] += 1
+        if price_data_stale_skip:
+            price_data_stale_skips.append(company_master_id)
         rows.append(
             {
                 "company_master_id": company_master_id,
                 "status": status,
                 "status_reason": reason,
                 "status_updated_at": load_ts,
+                # BUG FOUND LIVE 2026-08-18 (re-audit): the live-re-derived
+                # first_seen_price above (this function's own 2026-08-15 fix for
+                # split/bonus drift) was only ever used in-memory to decide THIS
+                # function's own status -- never written back, so notifications.py's
+                # digest and api/queries.py (which both read the stored column
+                # directly) kept showing the stale, un-corrected value. Live: BLKASHYAP
+                # showed -4.0% in the digest vs -1.5% in this evaluator for the same
+                # two prices. row_dict["first_seen_price"] is always populated here --
+                # either the live value, or (when the live lookup came back empty) the
+                # already-correct stored value it fell back to -- so this is never a
+                # guessed write.
+                "first_seen_price": row_dict["first_seen_price"],
             }
         )
 
     upsert_to_db(pd.DataFrame(rows), "fundamentals_watchlist", unique_keys=["company_master_id"])
-    return {"companies": len(rows), **counts}
+    # BUG FOUND LIVE 2026-08-18 (re-audit): a stale-price skip used to be completely
+    # silent -- no telemetry at all, and main() hardcoded fallback_used: False
+    # regardless. AAREYDRUGS was +66% off its stale basis on a real run, exactly the
+    # "look again" case this whole mechanism exists to raise, suppressed invisibly.
+    if price_data_stale_skips:
+        _record_fallback(
+            "watchlist_exit_price_check_skipped_stale_data",
+            reason="Price-move exit check skipped for these companies because their price data is effectively stale (flag set, missing, or the underlying technicals row is too old to trust) -- not evaluated for price_flagged this run.",
+            error="price data effectively stale",
+            metadata={"company_master_ids": price_data_stale_skips, "count": len(price_data_stale_skips)},
+        )
+    return {"companies": len(rows), **counts, "price_data_stale_skips": len(price_data_stale_skips)}
 
 
 def main() -> int:
@@ -297,7 +372,11 @@ def main() -> int:
         "invalidated": result["invalidated"],
         "price_flagged": result["price_flagged"],
         "stale": result["stale"],
-        "fallback_used": False,
+        # BUG FOUND LIVE 2026-08-18 (re-audit): hardcoded False regardless of what
+        # actually happened this run -- stale-price skips are the one real fallback
+        # condition this module can hit, and it was invisible both at the per-row
+        # level (see run_watchlist_exit_evaluation's own fix) and here.
+        "fallback_used": result["price_data_stale_skips"] > 0,
         "state_advanced": result["companies"] > 0,
         "status": "ok",
     }
