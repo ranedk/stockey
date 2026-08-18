@@ -80,6 +80,18 @@ BSE_HEADERS = {"User-Agent": _UA, "Referer": "https://www.bseindia.com/", "Accep
 
 RESULTS_TABLE = "bseindia_ohlcv"
 BSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS = max(env.int("BSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+# BUG FOUND LIVE 2026-08-18 (re-audit): run_bse_bhavcopy_collection() had no
+# per-run bound, unlike every comparable backfill in this codebase (e.g.
+# fundamentals/collectors/ocr_pipeline.py's DEFAULT_BATCH_LIMIT). With only 3 days
+# of history present against the 365-day lookback (the backfill has never actually
+# completed), the next cron run would produce ~250-260 missing weekday candidates
+# at the 10s BSE_MIN_REQUEST_INTERVAL_SECONDS floor -- ~45 minutes inside
+# complete_data.sh, delaying every step scheduled after it in the same run. First-
+# cut default (documented placeholder, same "easy to tune once reviewed" treatment
+# l3_triggers.py's RESULTS_DECLINE_THRESHOLD_PCT and others already get): 60
+# dates/run (~10 minutes worst case) makes real backfill progress across
+# consecutive daily runs without dominating complete_data.sh's total runtime.
+BSE_BHAVCOPY_MAX_DATES_PER_RUN = max(env.int("BSE_BHAVCOPY_MAX_DATES_PER_RUN", 60), 1)
 # BSE's UDiFF-format bhavcopy is only available from this date onward (confirmed live
 # 2026-08-15: dates before this return a 200 with an HTML "not found" page, not a CSV) --
 # a backfill request older than this is never fetchable via this URL pattern.
@@ -362,7 +374,22 @@ def run_bse_bhavcopy_collection(*, lookback_days: int | None = None) -> dict[str
     2026-08-15, before this had ever run unattended). bseindia_ohlcv's own contents
     plus bseindia_non_trading_dates ARE the complete dedup state, checked directly --
     no separate store/redis dedup layer needed, since this is one lightweight
-    request per missing date, not a heavy CDP download."""
+    request per missing date, not a heavy CDP download.
+
+    end = today - 1 matches NSE's own bhavcopy_downloader.py exactly (same reason:
+    the exchange's own bhavcopy for TODAY isn't published yet when this runs).
+    BUT this collector, unlike NSE's, has no downstream same-day catch-up: NSE
+    symbols get a further same-day freshness boost from data/dhanlive/
+    ohlcv_reconcile.py (18:45 IST, backfills from Dhan's own broker feed, which DOES
+    cover today), while BSE-only companies (this collector's whole reason for
+    existing, see module docstring) have no Dhan symbol at all -- confirmed live,
+    dhan_bse_id populated / dhan_nse_id NULL for all 43 target companies -- so they
+    structurally can never get same-day pricing the way NSE companies do. Not fixed
+    here (there is no BSE-side same-day broker feed in this codebase to reconcile
+    against), but now explicitly documented rather than silently assumed to match
+    NSE's effective freshness -- a digest/report comparing a T close for NSE
+    companies against a T-1 close for BSE-only ones side by side should account for
+    this, not treat the two as equally fresh."""
     ensure_ohlcv_table()
     today = datetime.now().date()
     start = today - timedelta(days=lookback_days if lookback_days is not None else BSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS)
@@ -377,10 +404,25 @@ def run_bse_bhavcopy_collection(*, lookback_days: int | None = None) -> dict[str
         if d.weekday() < 5 and d not in existing and d not in known_non_trading
     ]
     if not missing_candidates:
-        return {"days_written": 0, "rows_written": 0, "non_trading_days": 0, "failed_days": [], "blocked": False, "candidate_dates": 0}
+        return {"days_written": 0, "rows_written": 0, "non_trading_days": 0, "failed_days": [], "blocked": False, "candidate_dates": 0, "total_missing_dates": 0}
+
+    total_missing = len(missing_candidates)
+    missing_candidates = missing_candidates[:BSE_BHAVCOPY_MAX_DATES_PER_RUN]
+    if total_missing > len(missing_candidates):
+        _record_fallback(
+            "bse_bhavcopy_backlog_capped",
+            reason=(
+                f"{total_missing} missing dates found, more than BSE_BHAVCOPY_MAX_DATES_PER_RUN "
+                f"({BSE_BHAVCOPY_MAX_DATES_PER_RUN}) -- only the oldest {len(missing_candidates)} attempted "
+                "this run to bound total runtime; the rest stay candidates for the next run(s)."
+            ),
+            error="backlog exceeds one run's own item cap",
+            metadata={"total_missing": total_missing, "attempted_this_run": len(missing_candidates)},
+        )
 
     result = collect_dates(missing_candidates)
     result["candidate_dates"] = len(missing_candidates)
+    result["total_missing_dates"] = total_missing
     return result
 
 
@@ -395,7 +437,12 @@ def main() -> int:
         "non_trading_days": result["non_trading_days"],
         "failed_days": result["failed_days"],
         "blocked": result["blocked"],
-        "fallback_used": bool(result["failed_days"]) or result["blocked"],
+        "candidate_dates": result["candidate_dates"],
+        "total_missing_dates": result["total_missing_dates"],
+        # BUG FOUND LIVE 2026-08-18 (re-audit): backlog capping (BSE_BHAVCOPY_MAX_
+        # DATES_PER_RUN) is now a real fallback condition too, not just failures/
+        # blocking.
+        "fallback_used": bool(result["failed_days"]) or result["blocked"] or result["candidate_dates"] < result["total_missing_dates"],
         "state_advanced": result["rows_written"] > 0,
         "status": "blocked" if result["blocked"] else "ok",
     }

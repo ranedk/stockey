@@ -2922,6 +2922,52 @@ def test_run_bse_bhavcopy_collection_only_fetches_actually_missing_dates(monkeyp
     assert result["candidate_dates"] == 1
 
 
+def test_run_bse_bhavcopy_collection_caps_dates_per_run_and_records_fallback(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): no per-run bound at all -- with only 3
+    # days of history present against the 365-day lookback (the backfill has never
+    # completed), the next cron run would produce ~250-260 missing weekday
+    # candidates at the 10s rate-gate floor, ~45 minutes inside complete_data.sh.
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_EARLIEST_DATE", date(2024, 1, 1))
+    monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: set())
+    monkeypatch.setattr(bse_bhavcopy, "load_known_non_trading_dates", lambda: set())
+    monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_MAX_DATES_PER_RUN", 2)
+
+    class _FakeNow:
+        @staticmethod
+        def date():
+            return date(2026, 8, 15)  # a Friday
+
+    class _FakeDatetime:
+        @staticmethod
+        def now():
+            return _FakeNow()
+
+    monkeypatch.setattr(bse_bhavcopy, "datetime", _FakeDatetime)
+    fetched = []
+
+    def fake_collect_dates(dates, **k):
+        fetched.extend(dates)
+        return {"days_written": len(dates), "rows_written": 0, "non_trading_days": 0, "failed_days": [], "blocked": False}
+
+    monkeypatch.setattr(bse_bhavcopy, "collect_dates", fake_collect_dates)
+    fallback_events = []
+    monkeypatch.setattr(bse_bhavcopy, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    # 5 weekdays missing (08-11 Mon .. 08-14 Thu, end is always today-1) but capped to 2.
+    result = bse_bhavcopy.run_bse_bhavcopy_collection(lookback_days=10)
+
+    assert len(fetched) == 2  # only the oldest 2, not all of them
+    assert fetched == sorted(fetched)  # oldest-first
+    assert result["candidate_dates"] == 2
+    assert result["total_missing_dates"] > 2
+    assert len(fallback_events) == 1
+    assert fallback_events[0][0][0] == "bse_bhavcopy_backlog_capped"
+    assert fallback_events[0][1]["metadata"]["attempted_this_run"] == 2
+
+
 def test_bse_bhavcopy_main_returns_nonzero_exit_code_when_blocked(monkeypatch):
     # found live 2026-08-15: main() always `return 0` regardless of a circuit-breaker
     # trip, so data.download_runner.py's exit-code-only classify_run_status() could
@@ -2932,7 +2978,7 @@ def test_bse_bhavcopy_main_returns_nonzero_exit_code_when_blocked(monkeypatch):
     monkeypatch.setattr(
         bse_bhavcopy,
         "run_bse_bhavcopy_collection",
-        lambda: {"days_written": 0, "rows_written": 0, "non_trading_days": 0, "failed_days": ["2026-08-10", "2026-08-11", "2026-08-12"], "blocked": True, "candidate_dates": 3},
+        lambda: {"days_written": 0, "rows_written": 0, "non_trading_days": 0, "failed_days": ["2026-08-10", "2026-08-11", "2026-08-12"], "blocked": True, "candidate_dates": 3, "total_missing_dates": 3},
     )
     assert bse_bhavcopy.main() == 1
 
@@ -2943,7 +2989,7 @@ def test_bse_bhavcopy_main_returns_zero_exit_code_when_not_blocked(monkeypatch):
     monkeypatch.setattr(
         bse_bhavcopy,
         "run_bse_bhavcopy_collection",
-        lambda: {"days_written": 1, "rows_written": 4900, "non_trading_days": 0, "failed_days": [], "blocked": False, "candidate_dates": 1},
+        lambda: {"days_written": 1, "rows_written": 4900, "non_trading_days": 0, "failed_days": [], "blocked": False, "candidate_dates": 1, "total_missing_dates": 1},
     )
     assert bse_bhavcopy.main() == 0
 
