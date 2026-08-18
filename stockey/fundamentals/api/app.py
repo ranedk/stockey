@@ -102,6 +102,14 @@ def watchlist_detail(company_master_id: str) -> dict:
     return result
 
 
+@app.get("/api/drafts")
+def drafts() -> list[dict]:
+    """Every CANDIDATE-ONLY draft L4 thesis for a currently-active watchlist company
+    -- see queries.get_draft_theses's own docstring for why this exists (same data
+    the digest email already sends, previously not reachable via the API at all)."""
+    return queries.get_draft_theses()
+
+
 @app.get("/api/sectors")
 def sectors() -> list[dict]:
     return queries.get_sectors()

@@ -14620,12 +14620,36 @@ def test_get_universe_empty_returns_empty_companies(monkeypatch):
 
 def test_get_watchlist_attaches_strategies_per_company(monkeypatch):
     df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
-    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: df)
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise", "rating_downgrade"]})
 
     result = fundamentals_api_queries.get_watchlist()
 
     assert result[0]["strategies"] == ["capital_raise", "rating_downgrade"]
+    assert result[0]["draft_thesis"] is None
+
+
+def test_get_watchlist_attaches_draft_thesis_per_company(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: draft L4 theses were never exposed via the API at
+    # all -- notifications.py's digest email already shows them (load_full_watchlist
+    # does this exact per-company join).
+    watchlist_df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
+    draft_df = pd.DataFrame([{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 55}])
+
+    def fake_sql_to_df(q, params=None):
+        return draft_df if "fundamentals_l4_thesis_draft" in q else watchlist_df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist()
+
+    assert result[0]["draft_thesis"]["prediction_text"] == "p"
+    assert result[0]["draft_thesis"]["confidence_score"] == 55
 
 
 def test_get_watchlist_empty_watchlist_skips_strategies_query(monkeypatch):
@@ -14639,7 +14663,11 @@ def test_get_watchlist_empty_watchlist_skips_strategies_query(monkeypatch):
 
 def test_get_watchlist_company_with_no_strategies_gets_empty_list(monkeypatch):
     df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 0}])
-    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: df)
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
 
     result = fundamentals_api_queries.get_watchlist()
@@ -14658,9 +14686,10 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
         [{"source": "bse", "news_id": "n1", "trigger_type": "insider_buy", "origin": "rule", "alert_date": date(2026, 8, 1), "reasoning": "r", "status": "new", "evidence_bundle_json": json.dumps({"event": {"headline": "h"}})}]
     )
     thesis_df = pd.DataFrame()
+    draft_df = pd.DataFrame([{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 72}])
 
-    calls = {"watchlist": watchlist_df, "alerts": alerts_df, "thesis": thesis_df}
-    call_order = iter(["watchlist", "alerts", "thesis"])
+    calls = {"watchlist": watchlist_df, "alerts": alerts_df, "thesis": thesis_df, "draft": draft_df}
+    call_order = iter(["watchlist", "alerts", "thesis", "draft"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: {"ticker": "FOO"})
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: {"close": 100})
@@ -14677,6 +14706,57 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
     assert result["sector_context"] == {"sector_code": "IN01"}
     assert result["portfolio"] == []
     assert result["signal_pointers"] == [{"signal_type": "rating_action", "value": "downgraded"}]
+    # BUG FOUND LIVE 2026-08-17: draft L4 theses were never exposed via the API at
+    # all -- notifications.py's digest email already shows them.
+    assert result["draft_thesis"]["prediction_text"] == "p"
+    assert result["draft_thesis"]["confidence_score"] == 72
+
+
+def test_get_watchlist_detail_draft_thesis_none_when_no_draft(monkeypatch):
+    watchlist_df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 1}])
+    calls = {"watchlist": watchlist_df, "alerts": pd.DataFrame(), "thesis": pd.DataFrame(), "draft": pd.DataFrame()}
+    call_order = iter(["watchlist", "alerts", "thesis", "draft"])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
+    monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: None)
+    monkeypatch.setattr(fundamentals_api_queries, "get_stock_signal_pointers", lambda cmid: [])
+
+    result = fundamentals_api_queries.get_watchlist_detail("nse:FOO")
+
+    assert result["draft_thesis"] is None
+
+
+def test_get_draft_theses_returns_active_watchlist_drafts(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: draft L4 theses (fundamentals_l4_thesis_draft) are
+    # generated daily and shown in the digest email (notifications.py's own
+    # load_full_watchlist), but were never exposed anywhere in this API.
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["query"] = q
+        return pd.DataFrame([{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 80}])
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_api_queries.get_draft_theses()
+
+    assert result == [{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 80}]
+    assert "fundamentals_l4_thesis_draft" in captured["query"]
+    assert "w.status = 'active'" in captured["query"]
+
+
+def test_get_draft_theses_empty_when_none(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_api_queries.get_draft_theses() == []
+
+
+def test_api_drafts_route_returns_queries_result(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_draft_theses", lambda: [{"company_master_id": "nse:FOO", "prediction_text": "p"}])
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/drafts")
+    assert r.status_code == 200
+    assert r.json() == [{"company_master_id": "nse:FOO", "prediction_text": "p"}]
 
 
 def test_get_sectors_groups_watched_companies_by_sector(monkeypatch):

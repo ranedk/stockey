@@ -121,9 +121,43 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     # 2026-08-13: strategy badges per row -- was previously just a bare alert_count,
     # the same gap fixed on the digest email (notifications.py's load_full_watchlist).
     strategies_by_company = load_satisfied_strategies_by_company()
+    # BUG FOUND LIVE 2026-08-17: draft L4 theses (fundamentals_l4_thesis_draft) are
+    # generated daily and shown in the digest email (notifications.py's own
+    # load_full_watchlist does this exact join), but were never exposed anywhere in
+    # this API -- the frontend had no way to show what the email already tells a
+    # human. CANDIDATE ONLY, same as the email: never implies anything was saved to
+    # fundamentals_l4_thesis.
+    drafts_by_company = _load_draft_theses_by_company()
     for row in watchlist:
         row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
+        row["draft_thesis"] = drafts_by_company.get(row["company_master_id"])
     return watchlist
+
+
+def _load_draft_theses_by_company() -> dict[str, dict]:
+    """JSON-safe (see module docstring's _clean_records rationale -- confidence_score/
+    target_date/generated_at can round-trip as NaN/Timestamp otherwise) draft L4
+    theses for every currently-active watchlist company, keyed by company_master_id.
+    Same join fundamentals/screens/l4_thesis_draft.py's own load_current_drafts_by_
+    company() uses for the digest email; not reused directly here because that
+    function's raw .to_dict("records") isn't run through _clean_records()."""
+    df = sql_to_df(
+        """
+        SELECT d.* FROM fundamentals_l4_thesis_draft d
+        JOIN fundamentals_watchlist w ON w.company_master_id = d.company_master_id
+        WHERE w.status = 'active'
+        """
+    )
+    return {record["company_master_id"]: record for record in _clean_records(df)}
+
+
+def get_draft_theses() -> list[dict]:
+    """Every CANDIDATE-ONLY draft L4 thesis for a currently-active watchlist company
+    (fundamentals_l4_thesis_draft, generated daily by fundamentals/screens/
+    l4_thesis_draft.py) -- same data the digest email already shows, now reachable
+    without waiting for the next email. Never implies anything was saved to the real
+    fundamentals_l4_thesis register; l4_thesis_draft.py never writes that table."""
+    return list(_load_draft_theses_by_company().values())
 
 
 def get_watchlist_detail(company_master_id: str) -> dict | None:
@@ -151,6 +185,14 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
         params=(company_master_id,),
     )
 
+    # BUG FOUND LIVE 2026-08-17: unlike get_watchlist()'s list view, the detail page
+    # didn't even try to show a draft L4 thesis -- not status-gated the way the list
+    # view's own draft lookup is (this is a single-company detail page: a company
+    # that has since left the active watchlist still shows its alerts/portfolio here,
+    # so its draft shouldn't disappear either).
+    draft_df = sql_to_df("SELECT * FROM fundamentals_l4_thesis_draft WHERE company_master_id = %s", params=(company_master_id,))
+    draft_records = _clean_records(draft_df)
+
     return {
         "watchlist": _clean_records(watchlist_df)[0],
         "alerts": alerts,
@@ -158,6 +200,7 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
         "technicals": load_latest_technicals_for_company(company_master_id),
         "sector_context": load_sector_context_for_company(company_master_id),
         "portfolio": _clean_records(thesis_df),
+        "draft_thesis": draft_records[0] if draft_records else None,
         # 2026-08-13: structured pointers (fundamentals/screens/signal_pointers.py),
         # same aggregator watch_summary.py's narrative LLM sees -- so a human viewing
         # this detail page gets the same agency-name/investor-tier/sector-growth
