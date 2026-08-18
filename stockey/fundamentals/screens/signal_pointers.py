@@ -37,20 +37,42 @@ from utils.db import sql_to_df
 SYNC_SOURCE_NAME = "fundamentals.screens.signal_pointers"
 
 
+# Twin of l3_triggers.py's own RATING_ACTION_SEVERITY_ORDER -- see module docstring
+# for why this isn't a shared import. Most-to-least severe, matching RATING_ACTION_
+# SCHEMA's own rating_action field description in structured_extraction.py exactly.
+_RATING_ACTION_SEVERITY_ORDER = ["downgraded", "placed_on_watch", "suspended", "withdrawn", "assigned", "reaffirmed", "upgraded"]
+
+
 def _resolve_rating_action(event: dict) -> str | None:
     """Twin of l3_triggers.py's _resolve_rating_action_type -- see module docstring
-    for why this isn't a shared import."""
-    action = event.get("rating_action_type")
-    if action:
-        return str(action)
+    for why this isn't a shared import.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit, same fix as l3_triggers.py's own twin): used
+    to check the flat rating_action_type column FIRST, unconditionally, bypassing
+    structured_extraction_json's own per-instrument instrument_actions breakdown
+    entirely whenever the flat column was populated -- a genuine downgrade on one
+    instrument could be silently masked by a same-filing reaffirmation on another,
+    or by a simpler, non-multi-instrument-aware ICRA-site scrape. Now takes the most
+    severe action across the flat column, JSON top-level, and every instrument_
+    actions entry, same logic as l3_triggers.py's twin."""
+    flat_action = event.get("rating_action_type")
+    flat_action = str(flat_action).lower() if flat_action else None
     raw_json = event.get("structured_extraction_json")
-    if not raw_json:
-        return None
-    try:
-        extracted = json.loads(raw_json)
-    except (TypeError, ValueError):
-        return None
-    return extracted.get("rating_action")
+    extracted = None
+    if raw_json:
+        try:
+            extracted = json.loads(raw_json)
+        except (TypeError, ValueError):
+            extracted = None
+    json_top_level = extracted.get("rating_action") if extracted else None
+    json_top_level = str(json_top_level).lower() if json_top_level else None
+    instrument_actions = (extracted.get("instrument_actions") if extracted else None) or []
+    per_instrument = [str(a.get("rating_action")).lower() for a in instrument_actions if a.get("rating_action")]
+
+    recognized = [a for a in (flat_action, json_top_level, *per_instrument) if a in _RATING_ACTION_SEVERITY_ORDER]
+    if recognized:
+        return min(recognized, key=_RATING_ACTION_SEVERITY_ORDER.index)
+    return flat_action or json_top_level
 
 
 def load_l2_signals_for_company(company_master_id: str) -> dict | None:

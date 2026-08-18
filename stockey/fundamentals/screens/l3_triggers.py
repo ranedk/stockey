@@ -56,7 +56,7 @@ import pandas as pd
 from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.screens.investor_classification import effective_tier, normalize_investor_key
-from fundamentals.screens.l1_universe import RPT_PCT_OF_REVENUE_THRESHOLD
+from fundamentals.screens.l1_universe import RPT_PCT_OF_REVENUE_THRESHOLD, rpt_is_material
 from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
@@ -182,6 +182,18 @@ def load_latest_l2_state() -> pd.DataFrame:
     )
 
 
+# Most-to-least severe, matching RATING_ACTION_SCHEMA's own rating_action field
+# description in structured_extraction.py exactly.
+RATING_ACTION_SEVERITY_ORDER = ["downgraded", "placed_on_watch", "suspended", "withdrawn", "assigned", "reaffirmed", "upgraded"]
+
+
+def _most_severe_rating_action(actions: list[str | None]) -> str | None:
+    ranked = [a for a in actions if a in RATING_ACTION_SEVERITY_ORDER]
+    if not ranked:
+        return None
+    return min(ranked, key=RATING_ACTION_SEVERITY_ORDER.index)
+
+
 def _resolve_rating_action_type(event: dict) -> str | None:
     """rating_action_type is only ever populated by the ICRA-specific enrichment
     path (fundamentals/collectors/rating_agencies.py) -- for other agencies, the
@@ -191,20 +203,42 @@ def _resolve_rating_action_type(event: dict) -> str | None:
     a company's own BSE filing states the actual rating change explicitly (previous
     rating, new rating, action taken) -- it just doesn't carry the agency's
     rationale, which genuinely does require agency-site enrichment (see
-    rating_agencies.py's own docstring). Falls back to structured_extraction_json
-    only when the dedicated column is empty, so ICRA's existing behavior (which
-    always has the column populated) is unchanged."""
-    action = event.get("rating_action_type")
-    if action:
-        return str(action)
+    rating_agencies.py's own docstring).
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): this used to check the flat
+    rating_action_type column FIRST, unconditionally -- bypassing structured_
+    extraction_json's own per-instrument instrument_actions breakdown entirely
+    whenever the flat column happened to be populated. And RATING_ACTION_SCHEMA's
+    "never collapse a mix of actions into reaffirmed/upgraded when ANY covered
+    instrument was downgraded" guarantee was enforced by PROMPT INSTRUCTION ALONE --
+    nothing here cross-checked the top-level rating_action against instrument_
+    actions' own per-instrument list, so a model that didn't follow the instruction
+    could silently mask a real downgrade. Now takes the MOST SEVERE action across
+    all three sources (flat column, JSON top-level, and every instrument_actions
+    entry) whenever at least one is a recognized severity value -- a genuine
+    downgrade on any one instrument can no longer be outvoted by a same-filing
+    reaffirmation on another, or by a simpler, non-multi-instrument-aware ICRA-site
+    scrape. Falls back to the old simple flat-then-JSON precedence only when none of
+    the candidates are a recognized vocabulary value (preserves prior behavior for
+    an unexpected/unrecognized action string)."""
+    flat_action = event.get("rating_action_type")
+    flat_action = str(flat_action).lower() if flat_action else None
     raw_json = event.get("structured_extraction_json")
-    if not raw_json:
-        return None
-    try:
-        extracted = json.loads(raw_json)
-    except (TypeError, ValueError):
-        return None
-    return extracted.get("rating_action")
+    extracted = None
+    if raw_json:
+        try:
+            extracted = json.loads(raw_json)
+        except (TypeError, ValueError):
+            extracted = None
+    json_top_level = extracted.get("rating_action") if extracted else None
+    json_top_level = str(json_top_level).lower() if json_top_level else None
+    instrument_actions = (extracted.get("instrument_actions") if extracted else None) or []
+    per_instrument = [str(a.get("rating_action")).lower() for a in instrument_actions if a.get("rating_action")]
+
+    recognized = [a for a in (flat_action, json_top_level, *per_instrument) if a in RATING_ACTION_SEVERITY_ORDER]
+    if recognized:
+        return _most_severe_rating_action(recognized)
+    return flat_action or json_top_level
 
 
 def evaluate_rating_action_trigger(event: dict, l2_row: dict | None) -> dict | None:
@@ -262,15 +296,55 @@ def _resolve_pit_transaction_fields(event: dict) -> tuple[str | None, str | None
     return extracted.get("transaction_type"), insider_name or extracted.get("insider_name")
 
 
+# insider_category ("promoter"/"kmp"/"director"/"employee"/"other", per PIT_SAST_
+# SCHEMA) -> the reasoning label evaluate_pit_sast_trigger uses, instead of a
+# hardcoded "Promoter/insider" regardless of who the filing actually named. "other"
+# and an unrecognized/missing category both fall back to a generic "Insider" label
+# -- still PIT-regulated, just not confidently one of the four named categories.
+PIT_INSIDER_CATEGORY_LABELS = {"promoter": "Promoter", "kmp": "KMP", "director": "Director", "employee": "Employee"}
+
+
+def _resolve_pit_disclosure_fields(event: dict) -> tuple[str | None, str | None]:
+    """(disclosure_type, insider_category) from structured_extraction_json -- both
+    only ever populated for BSE-sourced pit_sast rows (NSE's own rows are already
+    fully structured with no OCR/extraction step, see nse_pit.py's build_pit_rows
+    docstring, so this always returns (None, None) for them today; 0 NSE-sourced
+    pit_sast rows exist in production as of this fix)."""
+    raw_json = event.get("structured_extraction_json")
+    if not raw_json:
+        return None, None
+    try:
+        extracted = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return None, None
+    return extracted.get("disclosure_type"), extracted.get("insider_category")
+
+
 def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
+    # BUG FOUND LIVE 2026-08-18 (re-audit): this used to ignore insider_category and
+    # disclosure_type entirely, both already extracted by PIT_SAST_SCHEMA -- alerting
+    # on any transaction_type buy/sell match and hardcoding "Promoter/insider" in the
+    # reasoning regardless of who the filing actually named. Live: a real resolved
+    # SAST disclosure named a corporate acquirer under Regulation 10(6), not a
+    # promoter/KMP buy -- would have been mislabeled had its transaction_type been a
+    # plain "buy" instead of "other" (an inter-se transfer). disclosure_type is now
+    # also an explicit gate: a "trading_window_notice" (the common case -- most
+    # BSE-detected pit_sast rows are this, a routine procedural notice) never alerts
+    # even if transaction_type came back non-empty, rather than trusting a possibly
+    # spurious LLM-extracted value from a filing that structurally isn't a
+    # transaction disclosure.
+    disclosure_type, insider_category = _resolve_pit_disclosure_fields(event)
+    if disclosure_type == "trading_window_notice":
+        return None
     transaction_type_raw, insider_name = _resolve_pit_transaction_fields(event)
     transaction_type = (transaction_type_raw or "").lower()
     if not transaction_type:
         return None  # the common case -- a procedural notice with no actual trade
+    category_label = PIT_INSIDER_CATEGORY_LABELS.get(insider_category, "Insider")
     if "buy" in transaction_type:
         return {
             "trigger_type": "insider_buy",
-            "reasoning": f"Promoter/insider buy ({insider_name}) -- rarer and higher-signal than a sell, alerted regardless of prior L2 state.",
+            "reasoning": f"{category_label} buy ({insider_name}) -- rarer and higher-signal than a sell, alerted regardless of prior L2 state.",
         }
     if "sell" in transaction_type:
         direction = (l2_row.get("promoter_stake_direction") if l2_row else None) or ""
@@ -278,7 +352,7 @@ def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
             return {
                 "trigger_type": "insider_sell_surprise",
                 "reasoning": (
-                    f"Promoter/insider sell ({insider_name}) while L2's own promoter_stake_direction "
+                    f"{category_label} sell ({insider_name}) while L2's own promoter_stake_direction "
                     f"was '{direction or 'unknown'}', not already 'decreasing' -- this is new information, not "
                     "confirmation of a trend L2 had already captured."
                 ),
@@ -308,9 +382,6 @@ def _summarize_investor_tiers(investor_tiers: list[dict] | None) -> str | None:
 # per the PRD's own "version every signal definition" rule -- an LLM asked to
 # compute/eyeball growth would drift silently between runs, arithmetic on
 # already-extracted numbers won't.
-
-GROWTH_QUARTERLY_PERIOD_TYPES = {"Q1", "Q2", "Q3", "Q4"}
-GROWTH_HALF_YEARLY_PERIOD_TYPES = {"H1", "H2"}
 
 
 def compute_growth_pct(current: float | None, baseline: float | None) -> float | None:
@@ -349,46 +420,7 @@ def compute_approx_operating_margin_pct(
     return round((pat + finance_costs + depreciation_amortisation) / revenue * 100, 2)
 
 
-def infer_reporting_cadence(period_types: list[str | None]) -> str:
-    """"quarterly" if this company's own results history ever shows a Q1-Q4 period,
-    "half_yearly" if it only ever shows H1/H2, "unknown" if there's no resolved
-    period_type history yet. Checked as "any quarterly ever seen", not "most
-    recent" -- a company could legitimately show one H1 filing (e.g. a half-year
-    cumulative column alongside quarterly ones) without actually switching cadence;
-    quarterly, if ever seen, is the stronger claim about how this company reports."""
-    normalized = {(pt or "").upper() for pt in period_types if pt}
-    if normalized & GROWTH_QUARTERLY_PERIOD_TYPES:
-        return "quarterly"
-    if normalized & GROWTH_HALF_YEARLY_PERIOD_TYPES:
-        return "half_yearly"
-    return "unknown"
-
-
-def load_results_period_type_history(company_master_id: str) -> list[str | None]:
-    """Every period_type this company's own past results filings resolved to
-    (structured_extraction_json), for infer_reporting_cadence above. Company-scoped,
-    same per-company loader shape fundamentals/screens/signal_pointers.py already
-    uses throughout, not a bulk/market-wide query -- called once per candidate event
-    during rule evaluation, not once per pipeline run."""
-    df = sql_to_df(
-        """
-        SELECT structured_extraction_json
-        FROM fundamentals_events
-        WHERE company_master_id = %s AND filing_type = 'results'
-          AND structured_extraction_status = 'done' AND structured_extraction_json IS NOT NULL
-        """,
-        params=(company_master_id,),
-    )
-    if df.empty:
-        return []
-    period_types = []
-    for raw_json in df["structured_extraction_json"]:
-        try:
-            extracted = json.loads(raw_json)
-        except (TypeError, ValueError):
-            continue
-        period_types.append(extracted.get("period_type"))
-    return period_types
+RESULTS_PRIOR_PERIOD_LOOKBACK_DAYS = 550  # ~18 months -- see load_prior_same_period_results_event's own docstring
 
 
 def load_prior_same_period_results_event(company_master_id: str, *, period_type: str | None, before_disclosure_date) -> dict | None:
@@ -398,19 +430,32 @@ def load_prior_same_period_results_event(company_master_id: str, *, period_type:
     BSE's own forward calendar. Matched by period_type, not just "closest to 1 year
     back", so a Q1 filing is never compared against a Q2 one. None when period_type
     is unknown, or this is the first filing ever seen for that period_type (nothing
-    to compare against, not a guessed baseline)."""
+    to compare against, not a guessed baseline).
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): no upper bound on how far back this could
+    reach -- if a company had a genuine multi-year gap for this period_type (e.g. a
+    filing cadence change), the query would walk arbitrarily far into history and
+    silently pick up a 2+-year-old filing as "last year's" baseline.
+    compute_timing_delay_days adds exactly 365 days to whatever this returns, so a
+    2-year-old match would report results_delayed as ~365 days late -- a full extra
+    year of false lateness, not a real signal. Bounded to
+    RESULTS_PRIOR_PERIOD_LOOKBACK_DAYS (18 months -- generous slack past the
+    expected ~12 months for real-world filing-date variance, without accepting a
+    multi-year-old match); no candidate in that window now correctly returns None
+    (an unknown baseline) rather than a wrong one."""
     if not period_type:
         return None
+    lookback_start = pd.Timestamp(before_disclosure_date) - pd.Timedelta(days=RESULTS_PRIOR_PERIOD_LOOKBACK_DAYS)
     df = sql_to_df(
         """
         SELECT disclosure_date, structured_extraction_json
         FROM fundamentals_events
         WHERE company_master_id = %s AND filing_type = 'results'
           AND structured_extraction_status = 'done' AND structured_extraction_json IS NOT NULL
-          AND disclosure_date < %s
+          AND disclosure_date < %s AND disclosure_date >= %s
         ORDER BY disclosure_date DESC
         """,
-        params=(company_master_id, str(before_disclosure_date)),
+        params=(company_master_id, str(before_disclosure_date), str(lookback_start.date())),
     )
     if df.empty:
         return None
@@ -553,6 +598,26 @@ def evaluate_results_trigger(event: dict, l2_row: dict | None) -> dict | None:
                 "-- alert-worthy regardless of prior L2 state or the numbers themselves."
             ),
         }
+    # BUG FOUND LIVE 2026-08-18 (re-audit): vs_calendar_days was computed by
+    # compute_timing_delay_days above but never actually read anywhere -- a real
+    # per-event DB query (load_latest_results_calendar_event) with no observable
+    # effect. Used here as a genuine fallback (not a replacement) only when own-
+    # history has no baseline at all (e.g. this company's first-ever filing of this
+    # period_type) -- own-history stays the preferred, primary baseline per this
+    # function's own docstring, calendar is corroborating-only.
+    if (
+        delay["vs_own_history_days"] is None
+        and delay["vs_calendar_days"] is not None
+        and delay["vs_calendar_days"] > RESULTS_DELAY_THRESHOLD_DAYS
+    ):
+        return {
+            "trigger_type": "results_delayed",
+            "reasoning": (
+                f"Results filed {delay['vs_calendar_days']} days later than BSE's own forward results "
+                "calendar expected (no own-history baseline available yet for this period type) -- "
+                "alert-worthy regardless of prior L2 state or the numbers themselves."
+            ),
+        }
 
     revenue_growth_yoy = compute_growth_pct(extracted.get("revenue_current_rs_lakh"), extracted.get("revenue_yoy_rs_lakh"))
     pat_growth_yoy = compute_growth_pct(extracted.get("pat_current_rs_lakh"), extracted.get("pat_yoy_rs_lakh"))
@@ -634,12 +699,13 @@ def evaluate_auditor_change_trigger(event: dict, l2_row: dict | None) -> dict | 
 
 def evaluate_related_party_transaction_trigger(event: dict, l2_row: dict | None) -> dict | None:
     """Always alert-worthy, unconditional on L2 state, same reasoning as
-    evaluate_auditor_change_trigger above and the same gap it closes. Reuses the
-    exact is_applicable + RPT_PCT_OF_REVENUE_THRESHOLD gate fundamentals/screens/
-    l1_universe.py's own _rpt_excludes already established (SEBI LODR Regulation
-    23's own materiality threshold, not an invented number) -- a non-applicability
-    declaration or a below-threshold amount never alerts here either, matching the
-    L1 gate's own policy exactly."""
+    evaluate_auditor_change_trigger above and the same gap it closes. Reuses
+    l1_universe.py's own rpt_is_material() -- SEBI LODR Regulation 23's own
+    materiality threshold, not an invented number, and the SAME materiality
+    decision fundamentals/screens/l1_universe.py's own _rpt_excludes makes (a
+    non-applicable/below-threshold RPT never alerts here either) -- see
+    rpt_is_material's own docstring for why this now also falls back to
+    rpt_amount_rs_cr when the filing states an amount but no percentage."""
     raw_json = event.get("structured_extraction_json")
     if not raw_json:
         return None
@@ -647,20 +713,22 @@ def evaluate_related_party_transaction_trigger(event: dict, l2_row: dict | None)
         extracted = json.loads(raw_json)
     except (TypeError, ValueError):
         return None
-    if not extracted.get("is_applicable"):
+    material, basis = rpt_is_material(extracted)
+    if not material:
         return None
     pct = extracted.get("pct_of_revenue")
-    if not isinstance(pct, (int, float)) or pct < RPT_PCT_OF_REVENUE_THRESHOLD:
-        return None
     related_party_name = extracted.get("related_party_name")
     amount = extracted.get("rpt_amount_rs_cr")
     detail = f" with {related_party_name}" if related_party_name else ""
     amount_note = f", Rs.{amount} cr" if isinstance(amount, (int, float)) else ""
+    if basis == "pct":
+        threshold_note = f" at {pct}% of revenue (>= {RPT_PCT_OF_REVENUE_THRESHOLD}% materiality threshold)"
+    else:
+        threshold_note = " -- no percentage-of-revenue stated in the filing, alerting on the stated amount alone"
     return {
         "trigger_type": "related_party_transaction",
         "reasoning": (
-            f"Related-party transaction{detail}{amount_note} at {pct}% of revenue "
-            f"(>= {RPT_PCT_OF_REVENUE_THRESHOLD}% materiality threshold) -- alert-worthy regardless of prior L2 state."
+            f"Related-party transaction{detail}{amount_note}{threshold_note} -- alert-worthy regardless of prior L2 state."
         ),
     }
 
@@ -831,6 +899,12 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
                 "reasoning": result["reasoning"],
                 "l2_run_date": str(l2_row.get("run_date")) if l2_row is not None else None,
                 "l2_state_snapshot_json": json.dumps(l2_row, ensure_ascii=False, default=str) if l2_row is not None else None,
+                # LOW FINDING (re-audit 2026-08-18): "status" is write-only -- always
+                # "new", no reader or updater anywhere in this repo, shipped to the
+                # frontend where it will always read "new" regardless of real review
+                # state. Left as-is (a human-review-status workflow is real new
+                # feature scope, not a bug fix) but documented so a future reader
+                # doesn't assume this reflects live review state.
                 "status": "new",
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }

@@ -9170,6 +9170,27 @@ def test_rpt_excludes_only_when_applicable_and_over_threshold():
     assert fundamentals_l1_universe._rpt_excludes([]) is False
 
 
+def test_rpt_excludes_falls_back_to_amount_when_no_percentage_stated():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): RPT_SCHEMA's own description says
+    # pct_of_revenue is populated "only if the filing itself states this
+    # percentage" -- many real filings only ever state an absolute rpt_amount_rs_cr
+    # instead, and this used to silently never exclude those. Falls back to
+    # "material because we can't rule it out" -- any positive amount with no stated
+    # percentage counts, matching rpt_is_material's own docstring.
+    amount_only = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 120.0})}
+    zero_amount = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 0})}
+    assert fundamentals_l1_universe._rpt_excludes([amount_only]) is True
+    assert fundamentals_l1_universe._rpt_excludes([zero_amount]) is False
+
+
+def test_rpt_is_material_reports_which_basis_decided_it():
+    assert fundamentals_l1_universe.rpt_is_material({"is_applicable": False}) == (False, "not_applicable")
+    assert fundamentals_l1_universe.rpt_is_material({"is_applicable": True, "pct_of_revenue": 15.0}) == (True, "pct")
+    assert fundamentals_l1_universe.rpt_is_material({"is_applicable": True, "pct_of_revenue": 5.0}) == (False, "pct")
+    assert fundamentals_l1_universe.rpt_is_material({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 50.0}) == (True, "amount")
+    assert fundamentals_l1_universe.rpt_is_material({"is_applicable": True, "pct_of_revenue": None}) == (False, "unknown")
+
+
 def _mock_identity_resolution_nse_prefix(monkeypatch):
     """apply_post_hoc_exclusions now resolves identity via
     map_company_master_ids_nse_or_bse instead of a naive 'nse:'+ticker string (see
@@ -13029,6 +13050,43 @@ def test_evaluate_pit_sast_trigger_no_json_and_no_flat_column_does_not_alert():
     assert fundamentals_l3_triggers.evaluate_pit_sast_trigger({"transaction_type": None, "structured_extraction_json": "not json"}, {"promoter_stake_direction": "flat"}) is None
 
 
+def test_evaluate_pit_sast_trigger_labels_reasoning_from_insider_category():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): used to hardcode "Promoter/insider" in
+    # the reasoning regardless of PIT_SAST_SCHEMA's own already-extracted
+    # insider_category. Real captured row shape: a KMP buy, not a promoter one.
+    raw_json = json.dumps({"transaction_type": "buy", "insider_category": "kmp", "disclosure_type": "pit_disclosure"})
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": None, "insider_name": "X", "structured_extraction_json": raw_json},
+        {"promoter_stake_direction": "flat"},
+    )
+    assert result["trigger_type"] == "insider_buy"
+    assert result["reasoning"].startswith("KMP buy")
+
+
+def test_evaluate_pit_sast_trigger_unrecognized_category_falls_back_to_generic_insider_label():
+    # Real captured row shape: a corporate SAST acquirer under Reg 10(6), not a
+    # promoter/KMP/director/employee -- insider_category came back "other".
+    raw_json = json.dumps({"transaction_type": "buy", "insider_category": "other", "disclosure_type": "sast_disclosure"})
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": None, "insider_name": "TSF Investments Limited", "structured_extraction_json": raw_json},
+        {"promoter_stake_direction": "flat"},
+    )
+    assert result["reasoning"].startswith("Insider buy")
+
+
+def test_evaluate_pit_sast_trigger_trading_window_notice_never_alerts_even_with_a_transaction_type():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): disclosure_type was ignored entirely --
+    # a "trading_window_notice" (the common case, a routine procedural filing) is
+    # structurally not a transaction disclosure and must never alert, even if a
+    # transaction_type value is present (e.g. a spurious LLM extraction).
+    raw_json = json.dumps({"transaction_type": "buy", "insider_category": "promoter", "disclosure_type": "trading_window_notice"})
+    result = fundamentals_l3_triggers.evaluate_pit_sast_trigger(
+        {"transaction_type": None, "insider_name": "X", "structured_extraction_json": raw_json},
+        {"promoter_stake_direction": "flat"},
+    )
+    assert result is None
+
+
 def test_evaluate_capital_raise_trigger_always_alerts_regardless_of_l2_state():
     assert fundamentals_l3_triggers.evaluate_capital_raise_trigger({}, {"promoter_stake_direction": "decreasing"})["trigger_type"] == "capital_raise"
     assert fundamentals_l3_triggers.evaluate_capital_raise_trigger({}, None)["trigger_type"] == "capital_raise"
@@ -13096,38 +13154,6 @@ def test_compute_approx_operating_margin_pct_none_when_any_input_missing():
     assert fundamentals_l3_triggers.compute_approx_operating_margin_pct(revenue=100, pat=None, finance_costs=1, depreciation_amortisation=1) is None
 
 
-def test_infer_reporting_cadence_quarterly_when_any_quarter_seen():
-    assert fundamentals_l3_triggers.infer_reporting_cadence(["Q1", "Q2"]) == "quarterly"
-    assert fundamentals_l3_triggers.infer_reporting_cadence(["H1", "Q3"]) == "quarterly"  # quarterly wins if ever seen
-
-
-def test_infer_reporting_cadence_half_yearly_when_only_h1_h2():
-    assert fundamentals_l3_triggers.infer_reporting_cadence(["H1", "H2"]) == "half_yearly"
-
-
-def test_infer_reporting_cadence_unknown_when_no_history():
-    assert fundamentals_l3_triggers.infer_reporting_cadence([]) == "unknown"
-    assert fundamentals_l3_triggers.infer_reporting_cadence([None, None]) == "unknown"
-
-
-def test_load_results_period_type_history_extracts_period_types(monkeypatch):
-    df = pd.DataFrame(
-        [
-            {"structured_extraction_json": json.dumps({"period_type": "Q1"})},
-            {"structured_extraction_json": json.dumps({"period_type": "H1"})},
-            {"structured_extraction_json": "not json"},
-        ]
-    )
-    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: df)
-    result = fundamentals_l3_triggers.load_results_period_type_history("nse:ABC")
-    assert result == ["Q1", "H1"]
-
-
-def test_load_results_period_type_history_empty(monkeypatch):
-    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: pd.DataFrame())
-    assert fundamentals_l3_triggers.load_results_period_type_history("nse:ABC") == []
-
-
 def test_load_prior_same_period_results_event_matches_period_type(monkeypatch):
     df = pd.DataFrame(
         [
@@ -13148,6 +13174,26 @@ def test_load_prior_same_period_results_event_none_when_no_match(monkeypatch):
     df = pd.DataFrame([{"disclosure_date": "2025-11-10", "structured_extraction_json": json.dumps({"period_type": "Q2"})}])
     monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", lambda q, params=None: df)
     assert fundamentals_l3_triggers.load_prior_same_period_results_event("nse:ABC", period_type="Q1", before_disclosure_date="2026-08-01") is None
+
+
+def test_load_prior_same_period_results_event_query_is_bounded_by_lookback_window(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): no upper bound on how far back this could
+    # reach -- a genuine multi-year gap for a period_type could silently pick up a
+    # 2+-year-old filing, and compute_timing_delay_days would then report ~365 days
+    # of FALSE lateness (it always adds exactly 365 days to whatever this returns).
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_l3_triggers, "sql_to_df", fake_sql_to_df)
+    fundamentals_l3_triggers.load_prior_same_period_results_event("nse:ABC", period_type="Q1", before_disclosure_date="2026-08-01")
+
+    assert "disclosure_date >= %s" in captured["query"]
+    lookback_start = pd.Timestamp("2026-08-01") - pd.Timedelta(days=fundamentals_l3_triggers.RESULTS_PRIOR_PERIOD_LOOKBACK_DAYS)
+    assert captured["params"] == ("nse:ABC", "2026-08-01", str(lookback_start.date()))
 
 
 def test_load_latest_results_calendar_event_returns_row(monkeypatch):
@@ -13277,6 +13323,30 @@ def test_evaluate_results_trigger_delayed_wins_regardless_of_growth(monkeypatch)
     result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
     assert result["trigger_type"] == "results_delayed"
     assert "31 days" in result["reasoning"]
+
+
+def test_evaluate_results_trigger_falls_back_to_calendar_delay_when_no_own_history(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): vs_calendar_days was computed but never
+    # actually read anywhere -- a real per-event DB query with no observable effect.
+    # Must now fire as a fallback when own-history has no baseline at all (e.g. this
+    # company's first-ever filing of this period_type).
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_prior_same_period_results_event", lambda cmid, **k: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_results_calendar_event", lambda cmid: {"disclosure_date": "2026-07-01"})
+    event = _results_event(disclosure_date="2026-08-01")  # 31 days after the calendar's expected date
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, None)
+    assert result["trigger_type"] == "results_delayed"
+    assert "31 days" in result["reasoning"]
+    assert "forward results calendar" in result["reasoning"]
+
+
+def test_evaluate_results_trigger_own_history_wins_over_calendar_when_both_present(monkeypatch):
+    # own-history stays the preferred, primary baseline -- calendar is a fallback
+    # only, not a second independent trigger path.
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_prior_same_period_results_event", lambda cmid, **k: {"disclosure_date": "2026-07-25"})  # not late
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_results_calendar_event", lambda cmid: {"disclosure_date": "2026-06-01"})  # would be late
+    event = _results_event(revenue_current_rs_lakh=110.0, revenue_yoy_rs_lakh=100.0, disclosure_date="2026-08-01")  # +10%, no growth trigger either
+    result = fundamentals_l3_triggers.evaluate_results_trigger(event, {"net_debt_yoy_delta_rscr": -5})
+    assert result is None  # own-history says not late; calendar must not override that
 
 
 def test_evaluate_results_trigger_decline_always_alerts(monkeypatch):
@@ -13420,6 +13490,18 @@ def test_evaluate_related_party_transaction_trigger_none_when_pct_missing():
     assert fundamentals_l3_triggers.evaluate_related_party_transaction_trigger(event, None) is None
 
 
+def test_evaluate_related_party_transaction_trigger_alerts_on_amount_when_no_percentage_stated():
+    # BUG FOUND LIVE 2026-08-18 (re-audit): gated purely on pct_of_revenue, while
+    # rpt_amount_rs_cr (what filings actually carry) was used only for display text.
+    # A material RPT stated as an amount, not a percentage, silently never alerted.
+    event = {"structured_extraction_json": json.dumps({"is_applicable": True, "pct_of_revenue": None, "rpt_amount_rs_cr": 120.0, "related_party_name": "Promoter Group Ltd"})}
+    result = fundamentals_l3_triggers.evaluate_related_party_transaction_trigger(event, None)
+    assert result["trigger_type"] == "related_party_transaction"
+    assert "Promoter Group Ltd" in result["reasoning"]
+    assert "Rs.120.0 cr" in result["reasoning"]
+    assert "no percentage-of-revenue stated" in result["reasoning"]
+
+
 def test_related_party_transaction_is_in_supported_filing_types_and_evaluators():
     assert "related_party_transaction" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
     assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["related_party_transaction"] is fundamentals_l3_triggers.evaluate_related_party_transaction_trigger
@@ -13464,6 +13546,47 @@ def test_resolve_rating_action_type_none_when_neither_source_has_it():
 def test_resolve_rating_action_type_handles_unparseable_json():
     event = {"rating_action_type": None, "structured_extraction_json": "not json"}
     assert fundamentals_l3_triggers._resolve_rating_action_type(event) is None
+
+
+def test_resolve_rating_action_type_a_downgraded_instrument_cannot_be_masked_by_the_flat_column(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): used to check the flat rating_action_type
+    # column FIRST, unconditionally -- bypassing instrument_actions' own per-
+    # instrument breakdown entirely whenever the flat column (a simpler,
+    # non-multi-instrument-aware ICRA-site scrape) happened to be populated. A real
+    # downgrade on one instrument, with the flat column saying "reaffirmed" (about a
+    # DIFFERENT instrument in the same filing), must still resolve to "downgraded".
+    event = {
+        "rating_action_type": "reaffirmed",
+        "structured_extraction_json": json.dumps({
+            "rating_action": "reaffirmed",
+            "instrument_actions": [
+                {"instrument_description": "Long-term Bank Facilities", "rating_action": "downgraded"},
+                {"instrument_description": "Short-term Bank Facilities", "rating_action": "reaffirmed"},
+            ],
+        }),
+    }
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) == "downgraded"
+
+
+def test_resolve_rating_action_type_top_level_summary_cannot_mask_a_downgraded_instrument():
+    # Same guarantee, but defending against the top-level JSON rating_action field
+    # itself disagreeing with its own instrument_actions breakdown (the LLM not
+    # following RATING_ACTION_SCHEMA's "never collapse into reaffirmed" instruction).
+    event = {
+        "rating_action_type": None,
+        "structured_extraction_json": json.dumps({
+            "rating_action": "reaffirmed",  # should have been "downgraded" per the schema's own instruction
+            "instrument_actions": [{"instrument_description": "NCD", "rating_action": "downgraded"}],
+        }),
+    }
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) == "downgraded"
+
+
+def test_resolve_rating_action_type_falls_back_to_old_precedence_for_unrecognized_values():
+    # Neither source is a recognized severity vocabulary value -- falls back to the
+    # simple flat-then-JSON precedence rather than returning None outright.
+    event = {"rating_action_type": "some_unusual_action", "structured_extraction_json": json.dumps({"rating_action": "another_unusual_action"})}
+    assert fundamentals_l3_triggers._resolve_rating_action_type(event) == "some_unusual_action"
 
 
 def test_evaluate_rating_action_trigger_reasoning_names_agency_when_known():
@@ -16605,6 +16728,19 @@ def test_resolve_rating_action_falls_back_to_json():
 
 def test_resolve_rating_action_none_when_neither_present():
     assert fundamentals_signal_pointers._resolve_rating_action({"rating_action_type": None, "structured_extraction_json": None}) is None
+
+
+def test_resolve_rating_action_a_downgraded_instrument_cannot_be_masked_by_the_flat_column():
+    # Twin of l3_triggers.py's own regression test -- same bug, same fix, see there
+    # for the full explanation.
+    event = {
+        "rating_action_type": "reaffirmed",
+        "structured_extraction_json": json.dumps({
+            "rating_action": "reaffirmed",
+            "instrument_actions": [{"instrument_description": "NCD", "rating_action": "downgraded"}],
+        }),
+    }
+    assert fundamentals_signal_pointers._resolve_rating_action(event) == "downgraded"
 
 
 def test_load_l2_signals_for_company_resolves_l1_ticker_and_returns_row(monkeypatch):

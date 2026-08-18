@@ -168,16 +168,42 @@ def _auditor_change_excludes(events: list[dict], *, as_of: pd.Timestamp) -> bool
     return False
 
 
+def rpt_is_material(extracted: dict) -> tuple[bool, str]:
+    """True if an already-extracted RPT_SCHEMA payload crosses SEBI LODR Reg 23's
+    materiality threshold, plus which field it was decided on ("pct"/"amount"/
+    "not_applicable"/"unknown") so a caller can be honest in its own reasoning text.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): both callers of this logic (this function's
+    predecessor here, and l3_triggers.py's evaluate_related_party_transaction_
+    trigger) used to gate purely on pct_of_revenue -- but RPT_SCHEMA's own
+    description says that field is populated "only if the filing itself states this
+    percentage", while rpt_amount_rs_cr (what filings actually carry) was read only
+    for display text, never for the materiality decision itself. A material RPT
+    stated as an amount, not a percentage, silently never excluded/alerted. Falls
+    back to "material because we can't rule it out": any positive rpt_amount_rs_cr
+    with no stated percentage counts as material -- favors recall over precision,
+    matching fundamental_basic_goal.md's own "judge it on recall and falsifiability"
+    framing already cited elsewhere in this codebase, rather than inventing an
+    amount-only threshold with no revenue figure to compute a true percentage from."""
+    if not extracted.get("is_applicable"):
+        return False, "not_applicable"  # non-applicability declaration -- the common real case
+    pct = extracted.get("pct_of_revenue")
+    if isinstance(pct, (int, float)):
+        return pct >= RPT_PCT_OF_REVENUE_THRESHOLD, "pct"
+    amount = extracted.get("rpt_amount_rs_cr")
+    if isinstance(amount, (int, float)) and amount > 0:
+        return True, "amount"
+    return False, "unknown"
+
+
 def _rpt_excludes(events: list[dict]) -> bool:
     for event in events:
         try:
             extracted = json.loads(event["structured_extraction_json"])
         except (TypeError, ValueError):
             continue
-        if not extracted.get("is_applicable"):
-            continue  # non-applicability declaration -- the common real case, never excludes
-        pct = extracted.get("pct_of_revenue")
-        if isinstance(pct, (int, float)) and pct >= RPT_PCT_OF_REVENUE_THRESHOLD:
+        material, _basis = rpt_is_material(extracted)
+        if material:
             return True
     return False
 

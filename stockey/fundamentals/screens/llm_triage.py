@@ -293,6 +293,8 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
                 "reasoning": judgment.get("reasoning"),
                 "l2_run_date": str(l2_row.get("run_date")) if l2_row is not None else None,
                 "l2_state_snapshot_json": json.dumps(l2_row, ensure_ascii=False, default=str) if l2_row is not None else None,
+                # LOW FINDING (re-audit 2026-08-18): "status" is write-only -- see
+                # l3_triggers.py's own identical comment on its twin write site.
                 "status": "new",
                 "model": model,
                 "prompt_version": PROMPT_VERSION,
