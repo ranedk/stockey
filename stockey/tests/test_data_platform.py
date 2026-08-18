@@ -10107,6 +10107,78 @@ def test_build_result_calendar_row_handles_unparseable_date():
     assert row["disclosure_date"] is None
 
 
+def test_fetch_company_announcements_single_page_stops_without_extra_requests(monkeypatch):
+    calls = []
+
+    def fake_bse_get(url, params):
+        calls.append(params["pageno"])
+        return {"Table": [{"NEWSID": "1"}, {"NEWSID": "2"}], "Table1": [{"ROWCNT": 2}]}
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
+    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2026, 1, 1), to_date=date(2026, 8, 1))
+
+    assert calls == [1]
+    assert len(rows) == 2
+
+
+def test_fetch_company_announcements_paginates_until_rowcnt_satisfied(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18: this endpoint paginates at 50 rows/page and
+    # reports the true total in Table1[0].ROWCNT -- the collector only ever
+    # requested page 1. Confirmed live: every company tested returned exactly 50
+    # rows with a real ROWCNT of 95-293. run_auditor_rpt_backfill's "3-year"
+    # lookback was actually covering 5-15 months per company, and the company
+    # gets marked permanently backfilled after that one truncated fetch.
+    pages = {
+        1: {"Table": [{"NEWSID": str(i)} for i in range(50)], "Table1": [{"ROWCNT": 120}]},
+        2: {"Table": [{"NEWSID": str(i)} for i in range(50, 100)], "Table1": [{"ROWCNT": 120}]},
+        3: {"Table": [{"NEWSID": str(i)} for i in range(100, 120)], "Table1": [{"ROWCNT": 120}]},
+    }
+    calls = []
+
+    def fake_bse_get(url, params):
+        calls.append(params["pageno"])
+        return pages[params["pageno"]]
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
+    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
+
+    assert calls == [1, 2, 3]
+    assert len(rows) == 120
+    assert [r["NEWSID"] for r in rows] == [str(i) for i in range(120)]
+
+
+def test_fetch_company_announcements_stops_on_empty_page_even_if_rowcnt_says_more(monkeypatch):
+    pages = {
+        1: {"Table": [{"NEWSID": str(i)} for i in range(50)], "Table1": [{"ROWCNT": 120}]},
+        2: {"Table": [], "Table1": [{"ROWCNT": 120}]},  # BSE has nothing more despite ROWCNT
+    }
+    calls = []
+
+    def fake_bse_get(url, params):
+        calls.append(params["pageno"])
+        return pages[params["pageno"]]
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
+    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
+
+    assert calls == [1, 2]
+    assert len(rows) == 50
+
+
+def test_fetch_company_announcements_missing_rowcnt_does_not_paginate(monkeypatch):
+    calls = []
+
+    def fake_bse_get(url, params):
+        calls.append(params["pageno"])
+        return {"Table": [{"NEWSID": str(i)} for i in range(50)], "Table1": []}
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
+    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
+
+    assert calls == [1]  # no ROWCNT to compare against -- can't safely assume more pages exist
+    assert len(rows) == 50
+
+
 def test_resolve_company_identity_joins_on_ticker_and_preserves_index(monkeypatch):
     tickers = pd.Series(["AAREYDRUGS", "UNKNOWNTICKER"], index=[5, 9])
     monkeypatch.setattr(

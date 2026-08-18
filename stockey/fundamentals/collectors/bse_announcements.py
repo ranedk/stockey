@@ -363,11 +363,19 @@ def _bse_get(url: str, params: dict[str, object]) -> dict:
         raise BseBlockedError(f"non-JSON response: {exc}") from exc
 
 
-def fetch_company_announcements(scrip_code: str, *, from_date, to_date) -> list[dict]:
+BSE_ANNOUNCEMENTS_PAGE_SIZE = 50
+# Safety ceiling, not an expected case -- confirmed live 2026-08-18 that BACKFILL_
+# LOOKBACK_DAYS=1095 windows for a real, fairly-active company return up to ~260
+# rows (6 pages); this leaves generous headroom without risking an unbounded loop
+# against a genuinely pathological scrip.
+BSE_ANNOUNCEMENTS_MAX_PAGES = 40
+
+
+def _fetch_company_announcements_page(scrip_code: str, *, from_date, to_date, page: int) -> tuple[list[dict], int | None]:
     payload = _bse_get(
         ANNOUNCEMENTS_URL,
         {
-            "pageno": 1,
+            "pageno": page,
             "strCat": "-1",
             "subcategory": "-1",
             "strPrevDate": from_date.strftime("%Y%m%d"),
@@ -379,7 +387,36 @@ def fetch_company_announcements(scrip_code: str, *, from_date, to_date) -> list[
     )
     if "Table" not in payload:
         raise BseBlockedError("response missing expected 'Table' key")
-    return payload["Table"] or []
+    row_count = None
+    table1 = payload.get("Table1")
+    if table1 and isinstance(table1, list) and "ROWCNT" in table1[0]:
+        row_count = int(table1[0]["ROWCNT"])
+    return payload["Table"] or [], row_count
+
+
+def fetch_company_announcements(scrip_code: str, *, from_date, to_date) -> list[dict]:
+    # BUG FOUND LIVE 2026-08-18: this endpoint paginates at BSE_ANNOUNCEMENTS_
+    # PAGE_SIZE (50) rows/page and reports the true total in Table1[0].ROWCNT --
+    # this function only ever requested page 1 and never read ROWCNT. Confirmed
+    # live: every company tested returned exactly 50 rows with a real ROWCNT of
+    # 95-293, i.e. 2-6x more exists. run_auditor_rpt_backfill's "3-year" lookback
+    # was actually covering 5-15 months per company, and _mark_backfilled marks a
+    # company permanently done after that one truncated fetch -- the missing
+    # history was invisible forever. Now paginates until every row is fetched (or
+    # BSE stops returning ROWCNT-worth of new rows / hits the safety ceiling).
+    first_page, row_count = _fetch_company_announcements_page(scrip_code, from_date=from_date, to_date=to_date, page=1)
+    all_rows = list(first_page)
+    if row_count is None or len(all_rows) >= row_count:
+        return all_rows
+
+    page = 1
+    while len(all_rows) < row_count and page < BSE_ANNOUNCEMENTS_MAX_PAGES:
+        page += 1
+        next_page, _ = _fetch_company_announcements_page(scrip_code, from_date=from_date, to_date=to_date, page=page)
+        if not next_page:
+            break  # BSE has nothing more, regardless of what ROWCNT claimed
+        all_rows.extend(next_page)
+    return all_rows
 
 
 def fetch_result_calendar() -> list[dict]:
