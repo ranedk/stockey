@@ -1086,6 +1086,26 @@ def test_company_master_success_path_does_not_record_fallback(monkeypatch):
     assert events == []
 
 
+def test_company_master_records_fallback_on_duplicate_ticker_collision(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: two company_master rows sharing the same ticker used
+    # to resolve via drop_duplicates(keep="last") with no ORDER BY and zero telemetry
+    # -- an effectively arbitrary, silent pick.
+    events: list[dict[str, object]] = []
+
+    def fake_sql_to_df(*_args, **_kwargs):
+        return pd.DataFrame([{"ticker": "DUP", "company_master_id": "nse:DUP_OLD"}, {"ticker": "DUP", "company_master_id": "nse:DUP_NEW"}])
+
+    monkeypatch.setattr(company_master_utils, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = company_master_utils.map_company_master_ids(["DUP"], exchange="NSE")
+
+    assert out.astype("string").tolist() == ["nse:DUP_NEW"]  # still resolves -- just now visible when it does
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "company_master_ticker_collision"
+    assert events[0]["metadata"]["tickers"] == ["DUP"]
+
+
 def test_company_master_preserves_index_for_non_contiguous_series(monkeypatch):
     """Regression test: map_company_master_ids() used to do list(tickers) internally,
     discarding the caller's index in favor of a fresh 0-based RangeIndex. A caller doing

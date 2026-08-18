@@ -227,6 +227,29 @@ def map_company_master_ids(tickers: Iterable[object], *, exchange: str) -> pd.Se
     if lookup.empty:
         return pd.Series(pd.NA, index=ticker_series.index, dtype="string")
 
+    # BUG FOUND LIVE 2026-08-17: two company_master rows sharing the same
+    # nse_ticker/bse_ticker used to be resolved via drop_duplicates(keep="last") with
+    # no visibility at all -- "last" here means whatever order the DB happened to
+    # return them in (no ORDER BY on the query above), so which company_master_id a
+    # colliding ticker actually maps to was effectively arbitrary and silent. Zero
+    # real collisions exist today (confirmed live), but a future one would resolve
+    # the exact same way with no record of it having happened.
+    duplicated_tickers = lookup.loc[lookup["ticker"].duplicated(keep=False), "ticker"].unique().tolist()
+    if duplicated_tickers:
+        record_local_fallback_event(
+            module="utils.company_master",
+            source=COMPANY_MASTER_TABLE,
+            fallback_type="company_master_ticker_collision",
+            severity="warn",
+            reason=(
+                f"{len(duplicated_tickers)} {column} value(s) matched more than one company_master row; "
+                "resolved via drop_duplicates(keep='last') with no ORDER BY, so the pick is effectively "
+                "arbitrary, not necessarily the current/correct company."
+            ),
+            error="duplicate ticker mapping",
+            metadata={"exchange": exchange_upper, "tickers": duplicated_tickers[:20]},
+        )
+
     mapping = lookup.drop_duplicates(subset=["ticker"], keep="last").set_index("ticker")["company_master_id"]
     return cleaned.map(mapping).astype("string")
 
