@@ -11973,12 +11973,13 @@ def test_run_ocr_pipeline_returns_early_when_nothing_pending(monkeypatch):
 
     result = fundamentals_ocr_pipeline.run_ocr_pipeline()
 
-    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False}
+    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False, "backlog_remaining": 0}
 
 
 def test_run_ocr_pipeline_marks_rows_with_no_document_reference(monkeypatch):
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
     pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": None}])
     monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
     status_calls = []
@@ -11993,6 +11994,7 @@ def test_run_ocr_pipeline_marks_rows_with_no_document_reference(monkeypatch):
 def test_run_ocr_pipeline_happy_path_stores_pdf_and_text(monkeypatch):
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
     pending = pd.DataFrame(
         [{"source": "icra", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": "https://www.icra.in/Rating/GetRationalReportFilePdf?Id=1"}]
     )
@@ -12034,6 +12036,7 @@ def test_run_ocr_pipeline_stops_at_time_budget_leaving_remaining_rows_pending(mo
     # not reached before the cutoff must stay untouched (pending), not marked failed.
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
     pending = pd.DataFrame(
         [
             {"source": "icra", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": "https://www.icra.in/x?Id=1"},
@@ -12068,6 +12071,7 @@ def test_run_ocr_pipeline_stops_at_time_budget_leaving_remaining_rows_pending(mo
 def test_run_ocr_pipeline_trips_circuit_breaker_per_domain(monkeypatch):
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
     pending = pd.DataFrame(
         [
             {"source": "bse", "news_id": f"n{i}", "attachment_name": f"file{i}.pdf", "rationale_pdf_url": None}
@@ -12089,6 +12093,61 @@ def test_run_ocr_pipeline_trips_circuit_breaker_per_domain(monkeypatch):
     assert result["blocked"] is True
     assert result["failed"] == fundamentals_ocr_pipeline.CIRCUIT_BREAKER_THRESHOLD
     assert any(a and a[0] == "ocr_pipeline_circuit_breaker_tripped" for a, k in fallback_events)
+
+
+def test_count_pending_ocr_targets_mirrors_load_pending_where_clause(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, **kwargs):
+        captured["query"] = query
+        return pd.DataFrame([{"n": 42}])
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "sql_to_df", fake_sql_to_df)
+    assert fundamentals_ocr_pipeline.count_pending_ocr_targets() == 42
+    assert "ocr_status IS NULL OR ocr_status = 'pending'" in captured["query"]
+    assert "attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL" in captured["query"]
+
+
+def test_run_ocr_pipeline_backlog_fallback_fires_after_a_real_run(monkeypatch):
+    # BUG FOUND LIVE 2026-08-17: DEFAULT_BATCH_LIMIT/MAX_RUNTIME_SECONDS bound one
+    # run's damage, but nothing ever checked whether the backlog was actually
+    # shrinking -- at worst-case documented per-item latency, MAX_RUNTIME_SECONDS's
+    # budget binds long before DEFAULT_BATCH_LIMIT's item cap does, silently
+    # undercutting the "pace up so we don't have backlog" intent. Now visible as a
+    # distinct, monitorable fallback event instead of a one-time audit finding. Note:
+    # load_pending_ocr_targets returning empty would take run_ocr_pipeline()'s early-
+    # return path, which short-circuits BEFORE this check -- uses a nonempty pending
+    # row so the check itself is actually exercised.
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": None}])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
+    monkeypatch.setattr(
+        fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: fundamentals_ocr_pipeline.BACKLOG_NOT_CLEARING_THRESHOLD + 1
+    )
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    result = fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert result["backlog_remaining"] == fundamentals_ocr_pipeline.BACKLOG_NOT_CLEARING_THRESHOLD + 1
+    assert any(a and a[0] == "ocr_pipeline_backlog_not_clearing" for a, k in fallback_events)
+
+
+def test_run_ocr_pipeline_no_backlog_fallback_when_under_threshold(monkeypatch):
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_ensure_events_schema", lambda: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_bootstrap_ocr_columns", lambda: None)
+    pending = pd.DataFrame([{"source": "bse", "news_id": "n1", "attachment_name": None, "rationale_pdf_url": None}])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "count_pending_ocr_targets", lambda: 1)
+    fallback_events = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
+
+    fundamentals_ocr_pipeline.run_ocr_pipeline()
+
+    assert not any(a and a[0] == "ocr_pipeline_backlog_not_clearing" for a, k in fallback_events)
 
 
 # fundamentals/collectors/structured_extraction.py -- L3/L4 OCR-text -> typed fields

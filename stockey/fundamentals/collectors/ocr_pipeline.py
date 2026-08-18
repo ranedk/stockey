@@ -77,6 +77,20 @@ CIRCUIT_BREAKER_THRESHOLD = 3
 # another took 7 minutes for the same count) -- MAX_RUNTIME_SECONDS below is the real
 # safety net now, this limit is a sanity ceiling underneath it.
 DEFAULT_BATCH_LIMIT = 200
+# BUG FOUND LIVE 2026-08-17: DEFAULT_BATCH_LIMIT/MAX_RUNTIME_SECONDS bound one run's
+# damage, but nothing ever checked whether the backlog was actually shrinking --
+# at worst-case documented per-item latency, MAX_RUNTIME_SECONDS's 3h budget binds
+# LONG before DEFAULT_BATCH_LIMIT's 200-item cap does (only ~18-37 items complete at
+# the observed 289-583s/page worst case), silently undercutting the "pace up so we
+# don't have backlog" intent this limit was raised for in the first place. Not fixed
+# by raising either number here -- that's a real CPU-cost/pipeline-completion-time
+# tradeoff, not something to guess at unilaterally. Instead, run_ocr_pipeline()
+# records a distinct ocr_pipeline_backlog_not_clearing fallback event whenever the
+# TRUE remaining backlog (count_pending_ocr_targets(), unbounded by this limit)
+# still exceeds it after a run -- i.e. even a full, uninterrupted run at the item cap
+# wouldn't have been enough to clear it -- so this stays a monitorable, visible
+# trend rather than a one-time audit finding nobody re-checks.
+BACKLOG_NOT_CLEARING_THRESHOLD = DEFAULT_BATCH_LIMIT
 # Wall-clock budget for one run, independent of item count -- protects the REST of
 # that day's fundamentals pipeline (L1/L2/L3/watchlist/notifications all run after
 # this step in run_pipeline.py's STEPS) from a bad day of large scanned documents
@@ -205,6 +219,21 @@ def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
     return sql_to_df(query)
 
 
+def count_pending_ocr_targets() -> int:
+    """Cheap COUNT(*) mirroring load_pending_ocr_targets()'s own WHERE clause,
+    unbounded by DEFAULT_BATCH_LIMIT -- used only to size the true remaining backlog
+    for BACKLOG_NOT_CLEARING_THRESHOLD's own check below, not for selecting rows."""
+    df = sql_to_df(
+        """
+        SELECT COUNT(*) AS n
+        FROM fundamentals_events
+        WHERE (ocr_status IS NULL OR ocr_status = 'pending')
+          AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
+        """
+    )
+    return int(df.iloc[0]["n"]) if not df.empty else 0
+
+
 def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     """Render every page of a PDF (already-downloaded bytes) and OCR each one through
     the local provider, joined into one document's worth of text. See
@@ -255,7 +284,7 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
 
     pending = load_pending_ocr_targets(limit or DEFAULT_BATCH_LIMIT)
     if pending.empty:
-        return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False}
+        return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False, "backlog_remaining": 0}
 
     counts = {"ocred": 0, "failed": 0, "no_document": 0}
     consecutive_failures_by_domain: dict[str, int] = {}
@@ -315,7 +344,22 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
         counts["ocred"] += 1
         _set_ocr_result(source=row["source"], news_id=row["news_id"], status="done", fields=fields)
 
-    return {**counts, "blocked": bool(blocked_domains), "time_budget_exceeded": time_budget_exceeded}
+    backlog_remaining = count_pending_ocr_targets()
+    if backlog_remaining > BACKLOG_NOT_CLEARING_THRESHOLD:
+        _record_fallback(
+            "ocr_pipeline_backlog_not_clearing",
+            source="ocr_pipeline",
+            reason=(
+                f"{backlog_remaining} rows still pending after this run -- more than BACKLOG_NOT_CLEARING_"
+                f"THRESHOLD ({BACKLOG_NOT_CLEARING_THRESHOLD}), meaning even a full uninterrupted run at "
+                "DEFAULT_BATCH_LIMIT wouldn't clear it. Not necessarily new/getting worse -- see metadata "
+                "for this run's own throughput to judge the trend."
+            ),
+            error="backlog exceeds one run's own item cap",
+            metadata={"backlog_remaining": backlog_remaining, "ocred_this_run": counts["ocred"], "failed_this_run": counts["failed"]},
+        )
+
+    return {**counts, "blocked": bool(blocked_domains), "time_budget_exceeded": time_budget_exceeded, "backlog_remaining": backlog_remaining}
 
 
 def main() -> int:
@@ -329,6 +373,7 @@ def main() -> int:
         "no_document": result["no_document"],
         "blocked": result["blocked"],
         "time_budget_exceeded": result["time_budget_exceeded"],
+        "backlog_remaining": result["backlog_remaining"],
         "fallback_used": bool(result["failed"] or result["blocked"]),
         "state_advanced": result["ocred"] > 0,
         "status": "blocked" if result["blocked"] else "ok",
