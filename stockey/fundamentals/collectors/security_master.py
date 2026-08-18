@@ -187,7 +187,16 @@ def build_identity_break_events(identity_breaks: pd.DataFrame) -> pd.DataFrame:
     effective_to DESC NULLS LAST to pick deterministically; this one didn't. 20 real
     symbols have more than one dim_security row and would have been affected -- no
     wrong review event confirmed yet, but the picked "prior" isin/security_id was
-    exposed to Postgres's own unspecified row order, not the actual current row."""
+    exposed to Postgres's own unspecified row order, not the actual current row.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): that fix still had no FINAL tiebreaker --
+    last_trade_date/effective_to alone are still non-deterministic on a true tie.
+    Live: 12 symbols tied on both (e.g. AARTISURF's EQ and P1 rows share the exact
+    same dates), 3 real identity-break pairs already double-recorded under different
+    prior ISINs as a result. Adds "series = 'EQ'" as a preference (the canonical
+    equity listing -- same convention fundamentals/screens/technicals.py and
+    watchlist.py already use for "the" price series over a partly-paid/rights
+    variant), then isin as a final, fully deterministic tiebreaker."""
     if identity_breaks.empty:
         return pd.DataFrame()
 
@@ -196,7 +205,7 @@ def build_identity_break_events(identity_breaks: pd.DataFrame) -> pd.DataFrame:
         SELECT DISTINCT ON (symbol) isin, symbol, series, security_id
         FROM dim_security
         WHERE isin IS NOT NULL
-        ORDER BY symbol, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST
+        ORDER BY symbol, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST, (series = 'EQ') DESC, isin
         """
     )
     current_by_symbol = current.set_index("symbol")
@@ -298,7 +307,12 @@ def load_bse_scrip_code_targets(limit: int | None = None) -> pd.DataFrame:
     historical ISINs (renames) must not generate one lookup per ISIN, that would
     waste BSE requests on superseded identities with no value. Handles the bootstrap
     case where the column doesn't exist at all yet (upsert_to_db adds it dynamically
-    on first write, same pattern master_dhan_instruments already uses)."""
+    on first write, same pattern master_dhan_instruments already uses).
+
+    Same non-deterministic-tie gap as build_identity_break_events' own DISTINCT ON
+    query (re-audit 2026-08-18, see its docstring) -- last_trade_date/effective_to
+    alone can tie (e.g. AARTISURF's EQ and P1 rows), so this sibling query needs the
+    identical "series = 'EQ'", then isin, final tiebreaker to pick deterministically."""
     has_column = not sql_to_df(
         "SELECT 1 FROM information_schema.columns "
         "WHERE table_name = 'company_master' AND column_name = 'bse_scrip_code'"
@@ -312,7 +326,7 @@ def load_bse_scrip_code_targets(limit: int | None = None) -> pd.DataFrame:
         LEFT JOIN company_master cm ON cm.company_master_id = ds.company_master_id
         WHERE ds.isin IS NOT NULL AND ds.company_master_id IS NOT NULL
         {filter_clause}
-        ORDER BY ds.company_master_id, ds.last_trade_date DESC NULLS LAST, ds.effective_to DESC NULLS LAST
+        ORDER BY ds.company_master_id, ds.last_trade_date DESC NULLS LAST, ds.effective_to DESC NULLS LAST, (ds.series = 'EQ') DESC, ds.isin
         {limit_clause}
         """
     )

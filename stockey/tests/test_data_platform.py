@@ -8818,6 +8818,43 @@ def test_build_identity_break_events_picks_current_row_deterministically(monkeyp
     assert result.iloc[0]["related_isin"] == "INE_NEW"
 
 
+def test_build_identity_break_events_query_has_a_final_deterministic_tiebreaker(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): last_trade_date DESC NULLS LAST,
+    # effective_to DESC NULLS LAST alone is STILL non-deterministic on a true tie --
+    # live, 12 symbols tie on both (e.g. AARTISURF's EQ and P1 rows share the exact
+    # same dates). Must prefer series='EQ' (the canonical listing, same convention
+    # technicals.py/watchlist.py already use), then fall back to isin as a fully
+    # deterministic final tiebreaker.
+    captured = {}
+
+    def fake_sql_to_df(query, **k):
+        captured["query"] = query
+        return pd.DataFrame(columns=["isin", "symbol", "series", "security_id"])
+
+    monkeypatch.setattr(fundamentals_security_master, "sql_to_df", fake_sql_to_df)
+    fundamentals_security_master.build_identity_break_events(
+        pd.DataFrame([{"SYMBOL": "TEST", "SERIES": "EQ", "ISIN NUMBER": "INE_NEW"}])
+    )
+    assert "(series = 'EQ') DESC, isin" in captured["query"]
+
+
+def test_load_bse_scrip_code_targets_query_has_the_same_final_tiebreaker(monkeypatch):
+    # Same non-deterministic-tie gap as build_identity_break_events' own DISTINCT ON
+    # query (re-audit 2026-08-18) -- this sibling query needs the identical
+    # "series = 'EQ'", then isin, final tiebreaker.
+    captured = {}
+
+    def fake_sql_to_df(query, **k):
+        captured["query"] = query
+        return pd.DataFrame(columns=["company_master_id", "isin"])
+
+    monkeypatch.setattr(fundamentals_security_master, "sql_to_df", fake_sql_to_df)
+
+    fundamentals_security_master.load_bse_scrip_code_targets()
+
+    assert "ORDER BY ds.company_master_id, ds.last_trade_date DESC NULLS LAST, ds.effective_to DESC NULLS LAST, (ds.series = 'EQ') DESC, ds.isin" in captured["query"]
+
+
 # fundamentals/collectors/screenerin.py -- shared screener.in scraping infra (used by L1/L2).
 
 SCREENERIN_FIXTURE_HTML = """
