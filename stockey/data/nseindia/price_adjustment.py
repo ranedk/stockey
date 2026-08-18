@@ -299,6 +299,25 @@ def ensure_view() -> None:
         description="advisory_adjusted_ohlcv_daily as a view over nseindia_ohlcv x nseindia_adjustment_factors (no longer a written table).",
         metadata={"tables": [ADJUSTED_VIEW], "workflow": "price_adjustment"},
     )
+    # BUG FOUND LIVE 2026-08-18 (re-audit): "self-heals an accidental drop" is false
+    # once the migration is recorded -- apply_schema_migration() skips re-executing
+    # its statements entirely once migration_id is marked 'applied', regardless of
+    # whether the VIEW itself still exists. advisory_adjusted_ohlcv_daily is
+    # systrader's own PRIMARY series (see CLAUDE.md), so this is the highest-traffic
+    # place this gap could bite. CREATE OR REPLACE VIEW is itself already idempotent
+    # and cheap, so it's run directly here too, unconditionally, every call --
+    # apply_schema_migration above still provides the checksum-tracked audit trail,
+    # this direct run is what makes ensure_view() ACTUALLY self-heal a drop, not
+    # just a fresh DB. Same fix as data/bseindia/price_adjustment.py's own
+    # ensure_view, see its comment for the full rationale.
+    from utils.db import db_session, execute_db_operation
+
+    def _create_or_replace_view() -> None:
+        with db_session() as (_, cur):
+            for statement in VIEW_SCHEMA_STATEMENTS:
+                cur.execute(statement)
+
+    execute_db_operation(_create_or_replace_view, operation_name=f"{ADJUSTED_VIEW}:ensure_view_direct")
 
 
 def compute_total_return_factor(prices: pd.DataFrame, dividends: pd.DataFrame, *,

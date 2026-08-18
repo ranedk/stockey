@@ -3030,13 +3030,56 @@ def test_ensure_bse_view_creates_ohlcv_table_first(monkeypatch):
     from data.bseindia import price_adjustment as bse_pa
 
     calls = []
+
+    class _FakeCursor:
+        def execute(self, query, params=None):
+            calls.append("direct_view")
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, _FakeCursor()
+
     monkeypatch.setattr(bse_pa, "ensure_ohlcv_table", lambda: calls.append("ohlcv"))
     monkeypatch.setattr(bse_pa, "ensure_factors_table", lambda: calls.append("factors"))
     monkeypatch.setattr(bse_pa, "apply_schema_migration", lambda **k: calls.append("view"))
+    monkeypatch.setattr(bse_pa, "db_session", fake_db_session)
+    monkeypatch.setattr(bse_pa, "execute_db_operation", lambda op, **k: op())
 
     bse_pa.ensure_view()
 
-    assert calls == ["ohlcv", "factors", "view"]
+    assert calls == ["ohlcv", "factors", "view", "direct_view"]
+
+
+def test_ensure_bse_view_runs_create_or_replace_unconditionally(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the "self-heals an accidental drop"
+    # claim was false once the migration is recorded -- apply_schema_migration()
+    # skips re-executing its statements entirely once migration_id is marked
+    # 'applied', regardless of whether the VIEW itself still exists. CREATE OR
+    # REPLACE VIEW is idempotent and cheap, so it must run directly, unconditionally,
+    # on every ensure_view() call -- not gated behind the migration's own tracking.
+    from data.bseindia import price_adjustment as bse_pa
+
+    monkeypatch.setattr(bse_pa, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_pa, "ensure_factors_table", lambda: None)
+    # Simulate the migration already being marked applied (a no-op from apply_schema_migration's own POV).
+    monkeypatch.setattr(bse_pa, "apply_schema_migration", lambda **k: {"status": "skipped_already_applied"})
+    executed = []
+
+    class _FakeCursor:
+        def execute(self, query, params=None):
+            executed.append(query)
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, _FakeCursor()
+
+    monkeypatch.setattr(bse_pa, "db_session", fake_db_session)
+    monkeypatch.setattr(bse_pa, "execute_db_operation", lambda op, **k: op())
+
+    bse_pa.ensure_view()
+
+    assert len(executed) == 1
+    assert "CREATE OR REPLACE VIEW" in executed[0]
 
 
 # scripts/dedupe_fundamentals_events.py -- one-time remediation for the in-batch
@@ -6726,6 +6769,43 @@ def test_build_adjustment_factors_writes_compact_table(monkeypatch):
     # ensure_view() must run every non-dry-run build (2026-08-14 bug: it was defined but never called,
     # so a fresh DB or an accidental drop would silently never get advisory_adjusted_ohlcv_daily back).
     assert view_calls == [True]
+
+
+def test_nse_ensure_view_runs_create_or_replace_unconditionally(monkeypatch):
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the "self-heals an accidental drop"
+    # claim was false once the migration is recorded -- apply_schema_migration()
+    # skips re-executing its statements entirely once migration_id is marked
+    # 'applied', regardless of whether the VIEW itself still exists.
+    # advisory_adjusted_ohlcv_daily is systrader's own PRIMARY series, so this is
+    # the highest-traffic place this gap could bite. CREATE OR REPLACE VIEW is
+    # idempotent and cheap, so it must run directly, unconditionally, on every
+    # ensure_view() call -- not gated behind the migration's own tracking.
+    from data.nseindia import price_adjustment as pa
+
+    # ensure_view() imports apply_schema_migration/db_session/execute_db_operation
+    # locally on every call (same convention noted above for build_adjustment_
+    # factors), so the SOURCE modules, not this module's namespace, must be patched.
+    import utils.db as db_module
+    import utils.schema_migrations as schema_migrations_module
+
+    monkeypatch.setattr(schema_migrations_module, "apply_schema_migration", lambda **k: {"status": "skipped_already_applied"})
+    executed = []
+
+    class _FakeCursor:
+        def execute(self, query, params=None):
+            executed.append(query)
+
+    @contextlib.contextmanager
+    def fake_db_session():
+        yield None, _FakeCursor()
+
+    monkeypatch.setattr(db_module, "db_session", fake_db_session)
+    monkeypatch.setattr(db_module, "execute_db_operation", lambda op, **k: op())
+
+    pa.ensure_view()
+
+    assert len(executed) == 1
+    assert "CREATE OR REPLACE VIEW" in executed[0]
 
 
 def test_rbi_currency_parse_rate_rows():

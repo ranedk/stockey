@@ -42,7 +42,7 @@ import pandas as pd
 from data.bseindia.bhavcopy import PRIMARY_SERIES
 from data.bseindia.bhavcopy import ensure_ohlcv_table
 from data.nseindia.price_adjustment import adjust_frame, compute_total_return_factor
-from utils.db import sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 
 ADJUSTMENT_FACTORS_TABLE = "bseindia_adjustment_factors"
@@ -118,6 +118,26 @@ def ensure_view() -> None:
         description="bse_advisory_adjusted_ohlcv_daily as a view over bseindia_ohlcv x bseindia_adjustment_factors.",
         metadata={"tables": [ADJUSTED_VIEW], "workflow": "bse_price_adjustment"},
     )
+    # BUG FOUND LIVE 2026-08-18 (re-audit): the "self-heals an accidental drop"
+    # claim above was false once the migration is recorded -- apply_schema_
+    # migration() skips re-executing its statements entirely once migration_id is
+    # marked 'applied' in stockey_schema_migrations, regardless of whether the VIEW
+    # itself still exists. If the view (or bseindia_ohlcv/bseindia_adjustment_
+    # factors) is ever dropped after that first successful run, ensure_view() would
+    # silently no-op forever after, and the next read would raise UndefinedTable,
+    # failing the whole technicals step. CREATE OR REPLACE VIEW is itself already
+    # idempotent and cheap, so it's run directly here too, unconditionally, every
+    # call -- apply_schema_migration above still provides the checksum-tracked audit
+    # trail (a genuine, reviewed change to the view's own SQL text bumps
+    # VIEW_MIGRATION_ID), this direct run is what makes ensure_view() ACTUALLY
+    # self-heal a drop, not just a fresh DB. Same latent gap in NSE's own
+    # price_adjustment module -- not fixed there in this pass, this file only.
+    def _create_or_replace_view() -> None:
+        with db_session() as (_, cur):
+            for statement in VIEW_SCHEMA_STATEMENTS:
+                cur.execute(statement)
+
+    execute_db_operation(_create_or_replace_view, operation_name=f"{ADJUSTED_VIEW}:ensure_view_direct")
 
 
 def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
