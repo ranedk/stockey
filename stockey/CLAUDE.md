@@ -124,6 +124,18 @@ on a new machine (`(crontab -l; echo "*/15 * * * *
 crontab -`) and note it in `HANDOFF.md` alongside the existing "confirm
 go-crond is running" caveat.
 
+**A second, sharper gotcha confirmed live the same day**: `builder.py` always
+rewrites `config/stockey.generated.crontab`, even when the content is
+byte-identical to what's already there — there is currently no read-only
+"just check for drift" mode (`--dry-run` doesn't exist). Running it while
+go-crond is already live silently breaks the running instance's scheduling
+(it keeps running as a process, but stops firing ANY job — confirmed live:
+2.5 hours, zero jobs fired, including the 5-minute `fundamentals_api`
+health check) without crashing or logging anything — go-crond gives no
+indication it stopped working. If you run `builder.py` for any reason
+(including just to eyeball drift) while go-crond might already be running,
+restart go-crond afterward regardless of whether the diff was empty.
+
 ## Key Commands
 
 Daily/operator (matches the crontab exactly):
