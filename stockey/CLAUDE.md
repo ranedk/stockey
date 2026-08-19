@@ -109,6 +109,21 @@ screener/watchlist/narrative/portfolio — not technicals/trading;
    instance holds the lock, and the script's own `/api/health` check no-ops
    again if something is already serving.
 
+go-crond itself has no supervisor and no `@reboot` support, and every check
+above that would catch it dying (`cron_preflight.py`, `data_readiness.py`,
+`data_coverage_report.py`) is itself a go-crond job — confirmed live
+2026-08-19: go-crond died silently for 5 days with zero alerting until a
+human noticed a missing email. `scripts/ensure_go_crond_alive.sh` is the
+out-of-band fix: a cheap liveness check + auto-restart via `start_cron.sh`,
+registered in the **OS-level user crontab** (`crontab -e`, every 15 min) —
+deliberately NOT in go-crond's own generated crontab, since go-crond being
+down is exactly the failure mode it exists to catch. This OS crontab entry
+is host state, not tracked by git or `builder.py` — re-install it by hand
+on a new machine (`(crontab -l; echo "*/15 * * * *
+/path/to/stockey/scripts/ensure_go_crond_alive.sh >/dev/null 2>&1") |
+crontab -`) and note it in `HANDOFF.md` alongside the existing "confirm
+go-crond is running" caveat.
+
 ## Key Commands
 
 Daily/operator (matches the crontab exactly):
