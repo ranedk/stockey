@@ -10,6 +10,7 @@ from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import (
     DEFAULT_TOKEN_CACHE,
     DhanAuthError,
+    _dhan_login_lock,
     begin_browser_consent,
     clear_cached_access_token,
     consume_consent_token,
@@ -106,11 +107,23 @@ def refresh_token(token_input: str | None = None, *, auto_login: bool = False) -
     normalized = normalize_token_id(token_input)
     consent_url = None
     if not normalized:
-        if auto_login or is_auto_login_configured():
-            normalized = get_token_id_from_auto_login()
-        else:
-            consent_url = begin_browser_consent()
-            normalized = prompt_for_token_id(consent_url)
+        # BUG FOUND LIVE 2026-08-19 (re-audit): this branch drives the shared CDP browser's
+        # login form (get_token_id_from_auto_login / begin_browser_consent) exactly like
+        # auth.py's get_access_token()/force_refresh_access_token(), but -- unlike those --
+        # was never wrapped in auth.py's own _dhan_login_lock(). This is the documented
+        # operator tool for a manual refresh (its own error messages tell operators to run
+        # this), which is precisely the "manual run overlapping a scheduled downloader"
+        # scenario the lock's docstring exists to prevent: two processes submitting
+        # mobile/TOTP/PIN into the same browser tab at once, triggering Dhan's
+        # too-many-attempts block. Only the login-driving branch needs the lock -- a
+        # caller who already has a token_id skips this entirely, same as auth.py's own
+        # already-have-a-token fast paths outside the lock.
+        with _dhan_login_lock():
+            if auto_login or is_auto_login_configured():
+                normalized = get_token_id_from_auto_login()
+            else:
+                consent_url = begin_browser_consent()
+                normalized = prompt_for_token_id(consent_url)
     payload = consume_consent_token(normalized)
     validation = validate_token(str(payload["accessToken"]))
     return {

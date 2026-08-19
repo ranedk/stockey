@@ -1835,19 +1835,49 @@ def test_dhan_auto_login_subprocess_failure_records_fallback(monkeypatch):
     assert events[0]["metadata"]["stderr_tail"] == "playwright failed"
 
 
+@contextlib.contextmanager
+def _fake_dhan_login_lock_recording(calls):
+    calls.append("entered")
+    yield
+
+
 def test_dhan_auth_cli_refresh_auto_login_without_manual_browser(monkeypatch):
+    lock_calls = []
     monkeypatch.setattr(dhan_auth_cli, "normalize_token_id", lambda value: None)
     monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
     monkeypatch.setattr(dhan_auth_cli, "get_token_id_from_auto_login", lambda: "TOKEN123")
     monkeypatch.setattr(dhan_auth_cli, "consume_consent_token", lambda token_id: {"accessToken": f"access:{token_id}", "expiryTime": "2026-05-07T10:00:00Z"})
     monkeypatch.setattr(dhan_auth_cli, "validate_token", lambda access_token: {"status": "ok", "access_token": access_token})
     monkeypatch.setattr(dhan_auth_cli, "begin_browser_consent", lambda: (_ for _ in ()).throw(AssertionError("manual browser opened")))
+    monkeypatch.setattr(dhan_auth_cli, "_dhan_login_lock", lambda: _fake_dhan_login_lock_recording(lock_calls))
 
     result = dhan_auth_cli.refresh_token()
 
     assert result["status"] == "ok"
     assert result["token_id_used"] == "TOKEN123"
     assert result["validation"] == {"status": "ok", "access_token": "access:TOKEN123"}
+    # BUG FOUND LIVE 2026-08-19 (re-audit): refresh_token()'s login-driving branch (auto-login
+    # or manual browser consent) used to call auth.py's shared-CDP-browser login flow with no
+    # _dhan_login_lock() protection at all -- unlike auth.py's own get_access_token()/
+    # force_refresh_access_token(), which always take this lock before touching the login UI.
+    # Two processes racing this path could both submit mobile/TOTP/PIN into the same browser
+    # tab, triggering Dhan's too-many-attempts block -- exactly what the lock exists to prevent.
+    assert lock_calls == ["entered"]
+
+
+def test_dhan_auth_cli_refresh_with_explicit_token_id_skips_the_login_lock(monkeypatch):
+    # a caller who already has a token_id (e.g. a pasted CLI arg) never touches the login UI,
+    # so it should not need to wait on the lock at all.
+    lock_calls = []
+    monkeypatch.setattr(dhan_auth_cli, "normalize_token_id", lambda value: "EXPLICIT_TOKEN")
+    monkeypatch.setattr(dhan_auth_cli, "consume_consent_token", lambda token_id: {"accessToken": f"access:{token_id}", "expiryTime": "2026-05-07T10:00:00Z"})
+    monkeypatch.setattr(dhan_auth_cli, "validate_token", lambda access_token: {"status": "ok", "access_token": access_token})
+    monkeypatch.setattr(dhan_auth_cli, "_dhan_login_lock", lambda: _fake_dhan_login_lock_recording(lock_calls))
+
+    result = dhan_auth_cli.refresh_token("EXPLICIT_TOKEN")
+
+    assert result["token_id_used"] == dhan_auth_cli.mask_token("EXPLICIT_TOKEN")
+    assert lock_calls == []
 
 
 def test_dhan_auth_cli_ensure_uses_fresh_cached_token(monkeypatch):
