@@ -29,15 +29,39 @@ import pandas as pd
 # ---- whose ex-date also moved a few %, or a 5:2 / 7:5 ratio absent from the round set) is left ambiguous
 # ---- and UNADJUSTED by the price-only path; cross-referencing NSE's declared split/bonus fixes exactly
 # ---- those. Bonus "X:Y" = X new shares per Y held -> price factor Y/(X+Y); FV split A->B -> factor B/A.
-_BONUS_RE = re.compile(r"BON(?:US)?\.?\s*(\d+)\s*:\s*(\d+)")
-_SPLIT_RE = re.compile(r"(?:F\.?\s*V\.?\s*)?(?:SPLI?T|SUB[\s-]*DIV)\D*?(\d+)\D+?TO\D*?(\d+)")
+#
+# BUG FOUND LIVE 2026-08-19 (re-audit): both regexes required at least one separator character between
+# the "BON"/"SPLIT" keyword (bonus) or between the first number and the literal "TO" (split) -- but NSE
+# frequently writes these with NO separator at all: "BON-1:25" (hyphen, no space, for bonus) and
+# "10TORS.2" / "10TORE 1" (split, the digit runs straight into "TO" with zero characters between them).
+# Confirmed live: BAJFINANCE 2016-09-08's subject "BON 1:1/SPLIT RS.10TORS.2" (combined bonus+split) had
+# its split half silently dropped -- declared_ratios supplied only the bonus factor (0.5) instead of the
+# true combined ~0.1, and adjust_frame() applied that wrong-but-plausible-looking ratio with full
+# confidence (ca_flag='split_bonus_ca'), corrupting the symbol's entire pre-event history in
+# advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) by ~5x. WELSPUNIND 2016-03-21's
+# "DIV-RS6/SPLIT RS 10TORE 1" matched NEITHER regex at all, routing the date to declared_non_split_dates
+# and leaving a real 10:1 split completely unadjusted. \D+? (one-or-more) loosened to \D*? (zero-or-more)
+# for the split's digit-to-"TO" gap; bonus's separator widened to [.\s-]* (zero-or-more of period/
+# whitespace/hyphen) to admit the hyphenated form.
+_BONUS_RE = re.compile(r"BON(?:US)?[.\s-]*(\d+)\s*:\s*(\d+)")
+_SPLIT_RE = re.compile(r"(?:F\.?\s*V\.?\s*)?(?:SPLI?T|SUB[\s-]*DIV)\D*?(\d+)\D*?TO\D*?(\d+)")
 
 
 def _events_from_subject(subject: str) -> set[tuple[str, int, int]]:
     """Parse the canonical (kind, a, b) split/bonus events out of one Bc `subject` string. Splits on
-    '/', ';', '|' so a combined 'BONUS1:1/FVSPLIT 10 TO 5' yields both events."""
+    '/', ';', '|' so a combined 'BONUS1:1/FVSPLIT 10 TO 5' yields both events.
+
+    BUG FOUND LIVE 2026-08-19 (re-audit): a bare '/' was always a split point -- but NSE also uses '/'
+    inside its "Rs.X/-" face-value notation (meaning "Rupees X only"), which appears constantly in plain,
+    single-event split subjects like "FV SPLIT RS.5/- TO RS.2/-" (ASTRAL 2013-09-05) or "FV SPLIT RS
+    5/- TO RE 1/-" (HAVELLS 2014-08-26). Splitting blindly on every '/' shredded these into fragments
+    ("FV SPLIT RS.5", "- TO RS.2", "-") none of which contain a complete digit-TO-digit match, even though
+    the WHOLE, unsplit subject matches _SPLIT_RE cleanly. A '/' immediately followed by '-' is the "/-"
+    face-value marker, not an event separator -- excluded from the split via a negative lookahead so it
+    stays attached to its own event's text; a genuine combined-event '/' (not followed by '-') still
+    splits normally."""
     events: set[tuple[str, int, int]] = set()
-    for part in re.split(r"[/;|]", str(subject).upper()):
+    for part in re.split(r"/(?!-)|[;|]", str(subject).upper()):
         mb = _BONUS_RE.search(part)
         if mb:
             events.add(("bonus", int(mb.group(1)), int(mb.group(2))))
@@ -134,6 +158,28 @@ def _snap_event_ratio(price_ratio: float) -> float | None:
     return None
 
 
+# BUG FOUND LIVE 2026-08-19 (re-audit): declared_ratios used to be trusted unconditionally -- any parse
+# gap in _BONUS_RE/_SPLIT_RE (a future NSE wording change, a genuinely novel combined-event format the
+# regex loosening above doesn't happen to cover) would silently produce a wrong-but-plausible-looking
+# factor and apply it with full confidence (ca_flag='split_bonus_ca'), same failure shape as the
+# BAJFINANCE case the regex fix above closes. This is looser than _SNAP_TOL (6%) deliberately -- the
+# whole reason the declared path exists is to handle real CAs whose price step does NOT hit a clean round
+# number (a bonus whose ex-date also moved a genuine few % intraday, see adjust_frame's own docstring),
+# so it must not reject those. It exists only to catch a declared ratio that is off by a WHOLE separate
+# missed event's worth of magnitude, not to second-guess a normal declared CA.
+_DECLARED_RATIO_TOL = 0.15
+
+
+def _declared_ratio_plausible(declared: float, price_ratio: float) -> bool:
+    """Does a declared split/bonus ratio roughly explain the actual observed price step? Compared on the
+    same >=1 "implied" scale _snap_event_ratio uses so direction (split vs reverse-split) doesn't matter."""
+    if not np.isfinite(price_ratio) or price_ratio <= 0 or not np.isfinite(declared) or declared <= 0:
+        return False
+    declared_implied = declared if declared > 1.0 else 1.0 / declared
+    price_implied = price_ratio if price_ratio > 1.0 else 1.0 / price_ratio
+    return abs(declared_implied - price_implied) / price_implied <= _DECLARED_RATIO_TOL
+
+
 def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str = "date",
                  close_col: str = "close", open_col: str = "open",
                  declared_ratios: dict[tuple[str, Any], float] | None = None,
@@ -159,10 +205,13 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
     schemes of arrangement were all being misclassified as split_bonus this way. Checked AFTER
     `declared_ratios` (a declared split/bonus always wins) and BEFORE the price-snap fallback.
 
-    `ca_flag`: 'split_bonus_ca' (declared-confirmed split/bonus), 'split_bonus' (price-snapped, no
+    `ca_flag`: 'split_bonus_ca' (declared-confirmed split/bonus -- the declared ratio also plausibly
+    explains the observed price step, see _declared_ratio_plausible), 'split_bonus' (price-snapped, no
     declared CA either way), 'declared_non_split_ca' (breach, but NSE declared a different, non-split
-    reason -- NOT adjusted), 'ambiguous' (breach, no declared CA and no round-ratio match -> possible data
-    error, NOT adjusted), else ''.
+    reason -- NOT adjusted), 'declared_ca_mismatch' (breach, a declared ratio existed but didn't plausibly
+    explain the actual step and the step doesn't snap either -- likely a parse gap on a combined-event
+    subject, NOT adjusted, flagged for review), 'ambiguous' (breach, no declared CA and no round-ratio
+    match -> possible data error, NOT adjusted), else ''.
     """
     if df.empty:
         return df.assign(cum_adj_factor=[], adj_close=[], ca_flag=[])
@@ -193,7 +242,8 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
     # only circuit-breaching rows can be corporate actions -- resolve just those (fast on the full universe)
     for i in np.flatnonzero(np.nan_to_num(breach)):
         declared = declared_col[i]
-        if np.isfinite(declared) and declared > 0:
+        has_declared = np.isfinite(declared) and declared > 0
+        if has_declared and _declared_ratio_plausible(float(declared), float(price_ratio[i])):
             event_ratio[i] = declared            # NSE-declared split/bonus -> exact, ground-truth ratio
             ca_flag[i] = "split_bonus_ca"
             continue
@@ -202,7 +252,11 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
             continue
         snapped = _snap_event_ratio(float(price_ratio[i]))
         if snapped is None:
-            ca_flag[i] = "ambiguous"          # possible data error -> do not adjust, flag for review
+            # a declared ratio existed but didn't plausibly explain the actual price step (and the step
+            # doesn't snap cleanly either) -- likely a parse gap on a combined-event subject, not a clean
+            # miss. Flagged distinctly from plain 'ambiguous' so it's easy to find for manual review,
+            # rather than silently applying a ratio that only explains part of the real move.
+            ca_flag[i] = "declared_ca_mismatch" if has_declared else "ambiguous"
         else:
             event_ratio[i] = snapped
             ca_flag[i] = "split_bonus"
@@ -232,7 +286,12 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
 ADJUSTMENT_FACTORS_TABLE = "nseindia_adjustment_factors"
 ADJUSTED_VIEW = "advisory_adjusted_ohlcv_daily"
 FACTORS_MIGRATION_ID = "20260814_nseindia_adjustment_factors"
-VIEW_MIGRATION_ID = "20260814_advisory_adjusted_ohlcv_daily_view"
+# BUG FOUND LIVE 2026-08-19 (re-audit): apply_schema_migration() checksums its statements and refuses to
+# silently re-apply a migration_id whose recorded checksum no longer matches (a deliberate anti-drift
+# guard) -- so composing tr_adj_* with cum_price_adjustment_factor (see VIEW_SCHEMA_STATEMENTS below)
+# needed a new migration_id, not a mutation of the 2026-08-14 one. Confirmed live: reusing the old ID
+# raised ValueError("Migration checksum mismatch...") exactly as designed.
+VIEW_MIGRATION_ID = "20260819_advisory_adjusted_ohlcv_daily_view_tr_composed"
 
 FACTORS_SCHEMA_STATEMENTS = [
     f"""
@@ -264,10 +323,18 @@ VIEW_SCHEMA_STATEMENTS = [
         o.high * f.cum_price_adjustment_factor AS adj_high,
         o.low * f.cum_price_adjustment_factor AS adj_low,
         o.volume / NULLIF(f.cum_price_adjustment_factor, 0) AS adj_volume,
-        o.close * f.cum_total_return_factor AS tr_adj_close,
-        o.open * f.cum_total_return_factor AS tr_adj_open,
-        o.high * f.cum_total_return_factor AS tr_adj_high,
-        o.low * f.cum_total_return_factor AS tr_adj_low,
+        -- BUG FOUND LIVE 2026-08-19 (re-audit): these used to multiply raw close/open/high/low by
+        -- cum_total_return_factor ALONE -- cum_total_return_factor is purely dividend-derived (see
+        -- compute_total_return_factor) and knows nothing about splits/bonuses, so any split/bonus event
+        -- produced a fake discontinuity in the total-return columns at the exact same magnitude as the
+        -- (correctly-adjusted-elsewhere) split ratio. Confirmed live on IRCTC's 2021-10-28 5:1 split:
+        -- adj_close stayed correctly smooth (826.03 -> 913.50) while tr_adj_close faked a ~4.5x "crash"
+        -- (3950.82 -> 873.84) on the same date. Composed with cum_price_adjustment_factor, same as
+        -- adj_close/adj_open/etc. already are, so both corrections stack instead of only one applying.
+        o.close * f.cum_price_adjustment_factor * f.cum_total_return_factor AS tr_adj_close,
+        o.open * f.cum_price_adjustment_factor * f.cum_total_return_factor AS tr_adj_open,
+        o.high * f.cum_price_adjustment_factor * f.cum_total_return_factor AS tr_adj_high,
+        o.low * f.cum_price_adjustment_factor * f.cum_total_return_factor AS tr_adj_low,
         f.cum_price_adjustment_factor AS cum_adj_factor,
         f.cum_total_return_factor,
         f.ca_flag,

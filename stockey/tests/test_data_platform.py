@@ -6596,6 +6596,19 @@ def test_price_adjustment_open_gap_catches_split_with_intraday_move():
     assert (a2["ca_flag"] == "ambiguous").any() and (a2["cum_adj_factor"] == 1.0).all()
 
 
+def test_price_adjustment_view_composes_total_return_with_split_adjustment():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): tr_adj_close/open/high/low used to multiply raw close/open/
+    # high/low by cum_total_return_factor ALONE -- cum_total_return_factor is purely dividend-derived and
+    # knows nothing about splits/bonuses, so any split/bonus event faked a discontinuity in the
+    # total-return columns at the split's own magnitude. Confirmed live on IRCTC's 2021-10-28 5:1 split:
+    # adj_close stayed correctly smooth while tr_adj_close faked a ~4.5x "crash" on the same date.
+    from data.nseindia import price_adjustment as pa
+
+    view_sql = " ".join(pa.VIEW_SCHEMA_STATEMENTS)
+    for col in ("close", "open", "high", "low"):
+        assert f"o.{col} * f.cum_price_adjustment_factor * f.cum_total_return_factor AS tr_adj_{col}" in view_sql
+
+
 def test_price_adjustment_ca_purpose_parser():
     from data.nseindia import price_adjustment as pa
     f = lambda s: pa._factor_for_events(pa._events_from_subject(s))
@@ -6606,6 +6619,48 @@ def test_price_adjustment_ca_purpose_parser():
     assert abs(f("FVSPLT FRM RS 5 TO RE 1") - 0.2) < 1e-9
     assert abs(f("BON 2:1/FVSPLT FRM RS 2 TO RE 1") - (1 / 3) * (1 / 2)) < 1e-9  # combined multiply
     assert f("DIV - RS 5 PER SH") is None              # dividend is not a split/bonus
+
+
+def test_price_adjustment_ca_purpose_parser_handles_nse_no_separator_subjects():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): both regexes required a separator character NSE sometimes
+    # omits entirely. Real, live-confirmed subjects that used to silently drop or miss the split half.
+    from data.nseindia import price_adjustment as pa
+    f = lambda s: pa._factor_for_events(pa._events_from_subject(s))
+
+    # BAJFINANCE 2016-09-08: combined 1:1 bonus + 5:1 (FV 10->2) split, no separator before "TO".
+    # bonus factor 0.5 * split factor 0.2 = 0.1, matching the real observed overnight ratio (~0.101).
+    assert abs(f("BON 1:1/SPLIT RS.10TORS.2") - 0.1) < 1e-9
+
+    # WELSPUNIND 2016-03-21: dividend + a 10:1 split, no separator before "TO" either. Used to match
+    # NEITHER regex at all (bonus regex correctly doesn't match -- no bonus here -- but the split regex
+    # used to miss it too), routing the whole date to declared_non_split_dates and leaving a real 10:1
+    # split completely unadjusted.
+    events = pa._events_from_subject("DIV-RS6/SPLIT RS 10TORE 1")
+    assert ("split", 10, 1) in events
+    assert abs(pa._factor_for_events(events) - 0.1) < 1e-9
+
+    # the hyphenated bonus form ("BON-1:25") also used to fail to match at all.
+    assert f("BON-1:25") == pytest.approx(25 / 26)
+
+
+def test_price_adjustment_ca_purpose_parser_handles_face_value_slash_notation():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): _events_from_subject splits combined-event subjects on '/',
+    # but NSE also uses '/' inside its "Rs.X/-" face-value notation -- a bare '/' split shredded plain,
+    # single-event subjects like ASTRAL's "FV SPLIT RS.5/- TO RS.2/-" into unparseable fragments
+    # ("FV SPLIT RS.5", "- TO RS.2", "-"), even though the whole, unsplit text matches cleanly.
+    from data.nseindia import price_adjustment as pa
+    f = lambda s: pa._factor_for_events(pa._events_from_subject(s))
+
+    assert f("FV SPLIT RS.5/- TO RS.2/-") == 0.4          # ASTRAL 2013-09-05
+    assert f("FV SPLIT RS 5/- TO RE 1/-") == 0.2           # HAVELLS 2014-08-26
+
+    # a genuine combined-event '/' (not part of "/-" notation) still splits correctly
+    combined = pa._events_from_subject("BON-1:25/SPLIT RS10TORS.5")
+    assert combined == {("bonus", 1, 25), ("split", 10, 5)}
+
+    # a subject genuinely truncated at the source (no second number at all) correctly stays unparseable
+    # -- not a splitting bug, nothing to recover; must not be guessed at.
+    assert pa._events_from_subject("FV SPLT FRM RS 10/- TO RS") == set()
 
 
 def test_price_adjustment_declared_ca_fixes_missed_split():
@@ -6631,6 +6686,53 @@ def test_price_adjustment_declared_ca_fixes_missed_split():
                          "open": [100.0, 100.5], "close": [100.0, 101.0]})
     a2 = pa.adjust_frame(flat, declared_ratios={("Y", _dt.date(2024, 1, 2)): 0.5})
     assert (a2["cum_adj_factor"] == 1.0).all() and (a2["ca_flag"] == "").all()
+
+
+def test_declared_ratio_plausible_accepts_close_match_rejects_far_off():
+    from data.nseindia import price_adjustment as pa
+    # a declared 1:1 bonus (0.5) whose ex-date also moved a genuine few % -- exactly the case the
+    # declared path exists for, per adjust_frame's own docstring. Must still be trusted.
+    assert pa._declared_ratio_plausible(0.5, 0.535) is True
+    # TRIVENI-style: declared 0.6, observed ~0.615 -- also within tolerance.
+    assert pa._declared_ratio_plausible(0.6, 0.6149) is True
+    # BAJFINANCE-style: declared ratio only captures ONE of two combined events (bonus-only, 0.5) but the
+    # real combined step is ~0.1 -- a whole separate event's worth of magnitude off. Must be rejected.
+    assert pa._declared_ratio_plausible(0.5, 0.1013) is False
+    assert pa._declared_ratio_plausible(0.0, 0.5) is False
+    assert pa._declared_ratio_plausible(0.5, 0.0) is False
+    assert pa._declared_ratio_plausible(float("nan"), 0.5) is False
+
+
+def test_price_adjustment_declared_ratio_that_misses_a_combined_event_is_flagged_not_misapplied():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): reproduces BAJFINANCE's 2016-09-08 shape at unit-test scale --
+    # a declared ratio that only captures ONE of two combined events used to be applied with full
+    # confidence (ca_flag='split_bonus_ca'), corrupting the whole pre-event history. Now flagged for
+    # review instead of silently misapplied.
+    import datetime as _dt
+    from data.nseindia import price_adjustment as pa
+
+    # combined-event price ratio deliberately chosen to NOT snap cleanly to a round ratio either (~1/7.5,
+    # roughly equidistant between the round ratios 7 and 8, both outside _snap_event_ratio's 6% tolerance)
+    # -- isolates the plausibility-check behavior from the price-snap fallback recovering the same answer
+    # by coincidence, which is what a round-numbered combined ratio (like the real BAJFINANCE ~10x) would do.
+    true_ratio = 1 / 7.5
+    prev_close = 1139.330
+    df = pd.DataFrame({
+        "symbol": ["BAJ", "BAJ", "BAJ"],
+        "date": pd.to_datetime(["2016-09-06", "2016-09-07", "2016-09-08"], utc=True),
+        "open": [1120.0, 1130.0, prev_close * true_ratio], "close": [1126.585, prev_close, prev_close * true_ratio + 0.5],
+    })
+    # a declared ratio that only captured one of two combined events (0.5), nowhere near the true ~0.133
+    wrong_decl = {("BAJ", _dt.date(2016, 9, 8)): 0.5}
+    a = pa.adjust_frame(df.copy(), declared_ratios=wrong_decl).sort_values("date").reset_index(drop=True)
+    assert a.loc[2, "ca_flag"] == "declared_ca_mismatch"
+    assert (a["cum_adj_factor"] == 1.0).all()  # NOT adjusted with the wrong-magnitude ratio
+
+    # the correct combined ratio IS trusted and applied
+    right_decl = {("BAJ", _dt.date(2016, 9, 8)): true_ratio}
+    a2 = pa.adjust_frame(df.copy(), declared_ratios=right_decl).sort_values("date").reset_index(drop=True)
+    assert a2.loc[2, "ca_flag"] == "split_bonus_ca"
+    assert abs(a2.loc[0, "cum_adj_factor"] - true_ratio) < 1e-9
 
 
 def test_price_adjustment_declared_non_split_ca_blocks_price_snap():
