@@ -18447,13 +18447,44 @@ def test_evaluate_exit_status_aged_out_technicals_row_treated_as_stale_even_with
     # price_data_stale flag is frozen at whatever it was on its LAST processed run
     # and never recomputed. A real +60% move must not be trusted off a technicals
     # row that's 22 days old, even though price_data_stale itself is False/absent.
+    #
+    # technicals_as_of_date deliberately passed as a tz-aware pd.Timestamp here, not
+    # a bare date -- fundamentals_technicals.as_of_date is a real TIMESTAMPTZ column,
+    # and every one of these tests used to pass a naive `date(...)` instead, which
+    # masked the exact live crash fixed in test_price_data_is_effectively_stale_*
+    # below (both sides ended up tz-naive here, only in production did they mismatch).
     row = {
-        "first_seen_price": 100.0, "current_price": 160.0, "technicals_as_of_date": date(2026, 7, 22),
+        "first_seen_price": 100.0, "current_price": 160.0,
+        "technicals_as_of_date": pd.Timestamp("2026-07-22", tz="UTC"),
         "suggested_watch_until": date(2026, 8, 1), "last_alert_at": None, "narrative_generated_at": None,
     }
     status, reason, stale_skip = fundamentals_watchlist_exit.evaluate_exit_status(row, [], today=date(2026, 8, 13))
     assert status == "stale"  # not "price_flagged" -- the aged-out row must not be trusted
     assert stale_skip is True
+
+
+def test_price_data_is_effectively_stale_handles_tz_aware_as_of_date():
+    # BUG FOUND LIVE 2026-08-19: reproduced in the first real scheduled run since the
+    # go-crond outage -- `today` (pd.Timestamp.now(tz="UTC").date(), from
+    # run_watchlist_exit_evaluation) is a bare datetime.date, and pd.Timestamp(today)
+    # built a tz-NAIVE Timestamp from it, while `as_of` (parsed from
+    # fundamentals_technicals.as_of_date, a real TIMESTAMPTZ column) stayed
+    # tz-aware. Subtracting them raised `TypeError: Cannot subtract tz-naive and
+    # tz-aware datetime-like objects`, crashing the entire notifications pipeline
+    # step -- the daily digest never sent. No test existed for this function at all
+    # before this fix; every indirect test via evaluate_exit_status passed a bare
+    # `date(...)` for technicals_as_of_date, which never triggers a tz mismatch.
+    stale = fundamentals_watchlist_exit._price_data_is_effectively_stale
+    today = date(2026, 8, 19)  # matches pd.Timestamp.now(tz="UTC").date()'s own shape -- a bare date
+
+    # fresh, tz-aware, well within the threshold
+    assert stale(False, pd.Timestamp("2026-08-18T00:00:00+00:00"), today=today) is False
+    # stale, tz-aware, beyond the threshold -- must not crash, must correctly say stale
+    assert stale(False, pd.Timestamp("2026-07-01T00:00:00+00:00"), today=today) is True
+    # the flag itself still short-circuits regardless of the date
+    assert stale(True, pd.Timestamp("2026-08-18T00:00:00+00:00"), today=today) is True
+    # missing technicals row -- still correctly treated as stale, no crash
+    assert stale(False, None, today=today) is True
 
 
 def test_evaluate_exit_status_missing_technicals_row_treated_as_stale():

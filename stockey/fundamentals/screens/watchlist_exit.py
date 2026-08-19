@@ -204,13 +204,35 @@ def _price_data_is_effectively_stale(price_data_stale, technicals_as_of_date, *,
     ran) against STALE_PRICE_THRESHOLD_DAYS -- the same threshold technicals.py's
     own freshness check uses -- so an old row is caught even when its flag is stale
     or missing. No technicals row at all (as_of_date is NaT) is also treated as
-    stale -- can't judge freshness without one."""
+    stale -- can't judge freshness without one.
+
+    BUG FOUND LIVE 2026-08-19 (in a real scheduled run, first one to reach this line
+    since the go-crond outage): `today` here is `pd.Timestamp.now(tz="UTC").date()`
+    (run_watchlist_exit_evaluation's own caller) -- `.date()` strips all tz info, so
+    the old `pd.Timestamp(today)` built a tz-NAIVE Timestamp. `technicals_as_of_date`
+    comes from `fundamentals_technicals.as_of_date`, a TIMESTAMPTZ column, so
+    `as_of` (via pd.to_datetime) stays tz-aware. Subtracting a naive Timestamp from
+    an aware one raises `TypeError: Cannot subtract tz-naive and tz-aware
+    datetime-like objects` -- reproduced live with the exact real inputs. This
+    crashed the whole notifications pipeline step (uncaught inside
+    evaluate_exit_status's per-company loop), so the daily digest never sent.
+
+    First attempt at a fix forced `today` to `tz="UTC")` unconditionally and left
+    `as_of` alone -- immediately broke every existing test, all of which pass a bare
+    (tz-naive) `date(...)` for technicals_as_of_date, for the exact opposite
+    mismatch. Both sides are normalized to UTC-aware explicitly below instead of
+    assuming either one's tz-awareness -- correct regardless of whether the caller's
+    `today`/`as_of` happen to already carry a tz or not."""
     if price_data_stale:
         return True
     as_of = pd.to_datetime(technicals_as_of_date, errors="coerce")
     if pd.isna(as_of):
         return True
-    return (pd.Timestamp(today) - as_of.normalize()).days > STALE_PRICE_THRESHOLD_DAYS
+    as_of = as_of.normalize()
+    as_of = as_of.tz_localize("UTC") if as_of.tz is None else as_of.tz_convert("UTC")
+    today_ts = pd.Timestamp(today)
+    today_ts = today_ts.tz_localize("UTC") if today_ts.tz is None else today_ts.tz_convert("UTC")
+    return (today_ts - as_of).days > STALE_PRICE_THRESHOLD_DAYS
 
 
 def _check_price_flagged(first_seen_price, current_price, *, price_data_stale=False) -> str | None:
