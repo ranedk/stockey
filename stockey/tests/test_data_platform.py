@@ -7791,6 +7791,125 @@ def test_fbil_gsec_main_exports_failed_run_state(monkeypatch, capsys):
     assert state["state_advanced"] is False
 
 
+def _make_fake_rbi_modal(*, visible, button_labels=()):
+    from data.rbi import download_bank_rates as bank_rates
+
+    class FakeButton:
+        def __init__(self, present):
+            self._present = present
+            self.clicked = False
+
+        def count(self):
+            return 1 if self._present else 0
+
+        @property
+        def first(self):
+            return self
+
+        def click(self):
+            self.clicked = True
+
+    class FakeDialog:
+        def __init__(self):
+            self.buttons = {label: FakeButton(label in button_labels) for label in ("Refresh", "OK", "Close")}
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self, timeout=None):
+            if not visible:
+                raise bank_rates.PlaywrightTimeoutError("no modal")
+            return True
+
+        def get_by_role(self, role, name=None, exact=None):
+            return self.buttons[name]
+
+    class FakeKeyboard:
+        def __init__(self):
+            self.pressed = []
+
+        def press(self, key):
+            self.pressed.append(key)
+
+    class FakePage:
+        def __init__(self):
+            self.dialog = FakeDialog()
+            self.keyboard = FakeKeyboard()
+            self.waits = []
+
+        def locator(self, selector):
+            return self.dialog
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    return FakePage()
+
+
+def test_dismiss_blocking_modal_returns_false_when_nothing_visible(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    page = _make_fake_rbi_modal(visible=False)
+    assert bank_rates._dismiss_blocking_modal(page) is False
+    assert page.keyboard.pressed == []
+
+
+def test_dismiss_blocking_modal_clicks_known_button_label(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    page = _make_fake_rbi_modal(visible=True, button_labels=("Refresh",))
+    assert bank_rates._dismiss_blocking_modal(page) is True
+    assert page.dialog.buttons["Refresh"].clicked is True
+    assert page.keyboard.pressed == []  # a known button was found -- Escape never needed
+
+
+def test_dismiss_blocking_modal_falls_back_to_escape_without_known_button(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    page = _make_fake_rbi_modal(visible=True, button_labels=())
+    assert bank_rates._dismiss_blocking_modal(page) is True
+    assert page.keyboard.pressed == ["Escape"]
+
+
+def test_click_past_blocking_modals_retries_after_dismissing(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    page = _make_fake_rbi_modal(visible=True, button_labels=("OK",))
+
+    class FlakyLocator:
+        def __init__(self):
+            self.attempts = 0
+
+        def click(self, timeout=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise bank_rates.PlaywrightTimeoutError("blocked by modal")
+            # succeeds on the second attempt, after the modal is dismissed
+
+    locator = FlakyLocator()
+    bank_rates._click_past_blocking_modals(page, locator)
+    assert locator.attempts == 2
+    assert page.dialog.buttons["OK"].clicked is True
+
+
+def test_click_past_blocking_modals_reraises_when_nothing_to_dismiss(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19: the "Indicators" click has failed on every one of the
+    # last 15 recorded complete_data.sh runs with a modal-backdrop intercepting pointer
+    # events -- dismiss-and-retry is strictly protective, but a genuine non-modal timeout
+    # (nothing to dismiss) must still surface as a real failure, not swallow forever.
+    from data.rbi import download_bank_rates as bank_rates
+
+    page = _make_fake_rbi_modal(visible=False)
+
+    class AlwaysBlockedLocator:
+        def click(self, timeout=None):
+            raise bank_rates.PlaywrightTimeoutError("blocked, not by a modal")
+
+    with pytest.raises(bank_rates.PlaywrightTimeoutError, match="blocked, not by a modal"):
+        bank_rates._click_past_blocking_modals(page, AlwaysBlockedLocator())
+
+
 def test_rbi_bank_rates_exports_source_unavailable_state(monkeypatch):
     from data.rbi import download_bank_rates as bank_rates
 

@@ -85,6 +85,50 @@ def _wait_for_named_frame(page, *, name: str, timeout_ms: int = 20_000, poll_ms:
     raise PlaywrightTimeoutError(f"Timed out after {timeout_ms}ms waiting for frame name={name!r}")
 
 
+def _dismiss_blocking_modal(page) -> bool:
+    """BUG FOUND LIVE 2026-08-19: the "Indicators" click below has failed on every one of the
+    last 15 recorded runs (both complete_data.sh slots, several days running) with the same
+    Playwright error -- a `.modal-backdrop.show` element "intercepts pointer events". Live
+    reproduction on the real site/profile (2026-08-19) found a "Session has expired. Please
+    refresh the page" dialog (plus a "Download App" and generic "OK" dialog) present in the
+    DOM from this CDP profile's carried-over RBI session state, though its backdrop wasn't
+    reliably reproducible as blocking in 3/3 isolated attempts -- the real cron process shares
+    one Chrome instance with several other concurrent scrapers, so a slow fade-out under that
+    contention is the more likely trigger than a permanently stuck dialog. Either way, dismissing
+    any visible modal before the click is strictly protective (no-op when nothing is showing, as
+    it was in all 3 successful isolated reproductions) and directly targets the one element type
+    named in every historical failure. Returns True if a modal was found and dismissed."""
+    dialog = page.locator(".modal.show, [role='dialog']:visible").first
+    try:
+        if not dialog.is_visible(timeout=1_000):
+            return False
+    except PlaywrightTimeoutError:
+        return False
+    for label in ("Refresh", "OK", "Close"):
+        button = dialog.get_by_role("button", name=label, exact=False)
+        if button.count() > 0:
+            button.first.click()
+            page.wait_for_timeout(1_000)
+            return True
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(1_000)
+    return True
+
+
+def _click_past_blocking_modals(page, locator, *, max_dismissals: int = 3) -> None:
+    """Wraps a single .click() with up to max_dismissals modal-dismiss-and-retry attempts --
+    see _dismiss_blocking_modal()'s docstring for why. Bounded so a modal that keeps
+    reappearing (e.g. a reload loop) still surfaces as a real timeout, not an infinite retry."""
+    for _ in range(max_dismissals):
+        try:
+            locator.click(timeout=10_000)
+            return
+        except PlaywrightTimeoutError:
+            if not _dismiss_blocking_modal(page):
+                raise
+    locator.click()
+
+
 def download_latest_rates(playwright) -> dict[str, object]:
     """
     Automate RBI website's download using the sync Playwright API.
@@ -102,7 +146,7 @@ def download_latest_rates(playwright) -> dict[str, object]:
         page.goto("https://data.rbi.org.in/DBIE/#/dbie/home")
         page.wait_for_timeout(10_000)
 
-        page.get_by_role("link", name="Indicators", exact=True).click()
+        _click_past_blocking_modals(page, page.get_by_role("link", name="Indicators", exact=True))
         page.wait_for_timeout(2_000)
 
         page.locator("a").filter(has_text="Financial Sector Indicators").click()
