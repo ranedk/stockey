@@ -36,12 +36,13 @@ def _record_fbil_gsec_fallback(
     error: Exception | None = None,
     fdate: date | datetime | None = None,
     metadata: dict[str, object] | None = None,
+    severity: str = "warn",
 ) -> None:
     record_local_fallback_event(
         module=SYNC_SOURCE_NAME,
         source="rbi_fbil_gsec",
         fallback_type=fallback_type,
-        severity="warn",
+        severity=severity,
         reason=reason,
         error=error,
         metadata={
@@ -207,8 +208,25 @@ def download_all_gsec_data() -> dict[str, object]:
         "source_unavailable_count": 0,
         "fallback_used": False,
         "state_advanced": False,
+        "blocked": False,
     }
+    # BUG FOUND LIVE 2026-08-19 (re-audit): a raised exception (parse_xls crashing on a bad
+    # workbook, a network error from requests.Session.get not caught inside download_gsec's
+    # own graceful non-200 handling, etc.) used to `break` the whole catch-up loop outright.
+    # The redis DOWNLOADED cursor only advances on a genuine per-date success (download_gsec's
+    # own rop.set call), so one persistently-failing date permanently blocked every later
+    # date behind it -- next run's from_date starts right back at that same date, re-fails,
+    # re-breaks, forever. Confirmed live: fbil_gsec_par's max date was stuck at 2026-08-13 for
+    # 6 days after exactly this pattern (source_unavailable_count:1 on the 2026-08-14 run).
+    # Fixed the same way bseindia/bhavcopy.py's sibling per-date loop already handles this
+    # class of risk: record and skip the failed date (continue, not break) so later dates
+    # still get a chance, bounded by a consecutive-failure circuit breaker so a genuinely
+    # down/blocking source doesn't burn through the whole catch-up window date by date.
+    consecutive_failures = 0
+    blocked = False
     for fdate in daterange(from_date, today):
+        if blocked:
+            break
         state["date_count"] = int(state["date_count"]) + 1
         try:
             result = download_gsec(fdate, cookies=cookies) or {
@@ -217,9 +235,10 @@ def download_all_gsec_data() -> dict[str, object]:
                 "rows": 0,
             }
         except Exception as exc:
+            consecutive_failures += 1
             _record_fbil_gsec_fallback(
                 fallback_type="fbil_gsec_download_failed",
-                reason="FBIL G-sec date download or parse failed; stopping catch-up at this date.",
+                reason="FBIL G-sec date download or parse failed; it stays missing and is retried on a later run.",
                 error=exc,
                 fdate=fdate,
             )
@@ -236,7 +255,19 @@ def download_all_gsec_data() -> dict[str, object]:
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
-            break
+            if consecutive_failures >= 3:
+                blocked = True
+                state["blocked"] = True
+                state["fallback_used"] = True
+                _record_fbil_gsec_fallback(
+                    fallback_type="fbil_gsec_circuit_breaker_tripped",
+                    reason="3 consecutive FBIL G-sec download failures -- stopping this run rather than continuing to hit a possibly-down/blocking source.",
+                    error="circuit breaker",
+                    fdate=fdate,
+                    severity="error",
+                )
+            continue
+        consecutive_failures = 0
         status = str(result.get("status") or "")
         if status == "downloaded":
             rows = int(result.get("rows") or 0)
@@ -261,7 +292,12 @@ def download_all_gsec_data() -> dict[str, object]:
 def main() -> int:
     global STOCKEY_RUN_STATE
     STOCKEY_RUN_STATE = download_all_gsec_data()
-    status = "partial" if int(STOCKEY_RUN_STATE.get("failed_date_count") or 0) else "ok"
+    if STOCKEY_RUN_STATE.get("blocked"):
+        status = "blocked"
+    elif int(STOCKEY_RUN_STATE.get("failed_date_count") or 0):
+        status = "partial"
+    else:
+        status = "ok"
     print(
         json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str),
         flush=True,

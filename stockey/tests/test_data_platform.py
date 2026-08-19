@@ -7768,6 +7768,99 @@ def test_fbil_gsec_download_failure_records_local_fallback(monkeypatch):
     assert events[0]["metadata"]["date"] == "2026-06-08"
 
 
+def test_fbil_gsec_download_failure_skips_the_date_and_keeps_going(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): a raised exception used to `break` the whole
+    # catch-up loop -- since the redis DOWNLOADED cursor only advances on success, one
+    # persistently-failing date permanently blocked every later date behind it. Confirmed
+    # live: fbil_gsec_par's max date was stuck at 2026-08-13 for 6 days after exactly this.
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    dates = [date(2026, 6, 8), date(2026, 6, 9), date(2026, 6, 10)]
+    monkeypatch.setattr(fbil_gsec, "get_cookies", lambda: {"session": "ok"})
+    monkeypatch.setattr(fbil_gsec.rop, "get", lambda _key: None)
+    monkeypatch.setattr(fbil_gsec, "daterange", lambda _start, _stop: dates)
+    monkeypatch.setattr(fbil_gsec, "record_local_fallback_event", lambda **kwargs: None)
+
+    attempted = []
+
+    def fake_download_gsec(fdate, cookies):
+        attempted.append(fdate)
+        if fdate == dates[0]:
+            raise RuntimeError("fbil down for this one date")
+        return {"date": fdate.isoformat(), "status": "downloaded", "rows": 5}
+
+    monkeypatch.setattr(fbil_gsec, "download_gsec", fake_download_gsec)
+
+    state = fbil_gsec.download_all_gsec_data()
+
+    # all 3 dates were attempted -- the failure on dates[0] did NOT stop the loop
+    assert attempted == dates
+    assert state["failed_date_count"] == 1
+    assert state["downloaded_date_count"] == 2
+    assert state["blocked"] is False
+
+
+def test_fbil_gsec_circuit_breaker_trips_after_3_consecutive_failures(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    dates = [date(2026, 6, d) for d in range(8, 14)]  # 6 candidate dates
+    monkeypatch.setattr(fbil_gsec, "get_cookies", lambda: {"session": "ok"})
+    monkeypatch.setattr(fbil_gsec.rop, "get", lambda _key: None)
+    monkeypatch.setattr(fbil_gsec, "daterange", lambda _start, _stop: dates)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(fbil_gsec, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    attempted = []
+
+    def always_fails(fdate, cookies):
+        attempted.append(fdate)
+        raise RuntimeError("fbil source down")
+
+    monkeypatch.setattr(fbil_gsec, "download_gsec", always_fails)
+
+    state = fbil_gsec.download_all_gsec_data()
+
+    # bounded: stops after the 3rd consecutive failure, doesn't burn through all 6 dates
+    assert attempted == dates[:3]
+    assert state["failed_date_count"] == 3
+    assert state["blocked"] is True
+    assert state["fallback_used"] is True
+    assert any(e["fallback_type"] == "fbil_gsec_circuit_breaker_tripped" and e["severity"] == "error" for e in events)
+
+
+def test_fbil_gsec_main_reports_blocked_status(monkeypatch, capsys):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    payload = {
+        "source": "data.rbi.download_fbil_gsec",
+        "failed_date_count": 3,
+        "blocked": True,
+    }
+    monkeypatch.setattr(fbil_gsec, "download_all_gsec_data", lambda: payload)
+
+    fbil_gsec.main()
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["status"] == "blocked"
+
+
+def test_fbil_gsec_main_reports_partial_status_without_circuit_breaker(monkeypatch, capsys):
+    # a run with some failed dates but no circuit-breaker trip stays "partial", not "blocked"
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    payload = {
+        "source": "data.rbi.download_fbil_gsec",
+        "failed_date_count": 1,
+        "blocked": False,
+    }
+    monkeypatch.setattr(fbil_gsec, "download_all_gsec_data", lambda: payload)
+
+    fbil_gsec.main()
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["status"] == "partial"
+
+
 def test_fbil_gsec_try_parsing_date_records_format_fallback(monkeypatch):
     from data.rbi import download_fbil_gsec as fbil_gsec
 
