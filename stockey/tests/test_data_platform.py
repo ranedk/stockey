@@ -4327,6 +4327,34 @@ def test_fallback_telemetry_records_local_spool_read_failure(monkeypatch, tmp_pa
     assert events[0]["metadata"]["path"] == str(telemetry_file)
 
 
+def test_record_local_fallback_event_prints_to_stderr_on_write_failure(monkeypatch, tmp_path, capsys):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): this is the fallback-of-last-resort recorder --
+    # a bare `except: pass` here meant a write failure (disk full, permissions) left ZERO
+    # trace anywhere: no DB row (already failed to get here), no local JSONL line (this
+    # write just failed), no stderr line. Confirmed live by pointing the file at an
+    # unwritable path and observing silent success-shaped return with no output at all.
+    telemetry_file = tmp_path / "no_such_dir" / "local_fallback_events.jsonl"
+    original_open = fallback_telemetry.Path.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == telemetry_file:
+            raise OSError("cannot write")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(fallback_telemetry, "LOCAL_FALLBACK_TELEMETRY_FILE", telemetry_file)
+    monkeypatch.setattr(fallback_telemetry.Path, "open", fake_open)
+
+    row = fallback_telemetry.record_local_fallback_event(
+        module="unit.test", source="unit", fallback_type="unit_failed", error=RuntimeError("x")
+    )
+
+    # the row is still returned (callers don't crash), but the write failure is now visible
+    assert row["fallback_type"] == "unit_failed"
+    captured = capsys.readouterr()
+    assert "local fallback telemetry write failed" in captured.err
+    assert "cannot write" in captured.err
+
+
 def test_redaction_masks_secrets_mobile_and_auth_urls():
     text = (
         "DHAN_LOGIN_MOBILE=9876543210 tokenId=SECRET123 "

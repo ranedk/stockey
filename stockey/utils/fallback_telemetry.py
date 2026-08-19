@@ -217,8 +217,21 @@ def record_local_fallback_event(
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        # BUG FOUND LIVE 2026-08-19 (re-audit): this is the fallback-of-last-resort
+        # recorder -- the implementation of this repo's own "no silent fallback" rule,
+        # called (among other places) from record_fallback_event()'s except branch when
+        # the DB write itself fails. A bare `except: pass` here meant a disk-full/
+        # permissions failure on this path produced ZERO trace anywhere: no DB row (already
+        # failed), no local JSONL line (this write just failed), no stderr line. Mirrors
+        # utils/db.py's _write_db_retry_telemetry, which already gets this right for its
+        # own last-resort spool (prints to stderr instead of swallowing).
+        print(
+            f"[utils.fallback_telemetry] local fallback telemetry write failed "
+            f"error={exc.__class__.__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
     return row
 
 
