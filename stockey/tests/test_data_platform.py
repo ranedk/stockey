@@ -8090,6 +8090,31 @@ def test_handle_download_module_returns_normally_on_success(monkeypatch):
     assert result == {"module": "data.dhanlive.ohlcv", "status": "ok", "rows": 10}
 
 
+def test_external_task_queue_allowed_nse_modules_covers_every_registry_nse_step():
+    # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): ALLOWED_NSE_MODULES used to be a
+    # hand-maintained literal set, independent from data.download_runner's
+    # DOWNLOADER_STEPS/PARSER_STEPS -- the two had already drifted (adjusted_prices was
+    # missing; the newly-scheduled corporate_action_events would have hit the same gap on
+    # day one). data.download_queue.classify_step() routes every "data.nseindia.*" registry
+    # module into the queue by prefix match alone, so any gap here means a queued task fails
+    # with "Unsupported NSE module for queue worker" the first time that step runs via
+    # `--phase parsers`/`--phase all`. ALLOWED_NSE_MODULES is now derived from the registry
+    # itself, so this can no longer drift -- this test pins that invariant structurally
+    # rather than re-listing the modules by hand (which would just recreate the same drift
+    # risk in the test).
+    from data.download_runner import DOWNLOADER_STEPS, PARSER_STEPS
+
+    registry_nse_modules = {
+        str(step["module"])
+        for step in (*DOWNLOADER_STEPS, *PARSER_STEPS)
+        if str(step.get("module") or "").startswith("data.nseindia.")
+    }
+    assert registry_nse_modules  # sanity: the registry actually has nseindia modules
+    assert registry_nse_modules <= external_task_queue.ALLOWED_NSE_MODULES
+    assert "data.nseindia.adjusted_prices" in external_task_queue.ALLOWED_NSE_MODULES
+    assert "data.nseindia.corporate_action_events" in external_task_queue.ALLOWED_NSE_MODULES
+
+
 def test_external_task_queue_main_worker_returns_nonzero_when_tasks_failed(monkeypatch, capsys):
     # BUG FOUND LIVE 2026-08-19 (re-audit): main() used to unconditionally `return 0`
     # regardless of run_worker()'s own failed count -- a queued critical-path task

@@ -44,15 +44,36 @@ EXTERNAL_TASK_QUEUE_SCHEMA_STATEMENTS = [
     f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_claim ON {TABLE_NAME} (queue_name, status, next_attempt_at, priority DESC, created_at)",
 ]
 SINGLE_CLIENT_QUEUES = {"nse", "dhan"}
-ALLOWED_NSE_MODULES = {
-    "data.nseindia.holidays",
-    "data.nseindia.earnings_events",
-    "data.nseindia.bhavcopy_downloader",
-    "data.nseindia.indices_downloader",
-    "data.nseindia.recent_events",
-    "data.nseindia.bhavcopy_parser",
-    "data.nseindia.indices_parser",
-}
+
+
+def _nse_modules_from_download_runner() -> set[str]:
+    # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): this used to be a hand-maintained literal
+    # set, independent from data.download_runner's DOWNLOADER_STEPS/PARSER_STEPS registry --
+    # the two had already drifted apart (data.nseindia.adjusted_prices was missing here even
+    # though it's long been in PARSER_STEPS; data.nseindia.corporate_action_events, newly
+    # scheduled in this same audit pass, would have hit this exact gap on day one).
+    # data.download_queue.classify_step() routes EVERY "data.nseindia.*" registry module into
+    # the "nse" queue by prefix match alone -- if this worker-side allowlist doesn't cover
+    # every nseindia module the registry can produce, a queued task fails with "Unsupported
+    # NSE module for queue worker" the first time that step is ever run via
+    # `python -m data.download_queue --phase parsers` (or `--phase all`) instead of the
+    # downloaders-only phase all_downloaders_queue.sh currently uses. Deriving this set FROM
+    # the registry instead of hand-listing it makes that drift structurally impossible: any
+    # nseindia.* module data.download_runner knows about is automatically allowed here.
+    # data.nseindia.earnings_events/recent_events are deliberately NOT included -- they're
+    # BORDERLINE and frozen-not-scheduled (see download_runner.py's own comment), so nothing
+    # actually queues them today; re-adding either to DOWNLOADER_STEPS/PARSER_STEPS in the
+    # future automatically re-allows it here too, same as any other module.
+    from data.download_runner import DOWNLOADER_STEPS, PARSER_STEPS
+
+    return {
+        str(step["module"])
+        for step in (*DOWNLOADER_STEPS, *PARSER_STEPS)
+        if str(step.get("module") or "").startswith("data.nseindia.")
+    }
+
+
+ALLOWED_NSE_MODULES = _nse_modules_from_download_runner()
 
 
 def _record_queue_fallback(
