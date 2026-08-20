@@ -248,7 +248,15 @@ def main() -> int:
     rop.close()
     status = str(STOCKEY_RUN_STATE.get("status") or "ok")
     print(json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
-    return 0
+    # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): this used to unconditionally `return 0`
+    # regardless of `status` -- download_holidays() classifies "failed"/"source_unavailable"
+    # via record_local_fallback_event but never surfaces that through the exit code, so
+    # data.download_runner's run_download_module() (which only looks at the exit code to
+    # decide its own top-level "status": "ok"/"failed") reported a completely failed
+    # holidays download as a successful step, every time. A stale trading calendar is a
+    # correctness risk for every date-aware check downstream (data_readiness.py, the
+    # dim_trading_days-based clamp in ohlcv.py, ...), so it must not fail silently.
+    return 0 if status == "ok" else 1
 
 
 if __name__ == "__main__":

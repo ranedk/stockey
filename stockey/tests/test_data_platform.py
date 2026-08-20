@@ -9339,6 +9339,44 @@ def test_nse_holidays_main_exports_run_state(monkeypatch, capsys):
     assert nse_holidays.STOCKEY_RUN_STATE["state_advanced"] is True
 
 
+def test_nse_holidays_main_returns_nonzero_on_failure(monkeypatch, capsys):
+    # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): main() used to unconditionally `return 0`
+    # regardless of status -- download_runner.run_download_module() only looks at the exit
+    # code to decide its own top-level "status": "ok"/"failed", so a completely failed
+    # holidays download (or a source-unavailable one) was reported as a successful step
+    # every time, with the true failure buried only in the nested module_run_state.
+    from data.nseindia import holidays as nse_holidays
+
+    class FakeRedis:
+        def get(self, _key):
+            return None
+
+        def close(self):
+            pass
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(nse_holidays, "rop", FakeRedis())
+    monkeypatch.setattr(nse_holidays, "sync_playwright", lambda: FakePlaywrightContext())
+
+    monkeypatch.setattr(nse_holidays, "download_holidays", lambda _playwright: {"status": "failed", "error": "boom"})
+    assert nse_holidays.main() == 1
+    capsys.readouterr()
+
+    monkeypatch.setattr(nse_holidays, "download_holidays", lambda _playwright: {"status": "source_unavailable"})
+    assert nse_holidays.main() == 1
+    capsys.readouterr()
+
+    monkeypatch.setattr(nse_holidays, "download_holidays", lambda _playwright: {"status": "ok", "rows_written": 1})
+    assert nse_holidays.main() == 0
+    capsys.readouterr()
+
+
 def test_env_example_audit_extracts_python_and_shell_vars():
     from scripts import env_example_audit
 
