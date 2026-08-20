@@ -18,6 +18,7 @@ from data.dhanlive.auth import (
     is_auto_login_configured,
     load_cached_access_token_payload,
     normalize_token_id,
+    parse_iso_expiry_to_utc,
     prompt_for_token_id,
 )
 from data.dhanlive.client import DhanAPIError, DhanHistoricalClient
@@ -28,15 +29,23 @@ env.read_env()
 
 
 def parse_expiry(raw_expiry: str | None) -> datetime | None:
+    # BUG FOUND LIVE 2026-08-19 (re-audit): used to carry its own, second independent
+    # implementation of auth.py's ISO-expiry parsing/UTC-normalization logic -- self-consistent
+    # today only because this function's own naive-local output happened to be compared against
+    # an equally-naive-local `datetime.now()` in cache_status() below, but a real duplicate of the
+    # exact bug class auth.py's own _parse_expiry docstring documents already having fixed once
+    # (a naive LOCAL-wall-clock value compared against a differently-zoned "now" silently treats
+    # an already-expired token as valid for hours). Delegates the actual parse/normalize to the
+    # single shared implementation (parse_iso_expiry_to_utc) instead of maintaining its own copy;
+    # keeps its own fallback_type/module telemetry identity (distinct from auth.py's) since
+    # operators may already key off it.
     if not raw_expiry:
         return None
     text = raw_expiry.strip()
     if not text:
         return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
     try:
-        parsed = datetime.fromisoformat(text)
+        parsed_utc = parse_iso_expiry_to_utc(text)
     except ValueError as exc:
         record_local_fallback_event(
             module="data.dhanlive.auth_cli",
@@ -48,9 +57,9 @@ def parse_expiry(raw_expiry: str | None) -> datetime | None:
             metadata={"raw_expiry": raw_expiry[:120]},
         )
         return None
-    if parsed.tzinfo is not None:
-        return parsed.astimezone().astimezone(tz=None).replace(tzinfo=None)
-    return parsed
+    if parsed_utc is None:
+        return None
+    return parsed_utc.astimezone().astimezone(tz=None).replace(tzinfo=None)
 
 
 def mask_token(value: str | None) -> str | None:

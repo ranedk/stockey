@@ -99,7 +99,12 @@ def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now:
     cap = int(DEFAULT_MAX_SYMBOLS if max_symbols is None else max_symbols)
     skipped = 0
     to_sync = stale
-    if cap > 0 and len(stale) > cap:
+    # BUG FOUND LIVE 2026-08-19 (re-audit): `cap > 0` meant an explicit `--max-symbols 0` disabled
+    # the cap entirely (synced everything) instead of syncing zero -- the opposite of what anyone
+    # passing 0 would reasonably expect. `cap >= 0` now treats 0 as a literal "sync nothing" cap;
+    # a negative value (never the default, only reachable via an explicit --max-symbols) is still
+    # treated as "uncapped", preserving that escape hatch for anyone already relying on it.
+    if cap >= 0 and len(stale) > cap:
         to_sync = stale[:cap]
         skipped = len(stale) - cap
         print(f"[ohlcv_reconcile] symbol cap applied max={cap} stale={len(stale)} skipped={skipped}", file=sys.stderr)

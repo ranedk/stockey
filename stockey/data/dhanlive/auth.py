@@ -442,22 +442,19 @@ def _parse_json_response(response: requests.Response) -> dict:
         raise DhanAuthError(f"Expected JSON from Dhan auth endpoint, got: {response.text[:500]}") from exc
 
 
-def _parse_expiry(raw_expiry: str) -> datetime | None:
+def parse_iso_expiry_to_utc(raw_expiry: str) -> datetime | None:
+    """Pure parse, no telemetry -- shared by _parse_expiry below and auth_cli.py's own
+    parse_expiry(), which used to carry a second, independent implementation of exactly this
+    logic (BUG FOUND LIVE 2026-08-19, re-audit: not currently wrong -- both sides of its own
+    comparison happened to stay in the same, naive-local timezone -- but a real duplicate of the
+    one bug class already fixed here once (see the comment below), one careless edit on either
+    side away from reintroducing it). Callers own their own telemetry on a parse failure."""
     text = raw_expiry.strip()
     if not text:
         return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
-        _record_dhan_auth_fallback(
-            fallback_type="dhan_cached_access_token_expiry_invalid",
-            reason="Dhan cached access-token expiry could not be parsed; cached broker auth was ignored.",
-            error=exc,
-            metadata={"raw_expiry": raw_expiry},
-        )
-        return None
+    parsed = datetime.fromisoformat(text)
     # Dhan's expiryTime is UTC in practice ('...Z'); treat a bare timestamp as UTC too
     # rather than guessing the local zone. Always return timezone-aware UTC so callers
     # compare like-for-like against datetime.now(timezone.utc) -- a prior version
@@ -467,3 +464,19 @@ def _parse_expiry(raw_expiry: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _parse_expiry(raw_expiry: str) -> datetime | None:
+    text = raw_expiry.strip()
+    if not text:
+        return None
+    try:
+        return parse_iso_expiry_to_utc(text)
+    except ValueError as exc:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_cached_access_token_expiry_invalid",
+            reason="Dhan cached access-token expiry could not be parsed; cached broker auth was ignored.",
+            error=exc,
+            metadata={"raw_expiry": raw_expiry},
+        )
+        return None

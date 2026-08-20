@@ -365,6 +365,18 @@ def normalize_daily_frame(df: pd.DataFrame, identity: dict[str, object]) -> pd.D
         return df
 
     normalized = df.copy()
+    # BUG FOUND LIVE 2026-08-19 (re-audit): candles_to_df builds source_timestamp with
+    # pd.to_datetime(..., errors="coerce"), so a malformed timestamp entry from Dhan becomes NaT
+    # rather than raising. date/adj_close's NOT NULL 'date' column was derived from
+    # source_timestamp with no dropna -- a single malformed candle would surface as a Postgres
+    # NotNullViolation from upsert_to_db, aborting the WHOLE symbol's batch (that exception isn't
+    # DhanAPIError/ValueError, so it also hit the sync_many_daily/sync_many_intraday gap fixed
+    # above) instead of just dropping the one bad row and keeping the rest. I could not force Dhan
+    # to return a malformed payload to reproduce this end-to-end live; fixing the code-verified gap
+    # regardless.
+    normalized = normalized.dropna(subset=["source_timestamp"])
+    if normalized.empty:
+        return normalized
     trade_dates = (
         normalized["source_timestamp"]
         .dt.tz_convert("Asia/Kolkata")
@@ -415,6 +427,13 @@ def normalize_intraday_frame(
         return df
 
     normalized = df.copy()
+    # BUG FOUND LIVE 2026-08-19 (re-audit): same gap as normalize_daily_frame above -- a malformed
+    # source_timestamp (NaT, from candles_to_df's errors="coerce") flowed straight into the NOT
+    # NULL 'timestamp' column with no dropna, risking a NotNullViolation on upsert_to_db that would
+    # abort the whole symbol's batch instead of just dropping the one bad row.
+    normalized = normalized.dropna(subset=["source_timestamp"])
+    if normalized.empty:
+        return normalized
     normalized['timestamp'] = normalized["source_timestamp"]
     normalized["company_master_id"] = identity["company_master_id"]
     normalized["asset_type"] = identity["asset_type"]
@@ -619,6 +638,17 @@ def sync_intraday_ohlcv(
     return df
 
 
+# BUG FOUND LIVE 2026-08-19 (re-audit): sync_many_daily/sync_many_intraday's per-symbol try/except
+# only caught (DhanAPIError, ValueError) -- but DhanHistoricalClient._request has no try/except of
+# its own around the actual network call, so a raw requests exception (ConnectionError, Timeout,
+# SSLError) propagates uncaught, and candles_to_df can raise KeyError on a malformed/schema-changed
+# Dhan payload (missing "timestamp" while other candle arrays are non-empty). Neither is
+# DhanAPIError/ValueError, so either one escaped this try/except and aborted the WHOLE remaining
+# ticker list instead of being recorded via _record_ohlcv_bulk_sync_fallback for just that one
+# symbol -- contradicting this module's own stated design (the fallback reason text literally says
+# "the batch continues"). Broadened to Exception so no future exception type can silently reopen
+# this same gap; classify_symbol_sync_error's own text-matching already degrades gracefully to a
+# generic "failed" classification for anything it doesn't recognize, same as it already does today.
 def sync_many_daily(
     tickers: Iterable[str],
     *,
@@ -649,7 +679,7 @@ def sync_many_daily(
                     "to_date": None if df.empty else str(df["date"].max()),
                 }
             )
-        except (DhanAPIError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 -- see comment above sync_many_daily/sync_many_intraday
             error_text = f"{exc.__class__.__name__}: {exc}"
             classification = classify_symbol_sync_error(error_text)
             _record_ohlcv_bulk_sync_fallback(
@@ -725,7 +755,7 @@ def sync_many_intraday(
                     "to_timestamp": None if df.empty else str(df["timestamp"].max()),
                 }
             )
-        except (DhanAPIError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 -- see comment above sync_many_daily/sync_many_intraday
             error_text = f"{exc.__class__.__name__}: {exc}"
             classification = classify_symbol_sync_error(error_text)
             _record_ohlcv_bulk_sync_fallback(

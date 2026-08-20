@@ -17,9 +17,21 @@ DEFAULT_START_DATE = datetime(2014, 1, 1)
 
 
 def parse_datetime_arg(value: str | None) -> datetime | None:
+    # BUG FOUND LIVE 2026-08-19 (re-audit): only ever accepted a bare "YYYY-MM-DD" date, but
+    # data/dhanlive/ohlcv_pull.py's own --help epilog (and the --from-datetime/--to-datetime flag
+    # names themselves, distinct from --from-date/--to-date) advertise full ISO-8601
+    # datetime-with-offset input for intraday pulls ("2026-04-09T09:15:00+05:30") -- reproduced
+    # live: crashed with exit code 2 before main() even ran. Bare-date strings (every other
+    # existing caller of this function -- earnings_events.py, benchmark_sync.py,
+    # indices_downloader.py, ...) still parse exactly as before; only a value the old code could
+    # never accept anyway now also succeeds.
     if not value:
         return None
-    return datetime.strptime(value, "%Y-%m-%d")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        pass
+    return datetime.fromisoformat(value)
 
 
 def load_tracked_symbols(symbol_args: Iterable[str] | None = None) -> list[str]:

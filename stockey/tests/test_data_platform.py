@@ -376,6 +376,25 @@ def test_ohlcv_reconcile_run_caps_symbols_and_counts_results(monkeypatch):
     assert synced == [] and dry["dry_run"] is True and dry["stale_sample"] == ["A", "B", "C"]
 
 
+def test_ohlcv_reconcile_max_symbols_zero_syncs_nothing(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): `cap > 0` meant an explicit --max-symbols 0 disabled
+    # the cap entirely (synced EVERYTHING) instead of syncing zero -- the opposite of what anyone
+    # passing 0 would reasonably expect.
+    from data.dhanlive import ohlcv_reconcile as orc
+
+    monkeypatch.setattr(orc, "expected_complete_trading_day", lambda now=None: pd.Timestamp("2026-07-03", tz="UTC"))
+    monkeypatch.setattr(orc, "get_equity_universe", lambda: ["A", "B", "C"])
+    monkeypatch.setattr(orc, "find_stale_symbols", lambda universe, expected: ["A", "B", "C"])
+    synced: list[list[str]] = []
+    monkeypatch.setattr(orc, "sync_many_daily", lambda tickers, **_kwargs: synced.append(list(tickers)) or [])
+
+    summary = orc.run_reconcile(max_symbols=0)
+
+    assert synced == []  # nothing was synced
+    assert summary["skipped_over_cap"] == 3
+    assert summary["sync_attempted"] == 0
+
+
 def test_security_history_ensure_identity_tables_uses_schema_registry(monkeypatch):
     calls = []
 
@@ -1536,6 +1555,21 @@ def test_load_tracked_symbols_no_file_fallback(monkeypatch):
     assert sync_utils.load_tracked_symbols(["shaktipump,hdfcbank"]) == ["SHAKTIPUMP", "HDFCBANK"]
 
 
+def test_parse_datetime_arg_accepts_bare_date_and_full_iso_datetime():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): only ever accepted a bare "YYYY-MM-DD" date, but
+    # ohlcv_pull.py's own --help epilog (and the --from-datetime/--to-datetime flag names
+    # themselves) advertise full ISO-8601 datetime-with-offset input -- reproduced live: crashed
+    # with exit code 2 before main() even ran.
+    assert sync_utils.parse_datetime_arg(None) is None
+    assert sync_utils.parse_datetime_arg("2026-04-09") == datetime(2026, 4, 9)
+    parsed = sync_utils.parse_datetime_arg("2026-04-09T09:15:00+05:30")
+    assert parsed.year == 2026 and parsed.month == 4 and parsed.day == 9
+    assert parsed.hour == 9 and parsed.minute == 15
+    assert parsed.utcoffset() == timedelta(hours=5, minutes=30)
+    with pytest.raises(ValueError):
+        sync_utils.parse_datetime_arg("not a date")
+
+
 def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
     class FakeLocator:
         def __init__(self, page, name, count=1):
@@ -2030,6 +2064,20 @@ def test_dhan_auth_cli_parse_expiry_records_local_fallback_on_malformed_value(mo
     assert events[0]["source"] == "dhan_auth_cache"
     assert events[0]["fallback_type"] == "dhan_auth_cli_cached_expiry_parse_failed"
     assert events[0]["metadata"]["raw_expiry"] == "not-a-date"
+
+
+def test_dhan_auth_cli_parse_expiry_agrees_with_auth_pys_own_parser():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): auth_cli.py used to carry its own, second independent
+    # implementation of this exact ISO-expiry parsing/UTC-normalization logic -- a real duplicate
+    # of the bug class auth.py's own _parse_expiry already fixed once (a naive LOCAL-wall-clock
+    # value silently comparing wrong against a differently-zoned "now"). Now both delegate to the
+    # same shared parser (parse_iso_expiry_to_utc) -- this pins that a UTC "Z" timestamp parsed by
+    # each function represents the exact same real instant, just in different representations
+    # (auth.py: UTC-aware; auth_cli.py: naive-local, for its own existing naive-local comparison).
+    raw = "2026-05-07T10:00:00Z"
+    utc_aware = dhan_auth._parse_expiry(raw)
+    local_naive = dhan_auth_cli.parse_expiry(raw)
+    assert utc_aware.astimezone().replace(tzinfo=None) == local_naive
 
 
 def test_dhan_auth_cli_validate_token_records_local_fallback_on_failure(monkeypatch):
@@ -7701,6 +7749,34 @@ def test_sync_many_daily_continues_after_symbol_error(monkeypatch):
     assert event["metadata"]["asset_type"] == "stock"
 
 
+def test_sync_many_daily_continues_after_non_dhan_exception(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): only (DhanAPIError, ValueError) were caught, but
+    # DhanHistoricalClient._request has no try/except of its own, so a raw requests exception
+    # (ConnectionError, Timeout, ...) propagates uncaught, and candles_to_df can raise KeyError on
+    # a malformed Dhan payload -- neither is DhanAPIError/ValueError, so either used to abort the
+    # WHOLE remaining ticker list instead of being recorded for just that one symbol.
+    events = []
+    monkeypatch.setattr(dhan_ohlcv, "DhanHistoricalClient", lambda: object())
+    monkeypatch.setattr(dhan_ohlcv, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    def fake_sync_daily_ohlcv(ticker, **kwargs):
+        if ticker == "BAD":
+            raise KeyError("timestamp")  # candles_to_df's own real failure shape
+        return pd.DataFrame([{"date": pd.Timestamp("2026-04-09T00:00:00Z")}])
+
+    monkeypatch.setattr(dhan_ohlcv, "sync_daily_ohlcv", fake_sync_daily_ohlcv)
+
+    results = dhan_ohlcv.sync_many_daily(["BAD", "GOOD"], exchange="NSE", asset_type="stock")
+
+    assert len(results) == 2  # BAD did not abort GOOD
+    assert results[0]["ticker"] == "BAD"
+    assert results[0]["rows"] == 0
+    assert results[1]["ticker"] == "GOOD"
+    assert results[1]["rows"] == 1
+    assert len(events) == 1
+    assert events[0]["metadata"]["ticker"] == "BAD"
+
+
 def test_clamp_to_last_trading_day_skips_a_normal_weekend(monkeypatch):
     monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
     monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: set())
@@ -7765,6 +7841,47 @@ def test_load_special_weekend_trading_days_parses_real_shape(monkeypatch):
     )
     result = dhan_ohlcv.load_special_weekend_trading_days(date(2026, 11, 8))
     assert result == {date(2026, 11, 8)}
+
+
+_DHAN_OHLCV_TEST_IDENTITY = {
+    "company_master_id": "nse:TEST", "asset_type": "stock", "exchange": "NSE", "ticker": "TEST",
+    "security_id": 123, "exchange_segment": "NSE_EQ", "instrument": "EQUITY",
+}
+
+
+def test_normalize_daily_frame_drops_rows_with_malformed_source_timestamp():
+    # BUG FOUND LIVE 2026-08-19 (re-audit): candles_to_df builds source_timestamp with
+    # pd.to_datetime(..., errors="coerce"), so a malformed timestamp entry from Dhan becomes NaT
+    # rather than raising -- this used to flow straight into the NOT NULL 'date' column with no
+    # dropna, risking a NotNullViolation on upsert_to_db that aborted the whole symbol's batch.
+    df = pd.DataFrame(
+        [
+            {"source_timestamp": pd.Timestamp("2026-04-09T09:15:00Z"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000, "open_interest": 0},
+            {"source_timestamp": pd.NaT, "open": 200.0, "high": 201.0, "low": 199.0, "close": 200.5, "volume": 2000, "open_interest": 0},
+        ]
+    )
+    result = dhan_ohlcv.normalize_daily_frame(df, _DHAN_OHLCV_TEST_IDENTITY)
+    assert len(result) == 1  # the NaT row was dropped, not written with a null date
+    assert result.iloc[0]["date"].date() == date(2026, 4, 9)
+    assert result["date"].isna().sum() == 0
+
+
+def test_normalize_daily_frame_all_rows_malformed_returns_empty():
+    df = pd.DataFrame([{"source_timestamp": pd.NaT, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1, "open_interest": 0}])
+    result = dhan_ohlcv.normalize_daily_frame(df, _DHAN_OHLCV_TEST_IDENTITY)
+    assert result.empty
+
+
+def test_normalize_intraday_frame_drops_rows_with_malformed_source_timestamp():
+    df = pd.DataFrame(
+        [
+            {"source_timestamp": pd.Timestamp("2026-04-09T09:15:00Z"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000, "open_interest": 0},
+            {"source_timestamp": pd.NaT, "open": 200.0, "high": 201.0, "low": 199.0, "close": 200.5, "volume": 2000, "open_interest": 0},
+        ]
+    )
+    result = dhan_ohlcv.normalize_intraday_frame(df, _DHAN_OHLCV_TEST_IDENTITY, 1)
+    assert len(result) == 1
+    assert result["timestamp"].isna().sum() == 0
 
 
 def test_sync_daily_ohlcv_normalizes_mixed_timezone_dates(monkeypatch):
