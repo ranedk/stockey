@@ -19,7 +19,9 @@ in what order — check there first if this drifts.
 | `all_data_coverage_report.sh` | 17:10, weekdays | `python scripts/data_coverage_report.py` — non-fatal per-table coverage/health report, see `docs/DATA_COVERAGE.md` |
 | `all_fundamentals_screener.sh` | 19:15, weekdays | `python -m fundamentals.run_pipeline` — the fundamentals-screener carve-out (sector reference, L1/L2/L3, event collectors, watchlist/narrative/email), see `docs/FUNDAMENTAL_SCREENER_PRD.md` |
 | `all_fundamentals_api.sh` | every 5 min | long-running FastAPI service (`fundamentals/api/app.py`) serving the `screener/` Nuxt frontend; cron just retries the start, `with_lock.sh`/its own health check no-op once a real instance is up |
-| `start_cron.sh` | manual | supported way to (re)start `go-crond`: runs data readiness + OHLCV reconcile first, then execs `go-crond config/stockey.generated.crontab` |
+| `start_cron.sh` | manual | supported way to (re)start `go-crond`: refuses to double-start if already running, else runs data readiness + OHLCV reconcile first, then execs `go-crond config/stockey.generated.crontab` |
+| `stop_cron.sh` | manual | stops the running `go-crond` (SIGTERM, escalates to SIGKILL after `STOCKEY_CRON_STOP_TIMEOUT_SECONDS`, default 15s); no-op if not running. Does not kill any already-launched job. The OS-crontab `ensure_go_crond_alive.sh` watchdog will auto-restart go-crond within its own schedule unless disabled separately |
+| `restart_cron.sh` | manual | `stop_cron.sh` then `start_cron.sh` -- the supported way to safely restart the scheduler (waits for the real stop before starting, reuses `start_cron.sh`'s own already-running guard) |
 
 All wrap through `scripts/run_with_markers.sh` (emits `[stockey.script] name=... status=start|done|failed`)
 and most through `scripts/with_lock.sh` (skips overlapping runs instead of stacking them; `flock` on

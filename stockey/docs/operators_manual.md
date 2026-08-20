@@ -58,11 +58,19 @@ python scripts/cron_preflight.py
 ./start_cron.sh
 ```
 
-`start_cron.sh` always reconciles OHLCV coverage first (so a scheduler that
-was down during market hours doesn't start the day on stale bars), then execs
-`./go-crond config/stockey.generated.crontab --allow-unprivileged`. See
-`README.md`'s pipeline list for what runs and when. The generated cron file
-includes a username column (go-crond/system-crontab style); a normal per-user
+`start_cron.sh` refuses to start a second go-crond if one is already running,
+otherwise always reconciles OHLCV coverage first (so a scheduler that was
+down during market hours doesn't start the day on stale bars), then execs
+`./go-crond config/stockey.generated.crontab --allow-unprivileged`. Stop it
+with `./stop_cron.sh` (SIGTERM, escalates to SIGKILL after
+`STOCKEY_CRON_STOP_TIMEOUT_SECONDS`, default 15s; a no-op if not running) --
+note `scripts/ensure_go_crond_alive.sh`, if registered in the OS crontab,
+will auto-restart it within its own schedule unless you disable that entry
+separately. `./restart_cron.sh` chains the two safely (waits for the actual
+stop, then reuses `start_cron.sh` unmodified, including its already-running
+guard). See `README.md`'s pipeline list for what runs and when. The
+generated cron file includes a username column (go-crond/system-crontab
+style); a normal per-user
 `crontab` needs that column removed first.
 
 To run the full pipeline immediately instead of waiting for the schedule:

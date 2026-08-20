@@ -161,7 +161,9 @@ Cron:
 ```sh
 python builder.py
 python scripts/cron_preflight.py
-./start_cron.sh          # supported way to (re)start go-crond; runs OHLCV reconcile first
+./start_cron.sh          # start go-crond (refuses to double-start); runs OHLCV reconcile first
+./stop_cron.sh           # stop go-crond; SIGTERM then SIGKILL after a grace period; no-op if not running
+./restart_cron.sh        # stop then start, safely (waits for the real stop before starting)
 ```
 
 Dhan/Screener browser automation:

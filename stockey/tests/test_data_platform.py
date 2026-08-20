@@ -5150,6 +5150,125 @@ def test_start_cron_refuses_to_double_start_when_go_crond_already_running(tmp_pa
         holder.wait(timeout=5)
 
 
+def _copy_cron_control_scripts(repo):
+    for name in ("stop_cron.sh", "start_cron.sh", "restart_cron.sh"):
+        real = Path(name).resolve()
+        if not real.exists():
+            continue
+        dest = repo / name
+        dest.write_text(real.read_text(encoding="utf-8"), encoding="utf-8")
+        dest.chmod(0o755)
+
+
+def _spawn_fake_go_crond(repo, *, ignore_sigterm: bool):
+    """A real, running process whose argv[0] (as pgrep -f sees it) is exactly
+    <repo>/go-crond, standing in for "go-crond already running" -- see the
+    argv[0]-vs-shebang-script note on test_start_cron_refuses_to_double_start... above."""
+    fake_go_crond = repo / "go-crond"
+    if not ignore_sigterm:
+        shutil.copy2("/bin/sleep", fake_go_crond)
+        proc = subprocess.Popen([str(fake_go_crond), "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # `exec -a NAME` renames THIS process's argv[0] without forking -- bash itself (with
+        # a TERM trap installed) becomes the long-lived process pgrep matches, so it can
+        # actually ignore SIGTERM (a real `sleep` binary, and a plain #!-shebang script, both
+        # terminate on SIGTERM by default regardless of argv[0] tricks -- only the process
+        # that installs the trap can ignore it).
+        shutil.copy2("/bin/bash", fake_go_crond)  # unused stand-in path; bash below execs itself
+        # `sleep 10 & wait` (not a bare tail-position `sleep 10`) matters: bash applies a
+        # tail-call optimization to a lone trailing simple command in a `-c` script and execs
+        # straight into it, discarding the trap set just before -- backgrounding it and
+        # `wait`-ing (a builtin) keeps bash itself as the live, trap-holding process.
+        proc = subprocess.Popen(
+            ["bash", "-c", 'exec -a "$1" bash -c \'trap "" TERM; sleep 10 & wait\'', "_", str(fake_go_crond)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    deadline = time.monotonic() + 5
+    pattern = f"^{fake_go_crond} "
+    while time.monotonic() < deadline:
+        if subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL).returncode == 0:
+            break
+        time.sleep(0.05)
+    return fake_go_crond, proc
+
+
+def test_stop_cron_stops_a_running_go_crond_and_is_idempotent_when_not_running(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _copy_cron_control_scripts(repo)
+    fake_go_crond, holder = _spawn_fake_go_crond(repo, ignore_sigterm=False)
+    try:
+        result = subprocess.run([str(repo / "stop_cron.sh")], capture_output=True, text=True, timeout=15)
+
+        assert result.returncode == 0
+        assert "stopped" in result.stderr
+        assert subprocess.run(["pgrep", "-f", f"^{fake_go_crond} "], stdout=subprocess.DEVNULL).returncode != 0
+        holder.wait(timeout=5)  # already terminated by stop_cron.sh; reap it
+
+        # calling it again with nothing running must be a clean no-op, not an error
+        result2 = subprocess.run([str(repo / "stop_cron.sh")], capture_output=True, text=True, timeout=15)
+        assert result2.returncode == 0
+        assert "not running" in result2.stderr
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+
+
+def test_stop_cron_escalates_to_sigkill_when_process_ignores_sigterm(tmp_path, monkeypatch):
+    # A process that traps SIGTERM (ignores it) must still be brought down -- stop_cron.sh
+    # escalates to SIGKILL after STOCKEY_CRON_STOP_TIMEOUT_SECONDS rather than hanging or
+    # silently reporting success while go-crond is still alive.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _copy_cron_control_scripts(repo)
+    fake_go_crond, holder = _spawn_fake_go_crond(repo, ignore_sigterm=True)
+    env = dict(os.environ)
+    env["STOCKEY_CRON_STOP_TIMEOUT_SECONDS"] = "1"
+    try:
+        result = subprocess.run([str(repo / "stop_cron.sh")], capture_output=True, text=True, env=env, timeout=15)
+
+        assert result.returncode == 0
+        assert "SIGKILL" in result.stderr
+        assert "stopped" in result.stderr
+        assert subprocess.run(["pgrep", "-f", f"^{fake_go_crond} "], stdout=subprocess.DEVNULL).returncode != 0
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait(timeout=15)
+
+
+def test_restart_cron_stops_existing_go_crond_before_starting_a_new_one(tmp_path):
+    # restart_cron.sh must actually stop the old go-crond before start_cron.sh's own
+    # already-running guard is even consulted -- otherwise "restart" would silently no-op
+    # against the still-running old instance instead of picking up a new crontab/config.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _copy_cron_control_scripts(repo)
+    # stub out start_cron.sh so this test proves sequencing, not start_cron.sh's own
+    # readiness/reconcile/exec behavior (already covered by the double-start test above).
+    stub = repo / "start_cron.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\necho \"[start_cron] stub invoked\" >&2\nexit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    fake_go_crond, holder = _spawn_fake_go_crond(repo, ignore_sigterm=False)
+    try:
+        result = subprocess.run([str(repo / "restart_cron.sh")], capture_output=True, text=True, timeout=15)
+
+        assert result.returncode == 0
+        assert "stopped" in result.stderr
+        assert "stub invoked" in result.stderr
+        assert result.stderr.index("stopped") < result.stderr.index("stub invoked")  # stop happened first
+        holder.wait(timeout=5)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+
+
 def test_builder_render_crontab_raises_on_unresolved_placeholder(tmp_path, monkeypatch):
     # BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): render_crontab() used to substitute the
     # known placeholders and write whatever came out with no check that every `{{...}}`
