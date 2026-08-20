@@ -50,6 +50,13 @@ DOWNLOADER_STEPS = [
 PARSER_STEPS = [
     {"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.adjusted_prices", "args": [], "purpose": "corporate_action_normalize"},
+    # BUG FOUND LIVE 2026-08-20 (re-audit): this module was never scheduled anywhere --
+    # events_dividend/events_capital_change (both in-scope per docs/DATA_INVENTORY.md's
+    # "NSE corporate actions" row) have been silently stale since the module was written.
+    # Placed right after adjusted_prices, its only dependency (reads
+    # nseindia_corporate_actions_bc_raw, which adjusted_prices' normalize step just
+    # refreshed) -- purely derived and idempotent, safe to recompute every run.
+    {"module": "data.nseindia.corporate_action_events", "args": [], "purpose": "corporate_action_normalize"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
 ]

@@ -6509,6 +6509,11 @@ def test_download_runner_prioritizes_dhan_and_registered_screener_sync():
         "data.nseindia.indices_parser",
         "data.benchmark_sync",
     ]
+    # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): corporate_action_events was never
+    # scheduled anywhere -- events_dividend/events_capital_change (in-scope per
+    # docs/DATA_INVENTORY.md) went silently stale since the module was written. Must run
+    # right after adjusted_prices, its only dependency (nseindia_corporate_actions_bc_raw).
+    assert parser_modules.index("data.nseindia.corporate_action_events") == parser_modules.index("data.nseindia.adjusted_prices") + 1
 
 
 def test_company_master_main_exports_identifier_run_state(monkeypatch, capsys):
