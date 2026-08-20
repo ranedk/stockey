@@ -17,10 +17,12 @@ stored as-is, not silently rescaled. CLI: `python -m data.rbi.download_currency_
 """
 import argparse
 import json
+import time
 from datetime import date, datetime, timedelta
 
 import pandas as pd
 from dateutil.relativedelta import relativedelta
+from environs import Env
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -28,10 +30,20 @@ from playwright.sync_api import sync_playwright
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 
+env = Env()
+env.read_env()
+
 CDP_ENDPOINT = "http://localhost:9222"
 SYNC_SOURCE_NAME = "data.rbi.download_currency_rates"
 ARCHIVE_URL = "https://www.rbi.org.in/scripts/ReferenceRateArchive.aspx"
 TABLE = "rbi_currency_rates"
+# BUG FOUND LIVE 2026-08-19 (re-audit): the yearly-chunk backfill loop below had no per-run item
+# cap, unlike bseindia/bhavcopy.py's own sibling fix for exactly this risk (BSE_BHAVCOPY_MAX_
+# DATES_PER_RUN). A resume point far behind (e.g. after an extended CDP/site outage) would walk
+# every intervening yearly chunk in a single cron invocation -- a single problematic window
+# already cost 388s in a real run seen this session; a multi-year gap could turn one
+# complete_data.sh slot into many minutes-to-hours, delaying every step scheduled after it.
+RBI_CURRENCY_RATES_MAX_RUNTIME_SECONDS = env.int("RBI_CURRENCY_RATES_MAX_RUNTIME_SECONDS", 20 * 60)
 # map a header's leading currency CODE -> tidy column; legacy EURO/YEN labels tolerated for robustness.
 CURRENCY_CODES = {"USD": "usd", "GBP": "gbp", "EUR": "eur", "EURO": "eur",
                   "JPY": "jpy", "YEN": "jpy", "AED": "aed", "IDR": "idr"}
@@ -57,6 +69,25 @@ def parse_rate_rows(rows: list[list[str]]) -> pd.DataFrame:
         elif token in CURRENCY_CODES:
             col_idx[i] = CURRENCY_CODES[token]
     if date_idx is None or not col_idx:
+        # BUG FOUND LIVE 2026-08-19 (re-audit): silently returned an empty frame with no error and
+        # no telemetry whenever the header didn't contain a recognized "DATE"/currency-code cell --
+        # this module's own docstring documents that RBI has already relabeled this header once,
+        # silently corrupting output before this fix existed. If it happens again, every chunk
+        # would come back "0 rows, no error", reported as status "ok" with no trail distinguishing
+        # it from "genuinely nothing new this window".
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="rbi_currency_rates:parse",
+            fallback_type="rbi_currency_rates_header_not_recognized",
+            severity="warn",
+            reason=(
+                "RBI reference-rate result table's header row had no recognized DATE/currency-code "
+                "cell -- the source's header format may have changed again; this chunk parsed to 0 "
+                "rows with no other error."
+            ),
+            error=None,
+            metadata={"header": header},
+        )
         return pd.DataFrame(columns=["date"])
     records = []
     for raw in rows[1:]:
@@ -149,9 +180,19 @@ def download_currency_rates(playwright, from_date: date, to_date: date, *, dry_r
 
         total = 0
         failed_chunks = 0
+        time_budget_exceeded = False
+        run_started = time.monotonic()
         span_min = span_max = None
         cursor = from_date
         while cursor <= to_date:
+            if time.monotonic() - run_started >= RBI_CURRENCY_RATES_MAX_RUNTIME_SECONDS:
+                time_budget_exceeded = True
+                print(
+                    f"  stopping: {RBI_CURRENCY_RATES_MAX_RUNTIME_SECONDS}s runtime budget reached "
+                    f"with {cursor} .. {to_date} still remaining -- resumes from the DB max date next run",
+                    flush=True,
+                )
+                break
             chunk_end = min(cursor + relativedelta(years=1) - timedelta(days=1), to_date)
             # a chunk that stays broken after retries is skipped (recorded), not fatal -- the rest of the
             # multi-year backfill still completes and a later run resumes the gap from the DB max date.
@@ -160,6 +201,17 @@ def download_currency_rates(playwright, from_date: date, to_date: date, *, dry_r
             except (PlaywrightTimeoutError, PlaywrightError) as exc:
                 failed_chunks += 1
                 print(f"  {cursor} .. {chunk_end}: FAILED after retries ({type(exc).__name__}) -- skipping", flush=True)
+                # BUG FOUND LIVE 2026-08-19 (re-audit): a skipped chunk was only ever printed, never
+                # recorded via record_local_fallback_event -- no trail at all besides a cron log line.
+                record_local_fallback_event(
+                    module=SYNC_SOURCE_NAME,
+                    source="rbi_currency_rates:chunk",
+                    fallback_type="rbi_currency_rates_chunk_failed",
+                    severity="warn",
+                    reason="RBI reference-rate chunk failed after retries and was skipped; it stays missing and is retried on a later run.",
+                    error=exc,
+                    metadata={"from_date": cursor.isoformat(), "to_date": chunk_end.isoformat()},
+                )
                 cursor = chunk_end + timedelta(days=1)
                 continue
             df = parse_rate_rows(rows)
@@ -174,11 +226,15 @@ def download_currency_rates(playwright, from_date: date, to_date: date, *, dry_r
             page.wait_for_timeout(3000)  # RBI throttles rapid queries (partial tables) -- pace the submissions
 
         state.update({
-            "status": "ok" if failed_chunks == 0 else "partial",
+            "status": "blocked" if time_budget_exceeded else ("ok" if failed_chunks == 0 else "partial"),
             "rows": int(total),
             "rows_read": int(total),
             "rows_written": int(total),
             "failed_attempt_count": int(failed_chunks),
+            # BUG FOUND LIVE 2026-08-19 (re-audit): fallback_used was set once in the initial state
+            # dict (False) and never updated even when chunks were skipped or the run stopped early.
+            "fallback_used": bool(failed_chunks > 0 or time_budget_exceeded),
+            "time_budget_exceeded": time_budget_exceeded,
             "from_date": span_min.date().isoformat() if span_min is not None else None,
             "to_date": span_max.date().isoformat() if span_max is not None else None,
             "state_advanced": bool(total > 0),
@@ -200,6 +256,7 @@ def download_currency_rates(playwright, from_date: date, to_date: date, *, dry_r
             "status": "source_unavailable",
             "failed_attempt_count": 1,
             "source_unavailable_count": 1,
+            "fallback_used": True,
             "error": f"{type(exc).__name__}: {exc}",
         })
         return state
@@ -217,6 +274,7 @@ def download_currency_rates(playwright, from_date: date, to_date: date, *, dry_r
         state.update({
             "status": "failed",
             "failed_attempt_count": 1,
+            "fallback_used": True,
             "error": f"{type(exc).__name__}: {exc}",
         })
         return state
@@ -247,7 +305,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="fetch + parse but do not write to the DB")
     args = ap.parse_args()
     frm = pd.to_datetime(args.from_date).date() if args.from_date else _default_from()
-    to = pd.to_datetime(args.to_date).date() if args.to_date else date.today()
+    # BUG FOUND LIVE 2026-08-19 (re-audit): date.today() computes "today" against host-local time
+    # -- this host runs in UTC, not IST. Cron only ever invokes this at a time that maps to the
+    # same IST calendar day (currently masking the gap), but any manual/ad-hoc invocation between
+    # UTC 18:30-23:59 (IST 00:00-05:29) would compute "today" one IST day behind reality.
+    to = pd.to_datetime(args.to_date).date() if args.to_date else pd.Timestamp.now(tz="Asia/Kolkata").date()
     print(f"RBI currency rates {frm} .. {to} (dry_run={args.dry_run})", flush=True)
     with sync_playwright() as p:
         STOCKEY_RUN_STATE = download_currency_rates(p, frm, to, dry_run=args.dry_run)

@@ -16,6 +16,24 @@ SYNC_SOURCE_NAME = "data.rbi.download_bank_rates"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
+# BUG FOUND LIVE 2026-08-19 (re-audit): column_index_rename_map below maps output columns purely
+# by POSITION with zero validation that the scraped header text actually says "Bank Rate"/"Repo
+# Rate"/etc. -- if RBI ever inserts, reorders, or removes a column, values would be silently
+# mislabeled (e.g. CRR's value stored under msf_rate) with no error. Not hard-blocking on a
+# mismatch here -- I could not get a live download through the RBI site's own multi-step click
+# flow to confirm the exact real header text for every column during this fix (the site was
+# uncooperative on the attempts made), so a strict keyword check risks a false-positive block on
+# a real, valid run. Recording fallback telemetry (visible, non-blocking) instead if the expected
+# keywords aren't found where expected -- flags a real format change for review without stopping
+# genuinely-fine runs on an unverified assumption.
+_EXPECTED_HEADER_KEYWORDS = {
+    2: "bank",
+    3: "repo",
+    7: "crr",
+    8: "slr",
+}
+
+
 def parse_excel_file(file_path: str) -> pd.DataFrame:
     xls = pd.ExcelFile(file_path)
     sheet_names = xls.sheet_names
@@ -25,6 +43,27 @@ def parse_excel_file(file_path: str) -> pd.DataFrame:
     combined_headers = (
         header_rows.astype(str).agg(" ".join).str.strip().replace("", np.nan)
     )
+
+    mismatched = {}
+    for index, keyword in _EXPECTED_HEADER_KEYWORDS.items():
+        header_text = str(combined_headers.iloc[index]).lower() if index < len(combined_headers) else ""
+        if keyword not in header_text:
+            mismatched[index] = header_text
+    if mismatched:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="rbi_bank_rates:parse",
+            fallback_type="rbi_bank_rates_header_mismatch",
+            severity="warn",
+            reason=(
+                "RBI bank-rates Excel header text didn't contain the expected keyword at a "
+                "column this parser maps by position -- the source format may have changed; "
+                "values could be mislabeled. Proceeding with the existing positional mapping "
+                "since this isn't confirmed as a real format change, only flagged for review."
+            ),
+            error=None,
+            metadata={"mismatched_columns": mismatched},
+        )
 
     data_df = xls.parse(sheet_names[0], header=None, skiprows=8)
     data_df.columns = combined_headers.values
@@ -146,23 +185,36 @@ def download_latest_rates(playwright) -> dict[str, object]:
         page.goto("https://data.rbi.org.in/DBIE/#/dbie/home")
         page.wait_for_timeout(10_000)
 
+        # BUG FOUND LIVE 2026-08-19 (re-audit): the modal-dismiss-and-retry wrapper (see
+        # _dismiss_blocking_modal's own docstring for why it exists) was only applied to this
+        # first click -- the root cause it's defensive against (a page-wide modal-backdrop
+        # intercepting pointer events) isn't inherently specific to the Indicators link and could
+        # equally block any later click in this same sequence. Applied to every click in the flow.
         _click_past_blocking_modals(page, page.get_by_role("link", name="Indicators", exact=True))
         page.wait_for_timeout(2_000)
 
-        page.locator("a").filter(has_text="Financial Sector Indicators").click()
+        _click_past_blocking_modals(page, page.locator("a").filter(has_text="Financial Sector Indicators"))
         page.wait_for_timeout(2_000)
 
         with page.expect_popup() as popup_info:
-            page.get_by_text("Key Rates").click()
+            _click_past_blocking_modals(page, page.get_by_text("Key Rates"))
 
         rates_page = popup_info.value
         frame = _wait_for_named_frame(rates_page, name="openDocChildFrame")
 
-        frame.click("#__button60")
+        # #__button60 is an auto-generated ID from the underlying BI/reporting tool, unlike every
+        # other click in this flow which uses a resilient role/text-based locator -- a real,
+        # distinct brittleness point (BUG FOUND LIVE 2026-08-19, re-audit) with no equivalent
+        # semantic locator available on the real page to replace it with; left as-is rather than
+        # guessing at a "better" selector I can't verify against the live site, but still routed
+        # through the same dismiss-and-retry wrapper for whatever resilience that buys it. Dismiss
+        # target is rates_page (the popup these two clicks actually run in), not page (the
+        # original tab) -- a modal on the popup can't be dismissed via a different window.
+        _click_past_blocking_modals(rates_page, frame.locator("#__button60"))
         rates_page.wait_for_timeout(3_000)
 
         with rates_page.expect_download(timeout=15_000) as dl_info:
-            frame.get_by_role("button", name="Export", exact=True).click()
+            _click_past_blocking_modals(rates_page, frame.get_by_role("button", name="Export", exact=True))
 
         download = dl_info.value
         file_path = download.path()
@@ -212,6 +264,12 @@ def download_latest_rates(playwright) -> dict[str, object]:
                 "status": "source_unavailable",
                 "failed_attempt_count": 1,
                 "source_unavailable_count": 1,
+                # BUG FOUND LIVE 2026-08-19 (re-audit): fallback_used was set once in the initial
+                # state dict (False) and never updated in either failure branch here, even though
+                # record_local_fallback_event was just called a few lines above -- a consumer
+                # keying off fallback_used specifically (rather than status/classification) would
+                # misreport a real, recorded fallback as a clean run.
+                "fallback_used": True,
                 "error": f"{type(exc).__name__}: {exc}",
             }
         )
@@ -234,6 +292,7 @@ def download_latest_rates(playwright) -> dict[str, object]:
             {
                 "status": "failed",
                 "failed_attempt_count": 1,
+                "fallback_used": True,
                 "error": f"{type(exc).__name__}: {exc}",
             }
         )

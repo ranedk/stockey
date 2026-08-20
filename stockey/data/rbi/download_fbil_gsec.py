@@ -58,17 +58,25 @@ def get_cookies():
 
 
 def try_parsing_date(text):
-    for fmt in ("%d-%b-%Y", "%d %b, %Y", "%d/%b/%Y", "%d/%b/%y"):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): used to record fallback telemetry for EVERY rejected
+    # candidate format, including the normal, fully-successful case where an earlier format
+    # simply doesn't match before a later one does -- a routine, successful parse still emitted
+    # 1-2 "failure" events, diluting genuinely-actionable signal in advisory_fallback_events. Only
+    # the LAST rejected format (when every one has failed) is worth recording now.
+    formats = ("%d-%b-%Y", "%d %b, %Y", "%d/%b/%Y", "%d/%b/%y")
+    last_exc: ValueError | None = None
+    for fmt in formats:
         try:
             return datetime.strptime(text, fmt)
         except ValueError as exc:
-            _record_fbil_gsec_fallback(
-                fallback_type="fbil_gsec_date_format_parse_failed",
-                source="rbi_fbil_gsec",
-                reason="RBI FBIL G-sec date parser rejected one candidate format and will try the next supported format.",
-                error=exc,
-                metadata={"raw_date": str(text), "format": fmt},
-            )
+            last_exc = exc
+    _record_fbil_gsec_fallback(
+        fallback_type="fbil_gsec_date_format_parse_failed",
+        source="rbi_fbil_gsec",
+        reason=f"RBI FBIL G-sec date parser rejected all {len(formats)} supported formats.",
+        error=last_exc,
+        metadata={"raw_date": str(text), "formats_tried": list(formats)},
+    )
     raise ValueError("no valid date format found")
 
 
@@ -180,16 +188,23 @@ def download_gsec(fdate: date, cookies):
     }
 
 
+def _ist_today() -> datetime:
+    # BUG FOUND LIVE 2026-08-19 (re-audit): datetime.now()/date.today() compute "today" against
+    # host-local time -- this host runs in UTC, not IST. Cron only ever invokes this module at
+    # times that map to the same IST calendar day (currently masking the gap), but any manual/
+    # ad-hoc invocation between UTC 18:30-23:59 (IST 00:00-05:29) would compute "today" one IST
+    # day behind reality, silently narrowing the candidate-date window by a day.
+    return datetime.combine(pd.Timestamp.now(tz="Asia/Kolkata").date(), datetime.min.time())
+
+
 def download_all_gsec_data() -> dict[str, object]:
     cookies = get_cookies()
-    today = datetime.now()
+    today = _ist_today()
     from_date = rop.get(DOWNLOADED)
     if from_date:
         from_date = datetime.strptime(from_date, "%Y-%m-%d")
     else:
-        from_date = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(
-            days=FBIL_GSEC_LOOKBACK_DAYS
-        )
+        from_date = _ist_today() - pd.Timedelta(days=FBIL_GSEC_LOOKBACK_DAYS)
 
     state: dict[str, object] = {
         "source": SYNC_SOURCE_NAME,

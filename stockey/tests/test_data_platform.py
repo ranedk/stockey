@@ -2934,6 +2934,68 @@ def test_collect_range_skips_weekends_and_counts_non_trading_days(monkeypatch):
     assert marked_non_trading == [date(2026, 8, 14)]  # persisted so it isn't re-fetched forever
 
 
+def test_collect_range_does_not_permanently_cache_a_not_yet_published_date(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): _mark_non_trading_date() permanently caches ANY date
+    # BSE returns a non-CSV response for -- indistinguishable between "confirmed holiday" and
+    # "not yet published" (today/future -- BSE serves the same "not found" shell for these too).
+    # An operator running collect_range() with an end date at/after today would permanently mark
+    # a not-yet-published date "non-trading", and it would never be automatically retried once
+    # its real bhavcopy is actually published.
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
+    monkeypatch.setattr(bse_bhavcopy, "_ist_today", lambda: date(2026, 8, 14))  # "today" is 08-14
+
+    def fake_fetch(d, *, session=None):
+        raise bse_bhavcopy.BseBhavcopyNotAvailableError("not found")  # BSE says not-found for everything
+
+    monkeypatch.setattr(bse_bhavcopy, "fetch_bhavcopy_csv", fake_fetch)
+    marked_non_trading = []
+    monkeypatch.setattr(bse_bhavcopy, "_mark_non_trading_date", lambda d: marked_non_trading.append(d))
+
+    # 08-12 (Wed) and 08-13 (Thu) are genuinely past; 08-14 (Fri) == today -- only the past two
+    # weekdays may be permanently cached.
+    result = bse_bhavcopy.collect_range(date(2026, 8, 12), date(2026, 8, 14))
+
+    assert result["non_trading_days"] == 3  # all three still counted/reported
+    assert marked_non_trading == [date(2026, 8, 12), date(2026, 8, 13)]  # not today's date
+
+
+def test_attach_identity_records_fallback_on_unresolved_rows(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): no check or telemetry on the resulting match rate --
+    # if company_master's BSE scrip-code mapping ever regressed such that every row in a day's
+    # file failed to resolve, the day would still be written with no visible signal.
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    def fake_attach(df, *, ticker_column, exchange):
+        return df.assign(company_master_id=[None, "bse:X"])
+
+    monkeypatch.setattr(bse_bhavcopy, "attach_company_master_id", fake_attach)
+    events = []
+    monkeypatch.setattr(bse_bhavcopy, "_record_fallback", lambda *a, **k: events.append((a, k)))
+
+    df = pd.DataFrame({"scrip_code": ["1", "2"]})
+    result = bse_bhavcopy.attach_identity(df)
+
+    assert result["company_master_id"].isna().sum() == 1
+    assert len(events) == 1
+    assert events[0][0][0] == "bse_bhavcopy_identity_unresolved"
+    assert events[0][1]["metadata"]["unmatched_rows"] == 1
+    assert events[0][1]["metadata"]["total_rows"] == 2
+
+
+def test_attach_identity_no_fallback_when_all_rows_resolve(monkeypatch):
+    from data.bseindia import bhavcopy as bse_bhavcopy
+
+    monkeypatch.setattr(bse_bhavcopy, "attach_company_master_id", lambda df, **k: df.assign(company_master_id=["bse:X"]))
+    events = []
+    monkeypatch.setattr(bse_bhavcopy, "_record_fallback", lambda *a, **k: events.append((a, k)))
+
+    bse_bhavcopy.attach_identity(pd.DataFrame({"scrip_code": ["1"]}))
+
+    assert events == []
+
+
 def test_collect_range_trips_circuit_breaker(monkeypatch):
     from data.bseindia import bhavcopy as bse_bhavcopy
 
@@ -3044,17 +3106,7 @@ def test_run_bse_bhavcopy_collection_only_fetches_actually_missing_dates(monkeyp
     monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: downloaded)
     monkeypatch.setattr(bse_bhavcopy, "load_known_non_trading_dates", lambda: set())
 
-    class _FakeNow:
-        @staticmethod
-        def date():
-            return date(2026, 8, 15)
-
-    class _FakeDatetime:
-        @staticmethod
-        def now():
-            return _FakeNow()
-
-    monkeypatch.setattr(bse_bhavcopy, "datetime", _FakeDatetime)
+    monkeypatch.setattr(bse_bhavcopy, "_ist_today", lambda: date(2026, 8, 15))
 
     fetched = []
 
@@ -3170,6 +3222,59 @@ def test_build_bse_adjustment_factors_uses_scrip_code_as_symbol_col(monkeypatch)
     assert summary["rows"] == 2
     assert summary["scrips"] == 1
     assert summary["split_bonus_events"] == 0  # no >35% overnight gap in this fixture
+
+
+def test_build_bse_adjustment_factors_flags_cross_series_collision(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): bseindia_adjustment_factors is keyed
+    # UNIQUE(scrip_code, date) with no series column -- if a scrip_code ever carries two rows on
+    # the same date under two different series, the price-step detector would interleave them as
+    # one continuous series and the upsert would silently collide. Live-checked: not currently
+    # observed, so monitored via telemetry instead of a schema change in this pass.
+    from data.bseindia import price_adjustment as bse_pa
+
+    raw = pd.DataFrame(
+        [
+            {"scrip_code": "500001", "symbol": "A", "date": pd.Timestamp("2026-08-13", tz="UTC"), "series": "X", "open": 100, "close": 101, "previous_close": 100},
+            {"scrip_code": "500001", "symbol": "A", "date": pd.Timestamp("2026-08-13", tz="UTC"), "series": "XT", "open": 50, "close": 51, "previous_close": 50},
+        ]
+    )
+
+    def fake_sql_to_df(query):
+        if "bseindia_ohlcv" in query:
+            return raw
+        return pd.DataFrame(columns=["symbol", "ex_date", "dividend_amount"])
+
+    monkeypatch.setattr(bse_pa, "sql_to_df", fake_sql_to_df)
+    events = []
+    monkeypatch.setattr(bse_pa, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    bse_pa.build_adjustment_factors(dry_run=True)
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "bse_adjustment_scrip_code_date_spans_multiple_series"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"]["pair_count"] == 1
+
+
+def test_build_bse_adjustment_factors_no_telemetry_when_series_unique_per_date(monkeypatch):
+    from data.bseindia import price_adjustment as bse_pa
+
+    raw = pd.DataFrame(
+        [{"scrip_code": "500166", "symbol": "GOODRICKE", "date": pd.Timestamp("2026-08-13", tz="UTC"), "series": "X", "open": 217, "close": 217.95, "previous_close": 220}]
+    )
+
+    def fake_sql_to_df(query):
+        if "bseindia_ohlcv" in query:
+            return raw
+        return pd.DataFrame(columns=["symbol", "ex_date", "dividend_amount"])
+
+    monkeypatch.setattr(bse_pa, "sql_to_df", fake_sql_to_df)
+    events = []
+    monkeypatch.setattr(bse_pa, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    bse_pa.build_adjustment_factors(dry_run=True)
+
+    assert events == []
 
 
 def test_ensure_bse_view_creates_ohlcv_table_first(monkeypatch):
@@ -7086,6 +7191,131 @@ def test_nse_ensure_view_runs_create_or_replace_unconditionally(monkeypatch):
     assert "CREATE OR REPLACE VIEW" in executed[0]
 
 
+def test_rbi_currency_rates_source_unavailable_sets_fallback_used(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): fallback_used was set once in the initial state dict
+    # (False) and never updated in either failure branch, even though record_local_fallback_event
+    # was already called.
+    from data.rbi import download_currency_rates as currency_rates
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            raise currency_rates.PlaywrightTimeoutError("cdp timeout")
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    events = []
+    monkeypatch.setattr(currency_rates, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    state = currency_rates.download_currency_rates(FakePlaywright(), date(2026, 1, 1), date(2026, 1, 2))
+
+    assert state["status"] == "source_unavailable"
+    assert state["fallback_used"] is True
+    assert len(events) == 1
+
+
+def test_rbi_currency_rates_records_chunk_failure_and_continues(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): a skipped chunk was only ever printed, never recorded
+    # via record_local_fallback_event -- no trail besides a cron log line, and fallback_used
+    # stayed False even though a real chunk failed.
+    from data.rbi import download_currency_rates as currency_rates
+
+    class FakePage:
+        def close(self):
+            pass
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    calls = []
+
+    def fake_fetch(page, from_date, to_date, *, attempts=3):
+        calls.append((from_date, to_date))
+        if len(calls) == 1:
+            raise currency_rates.PlaywrightTimeoutError("boom")
+        return [["Date", "USD"], ["01/01/2027", "83.0"]]
+
+    monkeypatch.setattr(currency_rates, "_fetch_range_with_retry", fake_fetch)
+    events = []
+    monkeypatch.setattr(currency_rates, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(currency_rates, "upsert_to_db", lambda *a, **k: None)
+
+    state = currency_rates.download_currency_rates(
+        FakePlaywright(), date(2026, 1, 1), date(2027, 6, 1), dry_run=True
+    )
+
+    assert len(calls) == 2  # the failed chunk did not abort the second chunk
+    assert state["status"] == "partial"
+    assert state["failed_attempt_count"] == 1
+    assert state["fallback_used"] is True
+    assert any(e["fallback_type"] == "rbi_currency_rates_chunk_failed" for e in events)
+
+
+def test_rbi_currency_rates_stops_at_time_budget(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): the yearly-chunk backfill loop had no per-run item
+    # cap -- a resume point far behind could walk every intervening yearly chunk in one run.
+    from data.rbi import download_currency_rates as currency_rates
+
+    class FakePage:
+        def close(self):
+            pass
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(currency_rates, "RBI_CURRENCY_RATES_MAX_RUNTIME_SECONDS", 100)
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        clock["t"] += 200  # exceed the 100s budget on the very first loop check
+        return clock["t"]
+
+    monkeypatch.setattr(currency_rates.time, "monotonic", fake_monotonic)
+    calls = []
+    monkeypatch.setattr(currency_rates, "_fetch_range_with_retry", lambda *a, **k: calls.append(1) or [])
+
+    state = currency_rates.download_currency_rates(FakePlaywright(), date(2020, 1, 1), date(2027, 1, 1), dry_run=True)
+
+    assert calls == []  # stopped before even attempting the first chunk
+    assert state["status"] == "blocked"
+    assert state["time_budget_exceeded"] is True
+    assert state["fallback_used"] is True
+
+
 def test_rbi_currency_parse_rate_rows():
     from data.rbi.download_currency_rates import parse_rate_rows
     # current RBI header carries unit suffixes + EUR/JPY + new AED/IDR -- the old fixed ["USD","GBP","EURO",
@@ -8278,20 +8508,36 @@ def test_fbil_gsec_main_reports_partial_status_without_circuit_breaker(monkeypat
     assert printed["status"] == "partial"
 
 
-def test_fbil_gsec_try_parsing_date_records_format_fallback(monkeypatch):
+def test_fbil_gsec_try_parsing_date_succeeds_on_later_format_with_no_telemetry(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): used to record fallback telemetry for EVERY rejected
+    # candidate format, including this normal, fully-successful case (matches the 2nd of 4
+    # supported formats) -- a routine, successful parse used to still emit a "failure" event for
+    # the first format that simply didn't match, diluting genuinely-actionable telemetry signal.
     from data.rbi import download_fbil_gsec as fbil_gsec
 
     events: list[dict[str, object]] = []
     monkeypatch.setattr(fbil_gsec, "_record_fbil_gsec_fallback", lambda **kwargs: events.append(kwargs))
 
-    parsed = fbil_gsec.try_parsing_date("08 Jun, 2026")
+    parsed = fbil_gsec.try_parsing_date("08 Jun, 2026")  # matches "%d %b, %Y", not the first-tried format
 
     assert parsed == datetime(2026, 6, 8)
-    assert len(events) == 1
+    assert events == []  # a successful parse -- even via a later format -- emits nothing
+
+
+def test_fbil_gsec_try_parsing_date_records_one_event_when_all_formats_fail(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(fbil_gsec, "_record_fbil_gsec_fallback", lambda **kwargs: events.append(kwargs))
+
+    with pytest.raises(ValueError):
+        fbil_gsec.try_parsing_date("not-a-date-at-all")
+
+    assert len(events) == 1  # exactly one summary event, not one per rejected format
     assert events[0]["fallback_type"] == "fbil_gsec_date_format_parse_failed"
     assert events[0]["source"] == "rbi_fbil_gsec"
-    assert events[0]["metadata"]["format"] == "%d-%b-%Y"
-    assert events[0]["metadata"]["raw_date"] == "08 Jun, 2026"
+    assert events[0]["metadata"]["raw_date"] == "not-a-date-at-all"
+    assert len(events[0]["metadata"]["formats_tried"]) == 4
 
 
 def test_fbil_gsec_parse_xls_records_trade_date_and_sheet_fallbacks(monkeypatch):
@@ -8476,6 +8722,66 @@ def test_click_past_blocking_modals_reraises_when_nothing_to_dismiss(monkeypatch
 
     with pytest.raises(bank_rates.PlaywrightTimeoutError, match="blocked, not by a modal"):
         bank_rates._click_past_blocking_modals(page, AlwaysBlockedLocator())
+
+
+class _FakeBankRatesExcelFile:
+    """Mimics pd.ExcelFile's surface for download_bank_rates.parse_excel_file: .sheet_names and
+    .parse(sheet_name, header=None, nrows=..., skiprows=...) -- a preview call (nrows=20) and a
+    data call (skiprows=8)."""
+
+    def __init__(self, header_row: list[str]):
+        self.sheet_names = ["Sheet1"]
+        self._header_row = header_row
+
+    def parse(self, sheet_name, header=None, nrows=None, skiprows=None):
+        if nrows is not None:
+            # rows 0-4 blank filler, row 5 carries the full header text, rows 6-7 blank (joined
+            # into one combined header string per column by the real code's own .agg(" ".join))
+            blank = [""] * len(self._header_row)
+            rows = [blank] * 5 + [self._header_row, blank, blank]
+            return pd.DataFrame(rows)
+        # data rows: one real data row + one trailing footer row (dropped via .iloc[:-1])
+        data_row = ["ignored", "09-08-2026", "6.50", "5.50", "5.25", "5.25", "5.75", "4.50", "18.00"]
+        footer_row = ["footer"] + [""] * (len(self._header_row) - 1)
+        return pd.DataFrame([data_row, footer_row], columns=range(len(self._header_row)))
+
+
+def test_bank_rates_parse_excel_file_maps_columns_with_no_mismatch_telemetry(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    header = ["", "Effective Date", "Bank Rate", "Repo Rate", "Reverse Repo Rate", "SDF Rate", "MSF Rate", "CRR", "SLR"]
+    monkeypatch.setattr(bank_rates.pd, "ExcelFile", lambda path: _FakeBankRatesExcelFile(header))
+    events = []
+    monkeypatch.setattr(bank_rates, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    df = bank_rates.parse_excel_file("dummy.xls")
+
+    assert list(df.columns) == ["effective_date", "bank_rate", "repo_rate", "reverse_repo_rate", "sdf_rate", "msf_rate", "crr", "slr"]
+    assert df.iloc[0]["bank_rate"] == "6.50"
+    assert events == []  # headers matched expectations -- nothing flagged
+
+
+def test_bank_rates_parse_excel_file_records_fallback_on_header_mismatch(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): column_index_rename_map maps output columns purely by
+    # POSITION with zero validation that the scraped header text actually says what's expected --
+    # if RBI ever reorders a column, values would be silently mislabeled with no error. Not
+    # hard-blocking (a real, valid format I couldn't live-verify shouldn't get falsely rejected),
+    # but a mismatch must be visible.
+    from data.rbi import download_bank_rates as bank_rates
+
+    # CRR and SLR swapped relative to what column_index_rename_map expects at those positions
+    header = ["", "Effective Date", "Bank Rate", "Repo Rate", "Reverse Repo Rate", "SDF Rate", "MSF Rate", "SLR", "CRR"]
+    monkeypatch.setattr(bank_rates.pd, "ExcelFile", lambda path: _FakeBankRatesExcelFile(header))
+    events = []
+    monkeypatch.setattr(bank_rates, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    df = bank_rates.parse_excel_file("dummy.xls")  # still returns a result -- non-blocking
+
+    assert not df.empty
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "rbi_bank_rates_header_mismatch"
+    assert 7 in events[0]["metadata"]["mismatched_columns"]  # expected "crr", got "slr" text
+    assert 8 in events[0]["metadata"]["mismatched_columns"]  # expected "slr", got "crr" text
 
 
 def test_rbi_bank_rates_exports_source_unavailable_state(monkeypatch):

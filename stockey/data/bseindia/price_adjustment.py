@@ -43,7 +43,10 @@ from data.bseindia.bhavcopy import PRIMARY_SERIES
 from data.bseindia.bhavcopy import ensure_ohlcv_table
 from data.nseindia.price_adjustment import adjust_frame, compute_total_return_factor
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.schema_migrations import apply_schema_migration
+
+SYNC_SOURCE_NAME = "data.bseindia.price_adjustment"
 
 ADJUSTMENT_FACTORS_TABLE = "bseindia_adjustment_factors"
 ADJUSTED_VIEW = "bse_advisory_adjusted_ohlcv_daily"
@@ -153,12 +156,54 @@ def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
     if raw.empty:
         return {"rows": 0}
     raw["date"] = pd.to_datetime(raw["date"], utc=True, errors="coerce")
+    # BUG FOUND LIVE 2026-08-19 (re-audit): bseindia_adjustment_factors is keyed UNIQUE(scrip_code,
+    # date), dropping the `series` column bseindia_ohlcv's own key (date, scrip_code, series)
+    # deliberately preserves -- and adjust_frame below groups the price-step detector only by
+    # scrip_code. If a scrip_code ever carries two rows on the same date under two different
+    # series (e.g. a live transition between 'X'/'XT' or 'M'/'MT'), the detector would interleave
+    # two series' closes as one continuous series, and the upsert below (unique_keys=["scrip_code",
+    # "date"]) would silently collide, keeping only one series' factor row. Live-checked
+    # (2026-08-18): not currently observed. A real schema change (series added to the unique key,
+    # the view's join updated to match) is a bigger, reviewed migration out of scope for this pass
+    # -- monitoring instead, so a future occurrence is visible rather than silently reintroducing
+    # the exact under/over-adjustment class of bug this whole module exists to prevent.
+    cross_series = raw.groupby(["scrip_code", "date"])["series"].nunique()
+    multi_series_pairs = cross_series[cross_series > 1]
+    if not multi_series_pairs.empty:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="bseindia_ohlcv",
+            fallback_type="bse_adjustment_scrip_code_date_spans_multiple_series",
+            severity="error",
+            reason=(
+                "A (scrip_code, date) pair spans more than one series -- bseindia_adjustment_"
+                "factors is keyed UNIQUE(scrip_code, date) with no series column, so the price-step "
+                "detector will interleave both series as one continuous price series and the "
+                "upsert will silently keep only one series' factor row."
+            ),
+            error=None,
+            metadata={"pair_count": int(len(multi_series_pairs)), "sample": [
+                {"scrip_code": sc, "date": str(d)} for sc, d in list(multi_series_pairs.index)[:10]
+            ]},
+        )
     adj = adjust_frame(raw, symbol_col="scrip_code", date_col="date", close_col="close", open_col="open")
 
     # events_dividend is NSE-symbol-keyed, not scrip-code-keyed -- join on the BSE
     # ticker text (symbol) as a best-effort corroboration; most BSE-only names will
     # simply have no match (cum_total_return_factor stays 1.0), which is honest, not
     # a bug -- see module docstring.
+    #
+    # BUG FOUND LIVE 2026-08-19 (re-audit) -- NOT fixed here, scope decision recorded: the "no
+    # match" case above is safe, but a COINCIDENTAL match is not guarded against. Per bhavcopy.py's
+    # own docstring, BSE's ticker text is explicitly not a reliable identity key and can
+    # plausibly collide with an unrelated NSE symbol string -- a coincidental text collision would
+    # silently misattribute a different company's dividend onto this scrip's cum_total_return_
+    # factor, with no cross-check that the matched dividend is even plausible for this company. A
+    # real fix needs identity-verified matching (joining through company_master to confirm the
+    # dividend's source company is genuinely the same entity as this scrip_code), a bigger,
+    # reviewed change out of scope for this pass -- not adding a coarse plausibility check here
+    # instead, since (unlike price_adjustment.py's declared-ratio case) there's no independent
+    # signal here to sanity-check a dividend match against.
     dividends = sql_to_df("SELECT symbol, ex_date, dividend_amount FROM events_dividend")
     adj["cum_total_return_factor"] = compute_total_return_factor(
         adj, dividends, symbol_col="symbol", date_col="date", previous_close_col="previous_close"

@@ -205,7 +205,22 @@ def attach_identity(df: pd.DataFrame) -> pd.DataFrame:
     docstring) -- not the TckrSymb text, which does not match company_master."""
     if df.empty:
         return df.assign(company_master_id=pd.Series(dtype="string"))
-    return attach_company_master_id(df, ticker_column="scrip_code", exchange="BSE")
+    mapped = attach_company_master_id(df, ticker_column="scrip_code", exchange="BSE")
+    # BUG FOUND LIVE 2026-08-19 (re-audit): no check or telemetry on the resulting match rate --
+    # if company_master's BSE scrip-code mapping ever regressed (e.g. a bad migration) such that
+    # every row in a day's file failed to resolve company_master_id, the day would still be
+    # written and counted as days_written/rows_written > 0 with no fallback event, silently
+    # defeating this whole collector's stated purpose (closing the technicals gap for its target
+    # companies) with no visible signal.
+    unmatched = int(mapped["company_master_id"].isna().sum())
+    if unmatched:
+        _record_fallback(
+            "bse_bhavcopy_identity_unresolved",
+            reason="Some BSE bhavcopy rows did not resolve to a company_master_id -- those rows are still written, but downstream joins on company_master_id will miss them.",
+            error=None,
+            metadata={"unmatched_rows": unmatched, "total_rows": int(len(mapped))},
+        )
+    return mapped
 
 
 _NON_TRADING_TABLE_STATEMENT = """
@@ -281,7 +296,17 @@ def collect_dates(dates: list[date], *, dry_run: bool = False) -> dict[str, obje
             csv_bytes = fetch_bhavcopy_csv(d, session=session)
         except BseBhavcopyNotAvailableError:
             non_trading_days += 1
-            if not dry_run:
+            # BUG FOUND LIVE 2026-08-19 (re-audit): _mark_non_trading_date() permanently caches
+            # ANY date BSE returns a non-CSV response for -- indistinguishable between "confirmed
+            # holiday", "date not yet published" (today/future -- BSE serves the same "not found"
+            # shell for these too), and "before the UDiFF format cutover". collect_range() (the
+            # manual/CLI backfill entrypoint) makes no assumption about what range it's given, so
+            # an operator running it with an end date at/after today would permanently mark a
+            # not-yet-published date "non-trading" -- and once that date's real bhavcopy IS
+            # published, run_bse_bhavcopy_collection() would never automatically retry it again,
+            # since it's already excluded via known_non_trading. Only a date strictly in the past
+            # (and on/after the earliest-covered date) is unambiguous enough to cache permanently.
+            if not dry_run and BSE_BHAVCOPY_EARLIEST_DATE <= d < _ist_today():
                 _mark_non_trading_date(d)
             continue
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
@@ -363,6 +388,16 @@ def load_downloaded_dates() -> set[date]:
     return {pd.Timestamp(d).date() for d in df["d"]}
 
 
+def _ist_today() -> date:
+    # BUG FOUND LIVE 2026-08-19 (re-audit): datetime.now().date() computes "today" against
+    # host-local time -- this host runs in UTC, not IST. Cron only ever invokes this at a time
+    # that maps to the same IST calendar day (currently masking the gap), but any manual/ad-hoc
+    # invocation between UTC 18:30-23:59 (IST 00:00-05:29) would compute "today" one IST day
+    # behind reality, shifting `end = today - 1` an extra day short and silently omitting the
+    # true most-recent trading day from that run's candidate window.
+    return pd.Timestamp.now(tz="Asia/Kolkata").date()
+
+
 def run_bse_bhavcopy_collection(*, lookback_days: int | None = None) -> dict[str, object]:
     """Daily incremental collection -- same lookback-window-of-candidate-dates shape
     as NSE's bhavcopy_downloader.py. Fetches ONLY the actual missing weekday dates
@@ -391,7 +426,7 @@ def run_bse_bhavcopy_collection(*, lookback_days: int | None = None) -> dict[str
     companies against a T-1 close for BSE-only ones side by side should account for
     this, not treat the two as equally fresh."""
     ensure_ohlcv_table()
-    today = datetime.now().date()
+    today = _ist_today()
     start = today - timedelta(days=lookback_days if lookback_days is not None else BSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS)
     start = max(start, BSE_BHAVCOPY_EARLIEST_DATE)
     end = today - timedelta(days=1)
