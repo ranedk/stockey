@@ -4558,6 +4558,37 @@ def test_fallback_telemetry_includes_file_spooled_db_retry_events(monkeypatch):
     assert summary["rows"][0]["operation_name"] == "sql_to_df"
 
 
+def test_fallback_telemetry_merged_rows_are_globally_time_sorted(monkeypatch):
+    # BUG FOUND LIVE 2026-08-20 (re-audit): "rows" used to be a plain
+    # `(db_retry_rows + local_rows)[:limit]` concatenation -- each list is independently
+    # sorted DESC and independently capped to `limit` by its own reader, so if db_retry_rows
+    # alone filled `limit` with OLD rows, genuinely more recent local_rows were silently
+    # dropped from the merged view entirely, even though they belong at the front.
+    monkeypatch.setattr(fallback_telemetry, "table_exists", lambda table_name=fallback_telemetry.TABLE_NAME: False)
+    monkeypatch.setattr(
+        fallback_telemetry,
+        "read_db_retry_telemetry_events",
+        lambda **_kwargs: [
+            {"observed_at": "2026-01-01T00:01:00+00:00", "severity": "warn", "fallback_type": "db_retry", "module": "utils.db", "source": "old_b"},
+            {"observed_at": "2026-01-01T00:00:00+00:00", "severity": "warn", "fallback_type": "db_retry", "module": "utils.db", "source": "old_a"},
+        ],
+    )
+    monkeypatch.setattr(
+        fallback_telemetry,
+        "read_local_fallback_events",
+        lambda **_kwargs: [
+            {"observed_at": "2026-08-20T00:01:00+00:00", "severity": "warn", "fallback_type": "local", "module": "m", "source": "new_b"},
+            {"observed_at": "2026-08-20T00:00:00+00:00", "severity": "warn", "fallback_type": "local", "module": "m", "source": "new_a"},
+        ],
+    )
+
+    summary = fallback_telemetry.summarize_fallback_events(hours=24, limit=2)
+
+    # the 2 genuinely most recent rows (both from local_rows) must win, not the first-in-
+    # concatenation-order db_retry rows.
+    assert [row["source"] for row in summary["rows"]] == ["new_b", "new_a"]
+
+
 def test_fallback_telemetry_summary_records_table_check_failure(monkeypatch):
     events = []
     monkeypatch.setattr(fallback_telemetry, "read_db_retry_telemetry_events", lambda **_kwargs: [])

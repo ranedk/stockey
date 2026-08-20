@@ -322,6 +322,21 @@ def _merge_counts(*sources: dict[str, int]) -> dict[str, int]:
     return out
 
 
+def _merge_rows_by_recency(*row_lists: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    # BUG FOUND LIVE 2026-08-20 (re-audit): this used to be a plain list concatenation
+    # sliced to `limit` (e.g. `(db_retry_rows + local_rows)[:limit]`). Each input list is
+    # independently sorted DESC and independently capped to `limit` by its own reader, but
+    # concatenation order (db_retry first, then local, then DB-table rows) has nothing to do
+    # with actual recency -- if db_retry_rows alone filled `limit` with old rows, genuinely
+    # more recent local_rows/DB rows were silently dropped from the merged "rows" field
+    # entirely, even though they belong at the front. Sorting the merged set once by
+    # observed_at (all three sources already emit the same ISO-8601 string format) before
+    # truncating fixes that.
+    merged = [row for rows in row_lists for row in rows]
+    merged.sort(key=lambda item: str(item.get("observed_at") or ""), reverse=True)
+    return merged[: max(1, int(limit))]
+
+
 def _spool_only_summary(
     *,
     hours: int,
@@ -352,7 +367,7 @@ def _spool_only_summary(
         "nse_session_reset_count": 0,
         "nse_retry_count": 0,
         "nse_http_count": 0,
-        "rows": (db_retry_rows + local_rows)[:limit],
+        "rows": _merge_rows_by_recency(db_retry_rows, local_rows, limit=limit),
     }
     if error:
         out["error"] = error
@@ -481,5 +496,5 @@ def summarize_fallback_events(*, hours: int = 24, limit: int = 25) -> dict[str, 
         "db_retry_error_count": db_retry_error_count,
         "local_fallback_count": local_count,
         "local_fallback_error_count": local_error_count,
-        "rows": (db_retry_rows + local_rows + _records(rows))[:limit],
+        "rows": _merge_rows_by_recency(db_retry_rows, local_rows, _records(rows), limit=limit),
     }
