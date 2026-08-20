@@ -335,7 +335,22 @@ def handle_download_module(task_args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("module is required for download_module")
     if step["module"].startswith("data.nseindia.") and step["module"] not in ALLOWED_NSE_MODULES:
         raise ValueError(f"Unsupported NSE module for queue worker: {step['module']}")
-    return run_download_module(step)
+    result = run_download_module(step)
+    # BUG FOUND LIVE 2026-08-19 (re-audit): run_download_module() never raises -- by
+    # design, for the direct in-process download_runner caller, it always returns a
+    # result dict (catching every exception/SystemExit internally, per its own
+    # docstring). execute_task() -> run_worker() only treats a RAISED exception as a
+    # queue task failure (that's the only path that calls fail_task()/records queue
+    # fallback telemetry); a handler that returns normally is unconditionally passed
+    # to complete_task() and marked 'completed' -- even when result["status"] says
+    # "failed". A task run through this handler could fail every single retry and
+    # the queue table would show it as completed forever, with the real failure
+    # visible only if an operator opens result_json by hand. Raise here so a real
+    # failure flows through the same fail_task()/retry/fallback-telemetry path every
+    # other handler's failure already does.
+    if str(result.get("status") or "") == "failed":
+        raise RuntimeError(f"download_module {step['module']} failed: {result.get('error') or result}")
+    return result
 
 
 TASK_HANDLERS = {
@@ -439,6 +454,17 @@ def main() -> int:
         df = load_queue_status(queue_name=args.queue if args.status else None, limit=args.limit)
         result = {"status": "ok", "rows": df.to_dict(orient="records") if not df.empty else []}
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    # BUG FOUND LIVE 2026-08-19 (re-audit): main() used to unconditionally `return 0`
+    # regardless of what run_worker() actually reported. all_downloaders_queue.sh /
+    # all_external_workers.sh route critical-path market-data work (data.nseindia.
+    # bhavcopy_downloader, data.dhanlive.ohlcv, ...) through this queue -- if every
+    # queued task failed every night, the cron log would still show an unbroken
+    # string of "done exit_code=0" markers; only advisory_external_task_queue rows
+    # and scattered fallback_telemetry entries would record the truth, with nothing
+    # actively surfacing either. Now mirrors download_runner.py's own convention
+    # (exit 1 whenever the run itself reports a failure count > 0).
+    if args.worker and int(result.get("failed") or 0) > 0:
+        return 1
     return 0
 
 

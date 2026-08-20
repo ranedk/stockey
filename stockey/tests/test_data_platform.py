@@ -7404,6 +7404,67 @@ def test_external_task_queue_records_worker_task_failure(monkeypatch):
     assert events[0]["metadata"]["worker_id"] == "worker-test"
 
 
+def test_handle_download_module_raises_when_run_download_module_reports_failed(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): run_download_module() never raises -- it
+    # always returns a result dict, even on failure (by design, for the direct
+    # in-process download_runner caller). execute_task() -> run_worker() only treats
+    # a RAISED exception as a queue task failure; a handler that returns normally
+    # (even with status="failed" inside the dict) used to be unconditionally marked
+    # 'completed' by complete_task(), hiding the real failure unless an operator
+    # opened result_json by hand.
+    import data.download_runner as download_runner_module
+
+    monkeypatch.setattr(
+        download_runner_module,
+        "run_download_module",
+        lambda step: {"module": step["module"], "status": "failed", "error": "boom"},
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        external_task_queue.handle_download_module({"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"})
+
+
+def test_handle_download_module_returns_normally_on_success(monkeypatch):
+    import data.download_runner as download_runner_module
+
+    monkeypatch.setattr(
+        download_runner_module,
+        "run_download_module",
+        lambda step: {"module": step["module"], "status": "ok", "rows": 10},
+    )
+
+    result = external_task_queue.handle_download_module({"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"})
+
+    assert result == {"module": "data.dhanlive.ohlcv", "status": "ok", "rows": 10}
+
+
+def test_external_task_queue_main_worker_returns_nonzero_when_tasks_failed(monkeypatch, capsys):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): main() used to unconditionally `return 0`
+    # regardless of run_worker()'s own failed count -- a queued critical-path task
+    # (bhavcopy_downloader, dhan ohlcv, ...) could fail every single time and
+    # all_downloaders_queue.sh's cron log would still show an unbroken string of
+    # "done exit_code=0" markers.
+    monkeypatch.setattr(
+        external_task_queue,
+        "parse_args",
+        lambda: argparse.Namespace(enqueue=False, worker=True, queue="nse", worker_id="w1", once=True, drain=False, max_tasks=None, sleep_seconds=5.0, status=False, limit=50),
+    )
+    monkeypatch.setattr(external_task_queue, "run_worker", lambda **kwargs: {"status": "ok", "queue_name": "nse", "worker_id": "w1", "processed": 2, "failed": 1})
+
+    assert external_task_queue.main() == 1
+
+
+def test_external_task_queue_main_worker_returns_zero_when_nothing_failed(monkeypatch, capsys):
+    monkeypatch.setattr(
+        external_task_queue,
+        "parse_args",
+        lambda: argparse.Namespace(enqueue=False, worker=True, queue="nse", worker_id="w1", once=True, drain=False, max_tasks=None, sleep_seconds=5.0, status=False, limit=50),
+    )
+    monkeypatch.setattr(external_task_queue, "run_worker", lambda **kwargs: {"status": "ok", "queue_name": "nse", "worker_id": "w1", "processed": 3, "failed": 0})
+
+    assert external_task_queue.main() == 0
+
+
 def test_download_queue_dry_run_no_inline():
     result = download_queue.enqueue_download_work(phase="downloaders", run_non_queued=False, dry_run=True)
 
