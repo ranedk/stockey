@@ -4990,6 +4990,68 @@ def test_cron_status_missing_pid_remains_normal_false(monkeypatch):
     assert events == []
 
 
+def test_with_lock_holds_mutual_exclusion_under_concurrent_racers(tmp_path):
+    # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): TOCTOU race between LOCK_DIR's mkdir and
+    # its PID_FILE/COMMAND_FILE writes -- a second process observing an existing LOCK_DIR
+    # with no PID_FILE yet (the real holder hadn't written it yet) used to conclude the lock
+    # was stale, rm -rf it out from under the real holder, and take over -- letting two
+    # guarded commands run concurrently under the same lock, exactly what with_lock.sh
+    # exists to prevent. Fixed via stage-then-atomic-rename (mv -T): a second process can
+    # now only ever observe $LOCK_DIR absent or fully populated, never in between. This
+    # stress test races many concurrent real with_lock.sh invocations against the same lock
+    # file and asserts mutual exclusion actually held.
+    with_lock_script = Path("scripts/with_lock.sh").resolve()
+    assert with_lock_script.exists()
+    lock_file = tmp_path / "job.lock"
+    results_file = tmp_path / "results.txt"
+
+    racer_count = 10
+    guarded_command = (
+        f'echo "start $(date +%s.%N)" >> {shlex.quote(str(results_file))}; '
+        f"sleep 0.2; "
+        f'echo "end $(date +%s.%N)" >> {shlex.quote(str(results_file))}'
+    )
+    procs = [
+        subprocess.Popen(
+            [str(with_lock_script), str(lock_file), "bash", "-c", guarded_command],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(racer_count)
+    ]
+    for proc in procs:
+        assert proc.wait(timeout=15) == 0  # every invocation exits 0, whether it ran or was skipped
+
+    lock_dir = Path(f"{lock_file}.d")
+    assert not lock_dir.exists()  # cleaned up after the winner's guarded command finished
+
+    lines = results_file.read_text(encoding="utf-8").splitlines() if results_file.exists() else []
+    starts = sorted(float(line.split()[1]) for line in lines if line.startswith("start"))
+    ends = sorted(float(line.split()[1]) for line in lines if line.startswith("end"))
+    assert len(starts) == len(ends) == 1  # exactly one racer acquired the lock and ran
+
+
+def test_with_lock_recovers_a_genuinely_empty_stale_lock_dir(tmp_path):
+    # The staleness-recovery behavior for a real crash-leftover (an empty lock dir with no
+    # pid/command files -- e.g. left by a process that died between an old-style mkdir and
+    # its writes, or a pre-fix binary) must still work after closing the race above.
+    with_lock_script = Path("scripts/with_lock.sh").resolve()
+    lock_file = tmp_path / "job.lock"
+    lock_dir = Path(f"{lock_file}.d")
+    lock_dir.mkdir()
+
+    result = subprocess.run(
+        [str(with_lock_script), str(lock_file), "bash", "-c", "echo ran"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert "ran" in result.stdout
+    assert not lock_dir.exists()
+
+
 def test_cron_preflight_validates_generated_crontab(tmp_path, monkeypatch):
     from scripts import cron_preflight
 
