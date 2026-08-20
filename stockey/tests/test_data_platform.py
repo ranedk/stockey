@@ -1357,6 +1357,42 @@ def test_sync_company_master_dhan_only_nse_and_bse_rows_kept_separate(monkeypatc
     assert pd.isna(bse_row["nse_ticker"])  # not merged with the NSE row
 
 
+def test_sync_company_master_records_telemetry_on_id_collision(monkeypatch):
+    # BUG FOUND LIVE 2026-08-20 (re-audit): the final drop_duplicates(subset=["company_master_id"])
+    # used to silently keep one row per collision with zero telemetry -- unlike the read-side
+    # equivalent (map_company_master_ids's "company_master_ticker_collision" event). Two sharpely
+    # rows sharing an nse_ticker but no sharpely_id (and a different bse_ticker each, so they
+    # survive the earlier (nse_ticker,bse_ticker)-pair dedup) both compute company_master_id =
+    # "nse:DUPTICK" -- a genuine collision that must now be recorded.
+    events = []
+    monkeypatch.setattr(company_master_utils, "ensure_company_master_dhan_ids_are_bigint", lambda: None)
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(
+        company_master_utils,
+        "_company_master_sql_to_df",
+        lambda query, *, params=None, operation: {
+            "sync_sharpely_columns": pd.DataFrame({"column_name": ["sharpely_id"]}),
+            "sync_sharpely_equity": pd.DataFrame(
+                [
+                    {"nse_ticker": "DUPTICK", "bse_ticker": None, "company_name": "Dup Co A", "sharpely_id": None},
+                    {"nse_ticker": "DUPTICK", "bse_ticker": "999999", "company_name": "Dup Co B", "sharpely_id": None},
+                ]
+            ),
+            "sync_dhan_bse": pd.DataFrame(columns=["bse_ticker", "dhan_bse_id", "dhan_bse_name"]),
+            "sync_dhan_nse": pd.DataFrame(columns=["nse_ticker", "dhan_nse_id", "dhan_nse_name"]),
+        }[operation],
+    )
+    monkeypatch.setattr(company_master_utils, "upsert_to_db", lambda df, table, keys: None)
+
+    result = company_master_utils.sync_company_master()
+
+    assert list(result["company_master_id"]) == ["nse:DUPTICK"]  # one row silently kept, as before
+    collision_events = [e for e in events if e["fallback_type"] == "company_master_sync_id_collision"]
+    assert len(collision_events) == 1
+    assert collision_events[0]["metadata"]["collided_ids"] == ["nse:DUPTICK"]
+    assert collision_events[0]["severity"] == "warn"
+
+
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
     calls = {"attempts": 0}
     events: list[dict[str, object]] = []

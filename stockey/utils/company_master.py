@@ -215,6 +215,35 @@ def sync_company_master() -> pd.DataFrame:
         ]
         company_master = pd.concat([company_master, additions], ignore_index=True)
 
+    # BUG FOUND LIVE 2026-08-20 (re-audit): this final dedup silently kept one row per
+    # collided company_master_id with no telemetry at all -- the read-side equivalent
+    # (map_company_master_ids's "company_master_ticker_collision" event, above) already
+    # flags this same failure shape when resolving tickers, but the write side that
+    # actually causes it stayed silent. A collision here means two distinct source rows
+    # (e.g. two sharpely-less rows sharing an nse_ticker) computed the same
+    # company_master_id and drop_duplicates(keep="last") discarded one of them with no
+    # ORDER BY -- effectively arbitrary and, until now, invisible.
+    duplicated_ids = (
+        company_master.loc[company_master["company_master_id"].duplicated(keep=False), "company_master_id"]
+        .unique()
+        .tolist()
+    )
+    if duplicated_ids:
+        record_local_fallback_event(
+            module="utils.company_master",
+            source=COMPANY_MASTER_TABLE,
+            fallback_type="company_master_sync_id_collision",
+            severity="warn",
+            reason=(
+                f"{len(duplicated_ids)} company_master_id value(s) computed for more than one "
+                "distinct source row during sync; resolved via drop_duplicates(keep='last') with "
+                "no ORDER BY, so the surviving row is effectively arbitrary and the other was "
+                "silently dropped."
+            ),
+            error="duplicate company_master_id during sync",
+            metadata={"collided_ids": sorted(duplicated_ids)[:20], "collided_id_count": len(duplicated_ids)},
+        )
+
     company_master = company_master.drop_duplicates(subset=["company_master_id"], keep="last")
 
     upsert_to_db(company_master, COMPANY_MASTER_TABLE, ["company_master_id"])
