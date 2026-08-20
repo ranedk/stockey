@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -5103,6 +5104,50 @@ def test_rotate_logs_exits_zero_on_success(tmp_path):
     assert "failed=0" in result.stdout
     assert (repo / "logs" / "big.log").stat().st_size == 0  # truncated after successful rotation
     assert list((repo / "logs" / "archive").glob("*.log.gz"))
+
+
+def test_start_cron_refuses_to_double_start_when_go_crond_already_running(tmp_path):
+    # BUG FOUND LIVE 2026-08-20 (re-audit, LOW): start_cron.sh had no check for an
+    # already-running go-crond before its final `exec` replaced the process with a NEW
+    # go-crond instance -- a second manual invocation (or one racing
+    # scripts/ensure_go_crond_alive.sh's watchdog-triggered restart, which only protects ITS
+    # OWN restart call via with_lock.sh, not a direct call to this script) would end up with
+    # two go-crond processes both firing the same crontab, double-running every scheduled
+    # job. start_cron.sh derives its own paths from its own location (like rotate_logs.sh),
+    # so it's copied into an isolated fake repo here; a real background process matching the
+    # exact pgrep pattern start_cron.sh checks stands in for "go-crond already running".
+    real_script = Path("start_cron.sh").resolve()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script = repo / "start_cron.sh"
+    script.write_text(real_script.read_text(encoding="utf-8"), encoding="utf-8")
+    script.chmod(0o755)
+    fake_go_crond = repo / "go-crond"
+    # A real ELF binary (not a #!-shebang script) so argv[0] as seen by `pgrep -f` is
+    # literally this path, matching how the real go-crond (a compiled Go binary, invoked via
+    # bash's `exec`) behaves -- a shebang script would show up as "bash /path/..." instead,
+    # never matching start_cron.sh's anchored `^${GO_CROND_BIN} ` pattern.
+    shutil.copy2("/bin/sleep", fake_go_crond)
+
+    holder = subprocess.Popen([str(fake_go_crond), "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        pattern = f"^{fake_go_crond} "
+        while time.monotonic() < deadline:
+            if subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL).returncode == 0:
+                break
+            time.sleep(0.05)
+
+        result = subprocess.run([str(script)], capture_output=True, text=True, timeout=15)
+
+        assert result.returncode == 0
+        assert "already running" in result.stderr
+        # must exit before ever reaching the readiness/reconcile/exec steps
+        assert "step 1/2" not in result.stdout
+        assert "step 2/2" not in result.stdout
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
 
 
 def test_builder_render_crontab_raises_on_unresolved_placeholder(tmp_path, monkeypatch):
