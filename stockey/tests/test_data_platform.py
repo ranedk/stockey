@@ -7701,6 +7701,72 @@ def test_sync_many_daily_continues_after_symbol_error(monkeypatch):
     assert event["metadata"]["asset_type"] == "stock"
 
 
+def test_clamp_to_last_trading_day_skips_a_normal_weekend(monkeypatch):
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: set())
+    saturday = datetime(2026, 8, 22)  # a real, ordinary Saturday -- not a special session
+    assert dhan_ohlcv.clamp_to_last_trading_day(saturday).date() == date(2026, 8, 21)  # Friday
+
+
+def test_clamp_to_last_trading_day_keeps_a_confirmed_special_weekend_session(monkeypatch):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): unconditionally treated every Saturday/Sunday as
+    # non-trading, with no reference to dim_trading_days -- which has real weekend NSE sessions
+    # (Budget-day/Muhurat/DR-drill sessions), including a confirmed-live upcoming one on
+    # 2026-11-08. On a real weekend trading day, this silently clamped the sync window's end back
+    # to the prior Friday, so a same-day poll never requested that day's data at all.
+    #
+    # BUG FOUND LIVE (first fix attempt): OR'd the special-session check into the weekend branch
+    # only, leaving `holidays` free to clamp it anyway -- failed immediately live on the real date:
+    # NSE's own holiday calendar lists 2026-11-08 as a holiday AND dim_trading_days lists it as a
+    # real trading day, simultaneously true (it's a Diwali Muhurat session -- an evening trading
+    # session on an otherwise-holiday date, a real, well-known pattern). dim_trading_days must be
+    # authoritative and override the holiday classification, not just the weekend one -- this test
+    # deliberately puts the date in BOTH sets to guard against regressing that exact precedence bug.
+    sunday = datetime(2026, 11, 8)  # the real, confirmed-live upcoming special session
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: {sunday.date()})
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: {sunday.date()})
+    assert dhan_ohlcv.clamp_to_last_trading_day(sunday).date() == sunday.date()  # NOT clamped back
+
+
+def test_clamp_to_last_trading_day_falls_back_to_plain_weekday_heuristic_when_lookup_fails(monkeypatch):
+    # load_special_weekend_trading_days returning None (not an empty set) signals "couldn't check"
+    # -- must fall back to the safe default (skip weekends), same tolerant-degrade shape
+    # load_nse_holidays already has for an unavailable holidays table.
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: None)
+    saturday = datetime(2026, 8, 22)
+    assert dhan_ohlcv.clamp_to_last_trading_day(saturday).date() == date(2026, 8, 21)
+
+
+def test_clamp_to_last_trading_day_still_skips_declared_holidays(monkeypatch):
+    # holidays still win regardless of the weekend/special-session logic -- unaffected by this fix.
+    holiday = datetime(2026, 8, 27)  # a Thursday
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: {holiday.date()})
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: set())
+    assert dhan_ohlcv.clamp_to_last_trading_day(holiday).date() == date(2026, 8, 26)
+
+
+def test_load_special_weekend_trading_days_returns_none_on_missing_table(monkeypatch):
+    # same tolerant-degrade shape load_nse_holidays already uses for an unavailable table.
+    class FakeUndefinedTable(Exception):
+        pass
+    FakeUndefinedTable.__name__ = "UndefinedTable"
+
+    def fake_sql_to_df(query, params=None):
+        raise FakeUndefinedTable("relation dim_trading_days does not exist")
+
+    monkeypatch.setattr(dhan_ohlcv, "sql_to_df", fake_sql_to_df)
+    assert dhan_ohlcv.load_special_weekend_trading_days(date(2026, 8, 22)) is None
+
+
+def test_load_special_weekend_trading_days_parses_real_shape(monkeypatch):
+    monkeypatch.setattr(
+        dhan_ohlcv, "sql_to_df", lambda query, params=None: pd.DataFrame([{"trading_date": pd.Timestamp("2026-11-08")}])
+    )
+    result = dhan_ohlcv.load_special_weekend_trading_days(date(2026, 11, 8))
+    assert result == {date(2026, 11, 8)}
+
+
 def test_sync_daily_ohlcv_normalizes_mixed_timezone_dates(monkeypatch):
     captured: dict[str, datetime] = {}
 
@@ -7729,6 +7795,7 @@ def test_sync_daily_ohlcv_normalizes_mixed_timezone_dates(monkeypatch):
     )
     monkeypatch.setattr(dhan_ohlcv, "has_recent_adjustment", lambda symbol, latest_stored_date: False)
     monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: set())
     monkeypatch.setattr(dhan_ohlcv, "upsert_to_db", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         dhan_ohlcv,

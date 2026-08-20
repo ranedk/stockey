@@ -249,11 +249,64 @@ def load_nse_holidays() -> set[date]:
     return {value.date() for value in values}
 
 
+def load_special_weekend_trading_days(target_date: date, *, window_days: int = 10) -> set[date] | None:
+    """dim_trading_days rows within [target_date - window_days, target_date] -- the codebase's
+    own authoritative trading calendar (already used by utils/advisory_date.py and
+    ohlcv_reconcile.py). Returns None (not an empty set) on any lookup failure, so callers can
+    distinguish "checked, no special sessions in range" from "couldn't check, fall back to the
+    plain weekday heuristic" -- same tolerant-degrade shape load_nse_holidays() already uses for
+    an unavailable holidays table. Bounded window, not the whole table, since this is called per
+    symbol during bulk OHLCV syncs (same repeated-per-call-symbol pattern load_nse_holidays()
+    already has -- not a new inefficiency introduced here)."""
+    try:
+        df = sql_to_df(
+            "SELECT date::date AS trading_date FROM dim_trading_days WHERE date BETWEEN %s AND %s",
+            params=(target_date - timedelta(days=window_days), target_date),
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"} or "does not exist" in message:
+            print(f"[dhan.ohlcv] dim_trading_days table unavailable; continuing with plain weekday clamp: {exc}", flush=True)
+            return None
+        raise
+    if df.empty or "trading_date" not in df.columns:
+        return set()
+    values = pd.to_datetime(df["trading_date"], errors="coerce").dropna()
+    return {value.date() for value in values}
+
+
 def clamp_to_last_trading_day(target: datetime, *, exchange: str = "NSE") -> datetime:
+    # BUG FOUND LIVE 2026-08-19 (re-audit): unconditionally treated every Saturday/Sunday as
+    # non-trading, with no reference to dim_trading_days -- which has real weekend NSE sessions
+    # (Budget-day/Muhurat/DR-drill sessions), including an upcoming one on 2026-11-08 (confirmed
+    # live against the real DB). On a real weekend trading day, this clamped the sync window's
+    # end back to the prior Friday, so choose_daily_refresh_end/choose_intraday_refresh_end never
+    # requested that day's data on the day itself -- a same-day poll silently looked like
+    # "no_data" for what was actually a live session. ohlcv_reconcile.py's own staleness check
+    # correctly uses dim_trading_days and would flag the symbol stale, but its sync call went
+    # through this same buggy clamp, so even the gap-closer couldn't close this specific gap on
+    # the day it mattered.
+    #
+    # First fix attempt OR'd the special-session check into the weekend branch only, leaving
+    # `holidays` free to clamp it anyway -- and immediately failed live on the real 2026-11-08
+    # case: NSE's own holiday calendar (nseindia_holidays) lists 2026-11-08 as a holiday AND
+    # dim_trading_days lists it as a real trading day, simultaneously true -- it's a Diwali
+    # Muhurat trading session, a real, well-known pattern (an evening session on an otherwise-
+    # holiday date). dim_trading_days is treated as authoritative here, same as
+    # utils/advisory_date.py already treats it elsewhere -- a date it confirms as a real trading
+    # day is never clamped, regardless of what the holiday calendar separately says. Falls back
+    # to the plain weekday+holiday heuristic if the dim_trading_days lookup itself fails, same
+    # tolerant-degrade shape already used for the holidays table.
     current = target
     holidays = load_nse_holidays() if exchange.upper() == "NSE" else set()
-    while current.weekday() >= 5 or current.date() in holidays:
-        current = current - timedelta(days=1)
+    confirmed_trading_days = load_special_weekend_trading_days(target.date()) if exchange.upper() == "NSE" else None
+    while True:
+        if confirmed_trading_days is not None and current.date() in confirmed_trading_days:
+            break
+        if current.date() in holidays or current.weekday() >= 5:
+            current = current - timedelta(days=1)
+            continue
+        break
     return current
 
 
