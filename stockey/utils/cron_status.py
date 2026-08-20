@@ -72,14 +72,23 @@ def _cron_matches(dt: pd.Timestamp, fields: list[str]) -> bool:
 
 
 def estimate_next_run(fields: list[str], *, now: pd.Timestamp | None = None, horizon_days: int = 14) -> str | None:
+    # BUG FOUND LIVE 2026-08-20 (re-audit): this used to compare an IST wall-clock `now`
+    # directly against the crontab's minute/hour/dom/month/dow fields -- but per CLAUDE.md
+    # ("TIMEZONE" note in config/stockey.crontab.template, confirmed empirically 2026-08-13),
+    # go-crond has no CRON_TZ/TZ support, so those fields are always written in UTC (IST -
+    # 5:30), never IST. A job scheduled "40 01" (01:40 UTC = 07:10 IST) was being matched
+    # against IST 01:40 instead -- off by 5.5 hours for every single job, every call.
+    # Matching now happens in UTC (what the fields actually mean); the returned estimate is
+    # converted back to IST since that's the wall-clock a human operator actually reads.
     effective_now = pd.to_datetime(now or pd.Timestamp.now(tz="Asia/Kolkata"))
     if effective_now.tzinfo is None:
         effective_now = effective_now.tz_localize("Asia/Kolkata")
-    cursor = effective_now.floor("min") + pd.Timedelta(minutes=1)
-    end = effective_now + pd.Timedelta(days=max(1, int(horizon_days)))
+    effective_now_utc = effective_now.tz_convert("UTC")
+    cursor = effective_now_utc.floor("min") + pd.Timedelta(minutes=1)
+    end = effective_now_utc + pd.Timedelta(days=max(1, int(horizon_days)))
     while cursor <= end:
         if _cron_matches(cursor, fields):
-            return cursor.isoformat()
+            return cursor.tz_convert("Asia/Kolkata").isoformat()
         cursor += pd.Timedelta(minutes=1)
     return None
 

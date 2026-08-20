@@ -4805,7 +4805,9 @@ def test_cron_status_parses_generated_style_crontab_and_estimates_next_run(tmp_p
             [
                 "SHELL=/bin/bash",
                 "# comment",
-                '10 07 * * 1-5 rane cd "$STOCKEY_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1',
+                # go-crond has no CRON_TZ/TZ support -- generated crontab fields are always UTC
+                # (see CLAUDE.md's TIMEZONE note). "40 01" = 01:40 UTC = 07:10 IST.
+                '40 01 * * 1-5 rane cd "$STOCKEY_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1',
                 '*/10 09-15 * * 1-5 rane cd "$STOCKEY_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1',
             ]
         ),
@@ -4819,7 +4821,22 @@ def test_cron_status_parses_generated_style_crontab_and_estimates_next_run(tmp_p
     assert rows[0]["log_file"] == "complete_data.log"
     assert rows[0]["lock_file"] == "/tmp/stockey_complete_data.lock"
     assert rows[1]["job_name"] == "all_watchers"
+    # BUG FOUND LIVE 2026-08-20 (re-audit): estimate_next_run() used to compare an IST `now`
+    # directly against these UTC fields -- "40 01" (01:40 UTC = 07:10 IST) would previously
+    # (wrongly) resolve against 01:40 IST. now=06:58 IST is 01:28 UTC, so the correct next
+    # match is 01:40 UTC = 07:10 IST -- same wall-clock answer as before the fix by
+    # construction of this fixture, but now for the right reason (UTC-field matching,
+    # converted back to IST for display), not by accident.
     assert cron_status.estimate_next_run(rows[0]["cron_fields"], now=pd.Timestamp("2026-06-08T06:58:00+05:30")) == "2026-06-08T07:10:00+05:30"
+
+
+def test_cron_status_estimate_next_run_matches_utc_fields_not_ist_wall_clock():
+    # Divergent case: `now` is just PAST 07:10 IST but well BEFORE 07:10 UTC (=12:40 IST).
+    # The old IST-literal bug would treat "10 07" as already-passed-today and jump to
+    # tomorrow's 07:10 IST; correct UTC-field matching resolves to 12:40 IST later today.
+    fields = ["10", "07", "*", "*", "*"]
+    result = cron_status.estimate_next_run(fields, now=pd.Timestamp("2026-06-08T07:15:00+05:30"))
+    assert result == "2026-06-08T12:40:00+05:30"
 
 
 def test_cron_status_detects_stale_lock_and_log_marker(tmp_path):
