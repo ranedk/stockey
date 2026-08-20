@@ -91,16 +91,21 @@ def sync_company_master() -> pd.DataFrame:
     sharpely = sharpely.sort_values(["nse_ticker", "bse_ticker"], na_position="last")
     sharpely = sharpely.drop_duplicates(subset=["nse_ticker", "bse_ticker"], keep="last")
 
+    # instrument_type IN ('ES', 'ETF'), not just 'ES' -- broadened 2026-08-20 (user-reported "a
+    # lot of dhan errors") so ETFs are available for the Dhan-only-anchor addition below. Doesn't
+    # change the enrichment behavior for sharpely-anchored rows above (sharpely is an
+    # equity-fundamentals feed and has no ETF rows to match against either way).
     dhan_bse = _company_master_sql_to_df(
         """
         SELECT DISTINCT ON (security_id::text)
             security_id::text AS bse_ticker,
-            security_id AS dhan_bse_id
+            security_id AS dhan_bse_id,
+            COALESCE(NULLIF(display_name, ''), NULLIF(symbol_name, '')) AS dhan_bse_name
         FROM master_dhan_instruments
         WHERE valid_to IS NULL
           AND exch_id = 'BSE'
           AND instrument = 'EQUITY'
-          AND instrument_type = 'ES'
+          AND instrument_type IN ('ES', 'ETF')
         ORDER BY security_id::text, load_ts DESC, valid_from DESC
         """,
         operation="sync_dhan_bse",
@@ -112,12 +117,13 @@ def sync_company_master() -> pd.DataFrame:
         """
         SELECT DISTINCT ON (underlying_symbol)
             underlying_symbol AS nse_ticker,
-            security_id AS dhan_nse_id
+            security_id AS dhan_nse_id,
+            COALESCE(NULLIF(display_name, ''), NULLIF(symbol_name, '')) AS dhan_nse_name
         FROM master_dhan_instruments
         WHERE valid_to IS NULL
           AND exch_id = 'NSE'
           AND instrument = 'EQUITY'
-          AND instrument_type = 'ES'
+          AND instrument_type IN ('ES', 'ETF')
           AND underlying_symbol IS NOT NULL
         ORDER BY underlying_symbol, load_ts DESC, valid_from DESC
         """,
@@ -149,6 +155,66 @@ def sync_company_master() -> pd.DataFrame:
             "nse_ticker",
         ]
     ].copy()
+
+    # BUG FOUND LIVE 2026-08-20 (user-reported: "a lot of dhan errors", all
+    # "No company_master row found"): company_master is anchored ENTIRELY on
+    # master_sharpely_equity -- master_dhan_instruments is only used to enrich a
+    # row that already matched sharpely, never as its own anchor. Two real gaps
+    # this caused, confirmed live:
+    # (1) ETFs (BANKBEES, BANKPSU, BBETF0432, gold/silver funds, ...) -- Dhan
+    #     classifies these instrument_type='ETF', not 'ES', and sharpely (an
+    #     equity-fundamentals feed) doesn't carry funds at all -- they NEVER get a
+    #     company_master row even though they're real, actively-traded NSE/BSE
+    #     securities with real bhavcopy price data Dhan can and does serve OHLCV
+    #     for.
+    # (2) Ordinary companies Dhan already has a clean instrument_type='ES' mapping
+    #     for on BOTH NSE and BSE (confirmed live: ADOR, AGL, ...) but that
+    #     sharpely simply hasn't onboarded yet -- these are real companies, not an
+    #     asset-class exclusion, just a coverage lag in the third-party feed this
+    #     table is anchored on.
+    # Confirmed live: 519 of the current EQ/BE bhavcopy universe had no
+    # company_master row at all before this fix, causing "No company_master row
+    # found" on every Dhan OHLCV sync attempt for every one of them, every run.
+    # Added as Dhan-only rows (sharpely_id=NULL, company_master_id falls back to
+    # _build_company_master_id's existing nse:/bse: scheme) for any NSE or BSE
+    # Dhan instrument (instrument='EQUITY', instrument_type IN ('ES','ETF')) not
+    # already covered by a sharpely-anchored row -- kept as SEPARATE per-exchange
+    # rows rather than merged into one dual-listed row, deliberately: this
+    # codebase has repeatedly found BSE ticker TEXT is not a reliable identity
+    # key on its own (real coincidental collisions with unrelated NSE symbols,
+    # see data/bseindia/bhavcopy.py's own docstring) -- joining a Dhan-only NSE
+    # row to a Dhan-only BSE row purely by matching ticker text would risk
+    # reintroducing exactly that class of false merge. get_company_master_equity's
+    # existing per-exchange lookup (load_company_master_records) already resolves
+    # a ticker-only row correctly for its own exchange, so this loses nothing for
+    # the actual OHLCV-sync use case.
+    covered_nse = set(company_master["nse_ticker"].dropna())
+    covered_bse = set(company_master["bse_ticker"].dropna())
+    dhan_only_nse = dhan_nse[~dhan_nse["nse_ticker"].isin(covered_nse)].copy() if not dhan_nse.empty else dhan_nse
+    dhan_only_bse = dhan_bse[~dhan_bse["bse_ticker"].isin(covered_bse)].copy() if not dhan_bse.empty else dhan_bse
+    dhan_only_rows: list[pd.DataFrame] = []
+    if not dhan_only_nse.empty:
+        rows = dhan_only_nse.rename(columns={"dhan_nse_name": "company_name"}).copy()
+        rows["bse_ticker"] = None
+        rows["sharpely_id"] = None
+        rows["dhan_bse_id"] = pd.array([pd.NA] * len(rows), dtype="Int64")
+        rows["dhan_nse_id"] = rows["dhan_nse_id"].astype("Int64")
+        dhan_only_rows.append(rows)
+    if not dhan_only_bse.empty:
+        rows = dhan_only_bse.rename(columns={"dhan_bse_name": "company_name"}).copy()
+        rows["nse_ticker"] = None
+        rows["sharpely_id"] = None
+        rows["dhan_nse_id"] = pd.array([pd.NA] * len(rows), dtype="Int64")
+        rows["dhan_bse_id"] = rows["dhan_bse_id"].astype("Int64")
+        dhan_only_rows.append(rows)
+    if dhan_only_rows:
+        additions = pd.concat(dhan_only_rows, ignore_index=True)
+        additions["company_master_id"] = additions.apply(_build_company_master_id, axis=1)
+        additions = additions[
+            ["company_master_id", "company_name", "sharpely_id", "dhan_bse_id", "dhan_nse_id", "bse_ticker", "nse_ticker"]
+        ]
+        company_master = pd.concat([company_master, additions], ignore_index=True)
+
     company_master = company_master.drop_duplicates(subset=["company_master_id"], keep="last")
 
     upsert_to_db(company_master, COMPANY_MASTER_TABLE, ["company_master_id"])

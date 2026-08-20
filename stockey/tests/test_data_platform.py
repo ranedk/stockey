@@ -1268,6 +1268,76 @@ def test_sync_company_master_ticker_case_normalized_and_dhan_ids_nullable_int(mo
     assert len(upserts) == 1
 
 
+def test_sync_company_master_adds_dhan_only_nse_row_for_uncovered_etf(monkeypatch):
+    # BUG FOUND LIVE 2026-08-20 (user-reported: "a lot of dhan errors", all "No company_master
+    # row found"): company_master used to be anchored ENTIRELY on master_sharpely_equity --
+    # master_dhan_instruments only enriched a row that already matched sharpely, never anchored
+    # its own row. ETFs (Dhan instrument_type='ETF') are never in sharpely (an equity-
+    # fundamentals feed) at all -- confirmed live, 519 of the current bhavcopy EQ/BE universe had
+    # no company_master row before this fix, all failing Dhan OHLCV sync with this exact error.
+    monkeypatch.setattr(company_master_utils, "ensure_company_master_dhan_ids_are_bigint", lambda: None)
+    monkeypatch.setattr(
+        company_master_utils,
+        "_company_master_sql_to_df",
+        lambda query, *, params=None, operation: {
+            "sync_sharpely_columns": pd.DataFrame({"column_name": ["sharpely_id"]}),
+            "sync_sharpely_equity": pd.DataFrame(
+                [{"nse_ticker": "COVERED", "bse_ticker": None, "company_name": "Covered Co", "sharpely_id": "sh1"}]
+            ),
+            "sync_dhan_bse": pd.DataFrame(columns=["bse_ticker", "dhan_bse_id", "dhan_bse_name"]),
+            "sync_dhan_nse": pd.DataFrame(
+                [
+                    {"nse_ticker": "COVERED", "dhan_nse_id": 111, "dhan_nse_name": "Covered Co (Dhan)"},
+                    {"nse_ticker": "BANKBEES", "dhan_nse_id": 11439, "dhan_nse_name": "Nippon Nifty Bank ETF (BANKBEES)"},
+                ]
+            ),
+        }[operation],
+    )
+    monkeypatch.setattr(company_master_utils, "upsert_to_db", lambda df, table, keys: None)
+
+    result = company_master_utils.sync_company_master()
+
+    assert set(result["company_master_id"]) == {"sharpely:sh1", "nse:BANKBEES"}
+    etf_row = result[result["company_master_id"] == "nse:BANKBEES"].iloc[0]
+    assert etf_row["nse_ticker"] == "BANKBEES"
+    assert etf_row["company_name"] == "Nippon Nifty Bank ETF (BANKBEES)"
+    assert pd.isna(etf_row["sharpely_id"])
+    assert etf_row["dhan_nse_id"] == 11439
+    assert pd.isna(etf_row["bse_ticker"])
+    # the already-sharpely-covered dhan_nse row must NOT get a duplicate nse:COVERED row
+    assert "nse:COVERED" not in set(result["company_master_id"])
+
+
+def test_sync_company_master_dhan_only_nse_and_bse_rows_kept_separate(monkeypatch):
+    # deliberate design choice: a Dhan-only symbol uncovered on BOTH NSE and BSE gets TWO
+    # separate rows (nse:X, bse:X), not one row with both tickers merged -- this codebase has
+    # repeatedly found BSE ticker TEXT alone is not a reliable identity key (real coincidental
+    # collisions with unrelated NSE symbols), so joining Dhan-only NSE/BSE rows purely by ticker
+    # text would risk reintroducing that exact class of false merge.
+    monkeypatch.setattr(company_master_utils, "ensure_company_master_dhan_ids_are_bigint", lambda: None)
+    monkeypatch.setattr(
+        company_master_utils,
+        "_company_master_sql_to_df",
+        lambda query, *, params=None, operation: {
+            "sync_sharpely_columns": pd.DataFrame({"column_name": ["sharpely_id"]}),
+            "sync_sharpely_equity": pd.DataFrame(
+                [{"nse_ticker": "COVERED", "bse_ticker": None, "company_name": "Covered Co", "sharpely_id": "sh1"}]
+            ),
+            "sync_dhan_bse": pd.DataFrame([{"bse_ticker": "543418", "dhan_bse_id": 543418, "dhan_bse_name": "Bharat Bond ETF"}]),
+            "sync_dhan_nse": pd.DataFrame([{"nse_ticker": "BBETF0432", "dhan_nse_id": 7196, "dhan_nse_name": "Bharat Bond ETF"}]),
+        }[operation],
+    )
+    monkeypatch.setattr(company_master_utils, "upsert_to_db", lambda df, table, keys: None)
+
+    result = company_master_utils.sync_company_master()
+
+    assert set(result["company_master_id"]) == {"sharpely:sh1", "nse:BBETF0432", "bse:543418"}
+    nse_row = result[result["company_master_id"] == "nse:BBETF0432"].iloc[0]
+    bse_row = result[result["company_master_id"] == "bse:543418"].iloc[0]
+    assert pd.isna(nse_row["bse_ticker"])  # not merged with the BSE row
+    assert pd.isna(bse_row["nse_ticker"])  # not merged with the NSE row
+
+
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
     calls = {"attempts": 0}
     events: list[dict[str, object]] = []
