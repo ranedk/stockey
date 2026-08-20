@@ -24,6 +24,7 @@ file_size() {
 
 rotated=0
 skipped=0
+failed=0
 for dir in "$SCRIPT_DIR/logs" "$SCRIPT_DIR/logs/cron"; do
   [ -d "$dir" ] || continue
   archive_dir="$dir/archive"
@@ -47,6 +48,7 @@ for dir in "$SCRIPT_DIR/logs" "$SCRIPT_DIR/logs/cron"; do
       echo "[rotate_logs] rotated $(basename "$f") ($size bytes) -> ${target#$SCRIPT_DIR/}"
     else
       rm -f "${target}.partial"
+      failed=$((failed + 1))
       echo "[rotate_logs] FAILED to compress $f (left untouched)" >&2
     fi
   done
@@ -54,4 +56,13 @@ for dir in "$SCRIPT_DIR/logs" "$SCRIPT_DIR/logs/cron"; do
   find "$archive_dir" -name "*.log.gz" -mtime "+${keep_days}" -delete 2>/dev/null || true
 done
 
-echo "[rotate_logs] done rotated=${rotated} skipped_small=${skipped} keep_days=${keep_days}"
+echo "[rotate_logs] done rotated=${rotated} skipped_small=${skipped} failed=${failed} keep_days=${keep_days}"
+# BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): this used to always fall through to a
+# successful (0) exit regardless of `failed` -- the gzip failure was logged to stderr but
+# never affected the script's own exit code, so nothing invoking rotate_logs.sh (go-crond,
+# an operator eyeballing $?) could ever see a compression failure without reading the log
+# text itself. A source log left uncompressed AND untouched (never truncated on failure, by
+# design) will just keep growing every day this silently recurs.
+if [ "$failed" -gt 0 ]; then
+  exit 1
+fi

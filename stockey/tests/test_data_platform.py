@@ -5052,6 +5052,59 @@ def test_with_lock_recovers_a_genuinely_empty_stale_lock_dir(tmp_path):
     assert not lock_dir.exists()
 
 
+def _run_rotate_logs(tmp_path, *, fail_gzip: bool, log_content: bytes = b"x" * 100):
+    """Copy the real rotate_logs.sh into an isolated fake repo (it derives its own
+    SCRIPT_DIR/log paths from its own location, so it can't be pointed at tmp_path any
+    other way) and run it against a single oversized log file."""
+    real_script = Path("scripts/rotate_logs.sh").resolve()
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "logs").mkdir()
+    script = repo / "scripts" / "rotate_logs.sh"
+    script.write_text(real_script.read_text(encoding="utf-8"), encoding="utf-8")
+    script.chmod(0o755)
+    (repo / "logs" / "big.log").write_bytes(log_content)
+
+    env = dict(os.environ)
+    env["LOG_ROTATE_MIN_BYTES"] = "1"
+    if fail_gzip:
+        fake_bin = tmp_path / "fakebin"
+        fake_bin.mkdir()
+        fake_gzip = fake_bin / "gzip"
+        fake_gzip.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        fake_gzip.chmod(0o755)
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+    result = subprocess.run([str(script)], capture_output=True, text=True, env=env, timeout=15)
+    return result, repo
+
+
+def test_rotate_logs_exits_nonzero_when_compression_fails(tmp_path):
+    # BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): rotate_logs.sh used to always exit 0
+    # regardless of whether any file failed to compress -- the failure was logged to stderr
+    # ("FAILED to compress ... (left untouched)") but never affected the script's own exit
+    # code, so nothing invoking it (go-crond, an operator checking $?) could see the failure
+    # without reading the log text. A source log left uncompressed keeps growing unbounded
+    # every day this recurs.
+    result, repo = _run_rotate_logs(tmp_path, fail_gzip=True)
+
+    assert result.returncode == 1
+    assert "FAILED to compress" in result.stderr
+    assert "failed=1" in result.stdout
+    # the original log must be left untouched (not truncated) on a compression failure
+    assert (repo / "logs" / "big.log").stat().st_size == 100
+    assert not any((repo / "logs" / "archive").glob("*.log.gz"))
+
+
+def test_rotate_logs_exits_zero_on_success(tmp_path):
+    result, repo = _run_rotate_logs(tmp_path, fail_gzip=False)
+
+    assert result.returncode == 0
+    assert "failed=0" in result.stdout
+    assert (repo / "logs" / "big.log").stat().st_size == 0  # truncated after successful rotation
+    assert list((repo / "logs" / "archive").glob("*.log.gz"))
+
+
 def test_builder_render_crontab_raises_on_unresolved_placeholder(tmp_path, monkeypatch):
     # BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): render_crontab() used to substitute the
     # known placeholders and write whatever came out with no check that every `{{...}}`
