@@ -268,7 +268,7 @@ def build_cron_preflight(
         try:
             from utils.migration_drift import find_migration_drift
 
-            drift = find_migration_drift()
+            drift, capture_errors = find_migration_drift()
         except Exception as exc:
             checks.append(
                 _status(
@@ -287,7 +287,21 @@ def build_cron_preflight(
                         drifted=[row["migration_id"] for row in drift],
                     )
                 )
-            else:
+            if capture_errors:
+                # BUG FOUND LIVE 2026-08-19 (re-audit): these were previously swallowed inside
+                # capture_code_migrations() with a bare `except Exception: continue` -- a
+                # migration behind a raising ensure*() reported "ok" here even though its drift
+                # status was never actually checked. Surface it as its own warn so a broken
+                # ensure*() doesn't masquerade as a clean audit.
+                checks.append(
+                    _status(
+                        "warn",
+                        "migration_drift",
+                        f"{len(capture_errors)} ensure*() call(s) raised while capturing code migrations; drift for those migrations is UNKNOWN, not clean",
+                        capture_errors=capture_errors,
+                    )
+                )
+            if not drift and not capture_errors:
                 checks.append(
                     _status(
                         "ok",

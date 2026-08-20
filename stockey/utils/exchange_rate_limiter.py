@@ -117,8 +117,19 @@ def exchange_request_gate(
 
         yield
     finally:
-        _write_last_request_time(timestamp_path)
+        # BUG FOUND LIVE 2026-08-19 (re-audit): this write was unconditional -- unlike the unlock
+        # call right below it, which correctly checks `if acquired:`. A process that times out
+        # waiting for the lock (never acquired it, never made a request) still overwrote the
+        # shared last-request timestamp file. Reproduced live: a timed-out non-holder wrote
+        # time.time() at the moment of ITS OWN timeout into the file the real lock holder may be
+        # concurrently reading/writing -- an unsynchronized file access this gate's own contract
+        # ("hold the cross-process lock for the duration of that single request") says shouldn't
+        # happen. By construction the bogus value can't be OLDER than the real last request (it's
+        # always time.time() at this process's own timeout, later than when the holder actually
+        # started), so this couldn't shrink the enforced gap below the floor on its own -- but it's
+        # still a real unsynchronized write this gate exists specifically to prevent.
         if acquired:
+            _write_last_request_time(timestamp_path)
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:

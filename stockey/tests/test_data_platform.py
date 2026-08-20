@@ -5985,6 +5985,109 @@ def test_exchange_rate_limiter_two_domains_do_not_block_each_other(monkeypatch, 
             pass
 
 
+def test_exchange_rate_limiter_does_not_write_timestamp_when_lock_not_acquired(monkeypatch, tmp_path):
+    # BUG FOUND LIVE 2026-08-19 (re-audit): the timestamp write was unconditional -- unlike the
+    # unlock call right below it, which correctly checks `if acquired:`. A process that timed out
+    # waiting for another process's lock (never acquired it, never made a request) still
+    # overwrote the shared last-request timestamp file -- an unsynchronized write this gate's own
+    # contract ("hold the cross-process lock for the duration of that single request") says
+    # shouldn't happen.
+    monkeypatch.setattr(exchange_rate_limiter.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(exchange_rate_limiter.fcntl, "flock", lambda *a, **k: (_ for _ in ()).throw(BlockingIOError()))
+
+    timestamp_path = tmp_path / "ts"
+
+    with pytest.raises(TimeoutError):
+        with exchange_rate_limiter.exchange_request_gate(
+            domain="nse", lock_path=tmp_path / "lock", timestamp_path=timestamp_path, timeout_seconds=0.01,
+        ):
+            pass
+
+    assert not timestamp_path.exists()  # never acquired the lock -- must never write
+
+
+def test_exchange_rate_limiter_writes_timestamp_when_lock_is_acquired(monkeypatch, tmp_path):
+    # the successful path must still write -- this isn't a "never write" regression.
+    monkeypatch.setattr(exchange_rate_limiter.time, "sleep", lambda *a, **k: None)
+    timestamp_path = tmp_path / "ts"
+
+    with exchange_rate_limiter.exchange_request_gate(
+        domain="nse", lock_path=tmp_path / "lock", timestamp_path=timestamp_path,
+    ):
+        pass
+
+    assert timestamp_path.exists()
+
+
+def test_migration_drift_capture_records_error_when_ensure_raises(monkeypatch):
+    fake_mod = types.ModuleType("fake_migration_module_broken_for_test")
+
+    def apply_schema_migration(**kwargs):
+        return {"status": "applied"}
+
+    def ensure_broken():
+        raise RuntimeError("boom")
+
+    ensure_broken.__module__ = fake_mod.__name__
+    fake_mod.apply_schema_migration = apply_schema_migration
+    fake_mod.ensure_broken = ensure_broken
+
+    monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
+    monkeypatch.setattr(migration_drift, "_module_dotted_paths", lambda: [fake_mod.__name__])
+
+    recorded, errors = migration_drift.capture_code_migrations_with_errors()
+
+    # the pre-fix behavior swallowed this with a bare `except Exception: continue` -- the
+    # broken ensure*() must now show up as an explicit capture error, not silent omission.
+    assert recorded == {}
+    assert len(errors) == 1
+    assert errors[0]["module"] == fake_mod.__name__
+    assert errors[0]["function"] == "ensure_broken"
+    assert "boom" in errors[0]["error"]
+
+    # the plain capture_code_migrations() wrapper must still work for existing callers.
+    assert migration_drift.capture_code_migrations() == {}
+
+
+def test_migration_drift_capture_succeeds_when_ensure_does_not_raise(monkeypatch):
+    fake_mod = types.ModuleType("fake_migration_module_ok_for_test")
+    # exec'd directly into the module's own __dict__ so `ensure_clean`'s call to
+    # `apply_schema_migration` is a real module-global lookup, not a closure over a local --
+    # capture_code_migrations_with_errors rebinds `fake_mod.apply_schema_migration` to its
+    # recorder, and only a genuine module-attribute lookup picks that rebinding up.
+    exec(
+        "def apply_schema_migration(**kwargs):\n"
+        "    return {'status': 'applied'}\n"
+        "def ensure_clean():\n"
+        "    apply_schema_migration(migration_id='test_migration_ok', statements=['SELECT 1'])\n",
+        fake_mod.__dict__,
+    )
+
+    monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
+    monkeypatch.setattr(migration_drift, "_module_dotted_paths", lambda: [fake_mod.__name__])
+
+    recorded, errors = migration_drift.capture_code_migrations_with_errors()
+
+    assert recorded == {"test_migration_ok": ["SELECT 1"]}
+    assert errors == []
+
+
+def test_migration_drift_find_migration_drift_surfaces_capture_errors(monkeypatch):
+    capture_errors = [{"module": "m", "function": "ensure_x", "error": "RuntimeError: boom"}]
+    monkeypatch.setattr(
+        migration_drift, "capture_code_migrations_with_errors", lambda: ({}, capture_errors)
+    )
+    ledger = pd.DataFrame({"migration_id": [], "checksum": [], "status": []})
+    monkeypatch.setattr("utils.db.sql_to_df", lambda *a, **k: ledger)
+
+    drift, errors = migration_drift.find_migration_drift()
+
+    # no drift found among what WAS captured, but the capture failure must still surface --
+    # this is the "unknown, not clean" distinction the fix exists to preserve.
+    assert drift == []
+    assert errors == capture_errors
+
+
 def test_bhavcopy_downloader_records_download_failure_fallback(monkeypatch):
     events: list[dict[str, object]] = []
 
