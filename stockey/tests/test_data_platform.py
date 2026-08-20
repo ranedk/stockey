@@ -5582,6 +5582,22 @@ def test_ocr_pdf_routes_to_local_provider(monkeypatch):
     assert result == {"local": {1: "local text"}}
 
 
+def test_download_runner_normalize_exit_code_never_returns_a_bool():
+    # BUG FOUND LIVE 2026-08-20 (re-audit, LOW): isinstance(value, int) is also True for
+    # bool (bool subclasses int), so a module returning a bare True/False from main() used
+    # to pass through unchanged instead of being normalized to 0/1 -- comparisons against 0
+    # still worked, but this function's own contract is `-> int`, and callers embed the
+    # result directly into JSON result dicts, where json.dumps would serialize a bool exit
+    # code as literal true/false instead of 1/0.
+    assert download_runner._normalize_exit_code(True) == 1
+    assert type(download_runner._normalize_exit_code(True)) is int
+    assert download_runner._normalize_exit_code(False) == 0
+    assert type(download_runner._normalize_exit_code(False)) is int
+    assert download_runner._normalize_exit_code(2) == 2
+    assert download_runner._normalize_exit_code(None) == 0
+    assert download_runner._normalize_exit_code("boom") == 1
+
+
 def test_download_runner_preserves_string_state_advanced_false():
     state = download_runner.build_run_state_result(
         {
@@ -18159,6 +18175,31 @@ def _fake_step_module(*, main_fn, run_state=None):
     since run_step's SystemExit branch looks the module back up via sys.modules.get()."""
     module = types.SimpleNamespace(main=main_fn, STOCKEY_RUN_STATE=run_state or {})
     return module
+
+
+def test_run_pipeline_normalize_exit_code_never_returns_a_bool():
+    # Same fix, same LOW finding, as data.download_runner's copy of this helper (2026-08-20
+    # re-audit) -- isinstance(value, int) is also True for bool, so a step returning a bare
+    # True/False from main() used to pass through unchanged instead of 0/1, and this
+    # function's result gets embedded directly into a JSON-serialized result dict.
+    assert fundamentals_run_pipeline._normalize_exit_code(True) == 1
+    assert type(fundamentals_run_pipeline._normalize_exit_code(True)) is int
+    assert fundamentals_run_pipeline._normalize_exit_code(False) == 0
+    assert type(fundamentals_run_pipeline._normalize_exit_code(False)) is int
+
+
+def test_run_step_bool_return_normalized_to_int_returncode(monkeypatch):
+    # A step whose main() returns a bare False (an easy mistake, e.g. `return sync_ok`)
+    # must produce a real int returncode -- json.dumps(result) elsewhere in run_pipeline
+    # would otherwise serialize this as literal `false` instead of `0`.
+    fake_module = _fake_step_module(main_fn=lambda: False, run_state={"status": "ok"})
+    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: fake_module)
+
+    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_bool_return")
+
+    assert result["returncode"] == 0
+    assert type(result["returncode"]) is int
+    assert json.dumps(result)  # would raise/silently emit `false` if returncode stayed a bool
 
 
 def test_run_step_success_extracts_run_state(monkeypatch):

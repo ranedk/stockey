@@ -98,8 +98,16 @@ STEPS: list[str] = [
 
 
 def _normalize_exit_code(value: object) -> int:
+    # BUG FOUND LIVE 2026-08-20 (re-audit, LOW; same fix as data/download_runner.py's copy
+    # of this helper): `isinstance(value, int)` is also True for `bool` (bool is an int
+    # subclass in Python), so a module returning a bare True/False from main() used to pass
+    # through as a bool rather than being normalized to 0/1 -- comparisons against 0 still
+    # work, but this function's own contract is `-> int`, and json.dumps would serialize a
+    # bool exit code as literal `true`/`false` instead of `1`/`0`.
     if value is None:
         return 0
+    if isinstance(value, bool):
+        return int(value)
     if isinstance(value, int):
         return value
     return 1

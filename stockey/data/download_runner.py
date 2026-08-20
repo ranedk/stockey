@@ -499,8 +499,19 @@ def _emit_progress(message: str) -> None:
 
 
 def _normalize_exit_code(value: object) -> int:
+    # BUG FOUND LIVE 2026-08-20 (re-audit, LOW): `isinstance(value, int)` is also True for
+    # `bool` (bool is an int subclass in Python), so a module returning a bare True/False
+    # from main() (an easy mistake -- e.g. `return sync_ok`) used to pass through here AS a
+    # bool rather than being normalized to 0/1. The value still compares correctly against 0
+    # (True != 0, False == 0) and SystemExit(bool) is coerced fine by the interpreter, but
+    # this function's own contract is `-> int`, and every caller embeds its result directly
+    # into JSON result dicts (`"returncode": code`) -- json.dumps would serialize a bool
+    # exit code as literal `true`/`false` instead of `1`/`0`, breaking any consumer that
+    # expects returncode to always be numeric.
     if value is None:
         return 0
+    if isinstance(value, bool):
+        return int(value)
     if isinstance(value, int):
         return value
     return 1
