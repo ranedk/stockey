@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import threading
 from typing import Any
 
 import pandas as pd
@@ -10,6 +12,22 @@ from utils.fallback_telemetry import record_local_fallback_event
 from utils.company_master import load_company_master_records
 from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.schema_migrations import apply_schema_migration
+
+
+# LOW (re-audit): _resolve_one_issue's dry-run path monkeypatches
+# data.dhanlive.dhan_db's record_dhan_identity_issue/record_fallback_event to no-ops --
+# module-global state, not thread-local. Two overlapping dry-run resolutions in the same
+# process (e.g. an API endpoint hit twice concurrently) could otherwise race on the
+# save-original/restore step: one thread's restore could run while another thread's patch
+# is still meant to be active, either writing spurious telemetry mid-"preview" or leaving
+# the no-op patch stuck in place after both calls return. This lock serializes the
+# patch/call/restore critical section so that race can't happen. It does NOT protect a
+# genuinely concurrent real (apply=True) caller into dhan_db.resolve_dhan_identity from
+# another code path during that window -- that caller's telemetry would still be
+# suppressed. No such concurrent caller exists today (confirmed live), so that residual
+# risk is accepted rather than redesigning dhan_db's public API to avoid the monkeypatch
+# entirely.
+_DRY_RUN_TELEMETRY_PATCH_LOCK = threading.Lock()
 
 
 IDENTITY_ISSUES_TABLE = "advisory_identity_issues"
@@ -412,47 +430,49 @@ def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
 
     from data.dhanlive import dhan_db
 
-    original_record_issue = getattr(dhan_db, "record_dhan_identity_issue", None)
-    original_record_fallback = getattr(dhan_db, "record_fallback_event", None)
-    if not apply:
-        dhan_db.record_dhan_identity_issue = lambda **kwargs: kwargs
-        dhan_db.record_fallback_event = lambda **kwargs: kwargs
-    try:
-        identity = dhan_db.resolve_dhan_identity(symbol, requested_exchange, asset_type=asset_type)
-    except Exception as exc:
-        error_text = f"{type(exc).__name__}: {exc}"
-        context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
-        record_local_fallback_event(
-            module="utils.identity_issues",
-            fallback_type="identity_issue_resolution_failed",
-            source="data.dhanlive.dhan_db.resolve_dhan_identity",
-            severity="warn",
-            symbol=symbol or None,
-            reason="Open Dhan/security identity issue could not be resolved and remains open.",
-            error=exc,
-            metadata={
-                "issue_key": issue_key,
-                "requested_exchange": requested_exchange,
-                "asset_type": asset_type,
-                "apply": bool(apply),
-            },
-        )
-        if apply:
-            mark_identity_issue_resolution_failed(issue_key, error_text=error_text, resolution_context=context)
-        return {
-            "issue_key": issue_key,
-            "symbol": symbol,
-            "requested_exchange": requested_exchange,
-            "status": "still_open",
-            "error": error_text,
-            "applied": bool(apply),
-        }
-    finally:
+    patch_lock = _DRY_RUN_TELEMETRY_PATCH_LOCK if not apply else contextlib.nullcontext()
+    with patch_lock:
+        original_record_issue = getattr(dhan_db, "record_dhan_identity_issue", None)
+        original_record_fallback = getattr(dhan_db, "record_fallback_event", None)
         if not apply:
-            if original_record_issue is not None:
-                dhan_db.record_dhan_identity_issue = original_record_issue
-            if original_record_fallback is not None:
-                dhan_db.record_fallback_event = original_record_fallback
+            dhan_db.record_dhan_identity_issue = lambda **kwargs: kwargs
+            dhan_db.record_fallback_event = lambda **kwargs: kwargs
+        try:
+            identity = dhan_db.resolve_dhan_identity(symbol, requested_exchange, asset_type=asset_type)
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
+            record_local_fallback_event(
+                module="utils.identity_issues",
+                fallback_type="identity_issue_resolution_failed",
+                source="data.dhanlive.dhan_db.resolve_dhan_identity",
+                severity="warn",
+                symbol=symbol or None,
+                reason="Open Dhan/security identity issue could not be resolved and remains open.",
+                error=exc,
+                metadata={
+                    "issue_key": issue_key,
+                    "requested_exchange": requested_exchange,
+                    "asset_type": asset_type,
+                    "apply": bool(apply),
+                },
+            )
+            if apply:
+                mark_identity_issue_resolution_failed(issue_key, error_text=error_text, resolution_context=context)
+            return {
+                "issue_key": issue_key,
+                "symbol": symbol,
+                "requested_exchange": requested_exchange,
+                "status": "still_open",
+                "error": error_text,
+                "applied": bool(apply),
+            }
+        finally:
+            if not apply:
+                if original_record_issue is not None:
+                    dhan_db.record_dhan_identity_issue = original_record_issue
+                if original_record_fallback is not None:
+                    dhan_db.record_fallback_event = original_record_fallback
 
     context = {
         "checked_symbol": symbol,

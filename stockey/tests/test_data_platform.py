@@ -10,6 +10,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import types
 from datetime import date
@@ -4235,6 +4236,55 @@ def test_identity_issue_resolution_dry_run_does_not_mark_resolved(monkeypatch):
     assert resolved == []
     assert failed == []
     assert fallback_events == []
+
+
+def test_identity_issue_resolution_dry_run_serializes_on_shared_lock(monkeypatch):
+    # LOW (re-audit): the dry-run monkeypatch of dhan_db.record_dhan_identity_issue/
+    # record_fallback_event is module-global state, not thread-local -- two overlapping
+    # dry-run resolutions in the same process could otherwise race on the
+    # save-original/restore step (one thread's restore clobbering the other's in-flight
+    # patch, potentially leaving dhan_db permanently patched to a no-op after both calls
+    # return). _DRY_RUN_TELEMETRY_PATCH_LOCK now serializes that critical section --
+    # confirm _resolve_one_issue's dry-run path actually acquires it, by holding it from
+    # another thread and checking resolve_open_identity_issues(apply=False) blocks until
+    # released.
+    rows = pd.DataFrame(
+        [
+            {
+                "issue_key": "dhan_security_id_missing:stock:NSE:HUIL",
+                "issue_type": "dhan_security_id_missing",
+                "symbol": "HUIL",
+                "requested_exchange": "NSE",
+                "asset_type": "stock",
+            }
+        ]
+    )
+    monkeypatch.setattr(identity_issues, "load_open_identity_issues", lambda limit=100: rows.copy())
+    monkeypatch.setattr(
+        dhan_db,
+        "resolve_dhan_identity",
+        lambda symbol, exchange, asset_type="stock": {"security_id": 1, "exchange": exchange, "ticker": symbol, "asset_type": asset_type},
+    )
+
+    hold_seconds = 0.2
+    holder_acquired = threading.Event()
+
+    def holder():
+        with identity_issues._DRY_RUN_TELEMETRY_PATCH_LOCK:
+            holder_acquired.set()
+            time.sleep(hold_seconds)
+
+    holder_thread = threading.Thread(target=holder)
+    holder_thread.start()
+    assert holder_acquired.wait(timeout=5)
+
+    start = time.monotonic()
+    summary = identity_issues.resolve_open_identity_issues(limit=10, apply=False)
+    elapsed = time.monotonic() - start
+    holder_thread.join(timeout=5)
+
+    assert summary["mode"] == "dry_run"
+    assert elapsed >= hold_seconds - 0.05  # had to wait for the held lock to free
 
 
 def test_identity_issue_resolution_apply_marks_resolved(monkeypatch):
