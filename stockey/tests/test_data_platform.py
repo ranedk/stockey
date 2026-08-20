@@ -5052,6 +5052,76 @@ def test_with_lock_recovers_a_genuinely_empty_stale_lock_dir(tmp_path):
     assert not lock_dir.exists()
 
 
+def test_builder_render_crontab_raises_on_unresolved_placeholder(tmp_path, monkeypatch):
+    # BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): render_crontab() used to substitute the
+    # known placeholders and write whatever came out with no check that every `{{...}}`
+    # token was actually resolved -- a template typo or a new placeholder with no matching
+    # replacements entry would write the literal `{{...}}` text straight into the live
+    # generated crontab, either breaking go-crond's parser for every job or running one job
+    # with garbage literal input.
+    import builder
+
+    template = tmp_path / "stockey.crontab.template"
+    template.write_text("10 07 * * 1-5 {{STOCKEY_USER}} echo {{SOME_UNKNOWN_TOKEN}}\n", encoding="utf-8")
+    generated = tmp_path / "stockey.generated.crontab"
+    monkeypatch.setattr(builder, "CRON_TEMPLATE_PATH", template)
+    monkeypatch.setattr(builder, "GENERATED_CRONTAB_PATH", generated)
+
+    with pytest.raises(ValueError, match="SOME_UNKNOWN_TOKEN"):
+        builder.render_crontab()
+
+    assert not generated.exists()  # refuses to write a crontab with a literal {{...}} token
+
+
+def test_builder_check_crontab_drift_is_read_only_and_detects_both_states(tmp_path, monkeypatch):
+    import builder
+
+    template = tmp_path / "stockey.crontab.template"
+    template.write_text("10 07 * * 1-5 {{STOCKEY_USER}} echo {{STOCKEY_DIR}}\n", encoding="utf-8")
+    generated = tmp_path / "stockey.generated.crontab"
+    monkeypatch.setattr(builder, "CRON_TEMPLATE_PATH", template)
+    monkeypatch.setattr(builder, "GENERATED_CRONTAB_PATH", generated)
+    monkeypatch.setenv("STOCKEY_CRON_USER", "rane")
+
+    # generated file absent entirely -> drift, and the check must not create it
+    result = builder.check_crontab_drift()
+    assert result["status"] == "drift"
+    assert not generated.exists()
+
+    # generated file present but stale (STOCKEY_DIR changed) -> drift, still not overwritten
+    generated.write_text(f"10 07 * * 1-5 rane echo {builder.PROJECT_ROOT}-stale\n", encoding="utf-8")
+    stale_content = generated.read_text(encoding="utf-8")
+    result = builder.check_crontab_drift()
+    assert result["status"] == "drift"
+    assert generated.read_text(encoding="utf-8") == stale_content  # untouched by the check
+
+    # matching content -> clean
+    generated.write_text(f"10 07 * * 1-5 rane echo {builder.PROJECT_ROOT}\n", encoding="utf-8")
+    result = builder.check_crontab_drift()
+    assert result["status"] == "clean"
+
+
+def test_builder_main_check_crontab_flag_exit_codes(tmp_path, monkeypatch):
+    import builder
+
+    template = tmp_path / "stockey.crontab.template"
+    template.write_text("10 07 * * 1-5 {{STOCKEY_USER}} echo {{STOCKEY_DIR}}\n", encoding="utf-8")
+    generated = tmp_path / "stockey.generated.crontab"
+    monkeypatch.setattr(builder, "CRON_TEMPLATE_PATH", template)
+    monkeypatch.setattr(builder, "GENERATED_CRONTAB_PATH", generated)
+    monkeypatch.setenv("STOCKEY_CRON_USER", "rane")
+    monkeypatch.setattr(sys, "argv", ["builder.py", "--check-crontab"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        builder.main()
+    assert excinfo.value.code == 1  # drift: generated file doesn't exist yet
+
+    generated.write_text(f"10 07 * * 1-5 rane echo {builder.PROJECT_ROOT}\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        builder.main()
+    assert excinfo.value.code == 0  # now matches
+
+
 def test_cron_preflight_validates_generated_crontab(tmp_path, monkeypatch):
     from scripts import cron_preflight
 

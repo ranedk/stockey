@@ -124,17 +124,22 @@ on a new machine (`(crontab -l; echo "*/15 * * * *
 crontab -`) and note it in `HANDOFF.md` alongside the existing "confirm
 go-crond is running" caveat.
 
-**A second, sharper gotcha confirmed live the same day**: `builder.py` always
-rewrites `config/stockey.generated.crontab`, even when the content is
-byte-identical to what's already there — there is currently no read-only
-"just check for drift" mode (`--dry-run` doesn't exist). Running it while
-go-crond is already live silently breaks the running instance's scheduling
-(it keeps running as a process, but stops firing ANY job — confirmed live:
-2.5 hours, zero jobs fired, including the 5-minute `fundamentals_api`
-health check) without crashing or logging anything — go-crond gives no
-indication it stopped working. If you run `builder.py` for any reason
-(including just to eyeball drift) while go-crond might already be running,
-restart go-crond afterward regardless of whether the diff was empty.
+**A second, sharper gotcha confirmed live the same day**: `builder.py`'s
+plain (no-flag) invocation always rewrites `config/stockey.generated.crontab`,
+even when the content is byte-identical to what's already there. Running it
+while go-crond is already live silently breaks the running instance's
+scheduling (it keeps running as a process, but stops firing ANY job —
+confirmed live: 2.5 hours, zero jobs fired, including the 5-minute
+`fundamentals_api` health check) without crashing or logging anything —
+go-crond gives no indication it stopped working. If you run plain
+`builder.py` for any reason while go-crond might already be running, restart
+go-crond afterward regardless of whether the diff was empty. **Use
+`python builder.py --check-crontab` instead when you only want to know
+whether a rewrite is needed** (re-audit, 2026-08-20) — read-only, does not
+write `config/stockey.generated.crontab` or touch go-crond, exits 1 on
+drift/a template error and 0 when already up to date; also rejects (raises,
+does not write) a template with an unresolved `{{...}}` placeholder that has
+no matching entry in `render_crontab()`'s replacements map.
 
 ## Key Commands
 

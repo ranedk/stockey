@@ -1,6 +1,7 @@
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess  # nosec B603, B404
 import sys
@@ -147,7 +148,23 @@ def ensure_script_permissions() -> None:
             _log(f"Ensured executable script: {script_path}")
 
 
-def render_crontab() -> str:
+# Matches any leftover `{{SOME_TOKEN}}`-shaped placeholder after every known substitution
+# has run -- catches a template typo or a new placeholder added to
+# config/stockey.crontab.template without a matching entry in _render_crontab_text()'s
+# `replacements` map below.
+_UNRESOLVED_PLACEHOLDER_RE = re.compile(r"\{\{[A-Za-z0-9_]+\}\}")
+
+
+def _render_crontab_text() -> str:
+    # BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): this used to substitute the 4 known
+    # placeholders and write whatever came out with no check that every `{{...}}` token was
+    # actually resolved. A template typo or a new placeholder added to the .template file
+    # without a matching replacements entry would write the literal unresolved
+    # `{{SOME_TOKEN}}` text straight into the live generated crontab -- go-crond would then
+    # either choke on the malformed line (breaking scheduling for every job, not just the
+    # broken one, matching the same "go-crond fails silently" class CLAUDE.md already
+    # documents) or, if the token happened to sit inside a shell command, silently run a job
+    # with that literal garbage string as an argument.
     if not CRON_TEMPLATE_PATH.exists():
         raise FileNotFoundError(f"Missing cron template: {CRON_TEMPLATE_PATH}")
     stockey_user = os.getenv("STOCKEY_CRON_USER") or getpass.getuser()
@@ -160,6 +177,42 @@ def render_crontab() -> str:
     }
     for needle, value in replacements.items():
         rendered = rendered.replace(needle, value)
+
+    unresolved = sorted(set(_UNRESOLVED_PLACEHOLDER_RE.findall(rendered)))
+    if unresolved:
+        raise ValueError(
+            f"Cron template {CRON_TEMPLATE_PATH} has unresolved placeholder(s) with no "
+            f"matching entry in _render_crontab_text()'s replacements map: {unresolved}. "
+            "Refusing to write a crontab containing a literal {{...}} token -- add the "
+            "missing placeholder to `replacements` first."
+        )
+    return rendered
+
+
+def check_crontab_drift() -> dict:
+    """Read-only: report whether config/stockey.generated.crontab would change on a
+    re-render, without writing anything or touching go-crond.
+
+    BUG FOUND LIVE 2026-08-20 (re-audit, MEDIUM): render_crontab() always rewrote the
+    generated crontab unconditionally, even when byte-identical -- CLAUDE.md already
+    documents the resulting operational trap ("there is currently no read-only 'just check
+    for drift' mode"; running render_crontab() while go-crond is live silently breaks its
+    scheduling regardless of whether the diff was empty, since go-crond doesn't hot-reload).
+    This gives operators/scripts (e.g. cron_preflight.py) a way to detect drift first and
+    decide whether the disruptive rewrite-and-restart is actually needed.
+    """
+    rendered = _render_crontab_text()
+    existing = GENERATED_CRONTAB_PATH.read_text(encoding="utf-8") if GENERATED_CRONTAB_PATH.exists() else None
+    drifted = existing != rendered
+    return {
+        "status": "drift" if drifted else "clean",
+        "path": str(GENERATED_CRONTAB_PATH),
+        "exists": GENERATED_CRONTAB_PATH.exists(),
+    }
+
+
+def render_crontab() -> str:
+    rendered = _render_crontab_text()
     GENERATED_CRONTAB_PATH.write_text(rendered, encoding="utf-8")
     GENERATED_CRONTAB_PATH.chmod(0o600)
     _log(f"Rendered cron file: {GENERATED_CRONTAB_PATH}")
@@ -222,7 +275,25 @@ def setup_env():
 
 def main():
     parser = argparse.ArgumentParser(description="Bootstrap Stockey local runtime.")
-    parser.parse_args()
+    parser.add_argument(
+        "--check-crontab",
+        action="store_true",
+        help=(
+            "Read-only: report whether config/stockey.generated.crontab would change on a "
+            "re-render (and validate the template has no unresolved placeholders), without "
+            "writing anything or touching go-crond. Exits 1 on drift or a template error, "
+            "0 if already up to date."
+        ),
+    )
+    args = parser.parse_args()
+    if args.check_crontab:
+        try:
+            result = check_crontab_drift()
+        except (FileNotFoundError, ValueError) as exc:
+            _log(f"Cron template check: error - {exc}")
+            raise SystemExit(1)
+        _log(f"Cron template check: {result['status']} ({result['path']})")
+        raise SystemExit(0 if result["status"] == "clean" else 1)
     setup_env()
 
 
