@@ -55,7 +55,7 @@ reintroduce research/signal/LLM logic here — it belongs in systrader.
 
 ## Current Architecture
 
-The core pure-TA pipeline is 7 cron jobs (`config/stockey.crontab.template`).
+The core pure-TA pipeline is 9 cron jobs (`config/stockey.crontab.template`).
 Times below are the intended IST wall-clock schedule; go-crond
 (webdevops/go-crond) has no `CRON_TZ`/`TZ` support, so the crontab file itself
 is written in UTC (IST − 5:30) — see the per-job comments in the template for
@@ -80,12 +80,30 @@ each line's UTC/IST pair:
    `advisory_adjusted_ohlcv_daily` (a view, systrader's PRIMARY equity series),
    then its BSE-only-company twin (`bseindia_adjustment_factors` /
    `bse_advisory_adjusted_ohlcv_daily`, `data/bseindia/price_adjustment.py`).
-5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
+5. `all_dhan_intraday_sync.sh` (18:55, right after) —
+   `data/dhanlive/intraday_daily_sync.py`: daily incremental Dhan 1-min
+   intraday OHLCV sync for the full active NSE equity universe
+   (`utils.universe.get_equity_universe()`, no static symbol list). systrader
+   reads this table live via a `postgres_fdw` foreign table (both Postgres
+   instances are colocated on one disk — no local mirror, no sync script;
+   `scripts/sync_intraday_from_stockey.sh` in the systrader repo is
+   deprecated as of 2026-08-26, kept only as a reference for if the machines
+   are ever truly split). Companion
+   to the one-time 5-year historical backfill (`scripts/
+   backfill_intraday_5yr.py`, run manually, not scheduled — HF_DATA_PLATFORM_
+   PLAN.md, systrader repo, 2026-08-22).
+6. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
    bhavcopy/Dhan/benchmark freshness and runs bounded repairs.
-6. `all_data_coverage_report.sh` (17:10 UTC) — `scripts/data_coverage_report.py`:
+7. `all_data_coverage_report.sh` (17:10 UTC) — `scripts/data_coverage_report.py`:
    non-fatal per-table coverage/staleness report (`docs/DATA_COVERAGE.md`),
    monitoring only, not a data producer.
-7. Log rotation (06:50, `scripts/rotate_logs.sh`).
+8. `all_issue_digest.sh` (17:15 UTC, right after) — `scripts/issue_digest.py`:
+   rechecks and auto-closes open `advisory_identity_issues` rows that have
+   since resolved themselves, then reports what's left plus a 24h
+   `summarize_fallback_events()` snapshot. The reader half of the "no silent
+   fallback" write paths — both tables were write-only with no scheduled
+   review until this job (confirmed live 2026-08-14/2026-08-21).
+9. Log rotation (06:50, `scripts/rotate_logs.sh`).
 
 `data/nseindia/earnings_events.py` and `data/nseindia/recent_events.py` are
 BORDERLINE (LLM-free, useful for FnO event-vol research later per
@@ -97,13 +115,13 @@ carve-out from the pure-TA boundary above (long-term fundamental screening —
 screener/watchlist/narrative/portfolio — not technicals/trading;
 `docs/FUNDAMENTAL_SCREENER_PRD.md`):
 
-8. `all_fundamentals_screener.sh` (19:15, weekdays) — runs
+10. `all_fundamentals_screener.sh` (19:15, weekdays) — runs
    `fundamentals.run_pipeline`: sector reference, L1/L2 refresh, event
    collectors, OCR + structured extraction, sector capital-cycle, L3 alerts
    (rule + LLM triage), descriptive technicals, and the watchlist/narrative/
    email pipeline, in dependency order. One step failing does not abort the
    run.
-9. `all_fundamentals_api.sh` (every 5 min, no weekday restriction) — long-running
+11. `all_fundamentals_api.sh` (every 5 min, no weekday restriction) — long-running
    FastAPI service (`fundamentals/api/app.py`) serving the `screener/` Nuxt
    frontend. Cron retries every 5 minutes; `with_lock.sh` no-ops while a real
    instance holds the lock, and the script's own `/api/health` check no-ops
@@ -151,7 +169,10 @@ Daily/operator (matches the crontab exactly):
 ./all_external_workers.sh
 ./all_ohlcv_reconcile.sh
 ./all_price_adjustment.sh
+./all_dhan_intraday_sync.sh
 ./all_data_readiness.sh
+./all_data_coverage_report.sh
+./all_issue_digest.sh
 ./all_fundamentals_screener.sh
 ./all_fundamentals_api.sh   # long-running -- serves the screener/ Nuxt frontend
 ```

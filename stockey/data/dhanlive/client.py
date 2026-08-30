@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import sys
+import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +16,34 @@ from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import force_refresh_access_token, get_access_token
 
 env = Env()
+
+# BUG FOUND LIVE 2026-08-22: _request had ZERO pacing between calls -- a tight
+# sequential loop (scripts/backfill_intraday_5yr.py) hit Dhan's real 5 req/sec
+# historical-data rate limit (https://dhan.freshdesk.com/support/solutions/
+# articles/82000891163) within the first handful of symbols, and 429s were
+# treated as a hard failure with no retry at all (only 401/expired-token
+# responses were ever retried). Confirmed live: symbols 4 and 5 of a
+# 2,876-symbol backfill run failed outright on the very first burst.
+# Per-process pacing only (module-level, in-process) -- NOT a cross-process
+# rate limiter like utils/nse_rate_limiter.py's nse_goto/nse_request_gate.
+# Sufficient for today's single-process usage; if multiple stockey processes
+# ever call Dhan concurrently, this needs the same cross-process treatment
+# NSE already has.
+_DHAN_RATE_LIMIT_LOCK = threading.Lock()
+_dhan_last_request_at = 0.0
+DHAN_MIN_REQUEST_INTERVAL_SECONDS = 0.22  # ~4.5 req/sec, safely under the 5/sec cap
+DHAN_RATE_LIMIT_MAX_RETRIES = 5
+DHAN_RATE_LIMIT_BACKOFF_SECONDS = 3.0  # multiplied by attempt number
+
+
+def _pace_dhan_request() -> None:
+    global _dhan_last_request_at
+    with _DHAN_RATE_LIMIT_LOCK:
+        now = time.monotonic()
+        wait = DHAN_MIN_REQUEST_INTERVAL_SECONDS - (now - _dhan_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _dhan_last_request_at = time.monotonic()
 env.read_env()
 
 
@@ -115,10 +145,36 @@ class DhanHistoricalClient:
         }
         return self._request("POST", f"{self.BASE_URL}/charts/intraday", json=payload)
 
+    def _request_with_rate_limit_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        response: requests.Response | None = None
+        for rate_attempt in range(1, DHAN_RATE_LIMIT_MAX_RETRIES + 1):
+            _pace_dhan_request()
+            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            if response.status_code != 429:
+                return response
+            if rate_attempt >= DHAN_RATE_LIMIT_MAX_RETRIES:
+                break
+            backoff = DHAN_RATE_LIMIT_BACKOFF_SECONDS * rate_attempt
+            print(
+                f"[data.dhanlive.client] Dhan rate limit (429); backing off {backoff:.0f}s "
+                f"(attempt {rate_attempt}/{DHAN_RATE_LIMIT_MAX_RETRIES})",
+                file=sys.stderr,
+                flush=True,
+            )
+            _record_dhan_client_fallback(
+                fallback_type="dhan_rate_limited",
+                reason="Dhan API returned 429 despite in-process pacing; backing off and retrying.",
+                response=response,
+                metadata={"rate_attempt": rate_attempt, "backoff_seconds": backoff},
+            )
+            time.sleep(backoff)
+        assert response is not None
+        return response
+
     def _request(self, method: str, url: str, **kwargs) -> dict[str, Any] | list[dict[str, Any]]:
         last_response: requests.Response | None = None
         for attempt in range(1, self.auth_attempts + 1):
-            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            response = self._request_with_rate_limit_retry(method, url, **kwargs)
             last_response = response
             if not self._is_auth_failure(response):
                 return self._parse_response(response)

@@ -54,6 +54,13 @@ LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 # 17:10 UTC = 22:40 IST
 10 17 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
 
+# Digest of open identity issues + recent fallback telemetry -- the read/summarize half
+# of the write-only advisory_identity_issues / advisory_fallback_events tables (recorded
+# but never surfaced, confirmed live 2026-08-14; docs/DATA_COVERAGE.md's "Still open"
+# list). Runs right after data_coverage_report so this reflects the same nightly pass.
+# 17:15 UTC = 22:45 IST
+15 17 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_issue_digest.lock ./all_issue_digest.sh >> "$LOG_DIR/issue_digest.log" 2>&1
+
 # Daily log rotation before the morning jobs: archive sizable logs as
 # logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running
 # processes keep their handles) and prune archives past LOG_ROTATE_KEEP_DAYS.
@@ -92,6 +99,16 @@ LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 # them is gone -- no need to wait until 21:38 anymore.
 # 13:20 UTC = 18:50 IST
 20 13 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+
+# Daily incremental Dhan 1-min intraday OHLCV sync for the full active NSE equity
+# universe (data/dhanlive/intraday_daily_sync.py) -- HF_DATA_PLATFORM_PLAN.md
+# (systrader repo), 2026-08-22: companion to the one-time 5-year historical
+# backfill (scripts/backfill_intraday_5yr.py, run manually, not scheduled).
+# Independent of the fundamentals screener below (different tables, no
+# dependency either way) -- scheduled right after price_adjustment purely so
+# the day's EOD data is settled first.
+# 13:25 UTC = 18:55 IST
+25 13 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dhan_intraday_sync.lock ./all_dhan_intraday_sync.sh >> "$LOG_DIR/dhan_intraday_sync.log" 2>&1
 
 # Fundamentals screener pipeline: L1/L2 refresh, event collectors, OCR + structured
 # extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive

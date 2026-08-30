@@ -67,8 +67,8 @@ normal, not a bug (they cover the calendar year ahead).
 `master_dhan_instruments` (the full instrument master — includes every F&O
 strike/expiry combination, not just equities, so its distinct-symbol count is
 much larger than the equity universe), `dhan_ohlcv_daily` (fallback series),
-`dhan_ohlcv_intraday` (1-min bars — lives in the cloud DB, not currently
-synced to systrader; see `DATA_CONTRACT.md`'s open item).
+`dhan_ohlcv_intraday` (1-min bars — lives in the cloud DB; systrader reads it
+live via a `postgres_fdw` foreign table, not a sync, see `DATA_CONTRACT.md`).
 
 `dhan_ohlcv_daily` is neither purely raw nor continuously adjusted — Dhan
 applies its own split/bonus adjustment to a symbol's history whenever it
@@ -98,18 +98,28 @@ rate), `rbi_currency_rates`, `fbil_gsec_par`. (`fbil_gsec_quote` retired
 
 - `nseindia_mcap` history gap (2024 start vs. 2013 baseline) — decide
   whether backfilling is worth it.
-- `dhan_ohlcv_intraday` living in the cloud DB rather than locally, and not
-  synced to systrader at all — see `DATA_CONTRACT.md`'s open item.
 - `dim_trading_days` has no producer in the current codebase (confirmed live
   2026-08-14) — populated through 2026-12-31 today, not stale, but a live
   cron job (`ohlcv_reconcile.py`) depends on it; find/rebuild the producer
   before end of 2026. See `DATA_CONTRACT.md`'s table.
-- `advisory_identity_issues` / `advisory_fallback_events`: write paths are
-  active (Dhan identity-issue recording, fallback telemetry) but their
-  read/resolve/summarize functions (`utils/identity_issues.py`,
-  `utils/fallback_telemetry.py`'s `summarize_fallback_events`) are never
-  invoked by any cron job or documented runbook step — confirmed live
-  2026-08-14. Open issues/events accumulate with no scheduled review.
+- `dhan_ohlcv_intraday` has a confirmed historical gap for 2026-08-14 through
+  the day this was found (2026-08-30): 4,211 ticker-day rows fall short of a
+  full session's 375 one-minute bars (as few as 89), caused by an IST/UTC bug
+  in `choose_intraday_refresh_end`'s live-sync fallback (fixed same day, see
+  `data/dhanlive/ohlcv.py`'s `_ist_now()`) — the fix stops new gaps, it does
+  NOT repair the ones already stored. A targeted re-fetch for the affected
+  ticker/day pairs (`SELECT ticker, date_trunc('day', timestamp) FROM
+  dhan_ohlcv_intraday GROUP BY 1, 2 HAVING count(*) < 370`) is still needed.
+### Resolved 2026-08-21
+
+- `advisory_identity_issues` / `advisory_fallback_events` were write-only —
+  active recording (Dhan identity-issue tracking, fallback telemetry) but no
+  reader/resolver was ever scheduled (confirmed live 2026-08-14), so issues
+  accumulated with no review. `scripts/issue_digest.py` (`all_issue_digest.sh`,
+  scheduled nightly right after `all_data_coverage_report.sh`) is now that
+  reader: rechecks and auto-closes open identity issues that have since
+  resolved themselves, then reports what's left plus a 24h fallback-telemetry
+  summary. See `CLAUDE.md`'s Current Architecture job list.
 
 ### Resolved 2026-08-15
 

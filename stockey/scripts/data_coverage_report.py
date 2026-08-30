@@ -13,8 +13,8 @@ hasn't changed the repo rate).
 
 Writes to `data_coverage_report` (upserted daily, one row per table per day)
 so trends are queryable over time, and prints a text/JSON summary for cron
-logs. Run standalone or via `all_data_coverage_report.sh` (not yet scheduled
-by default -- add it to the crontab once you've reviewed a few days of output).
+logs. Run standalone or via `all_data_coverage_report.sh` -- scheduled nightly,
+see `CLAUDE.md`'s Current Architecture job list.
 """
 from __future__ import annotations
 
@@ -74,7 +74,17 @@ TABLES: list[tuple[str, str | None, str | None, str, str]] = [
     ("dim_trading_days", "date", None, "informational", "NSE calendar"),
     ("master_dhan_instruments", "load_ts", "symbol_name", "informational", "Dhan broker"),
     ("dhan_ohlcv_daily", "date", "ticker", "daily", "Dhan broker"),
-    ("dhan_ohlcv_intraday", "timestamp", "ticker", "informational", "Dhan broker"),
+    # BUG FOUND LIVE 2026-08-30 (adversarial review): stayed "informational" (no
+    # staleness check at all) even after data/dhanlive/intraday_daily_sync.py gave
+    # it a real daily producer (2026-08-22) -- the one new table this changeset
+    # added the most machinery around was exactly the one excluded from
+    # monitoring. Confirmed live the same day: 4,211 ticker-days since 2026-08-14
+    # were silently short a full session's worth of bars (a since-fixed IST/UTC
+    # bug in choose_intraday_refresh_end), and nothing here would ever have
+    # flagged it. "daily" here checks max(timestamp) freshness the same way
+    # dhan_ohlcv_daily does -- it does NOT check whether each DAY's bar count is
+    # complete (that needs its own per-day-count check, out of scope of this fix).
+    ("dhan_ohlcv_intraday", "timestamp", "ticker", "daily", "Dhan broker"),
     ("rbi_bank_rates", "date", None, "informational", "RBI/FBIL"),
     ("rbi_currency_rates", "date", None, "daily", "RBI/FBIL"),
     ("fbil_gsec_par", "date", None, "daily", "RBI/FBIL"),

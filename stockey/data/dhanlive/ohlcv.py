@@ -25,6 +25,40 @@ INTRADAY_MAX_WINDOW_DAYS = 90
 SUPPORTED_INTRADAY_INTERVALS = (1, 5, 15, 25, 60)
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def _ist_now() -> datetime:
+    """Current moment as naive IST wall-clock digits. This module treats every
+    naive datetime it handles AS IF it's IST (MARKET_CLOSE_HOUR/MINUTE=15:30 are
+    IST values; with_market_close() just does a bare .replace() on whatever it's
+    given, with no tz-awareness at all) -- a convention that only holds when the
+    host machine's own clock is also IST, or when every naive datetime is
+    produced deliberately in IST.
+
+    BUG FOUND LIVE 2026-08-30 (adversarial review, before the first commit of the
+    intraday feature): every "live now" fallback in this module used bare
+    `datetime.now()` instead. This host's system clock is UTC, so that silently
+    returned naive UTC digits, 5.5 hours behind the naive-IST value the rest of
+    this module's logic assumes -- and Dhan's intraday chart API reads a naive
+    `toDate` as IST wall-clock, not UTC. Confirmed against real stored data:
+    4,211 ticker-day rows in dhan_ohlcv_intraday since 2026-08-14 fall short of a
+    full session's 375 one-minute bars (as few as 89), every one of them a day
+    whose sync ran through this exact untimezoned `datetime.now()` fallback --
+    the daily incremental sync (choose_intraday_refresh_end's to_date=None path)
+    had been silently truncating each day's close, by an amount that varied with
+    exactly when that day's sync happened to run, ever since the feature shipped.
+    The one-time 5-year historical backfill is NOT affected by this specific bug
+    for its bulk history (each historical day gets an explicit end-of-window
+    datetime already correctly stamped to market close by with_market_close());
+    only the "live, no explicit to_date" fallback path was ever wrong.
+
+    A raw daily/multi-year lookback (choose_daily_refresh_end's own default, or
+    scripts/backfill_intraday_5yr.py's `years` window) is far less sensitive to a
+    5.5-hour error, but this is used everywhere "now" means "the actual current
+    moment" for consistency -- one correct definition of "now" for this whole
+    module, not two."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + IST_OFFSET
 
 
 DAILY_TABLE = "dhan_ohlcv_daily"
@@ -221,9 +255,9 @@ def choose_daily_refresh_start(
     latest_stored = snapshot.get("max_date")
     if latest_stored is not None:
         if has_recent_adjustment(ticker, latest_stored):
-            return datetime.now() - timedelta(days=365 * years)
+            return _ist_now() - timedelta(days=365 * years)
         return latest_stored - timedelta(days=max(0, DEFAULT_DAILY_OVERLAP_DAYS))
-    return datetime.now() - timedelta(days=365 * years)
+    return _ist_now() - timedelta(days=365 * years)
 
 
 def load_nse_holidays() -> set[date]:
@@ -315,7 +349,7 @@ def choose_daily_refresh_end(
     *,
     exchange: str,
 ) -> datetime:
-    requested = to_date or datetime.now()
+    requested = to_date or _ist_now()
     return clamp_to_last_trading_day(requested, exchange=exchange)
 
 
@@ -351,7 +385,7 @@ def choose_intraday_refresh_end(
     *,
     exchange: str,
 ) -> datetime:
-    requested = to_date or datetime.now()
+    requested = to_date or _ist_now()
     clamped = clamp_to_last_trading_day(requested, exchange=exchange)
     if clamped.date() != requested.date():
         return with_market_close(clamped)
@@ -581,7 +615,7 @@ def sync_intraday_ohlcv(
         if latest_stored is not None:
             effective_from_date = latest_stored - timedelta(minutes=max(0, DEFAULT_INTRADAY_OVERLAP_MINUTES))
         else:
-            effective_from_date = datetime.now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
+            effective_from_date = _ist_now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
     resolved_exchange = str(identity["exchange"])
     effective_to_date = choose_intraday_refresh_end(effective_to_date if to_date is not None else None, exchange=resolved_exchange)
     if effective_from_date > effective_to_date:
