@@ -135,9 +135,13 @@ def load_companies_needing_narrative_refresh(limit: int | None = None) -> pd.Dat
     company with no new alert has nothing new to synthesize, see module docstring.
 
     BUG FOUND LIVE 2026-08-18 (re-audit): the gate used to compare last_alert_at
-    (fundamentals_watchlist.last_alert_at = MAX(alert_date), the underlying
-    FILING's disclosure date) against narrative_generated_at (a wall-clock
-    processing timestamp) -- an event date compared to a processing time.
+    (at the time, fundamentals_watchlist.last_alert_at = MAX(alert_date), the
+    underlying FILING's disclosure date -- watchlist.py's 2026-08-22 fix later
+    rekeyed last_alert_at itself to MAX(load_ts)/detection time instead, but
+    that's a separate change; this gate never relied on last_alert_at's own
+    value for its decision, only alert_date directly, see below) against
+    narrative_generated_at (a wall-clock processing timestamp) -- an event date
+    compared to a processing time.
     alert_date lags real alert creation by a median of 15 days (0 of 60 sampled
     alerts were same-day), so a freshly-created alert almost never has an
     alert_date LATER than the day the narrative was already written -- the gate

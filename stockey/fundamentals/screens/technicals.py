@@ -9,6 +9,14 @@ decision pipeline"). This module answers "is this stock currently up a lot / dow
 lot / stretched from its own average", nothing more -- no buy/sell/hold verdict, no
 threshold-based classification, no backtest.
 
+BUG FOUND LIVE 2026-08-22: "feeds the watchlist" wasn't actually true for any
+watchlist company outside the CURRENT L1 universe snapshot -- run_technicals_refresh()
+only ever scanned load_l1_tickers(), and fundamentals_watchlist is a different,
+L3-alert-sourced population not gated on L1 screening membership at all. A company
+that never entered L1, or has since dropped out of it, silently stopped getting
+technicals forever, with no fallback event. Fixed via load_watchlist_only_tickers()
+-- see its own docstring for the live-confirmed cases.
+
 Uses advisory_adjusted_ohlcv_daily (stockey's own split/bonus-adjusted PRIMARY equity
 series, keyed by bare `symbol`, not company_master_id -- confirmed live 2026-08-11),
 not raw nseindia_ohlcv: momentum windows here (3/6/12 months) are long enough to
@@ -153,6 +161,66 @@ def load_l1_tickers() -> pd.DataFrame:
     )
 
 
+def load_watchlist_only_tickers(covered_company_master_ids) -> pd.DataFrame:
+    """Active watchlist companies NOT already covered by the current L1 universe
+    snapshot.
+
+    BUG FOUND LIVE 2026-08-22: this module's own docstring says it "feeds the
+    fundamentals screener's watch-summary narrative (watchlist.py)", but until
+    now run_technicals_refresh() only ever scanned load_l1_tickers() -- the L1
+    screening universe, a DIFFERENT and narrower population than the watchlist
+    (fundamentals_watchlist is L3-alert-sourced and not gated on L1 screening
+    membership at all; a company can enter the watchlist without ever being in
+    L1, or after having already left it). Once a watchlist company drops out of
+    L1 (or never enters it), it silently stopped getting technicals refreshes
+    forever -- no fallback event, because run_technicals_refresh() never even
+    attempted it. Confirmed live: REGENCERAM (in L1 exactly once, 2026-08-13,
+    zero fundamentals_technicals rows ever -- even that one day's run didn't
+    produce a row for it); PIONRINV/BANARISUG/KRITINUT/BGWTATO all dropped out
+    of L1 after 2026-08-13/19/20 and are frozen at that day's close, 2-9 days
+    stale and climbing, with price_data_stale itself now stale (it was computed
+    correctly as of the last run, nothing has re-evaluated it since).
+
+    ticker is nse_ticker if the company has one, else bse_scrip_code (matching
+    fundamentals_l1_universe's own convention -- a BSE-only ticker slot already
+    holds the scrip code, see this module's docstring) -- load_adjusted_price_
+    history's existing EQ->BE->BSE-scrip-code fallback chain handles either
+    correctly with no changes needed there."""
+    # BUG FOUND LIVE 2026-08-30 (adversarial review): fundamentals_watchlist's
+    # `status` column is bootstrapped by watchlist_exit.py's
+    # _bootstrap_status_columns(), called from notifications.py -- which runs
+    # AFTER technicals in run_pipeline.py's STEPS. On a truly fresh DB's first-
+    # ever pipeline run, this table (or its status column) may not exist yet,
+    # which would otherwise crash the whole technicals step rather than just
+    # degrade this one watchlist-only-companies lookup. Self-heals from the
+    # second run onward (notifications.py creates/bootstraps both by then), so
+    # this is a first-run-only hazard -- but the same "don't crash the whole
+    # step for a missing table" tolerance every other market-wide query in this
+    # pipeline already gets (e.g. l2_state.py's fetch_pledge_levels).
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT w.company_master_id,
+                   COALESCE(cm.nse_ticker, cm.bse_scrip_code) AS ticker
+            FROM fundamentals_watchlist w
+            JOIN company_master cm ON cm.company_master_id = w.company_master_id
+            WHERE w.status = 'active'
+            """
+        )
+    except Exception as exc:  # noqa: BLE001 -- a missing table/column (first-ever pipeline run) must not crash the whole technicals step
+        _record_fallback(
+            "technicals_watchlist_only_lookup_failed",
+            reason="Could not query fundamentals_watchlist for watchlist-only companies (likely a first-ever pipeline run, before notifications.py has created/bootstrapped it) -- watchlist companies outside the L1 universe were not scanned this run.",
+            error=exc,
+        )
+        return pd.DataFrame(columns=["ticker", "company_master_id"])
+    if df.empty:
+        return df
+    df = df[~df["company_master_id"].isin(covered_company_master_ids)]
+    df = df.dropna(subset=["ticker"])
+    return df[["ticker", "company_master_id"]].reset_index(drop=True)
+
+
 def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.DataFrame:
     nse_history = sql_to_df(
         """
@@ -187,9 +255,29 @@ def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.
     if not nse_be_history.empty:
         return nse_be_history.sort_values("date").reset_index(drop=True)
 
-    # BSE-only-company fallback -- see module docstring. `ticker` here is already the
-    # BSE scrip code for these companies, matching bse_advisory_adjusted_ohlcv_daily's
-    # own scrip_code key directly.
+    # BSE-only-company fallback -- see module docstring. `ticker` here is USUALLY
+    # already the BSE scrip code for BSE-only L1 companies (matching bse_advisory_
+    # adjusted_ohlcv_daily's own scrip_code key directly) -- but not always.
+    #
+    # BUG FOUND LIVE 2026-08-22: a company can have a real nse_ticker recorded in
+    # company_master with ZERO actual EQ/BE rows (an NSE identity exists but never
+    # actually traded/listed there in the adjusted series) while its real price
+    # history lives under a DIFFERENT identifier, the BSE scrip code. Confirmed
+    # live: BGWTATO -- nse_ticker='BGWTATO' (zero advisory_adjusted_ohlcv_daily
+    # rows, either series) vs bse_scrip_code='504646' (247 real bse_advisory_
+    # adjusted_ohlcv_daily rows). Querying scrip_code='BGWTATO' (the old
+    # behavior, reusing the same `ticker` string) can never match a numeric
+    # scrip code. Resolve the TRUE scrip code via company_master instead of
+    # assuming `ticker` already is one -- matches either nse_ticker or
+    # bse_scrip_code, so this is correct both for L1's BSE-only convention
+    # (ticker IS already the scrip code, matches via the second clause) and for
+    # this mixed case (ticker is an NSE ticker with no NSE data of its own).
+    scrip = sql_to_df(
+        "SELECT bse_scrip_code FROM company_master WHERE nse_ticker = %s OR bse_scrip_code = %s LIMIT 1",
+        params=(ticker, ticker),
+    )
+    if scrip.empty or pd.isna(scrip.iloc[0]["bse_scrip_code"]):
+        return pd.DataFrame(columns=["date", "adj_close"])
     bse_history = sql_to_df(
         """
         SELECT date, adj_close
@@ -198,7 +286,7 @@ def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.
         ORDER BY date DESC
         LIMIT %s
         """,
-        params=(ticker, lookback_days),
+        params=(str(scrip.iloc[0]["bse_scrip_code"]), lookback_days),
     )
     return bse_history.sort_values("date").reset_index(drop=True)
 
@@ -252,13 +340,23 @@ def compute_technicals(history: pd.DataFrame) -> dict:
 def run_technicals_refresh() -> dict[str, object]:
     ensure_bse_view()  # self-heals bseindia_ohlcv/bseindia_adjustment_factors/the view -- see module docstring
     tickers = load_l1_tickers()
-    if tickers.empty:
+    l1_universe_empty = tickers.empty
+    if l1_universe_empty:
         _record_fallback(
             "technicals_no_l1_universe",
             reason="No fundamentals_l1_universe rows to compute technicals for.",
             error="empty L1 universe",
         )
-        return {"companies": 0, "no_history": 0, "stale_price": 0}
+        # BUG FOUND LIVE 2026-08-30 (adversarial review): used to return here
+        # unconditionally -- the exact failure mode load_watchlist_only_tickers's
+        # own 2026-08-22 fix was built to close (a watchlist company outside the
+        # L1 universe going permanently unrefreshed) would still happen on any
+        # run where the L1 universe snapshot itself was empty, since this early
+        # return short-circuited BEFORE watchlist-only companies were ever
+        # loaded. Fall through with an empty L1 frame instead -- watchlist-only
+        # companies still get scanned; the real early-return (nothing at all to
+        # do) moves below, after both sources have had a chance to contribute.
+        tickers = pd.DataFrame(columns=["ticker", "company_name"])
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     if not check_bse_price_pipeline_freshness(run_date):
@@ -281,6 +379,16 @@ def run_technicals_refresh() -> dict[str, object]:
     # pipeline uses. Resolved via map_company_master_ids_nse_or_bse instead, same
     # helper every other fixed call site already uses.
     tickers["company_master_id"] = map_company_master_ids_nse_or_bse(tickers["ticker"])
+
+    # BUG FOUND LIVE 2026-08-22: see load_watchlist_only_tickers's own docstring --
+    # this module's docstring promises to feed the watchlist, but scanning only
+    # load_l1_tickers() left any watchlist company outside the current L1 snapshot
+    # (never in L1, or dropped out since) permanently unrefreshed with no signal.
+    # These rows already carry a resolved company_master_id (no map_company_master_
+    # ids_nse_or_bse call needed), so they're concatenated in directly.
+    watchlist_only = load_watchlist_only_tickers(set(tickers["company_master_id"].dropna()))
+    if not watchlist_only.empty:
+        tickers = pd.concat([tickers[["ticker", "company_master_id"]], watchlist_only], ignore_index=True)
 
     rows = []
     no_history = 0
