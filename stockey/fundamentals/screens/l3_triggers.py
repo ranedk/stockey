@@ -77,7 +77,8 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 # trigger.
 SUPPORTED_FILING_TYPES = (
     "rating_action", "pit_sast", "capital_raise", "institutional_entry", "results",
-    "auditor_change", "related_party_transaction",
+    "auditor_change", "related_party_transaction", "pledge_increase",
+    "bulk_deal_buy", "bulk_deal_sell",
 )
 
 _ALERTS_TABLE_STATEMENT = """
@@ -773,6 +774,46 @@ def evaluate_institutional_entry_trigger(event: dict, l2_row: dict | None) -> di
     }
 
 
+def evaluate_pledge_increase_trigger(event: dict, l2_row: dict | None) -> dict | None:
+    """Always alert-worthy, unconditional on L2 state -- same reasoning as
+    institutional_entry: this event's own source IS L2's own pledge snapshot
+    (fundamentals/screens/l2_state.py's compute_pledge_trend), so checking l2_row
+    here would be circular, not independent confirmation. A promoter pledging more
+    shares is a classic financial-stress red flag regardless of anything else the
+    state vector shows (PRD §12 todo #2, 2026-08-29 -- pledge_pct previously sat in
+    L2 with no dedicated trigger watching it rise at all)."""
+    return {
+        "trigger_type": "pledge_increase",
+        "reasoning": event.get("headline")
+        or "Promoter pledge percentage increased vs this pipeline's last stored reading -- alert-worthy regardless of prior L2 state.",
+    }
+
+
+def evaluate_bulk_deal_buy_trigger(event: dict, l2_row: dict | None) -> dict | None:
+    """Always alert-worthy, unconditional on L2 state -- NSE's own bulk/block-deal
+    disclosure threshold is itself the size filter (PRD §12 todo #3, 2026-08-29).
+    Investor tier folded into reasoning when known, same pattern as capital_raise's
+    _resolve_investor_tiers_for_event/_summarize_investor_tiers (this trigger_type is
+    now included in that resolution's gate -- see run_l3_rule_triggers)."""
+    reasoning = event.get("headline") or "Named client bought via a disclosed bulk/block deal -- alert-worthy regardless of prior L2 state."
+    tier_note = _summarize_investor_tiers(event.get("investor_tiers"))
+    if tier_note:
+        reasoning = f"{reasoning} {tier_note}"
+    return {"trigger_type": "bulk_deal_buy", "reasoning": reasoning}
+
+
+def evaluate_bulk_deal_sell_trigger(event: dict, l2_row: dict | None) -> dict | None:
+    """Always alert-worthy -- see evaluate_bulk_deal_buy_trigger's docstring. NOT a
+    claim of promoter/insider selling (see deal_flow.py's own module docstring for
+    why that specific claim isn't made from this data source) -- just a named,
+    disclosure-threshold-sized client exiting."""
+    reasoning = event.get("headline") or "Named client sold via a disclosed bulk/block deal -- alert-worthy regardless of prior L2 state."
+    tier_note = _summarize_investor_tiers(event.get("investor_tiers"))
+    if tier_note:
+        reasoning = f"{reasoning} {tier_note}"
+    return {"trigger_type": "bulk_deal_sell", "reasoning": reasoning}
+
+
 TRIGGER_EVALUATORS = {
     "rating_action": evaluate_rating_action_trigger,
     "pit_sast": evaluate_pit_sast_trigger,
@@ -781,6 +822,9 @@ TRIGGER_EVALUATORS = {
     "results": evaluate_results_trigger,
     "auditor_change": evaluate_auditor_change_trigger,
     "related_party_transaction": evaluate_related_party_transaction_trigger,
+    "pledge_increase": evaluate_pledge_increase_trigger,
+    "bulk_deal_buy": evaluate_bulk_deal_buy_trigger,
+    "bulk_deal_sell": evaluate_bulk_deal_sell_trigger,
 }
 
 
@@ -876,7 +920,7 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
                 metadata={"company_master_id": event_dict.get("company_master_id")},
             )
 
-        if event_dict["filing_type"] == "capital_raise":
+        if event_dict["filing_type"] in ("capital_raise", "bulk_deal_buy", "bulk_deal_sell"):
             event_dict["investor_tiers"] = _resolve_investor_tiers_for_event(event_dict, tiers_by_key)
 
         evaluator = TRIGGER_EVALUATORS[event_dict["filing_type"]]

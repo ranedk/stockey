@@ -27,10 +27,12 @@ import json
 import pandas as pd
 
 from fundamentals.collectors.rating_agencies import get_unsupported_rating_agencies
+from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
 from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
 from fundamentals.screens.l4_thesis_draft import _ensure_draft_table
+from fundamentals.screens.l5_sizing import get_position_size_recommendation as _get_position_size_recommendation
 from fundamentals.screens.signal_pointers import get_stock_signal_pointers, load_satisfied_strategies_by_company
 from fundamentals.screens.watch_summary import (
     load_latest_l2_state_for_company,
@@ -98,7 +100,15 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     selected the flag at all. Confirmed live: a real watchlist company showed a
     current_price frozen 3.6 months stale with nothing marking it as such. Now
     selected so callers (the frontend, the digest) can render it distinctly rather
-    than as if it were today's close."""
+    than as if it were today's close.
+
+    BUG FOUND LIVE 2026-08-29: the confluence-score LEFT JOIN LATERAL added just
+    below 500'd every request on a DB where fundamentals/screens/confluence_score.py
+    has never completed a real run yet (UndefinedTable -- upsert_to_db's own
+    CREATE TABLE IF NOT EXISTS only runs on a WRITE, never a read). Same failure
+    class _load_draft_theses_by_company already hit and fixed 2026-08-18 for
+    fundamentals_l4_thesis_draft; same fix here."""
+    _ensure_confluence_score_table()
     params: tuple = ()
     where_clause = ""
     if status is not None:
@@ -109,7 +119,8 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
         SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
                w.alert_count, w.narrative_text, w.suggested_watch_until, w.narrative_generated_at,
                w.status, w.status_reason, l1.company_name, tech.close AS current_price,
-               tech.price_data_stale
+               tech.price_data_stale, tech.as_of_date AS current_price_as_of,
+               conf.confluence_count, conf.contradicting_count, conf.evaluable_count
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
@@ -117,10 +128,21 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
-            SELECT close, price_data_stale FROM fundamentals_technicals
+            SELECT close, price_data_stale, as_of_date FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
+        LEFT JOIN LATERAL (
+            -- PRD §12 todo #6 (2026-08-29): fundamentals/screens/confluence_score.py's
+            -- mechanical axis count, latest run only. NULL (not 0) for a company
+            -- confluence_score.py hasn't scored yet -- see _clean_records' own
+            -- NaN-to-null handling; a real 0 (every axis unclear/contradicting)
+            -- must stay distinguishable from "never scored".
+            SELECT confluence_count, contradicting_count, evaluable_count
+            FROM fundamentals_confluence_score
+            WHERE company_master_id = w.company_master_id
+            ORDER BY run_date DESC LIMIT 1
+        ) conf ON TRUE
         {where_clause}
         ORDER BY w.last_alert_at DESC NULLS LAST
         """,  # noqa: S608 -- where_clause is a fixed internal string, params are parameterized
@@ -129,6 +151,24 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     watchlist = _clean_records(df)
     if not watchlist:
         return []
+
+    # BUG FOUND LIVE 2026-08-26: the digest email showed a real watchlist company
+    # (DBCORP) as "Rs.206.80 -> Rs.206.80 (+0.0%)" -- a confident-looking "no move"
+    # that was actually a routine ~1-day publish lag (advisory_adjusted_ohlcv_daily
+    # always runs a trading day behind nseindia_ohlcv) coinciding with the
+    # company's first_seen_at date, so entry price and "current" price resolved to
+    # the literal same row. price_data_stale doesn't catch this (the gap is 1 day,
+    # not >7). Fixed in the digest (notifications.py's _no_move_data_yet); this API
+    # response is the frontend watchlist page's identical gap -- same underlying
+    # query/join, so the same false-zero was reachable there too. Computed here,
+    # not left for the frontend to reimplement, same reasoning as price_data_stale
+    # already being a precomputed boolean rather than a raw date pair to diff.
+    for row in watchlist:
+        first_seen_at = row.get("first_seen_at")
+        current_price_as_of = row.get("current_price_as_of")
+        row["no_fresh_price_yet"] = bool(
+            first_seen_at and current_price_as_of and str(first_seen_at)[:10] == str(current_price_as_of)[:10]
+        )
 
     # 2026-08-13: strategy badges per row -- was previously just a bare alert_count,
     # the same gap fixed on the digest email (notifications.py's load_full_watchlist).
@@ -154,6 +194,47 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
         row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
         row["draft_thesis"] = drafts_by_company.get(row["company_master_id"])
     return watchlist
+
+
+def get_watchlist_return_summary(status: str | None = "active") -> dict:
+    """Equal-weight average return across the watchlist since each company's own
+    first_seen_at -- a cheap directional gut-check ("is this list net up or down"),
+    requested 2026-08-28 to show at the top of the screener/ watchlist page. status
+    defaults to 'active' same as get_watchlist() itself; pass None/'stale'/etc. the
+    same way to scope the summary to a different bucket.
+
+    Deliberately NOT a portfolio return: no time-weighting (a company added
+    yesterday counts the same as one added six months ago), no rebalancing, and no
+    correction for a company that has since left this status bucket -- same
+    survivorship-flavored caveat as any watchlist-return read. Good enough for
+    "which direction is this list moving", not a backtest result.
+
+    Reuses get_watchlist()'s own rows rather than a second query so the exclusion
+    rules can't drift from what the list view already shows: a row flagged
+    no_fresh_price_yet (the DBCORP-class bug, 2026-08-26) is excluded -- its
+    current_price is a stale artifact of first_seen_at coinciding with the
+    adjusted-price series' ~1-day publish lag, not a real reading, and would
+    silently drag the average toward 0%. A row missing either price (no technicals
+    row joined yet) is excluded too. price_data_stale rows are NOT excluded --
+    same precedent as the per-row price-change cell, which shows a stale move
+    rather than hiding it."""
+    watchlist = get_watchlist(status=status)
+    returns_pct = []
+    excluded_count = 0
+    for row in watchlist:
+        first_seen_price = row.get("first_seen_price")
+        current_price = row.get("current_price")
+        if row.get("no_fresh_price_yet") or first_seen_price in (None, 0) or current_price is None:
+            excluded_count += 1
+            continue
+        returns_pct.append((current_price - first_seen_price) / first_seen_price * 100.0)
+    return {
+        "status": status,
+        "net_return_pct": (sum(returns_pct) / len(returns_pct)) if returns_pct else None,
+        "included_count": len(returns_pct),
+        "excluded_count": excluded_count,
+        "total_count": len(watchlist),
+    }
 
 
 def _load_draft_theses_by_company(*, active_only: bool = True) -> dict[str, dict]:
@@ -301,6 +382,18 @@ def get_portfolio_scoring() -> dict:
     breakdown, time-to-confirmation), not returns. Read-only, computed fresh from
     whatever's resolved so far -- nothing here is cached or precomputed."""
     return compute_quarterly_scoring()
+
+
+def get_position_sizing(company_master_id: str, *, total_capital_rs: float, target_position_count: int) -> dict | None:
+    """Thin wrapper over l5_sizing.get_position_size_recommendation -- PRD §12
+    todo #8. None (-> app.py 404) if this company has no OPEN L4 thesis: the
+    calculator refuses to size a position nobody has committed to yet, same
+    "no capital decision without a human thesis" boundary as everything else in
+    this API. total_capital_rs/target_position_count have no server-side default
+    -- the caller must be explicit, never a guessed sleeve size."""
+    return _get_position_size_recommendation(
+        company_master_id, total_capital_rs=total_capital_rs, target_position_count=target_position_count
+    )
 
 
 def create_portfolio_entry(payload: dict) -> dict:

@@ -40,11 +40,14 @@ from data.dhanlive import auth_cli as dhan_auth_cli
 from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv, scrip_master as dhan_scrip_master
-from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, recent_events, security_dimension, security_history
+from data.dhanlive import intraday_daily_sync as dhan_intraday_daily_sync
+from data.nseindia import bhavcopy_downloader, bhavcopy_parser, earnings_events, indices_downloader, indices_parser, offmarket, offmarket_parser, recent_events, security_dimension, security_history
 from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data import benchmark_sync, download_runner, download_queue
 from fundamentals.collectors import security_master as fundamentals_security_master
 from fundamentals.collectors import screenerin as fundamentals_screenerin
+from fundamentals.screens import confluence_score as fundamentals_confluence_score
+from fundamentals.screens import deal_flow as fundamentals_deal_flow
 from fundamentals.screens import l1_universe as fundamentals_l1_universe
 from fundamentals.screens import l2_state as fundamentals_l2_state
 from fundamentals.collectors import bse_announcements as fundamentals_bse_announcements
@@ -54,6 +57,7 @@ from fundamentals.collectors import rating_agencies as fundamentals_rating_agenc
 from fundamentals.collectors import ocr_pipeline as fundamentals_ocr_pipeline
 from fundamentals.collectors import structured_extraction as fundamentals_structured_extraction
 from fundamentals.screens import l3_triggers as fundamentals_l3_triggers
+from fundamentals.screens import l5_sizing as fundamentals_l5_sizing
 from fundamentals.screens import llm_triage as fundamentals_llm_triage
 from fundamentals.screens import l4_thesis as fundamentals_l4_thesis
 from fundamentals.collectors import sector_data as fundamentals_sector_data
@@ -2298,6 +2302,69 @@ def test_dhan_client_refreshes_token_after_401(monkeypatch):
     assert refresh_calls == ["OLD"]
 
 
+def test_dhan_client_retries_429_with_backoff_then_succeeds(monkeypatch):
+    # BUG FOUND LIVE 2026-08-22: _request had zero pacing between calls and no
+    # retry at all for 429 (rate limit) -- only 401/expired-token responses
+    # were ever retried. A tight sequential loop (scripts/backfill_intraday_
+    # 5yr.py) hit Dhan's real 5 req/sec limit within the first few symbols and
+    # every 429 was a hard failure. Confirmed live: symbols 4 and 5 of a
+    # 2,876-symbol run failed outright.
+    calls = []
+    sleeps = []
+
+    class FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload)
+            self.ok = 200 <= status_code < 300
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+
+        def request(self, method, url, timeout=None, **kwargs):
+            calls.append((method, url))
+            if len(calls) <= 2:
+                return FakeResponse(429, {"errorMessage": "Too many requests"})
+            return FakeResponse(200, {"status": "ok"})
+
+    monkeypatch.setattr(dhan_client, "get_access_token", lambda: "TOKEN")
+    monkeypatch.setattr(dhan_client.requests, "Session", FakeSession)
+    monkeypatch.setattr(dhan_client, "_pace_dhan_request", lambda: None)  # pacing itself covered separately; not the point of this test
+    monkeypatch.setattr(dhan_client.time, "sleep", lambda s: sleeps.append(s))
+    events = []
+    monkeypatch.setattr(dhan_client, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    client = dhan_client.DhanHistoricalClient(auth_attempts=3)
+    payload = client.validate_access_token()
+
+    assert payload == {"status": "ok"}
+    assert len(calls) == 3  # 2x 429, then success
+    assert len(sleeps) == 2
+    assert sleeps[1] > sleeps[0]  # backoff grows with each retry
+    assert all(e["fallback_type"] == "dhan_rate_limited" for e in events)
+    assert len(events) == 2
+
+
+def test_dhan_client_paces_consecutive_requests(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(dhan_client.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(dhan_client, "_dhan_last_request_at", 0.0)
+
+    dhan_client._pace_dhan_request()
+    dhan_client._pace_dhan_request()
+
+    # First call: no prior request recorded (module resets to 0.0 above), the
+    # elapsed-since-epoch-0 gap is enormous, so no sleep is needed. Second call,
+    # immediately after, IS within the minimum interval and must be paced.
+    assert len(sleeps) == 1
+    assert 0 < sleeps[0] <= dhan_client.DHAN_MIN_REQUEST_INTERVAL_SECONDS
+
+
 def test_dhan_client_default_construction_reads_auth_attempts_from_env(monkeypatch):
     # 2026-08-14 regression found live: an earlier same-day dead-code-sweep commit removed this module's
     # `env = Env()` (it looked unused after deleting DhanTradingClient, the only caller of bare `env(...)`)
@@ -2732,6 +2799,523 @@ def test_bhavcopy_downloader_records_malformed_store_key(monkeypatch):
 
     assert events[0]["fallback_type"] == "nse_bhavcopy_download_key_date_parse_failed"
     assert events[0]["source"] == "bhavcopy/bhavcopy_bad.zip"
+
+
+def test_offmarket_downloader_uses_s3_ranges_as_source_of_truth(monkeypatch):
+    monkeypatch.setattr(
+        offmarket.store,
+        "list_files",
+        lambda prefix: iter(
+            [
+                "nsedeals/block_deals_01-01-2015_03-01-2015.csv",
+                "nsedeals/bulk_deals_05-01-2015_05-01-2015.csv",
+                "nsedeals/ignore.txt",
+            ]
+        ),
+    )
+
+    assert offmarket.load_downloaded_dates_from_store("block_deals") == {
+        "2015-01-01",
+        "2015-01-02",
+        "2015-01-03",
+    }
+    assert offmarket.load_downloaded_dates_from_store("bulk_deals") == {"2015-01-05"}
+
+
+def test_offmarket_downloader_records_malformed_download_key(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(offmarket, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    dates = offmarket.extract_downloaded_dates_from_key("nsedeals/block_deals_bad.csv", "block_deals")
+
+    assert dates == set()
+    assert events[0]["fallback_type"] == "nse_offmarket_download_key_date_parse_failed"
+    assert events[0]["source"] == "nsedeals/block_deals_bad.csv"
+    assert events[0]["metadata"]["dtype"] == "block_deals"
+
+
+def test_offmarket_get_next_download_block_caps_at_max_block_days(monkeypatch):
+    # REGRESSION (2026-08-29 revival): the old version capped a block at 365
+    # days -- a whole year of deals in one NSE request is the leading theory
+    # for why the download link never rendered before the old 10s timeout.
+    monkeypatch.setattr(offmarket, "NSE_OFFMARKET_MAX_BLOCK_DAYS", 5)
+    monkeypatch.setattr(
+        offmarket,
+        "get_missing_dates",
+        lambda rop, dtype, start, end, skipped_dates=None: [
+            offmarket.datetime(2026, 6, day) for day in range(20, 1, -1)  # 20..2, all missing, descending
+        ],
+    )
+
+    block = offmarket.get_next_download_block(None, "block_deals", offmarket.datetime(2026, 6, 1), offmarket.datetime(2026, 6, 20))
+
+    start, end = block
+    assert end == offmarket.datetime(2026, 6, 20)
+    assert (end - start).days == 4  # 5 calendar days inclusive, not the full 19-day gap
+
+
+def test_offmarket_download_data_rejects_zero_byte_download(monkeypatch, tmp_path):
+    # REGRESSION (2026-08-29 revival): a zero-byte NSE response used to be
+    # stored and marked downloaded (bhavcopy_downloader's own fix for the
+    # identical failure class was never ported over here before deletion).
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)
+
+    class FakeDownload:
+        def save_as(self, path):
+            open(path, "wb").close()  # zero bytes
+
+    class FakeDownloadInfo:
+        value = FakeDownload()
+
+    class FakeDownloadCtx:
+        def __enter__(self):
+            return FakeDownloadInfo()
+
+        def __exit__(self, *_a):
+            return False
+
+    class FakeLocator:
+        def click(self, *_a, **_k):
+            return None
+
+        def select_option(self, *_a, **_k):
+            return None
+
+    class FakePage:
+        def goto(self, *_a, **_k):
+            return None
+
+        def wait_for_timeout(self, *_a, **_k):
+            return None
+
+        def evaluate(self, *_a, **_k):
+            return None
+
+        def locator(self, *_a, **_k):
+            return FakeLocator()
+
+        def get_by_role(self, *_a, **_k):
+            return FakeLocator()
+
+        def expect_download(self, timeout=None):
+            return FakeDownloadCtx()
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeRedis:
+        def sadd(self, *_a, **_k):
+            raise AssertionError("a zero-byte download must not be marked downloaded")
+
+    monkeypatch.chdir(tmp_path)
+    ok = offmarket.download_data(
+        FakePlaywright(), "block_deals", offmarket.datetime(2026, 6, 9), offmarket.datetime(2026, 6, 10), FakeRedis()
+    )
+
+    assert ok is False
+    assert list(tmp_path.iterdir()) == []  # zero-byte file removed, not left behind
+
+
+def test_offmarket_downloader_stops_after_consecutive_block_failures(monkeypatch):
+    # REGRESSION (2026-08-29 revival): the old version only retried within a
+    # single block (MAX_DOWNLOAD_ATTEMPTS) and would otherwise iterate every
+    # remaining missing block for a dtype even during a total NSE outage --
+    # unbounded requests against a WAF-protected site during an outage is
+    # exactly the pattern this repo's own rate-limiter work exists to avoid.
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    call_count = {"get_next": 0}
+
+    def fake_get_next(rop, dtype, g_start, g_end, skipped_dates=None):
+        # Always another block available -- an infinite supply unless the
+        # consecutive-failure circuit breaker stops the loop itself.
+        call_count["get_next"] += 1
+        return offmarket.datetime(2026, 6, 1), offmarket.datetime(2026, 6, 2)
+
+    monkeypatch.setattr(offmarket, "get_redis_client", lambda *a, **k: FakeRedis())
+    monkeypatch.setattr(offmarket, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(offmarket, "latest_completed_day", lambda: offmarket.datetime(2026, 6, 10))
+    monkeypatch.setattr(offmarket, "NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS", 1)
+    monkeypatch.setattr(offmarket, "MAX_CONSECUTIVE_FAILURES", 3)
+    monkeypatch.setattr(offmarket, "get_next_download_block", fake_get_next)
+    monkeypatch.setattr(offmarket, "download_data", lambda *a, **k: False)
+
+    assert offmarket.main() == 1  # total failure -- nothing downloaded
+
+    state = offmarket.STOCKEY_RUN_STATE
+    assert state["stopped_after_consecutive_failures"] is True
+    assert state["purpose"] == "fundamentals_deal_flow"
+    # 3 dtypes x 3-failure circuit breaker = 9 blocks attempted, not an
+    # unbounded loop against every missing day in the lookback window.
+    assert state["blocks_attempted"] == 9
+    assert state["downloaded_blocks"] == 0
+
+
+def test_nse_offmarket_exports_retry_run_state(monkeypatch):
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    calls = {"get_next": 0, "download": 0}
+
+    def fake_get_next(rop, dtype, g_start, g_end, skipped_dates=None):
+        if dtype == "block_deals" and calls["get_next"] == 0:
+            calls["get_next"] += 1
+            return offmarket.datetime(2026, 6, 9), offmarket.datetime(2026, 6, 10)
+        calls["get_next"] += 1
+        return None
+
+    def fake_download_data(playwright, dtype, from_date, to_date, rop):
+        calls["download"] += 1
+        return calls["download"] == 2
+
+    monkeypatch.setattr(offmarket, "get_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(offmarket, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(offmarket, "latest_completed_day", lambda: offmarket.datetime(2026, 6, 10))
+    monkeypatch.setattr(offmarket, "NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS", 1)
+    monkeypatch.setattr(offmarket, "get_next_download_block", fake_get_next)
+    monkeypatch.setattr(offmarket, "download_data", fake_download_data)
+
+    assert offmarket.main() == 0
+
+    state = offmarket.STOCKEY_RUN_STATE
+    assert state["source"] == "data.nseindia.offmarket"
+    assert state["blocks_attempted"] == 1
+    assert state["download_attempts"] == 2
+    assert state["attempt_count"] == 2
+    assert state["retry_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["downloaded_blocks"] == 1
+    assert state["dates_downloaded"] == 2
+    assert state["rows_written"] == 2
+    assert state["state_advanced"] is True
+
+
+def test_nse_offmarket_records_download_failure_fallback(monkeypatch):
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)  # no real rate-gate delay in test
+    events: list[dict[str, object]] = []
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            raise RuntimeError("offmarket timeout")
+
+        def wait_for_timeout(self, *_a, **_k):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("download failure must not mark redis downloaded")
+
+    monkeypatch.setattr(offmarket, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    ok = offmarket.download_data(
+        FakePlaywright(),
+        "block_deals",
+        offmarket.datetime(2026, 6, 9),
+        offmarket.datetime(2026, 6, 10),
+        FakeRedis(),
+    )
+
+    assert ok is False
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.offmarket"
+    assert event["source"] == "nsedeals:block_deals:2026-06-09:2026-06-10"
+    assert event["fallback_type"] == "nse_offmarket_download_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert str(event["error"]) == "offmarket timeout"
+    assert event["metadata"] == {
+        "dtype": "block_deals",
+        "from_date": "2026-06-09",
+        "to_date": "2026-06-10",
+        "from_date_display": "09-06-2026",
+        "to_date_display": "10-06-2026",
+    }
+
+
+def test_nse_offmarket_parser_exports_file_run_state(monkeypatch):
+    failed_states = []
+    monkeypatch.setattr(
+        offmarket_parser,
+        "get_processed_keys",
+        lambda _source, status="processed": {"nsedeals/already.csv"} if status == "processed" else set(),
+    )
+    monkeypatch.setattr(
+        offmarket_parser,
+        "mark_failed",
+        lambda source_prefix, object_key, error_message: failed_states.append((source_prefix, object_key, error_message)),
+    )
+    monkeypatch.setattr(
+        offmarket_parser.store,
+        "list_files",
+        lambda _prefix: ["nsedeals/already.csv", "nsedeals/block_deals.csv", "nsedeals/bad.csv"],
+    )
+    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: f"/tmp/{key.rsplit('/', 1)[-1]}")
+
+    def fake_process(file_name, _csv_path):
+        if file_name == "nsedeals/bad.csv":
+            raise ValueError("bad schema")
+        return {"file_name": file_name, "dtype": "block_deals", "rows": 4, "from_date": "2026-06-01", "to_date": "2026-06-02"}
+
+    monkeypatch.setattr(offmarket_parser, "process_csv", fake_process)
+
+    state = offmarket_parser.run_parser()
+
+    assert state["source"] == "data.nseindia.offmarket_parser"
+    assert state["files_seen"] == 3
+    assert state["already_processed_count"] == 1
+    assert state["files_considered"] == 2
+    assert state["parsed_count"] == 1
+    assert state["failed_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["parse_failed_count"] == 1
+    assert state["failed_classifications"] == {"parser_bug": 1}
+    assert state["rows_written"] == 4
+    assert state["from_date"] == "2026-06-01"
+    assert state["to_date"] == "2026-06-02"
+    assert state["failed_files"][0]["file_name"] == "nsedeals/bad.csv"
+    assert state["failed_files"][0]["classification"] == "parser_bug"
+    assert failed_states == [("nsedeals", "nsedeals/bad.csv", "classification=parser_bug; ValueError: bad schema")]
+    assert state["state_advanced"] is True
+
+
+def test_nse_offmarket_parser_records_parse_failure_fallback(monkeypatch):
+    failed_states = []
+    events = []
+    monkeypatch.setattr(offmarket_parser, "get_processed_keys", lambda _source, status="processed": set())
+    monkeypatch.setattr(
+        offmarket_parser,
+        "mark_failed",
+        lambda source_prefix, object_key, error_message: failed_states.append((source_prefix, object_key, error_message)),
+    )
+    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/bulk_deals_bad.csv"])
+    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: "/tmp/bulk_deals_bad.csv")
+    monkeypatch.setattr(
+        offmarket_parser,
+        "process_csv",
+        lambda _file_name, _csv_path: (_ for _ in ()).throw(KeyError("client_name")),
+    )
+    monkeypatch.setattr(
+        offmarket_parser,
+        "record_local_fallback_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    state = offmarket_parser.run_parser()
+
+    assert state["failed_count"] == 1
+    assert state["failed_classifications"] == {"schema_changed": 1}
+    assert failed_states == [
+        ("nsedeals", "nsedeals/bulk_deals_bad.csv", "classification=schema_changed; KeyError: 'client_name'")
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.offmarket_parser"
+    assert event["source"] == "nsedeals/bulk_deals_bad.csv"
+    assert event["fallback_type"] == "nse_offmarket_parse_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], KeyError)
+    assert event["metadata"] == {
+        "file_name": "nsedeals/bulk_deals_bad.csv",
+        "classification": "schema_changed",
+        "error_message": "classification=schema_changed; KeyError: 'client_name'",
+    }
+
+
+def test_nse_offmarket_parser_marks_empty_valid_source(monkeypatch):
+    monkeypatch.setattr(offmarket_parser, "get_processed_keys", lambda _source, status="processed": set())
+    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/empty.csv"])
+    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: "/tmp/empty.csv")
+    monkeypatch.setattr(
+        offmarket_parser,
+        "process_csv",
+        lambda file_name, _csv_path: {
+            "file_name": file_name,
+            "dtype": "bulk_deals",
+            "status": offmarket_parser.EMPTY_VALID_STATUS,
+            "rows": 0,
+        },
+    )
+
+    state = offmarket_parser.run_parser()
+
+    assert state["files_considered"] == 1
+    assert state["parsed_count"] == 0
+    assert state["empty_valid_count"] == 1
+    assert state["failed_count"] == 0
+    assert state["rows_written"] == 1
+    assert state["state_advanced"] is True
+
+
+def test_nse_offmarket_parser_treats_empty_valid_source_as_completed(monkeypatch):
+    monkeypatch.setattr(
+        offmarket_parser,
+        "get_processed_keys",
+        lambda _source, status="processed": {"nsedeals/empty.csv"} if status == offmarket_parser.EMPTY_VALID_STATUS else set(),
+    )
+    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/empty.csv"])
+    monkeypatch.setattr(
+        offmarket_parser.store,
+        "get_as_temp_file",
+        lambda key: (_ for _ in ()).throw(AssertionError("completed empty key should not be fetched")),
+    )
+
+    state = offmarket_parser.run_parser()
+
+    assert state["already_processed_count"] == 1
+    assert state["files_considered"] == 0
+    assert state["empty_valid_count"] == 0
+    assert state["state_advanced"] is False
+
+
+def test_nse_offmarket_parser_schema_helpers_use_retryable_operations(monkeypatch):
+    operation_names = []
+    executed = []
+    fetch_rows = iter(
+        [
+            ("public.nseindia_offmarket_block_deals",),
+            None,
+            ("public.nseindia_offmarket_block_deals",),
+            ("integer",),
+        ]
+    )
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+        def fetchone(self):
+            return next(fetch_rows)
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(offmarket_parser, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(offmarket_parser, "execute_db_operation", fake_execute_db_operation)
+
+    offmarket_parser.ensure_unique_constraint(
+        "nseindia_offmarket_block_deals",
+        "uniq_test",
+        ["date", "symbol"],
+        drop_constraints=["old_constraint"],
+        drop_indexes=["old_index"],
+    )
+    offmarket_parser.ensure_text_columns("nseindia_offmarket_block_deals", ["symbol"])
+
+    assert operation_names == [
+        "offmarket_parser:ensure_unique_constraint:nseindia_offmarket_block_deals",
+        "offmarket_parser:ensure_text_columns:nseindia_offmarket_block_deals",
+    ]
+    assert any("DROP CONSTRAINT IF EXISTS old_constraint" in query for query, _ in executed)
+    assert any("DROP INDEX IF EXISTS old_index" in query for query, _ in executed)
+    assert any("ADD CONSTRAINT uniq_test UNIQUE (date, symbol)" in query for query, _ in executed)
+    assert any(
+        "ALTER TABLE nseindia_offmarket_block_deals ALTER COLUMN symbol TYPE TEXT" in query
+        for query, _ in executed
+    )
+
+
+def test_nse_offmarket_parser_failure_classifier_distinguishes_schema_and_parser_errors():
+    assert offmarket_parser.classify_offmarket_parse_failure(pd.errors.EmptyDataError("empty")) == "empty_valid_source"
+    assert offmarket_parser.classify_offmarket_parse_failure(KeyError("client_name")) == "schema_changed"
+    assert offmarket_parser.classify_offmarket_parse_failure(ValueError("Length mismatch: Expected axis has 4 elements")) == "schema_changed"
+    assert offmarket_parser.classify_offmarket_parse_failure(RuntimeError("unexpected parser branch")) == "parser_bug"
+
+
+def test_nse_offmarket_parser_main_exports_run_state(monkeypatch, capsys):
+    payload = {
+        "source": "data.nseindia.offmarket_parser",
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "files_seen": 1,
+        "failed_count": 1,
+        "failed_attempt_count": 1,
+        "parse_failed_count": 1,
+        "state_advanced": False,
+    }
+
+    class FakeRedis:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(offmarket_parser, "run_parser", lambda: payload)
+    monkeypatch.setattr(offmarket_parser, "rop", FakeRedis())
+
+    assert offmarket_parser.main() == 0
+    capsys.readouterr()
+
+    assert offmarket_parser.STOCKEY_RUN_STATE["source"] == "data.nseindia.offmarket_parser"
+    assert offmarket_parser.STOCKEY_RUN_STATE["failed_count"] == 1
+    assert offmarket_parser.STOCKEY_RUN_STATE["state_advanced"] is False
 
 
 def test_bhavcopy_parser_only_considers_last_year_keys():
@@ -6870,10 +7454,13 @@ def test_download_runner_prioritizes_dhan_and_registered_screener_sync():
         "data.dhanlive.ohlcv",
     ]
     parser_modules = [step["module"] for step in download_runner.PARSER_STEPS]
-    assert parser_modules[-2:] == [
-        "data.nseindia.indices_parser",
-        "data.benchmark_sync",
-    ]
+    # benchmark_sync must stay LAST -- it depends on the rest of the parser chain
+    # having already run. Checked as its own invariant (not a hardcoded tail
+    # slice) so a new, independent parser step (e.g. offmarket_parser,
+    # 2026-08-29) can be added anywhere before it without this test breaking on
+    # an unrelated ordering change.
+    assert parser_modules[-1] == "data.benchmark_sync"
+    assert "data.nseindia.indices_parser" in parser_modules
     # BUG FOUND LIVE 2026-08-20 (re-audit, HIGH): corporate_action_events was never
     # scheduled anywhere -- events_dividend/events_capital_change (in-scope per
     # docs/DATA_INVENTORY.md) went silently stale since the module was written. Must run
@@ -8684,6 +9271,52 @@ def test_clamp_to_last_trading_day_still_skips_declared_holidays(monkeypatch):
     assert dhan_ohlcv.clamp_to_last_trading_day(holiday).date() == date(2026, 8, 26)
 
 
+def test_ist_now_is_5h30m_ahead_of_utc(monkeypatch):
+    # BUG FOUND LIVE 2026-08-30 (adversarial review, confirmed against real data:
+    # 4,211 ticker-days in dhan_ohlcv_intraday since 2026-08-14 fall short of a
+    # full session -- every live intraday/daily sync used bare datetime.now(),
+    # which returns naive UTC digits on this UTC-clocked host, silently
+    # misread by Dhan's intraday API as IST wall-clock (5.5 hours later than
+    # the request actually intended).
+    class FixedUTC(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 30, 10, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(dhan_ohlcv, "datetime", FixedUTC)
+    result = dhan_ohlcv._ist_now()
+    assert result == datetime(2026, 8, 30, 15, 30, 0)  # 10:00 UTC -> 15:30 IST
+    assert result.tzinfo is None  # naive -- matches this module's own convention
+
+
+def test_choose_intraday_refresh_end_same_day_uses_ist_now_not_raw_utc(monkeypatch):
+    # REGRESSION GUARD for the exact bug: to_date=None on a normal trading day
+    # must resolve through _ist_now(), not a raw host-clock datetime.now(). Pins
+    # the live sync's actual to_date=None call shape.
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: set())
+    ist_now = datetime(2026, 8, 26, 18, 55, 0)  # a plausible post-close IST wall-clock reading
+    monkeypatch.setattr(dhan_ohlcv, "_ist_now", lambda: ist_now)
+
+    result = dhan_ohlcv.choose_intraday_refresh_end(None, exchange="NSE")
+
+    assert result == ist_now
+    # well past the 15:30 IST close -- a live sync at this moment must be able to
+    # reach the full session, not truncate it the way a UTC-misread "13:25" would.
+    assert result.hour >= dhan_ohlcv.MARKET_CLOSE_HOUR
+
+
+def test_choose_daily_refresh_end_same_day_uses_ist_now(monkeypatch):
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
+    monkeypatch.setattr(dhan_ohlcv, "load_special_weekend_trading_days", lambda target_date, **kwargs: set())
+    ist_now = datetime(2026, 8, 26, 18, 55, 0)
+    monkeypatch.setattr(dhan_ohlcv, "_ist_now", lambda: ist_now)
+
+    result = dhan_ohlcv.choose_daily_refresh_end(None, exchange="NSE")
+
+    assert result.date() == ist_now.date()
+
+
 def test_load_special_weekend_trading_days_returns_none_on_missing_table(monkeypatch):
     # same tolerant-degrade shape load_nse_holidays already uses for an unavailable table.
     class FakeUndefinedTable(Exception):
@@ -8843,6 +9476,82 @@ def test_sync_many_intraday_continues_after_symbol_error(monkeypatch):
     assert event["metadata"]["exchange"] == "NSE"
     assert event["metadata"]["asset_type"] == "stock"
     assert event["metadata"]["interval_minutes"] == 1
+
+
+def test_run_daily_intraday_sync_empty_universe_records_fallback(monkeypatch):
+    monkeypatch.setattr(dhan_intraday_daily_sync, "get_equity_universe", lambda: [])
+    events = []
+    monkeypatch.setattr(dhan_intraday_daily_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = dhan_intraday_daily_sync.run_daily_intraday_sync()
+
+    assert result == {"symbols": 0, "succeeded": 0, "failed": 0, "failed_symbols": [], "total_rows": 0}
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "intraday_daily_sync_empty_universe"
+    assert events[0]["severity"] == "error"
+
+
+def test_run_daily_intraday_sync_aggregates_results_and_flags_failures(monkeypatch):
+    monkeypatch.setattr(dhan_intraday_daily_sync, "get_equity_universe", lambda: ["AAA", "BBB", "BAD"])
+    monkeypatch.setattr(
+        dhan_intraday_daily_sync,
+        "sync_many_intraday",
+        lambda symbols, **k: [
+            {"ticker": "AAA", "rows": 10},
+            {"ticker": "BBB", "rows": 5},
+            {"ticker": "BAD", "rows": 0, "error": "ValueError: no identity"},
+        ],
+    )
+    events = []
+    monkeypatch.setattr(dhan_intraday_daily_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = dhan_intraday_daily_sync.run_daily_intraday_sync()
+
+    assert result["symbols"] == 3
+    assert result["succeeded"] == 2
+    assert result["failed"] == 1
+    assert result["failed_symbols"] == ["BAD"]
+    assert result["total_rows"] == 15
+    # 1/3 failed (>10%) -- must escalate to "error" severity, not stay "warn".
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "intraday_daily_sync_symbol_failures"
+    assert events[0]["severity"] == "error"
+
+
+def test_run_daily_intraday_sync_few_failures_stay_warn_severity(monkeypatch):
+    universe = [f"SYM{i}" for i in range(20)]
+    monkeypatch.setattr(dhan_intraday_daily_sync, "get_equity_universe", lambda: universe)
+    results = [{"ticker": s, "rows": 1} for s in universe[:19]] + [{"ticker": universe[19], "rows": 0, "error": "boom"}]
+    monkeypatch.setattr(dhan_intraday_daily_sync, "sync_many_intraday", lambda symbols, **k: results)
+    events = []
+    monkeypatch.setattr(dhan_intraday_daily_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = dhan_intraday_daily_sync.run_daily_intraday_sync()
+
+    assert result["failed"] == 1  # 1/20 = 5%, under the 10% degraded threshold
+    assert events[0]["severity"] == "warn"
+
+
+def test_main_status_degraded_when_failure_fraction_high(monkeypatch, capsys):
+    monkeypatch.setattr(
+        dhan_intraday_daily_sync,
+        "run_daily_intraday_sync",
+        lambda: {"symbols": 10, "succeeded": 5, "failed": 5, "failed_symbols": ["A", "B", "C", "D", "E"], "total_rows": 50},
+    )
+    dhan_intraday_daily_sync.main()
+    assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["status"] == "degraded"
+    assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["fallback_used"] is True
+
+
+def test_main_status_ok_when_no_failures(monkeypatch):
+    monkeypatch.setattr(
+        dhan_intraday_daily_sync,
+        "run_daily_intraday_sync",
+        lambda: {"symbols": 10, "succeeded": 10, "failed": 0, "failed_symbols": [], "total_rows": 100},
+    )
+    dhan_intraday_daily_sync.main()
+    assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["status"] == "ok"
+    assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["fallback_used"] is False
 
 
 def test_dhan_ohlcv_build_run_state_aggregates_windows_and_errors():
@@ -10403,6 +11112,18 @@ def test_data_coverage_report_check_table_daily_ok(monkeypatch):
     assert row["staleness_days"] == 0
 
 
+def test_dhan_ohlcv_intraday_is_monitored_as_daily_not_informational():
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-30): dhan_ohlcv_intraday stayed
+    # "informational" (no staleness check at all) even after it got a real daily
+    # producer (data/dhanlive/intraday_daily_sync.py, 2026-08-22) -- confirmed
+    # live the same day this was found: 4,211 ticker-days were silently short a
+    # full session's bars with nothing anywhere flagging it.
+    from scripts import data_coverage_report as dcr
+
+    spec = next(t for t in dcr.TABLES if t[0] == "dhan_ohlcv_intraday")
+    assert spec[3] == "daily"
+
+
 def test_data_coverage_report_check_table_daily_warn_and_error(monkeypatch):
     from scripts import data_coverage_report as dcr
 
@@ -10505,6 +11226,101 @@ def test_data_coverage_report_main_require_exits_nonzero_on_error(monkeypatch, c
 
     monkeypatch.setattr(dcr, "build_report", lambda: {"report_date": "2026-08-05", "overall": "warn", "counts": {"ok": 0, "warn": 1, "error": 0}, "tables": []})
     assert dcr.main(["--require"]) == 0
+
+
+def test_issue_digest_identity_report_ok_when_nothing_open(monkeypatch):
+    from scripts import issue_digest as idg
+
+    monkeypatch.setattr(idg, "resolve_open_identity_issues", lambda **k: {"mode": "apply", "counts": {"resolved": 2}})
+    monkeypatch.setattr(idg, "load_open_identity_issues", lambda **k: pd.DataFrame())
+    report = idg.build_identity_issue_report()
+    assert report == {
+        "status": "ok", "recheck_mode": "apply", "recheck_counts": {"resolved": 2},
+        "still_open": 0, "still_open_by_type": {},
+    }
+
+
+def test_issue_digest_identity_report_warn_and_error_thresholds(monkeypatch):
+    from scripts import issue_digest as idg
+
+    monkeypatch.setattr(idg, "resolve_open_identity_issues", lambda **k: {"mode": "dry_run", "counts": {}})
+
+    few_open = pd.DataFrame([{"issue_type": "dhan_ohlcv_history_unavailable"}] * 3)
+    monkeypatch.setattr(idg, "load_open_identity_issues", lambda **k: few_open)
+    report = idg.build_identity_issue_report(apply=False)
+    assert report["status"] == "warn"
+    assert report["still_open"] == 3
+    assert report["still_open_by_type"] == {"dhan_ohlcv_history_unavailable": 3}
+
+    many_open = pd.DataFrame([{"issue_type": "company_master_mapping_missing"}] * (idg.IDENTITY_ISSUE_ERROR_THRESHOLD + 1))
+    monkeypatch.setattr(idg, "load_open_identity_issues", lambda **k: many_open)
+    report = idg.build_identity_issue_report(apply=False)
+    assert report["status"] == "error"
+
+
+def test_issue_digest_build_report_aggregates_worst_status(monkeypatch):
+    from scripts import issue_digest as idg
+
+    monkeypatch.setattr(idg, "build_identity_issue_report", lambda **k: {
+        "status": "warn", "recheck_mode": "apply", "recheck_counts": {}, "still_open": 1, "still_open_by_type": {},
+    })
+    monkeypatch.setattr(idg, "summarize_fallback_events", lambda **k: {
+        "status": "error", "window_hours": 24, "active_count": 5, "error_count": 1, "warn_count": 0, "counts_by_type": {},
+    })
+    report = idg.build_report()
+    assert report["overall"] == "error"
+    assert report["identity_issues"]["status"] == "warn"
+    assert report["fallback_events"]["status"] == "error"
+
+
+def test_issue_digest_format_text_report_includes_both_halves():
+    from scripts import issue_digest as idg
+
+    report = {
+        "overall": "ok",
+        "identity_issues": {"status": "ok", "recheck_mode": "apply", "recheck_counts": {}, "still_open": 0, "still_open_by_type": {}},
+        "fallback_events": {"status": "ok", "window_hours": 24, "active_count": 0, "error_count": 0, "warn_count": 0, "counts_by_type": {}},
+    }
+    text = idg.format_text_report(report)
+    assert "overall=ok" in text
+    assert "identity_issues" in text and "fallback_events" in text
+
+
+def test_issue_digest_main_require_exits_nonzero_on_error(monkeypatch):
+    from scripts import issue_digest as idg
+
+    monkeypatch.setattr(idg, "build_report", lambda **k: {
+        "overall": "error",
+        "identity_issues": {"status": "error", "recheck_mode": "apply", "recheck_counts": {}, "still_open": 99, "still_open_by_type": {}},
+        "fallback_events": {"status": "ok", "window_hours": 24, "active_count": 0, "error_count": 0, "warn_count": 0, "counts_by_type": {}},
+    })
+    assert idg.main(["--require"]) == 1
+
+    monkeypatch.setattr(idg, "build_report", lambda **k: {
+        "overall": "warn",
+        "identity_issues": {"status": "warn", "recheck_mode": "apply", "recheck_counts": {}, "still_open": 1, "still_open_by_type": {}},
+        "fallback_events": {"status": "ok", "window_hours": 24, "active_count": 0, "error_count": 0, "warn_count": 0, "counts_by_type": {}},
+    })
+    assert idg.main(["--require"]) == 0
+
+
+def test_issue_digest_main_no_apply_passes_through(monkeypatch):
+    from scripts import issue_digest as idg
+
+    seen = {}
+
+    def fake_build_report(*, hours, apply):
+        seen["hours"] = hours
+        seen["apply"] = apply
+        return {
+            "overall": "ok",
+            "identity_issues": {"status": "ok", "recheck_mode": "dry_run", "recheck_counts": {}, "still_open": 0, "still_open_by_type": {}},
+            "fallback_events": {"status": "ok", "window_hours": hours, "active_count": 0, "error_count": 0, "warn_count": 0, "counts_by_type": {}},
+        }
+
+    monkeypatch.setattr(idg, "build_report", fake_build_report)
+    assert idg.main(["--no-apply", "--hours", "6"]) == 0
+    assert seen == {"hours": 6, "apply": False}
 
 
 def test_bse_search_response_parses_single_match():
@@ -11502,6 +12318,132 @@ def test_build_institutional_entry_event_row_resolves_bse_numeric_ticker_correct
     assert event["company_master_id"] == "nse:ALUFLUOR"  # not the naive "nse:524634"
 
 
+def test_compute_pledge_trend_no_prior_claims_no_direction():
+    # First-ever L2 row for a company -- no trend can be claimed, not a claimed "flat".
+    result = fundamentals_l2_state.compute_pledge_trend(12.0, None)
+    assert result == {"pledge_pct_prior": None, "pledge_pct_delta_pp": None, "pledge_pct_trend_direction": None}
+
+
+def test_compute_pledge_trend_increasing_at_threshold():
+    result = fundamentals_l2_state.compute_pledge_trend(12.0, 10.0)  # +2.0pp, at the threshold
+    assert result["pledge_pct_delta_pp"] == 2.0
+    assert result["pledge_pct_trend_direction"] == "increasing"
+
+
+def test_compute_pledge_trend_below_threshold_is_flat():
+    result = fundamentals_l2_state.compute_pledge_trend(11.5, 10.0)  # +1.5pp, below the 2.0pp threshold
+    assert result["pledge_pct_trend_direction"] == "flat"
+
+
+def test_compute_pledge_trend_decreasing():
+    result = fundamentals_l2_state.compute_pledge_trend(5.0, 10.0)
+    assert result["pledge_pct_delta_pp"] == -5.0
+    assert result["pledge_pct_trend_direction"] == "decreasing"
+
+
+def test_load_prior_pledge_levels_empty_company_ids_skips_query(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_l2_state, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not query with no company_ids"))
+    )
+    assert fundamentals_l2_state.load_prior_pledge_levels([]) == {}
+
+
+def test_load_prior_pledge_levels_reads_latest_row_per_company(monkeypatch):
+    df = pd.DataFrame([{"company_id": 1, "pledge_pct": 10.0}, {"company_id": 2, "pledge_pct": None}])
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return df
+
+    monkeypatch.setattr(fundamentals_l2_state, "sql_to_df", fake_sql_to_df)
+
+    levels = fundamentals_l2_state.load_prior_pledge_levels([1, 2])
+
+    assert levels == {1: 10.0}  # company 2's NULL pledge_pct is skipped, not coerced to 0.0
+    assert "DISTINCT ON (company_id)" in captured["query"]
+    assert "ORDER BY company_id, run_date DESC" in captured["query"]
+    assert captured["params"] == ([1, 2],)
+
+
+def test_build_pledge_increase_event_row_shape(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_l2_state,
+        "map_company_master_ids_nse_or_bse",
+        lambda tickers: pd.Series([f"nse:{t}" for t in tickers], index=tickers.index, dtype="string"),
+    )
+    row = {"ticker": "TESTCO", "pledge_pct": 12.0, "pledge_pct_prior": 10.0, "pledge_pct_delta_pp": 2.0}
+    event = fundamentals_l2_state._build_pledge_increase_event_row(row, run_date=date(2026, 8, 29), load_ts=pd.Timestamp("2026-08-29", tz="UTC"))
+
+    assert event["source"] == "l2_state"
+    assert event["news_id"] == "pledge_increase:TESTCO:2026-08-29"
+    assert event["company_master_id"] == "nse:TESTCO"
+    assert event["filing_type"] == "pledge_increase"
+    assert event["quantity"] == 2.0
+    assert event["disclosure_date"] == date(2026, 8, 29)
+    assert "12.0" in event["headline"]
+    assert "2.0" in event["headline"]
+
+
+def test_run_l2_state_refresh_writes_synthetic_event_on_pledge_increase(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
+    universe = pd.DataFrame([{"company_id": 1, "company_name": "Pledge Co", "ticker": "PLEDGECO"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {1: 15.0})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {1: 10.0})  # +5.0pp -> increasing
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"rows": {"Promoters": [74.37, 74.37, 74.37, 74.37]}},
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+    monkeypatch.setattr(fundamentals_l2_state, "_ensure_events_schema", lambda: None)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["pledge_increases"] == 1
+    assert len(upserts) == 2  # L2 state rows, then the synthetic event row
+    event_df, event_table, event_kwargs = upserts[1]
+    assert event_table == fundamentals_l2_state.EVENTS_TABLE
+    event_row = event_df.iloc[0]
+    assert event_row["filing_type"] == "pledge_increase"
+    assert event_row["quantity"] == 5.0
+
+
+def test_run_l2_state_refresh_no_synthetic_event_when_pledge_flat(monkeypatch):
+    monkeypatch.setattr(fundamentals_l2_state, "ensure_l2_valuation_columns_are_numeric", lambda: None)
+    universe = pd.DataFrame([{"company_id": 1, "company_name": "Flat Co", "ticker": "FLATCO"}])
+    monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {1: 10.5})
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {1: 10.0})  # +0.5pp -> flat
+    monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
+    monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
+    detail = {
+        "balance_sheet": {"rows": {"Borrowings": [17, 3], "CWIP": [0, 4], "Fixed Assets": [76, 95]}},
+        "profit_loss": {"rows": {"Operating Profit": [32, 31], "Interest": [4, 3]}},
+        "shareholding": {"rows": {"Promoters": [74.37, 74.37, 74.37, 74.37]}},
+    }
+    monkeypatch.setattr(fundamentals_l2_state, "fetch_company_detail", lambda session, ticker: detail)
+    upserts = []
+    monkeypatch.setattr(fundamentals_l2_state, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_l2_state, "record_local_fallback_event", lambda **kwargs: None)
+
+    result = fundamentals_l2_state.run_l2_state_refresh(session=object())
+
+    assert result["pledge_increases"] == 0
+    assert len(upserts) == 1  # only the L2 state upsert, no synthetic event
+
+
 def test_fetch_pledge_levels_builds_dict_keyed_by_company_id(monkeypatch):
     companies = [
         {"company_id": 3163, "metrics": {"pledged_pct": 96.64}},
@@ -11688,6 +12630,7 @@ def test_run_l2_state_refresh_upserts_and_logs_deferred_fields(monkeypatch):
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {1: 5.0})
     monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {1: {"pe": 10.0, "historical_pe_5y": 20.0}})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {})
     monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {"AAREYDRUGS": "IN01", "TCC": "IN01"})
     monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
     monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
@@ -11743,6 +12686,7 @@ def test_run_l2_state_refresh_does_not_mark_crawled_when_the_batched_upsert_fail
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
     monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {})
     monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
     monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
     detail = {
@@ -11783,6 +12727,7 @@ def test_run_l2_state_refresh_isolates_one_market_wide_query_failure(monkeypatch
         "fetch_valuation_levels",
         lambda session: (_ for _ in ()).throw(ValueError("Could not find screener.in results table in the response")),
     )
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {})
     monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {"AAREYDRUGS": "IN01"})
     monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
     monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
@@ -11813,6 +12758,7 @@ def test_run_l2_state_refresh_writes_synthetic_event_on_institutional_first_entr
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
     monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {})
     monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
     monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
     monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
@@ -11851,6 +12797,7 @@ def test_run_l2_state_refresh_no_synthetic_event_when_no_first_entry(monkeypatch
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
     monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {})
     monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
     monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
     monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
@@ -11881,6 +12828,7 @@ def test_run_l2_state_refresh_skips_a_company_whose_detail_fetch_fails(monkeypat
     monkeypatch.setattr(fundamentals_l2_state, "load_l1_universe", lambda: universe)
     monkeypatch.setattr(fundamentals_l2_state, "fetch_pledge_levels", lambda session: {})
     monkeypatch.setattr(fundamentals_l2_state, "fetch_valuation_levels", lambda session: {})
+    monkeypatch.setattr(fundamentals_l2_state, "load_prior_pledge_levels", lambda company_ids: {})
     monkeypatch.setattr(fundamentals_l2_state, "load_sector_codes_for_tickers", lambda tickers: {})
     monkeypatch.setattr(fundamentals_l2_state, "filter_universe_to_due", lambda u: u)
     monkeypatch.setattr(fundamentals_l2_state, "_mark_crawled", lambda cid, ticker: None)
@@ -15400,6 +16348,25 @@ def test_institutional_entry_is_in_supported_filing_types_and_evaluators():
     assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["institutional_entry"] is fundamentals_l3_triggers.evaluate_institutional_entry_trigger
 
 
+def test_evaluate_pledge_increase_trigger_always_alerts_regardless_of_l2_state():
+    assert fundamentals_l3_triggers.evaluate_pledge_increase_trigger({}, {"promoter_stake_direction": "decreasing"})["trigger_type"] == "pledge_increase"
+    assert fundamentals_l3_triggers.evaluate_pledge_increase_trigger({}, None)["trigger_type"] == "pledge_increase"
+
+
+def test_evaluate_pledge_increase_trigger_uses_event_headline_as_reasoning():
+    result = fundamentals_l3_triggers.evaluate_pledge_increase_trigger({"headline": "Promoter pledge rose 5.0pp to 15.0%"}, None)
+    assert "5.0pp" in result["reasoning"]
+
+
+def test_pledge_increase_is_in_supported_filing_types_and_evaluators():
+    # REGRESSION GUARD: TRIGGER_EVALUATORS alone is not enough -- a filing_type
+    # missing from SUPPORTED_FILING_TYPES is never queried by run_l3_rule_triggers
+    # at all (see its own SELECT ... WHERE filing_type IN (...) built from this
+    # tuple), so the evaluator would silently never fire on a real synthetic event.
+    assert "pledge_increase" in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+    assert fundamentals_l3_triggers.TRIGGER_EVALUATORS["pledge_increase"] is fundamentals_l3_triggers.evaluate_pledge_increase_trigger
+
+
 def _results_event(**overrides):
     extracted = {
         "period_type": "Q1",
@@ -15868,6 +16835,641 @@ def test_run_l3_rule_triggers_attaches_investor_tiers_to_capital_raise_reasoning
     df, _, _ = upserts[0]
     assert "Acme Fund" in df.iloc[0]["reasoning"]
     assert "marquee" in df.iloc[0]["reasoning"]
+
+
+def test_run_l3_rule_triggers_attaches_investor_tiers_to_bulk_deal_buy_reasoning(monkeypatch):
+    # REGRESSION GUARD (PRD §12 todo #3, 2026-08-29): the tier-resolution gate used
+    # to check `filing_type == "capital_raise"` only -- bulk_deal_buy/sell would
+    # otherwise silently never get investor_tiers attached despite TRIGGER_EVALUATORS
+    # calling _summarize_investor_tiers on event.get("investor_tiers") regardless.
+    monkeypatch.setattr(fundamentals_l3_triggers, "_bootstrap_rule_trigger_column", lambda: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_ensure_alerts_table", lambda: None)
+    events = pd.DataFrame(
+        [
+            {
+                "source": "deal_flow", "news_id": "n1", "company_master_id": "nse:X", "filing_type": "bulk_deal_buy",
+                "headline": "Bought 10000 shares via bulk deals at 150.0 -- Acme Fund", "rating_action_type": None,
+                "transaction_type": "BUY", "insider_name": None, "quantity": 10000, "disclosure_date": date(2026, 8, 1),
+                "structured_extraction_json": json.dumps({"investor_names": ["Acme Fund"]}),
+            }
+        ]
+    )
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_candidate_events", lambda limit=None: events)
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_latest_l2_state", lambda: pd.DataFrame(columns=["ticker"]))
+    monkeypatch.setattr(fundamentals_l3_triggers, "load_investor_tiers", lambda: pd.DataFrame([{"investor_key": "acme fund", "llm_tier": "recognized", "override_tier": "marquee"}]))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l3_triggers, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_l3_triggers, "_set_rule_trigger_status", lambda **kwargs: None)
+    monkeypatch.setattr(fundamentals_l3_triggers, "_record_fallback", lambda *a, **k: None)
+
+    fundamentals_l3_triggers.run_l3_rule_triggers()
+
+    df, _, _ = upserts[0]
+    assert df.iloc[0]["trigger_type"] == "bulk_deal_buy"
+    assert "Acme Fund" in df.iloc[0]["reasoning"]
+    assert "marquee" in df.iloc[0]["reasoning"]
+
+
+def test_evaluate_bulk_deal_buy_trigger_always_alerts_regardless_of_l2_state():
+    assert fundamentals_l3_triggers.evaluate_bulk_deal_buy_trigger({}, {"promoter_stake_direction": "decreasing"})["trigger_type"] == "bulk_deal_buy"
+    assert fundamentals_l3_triggers.evaluate_bulk_deal_buy_trigger({}, None)["trigger_type"] == "bulk_deal_buy"
+
+
+def test_evaluate_bulk_deal_sell_trigger_always_alerts_regardless_of_l2_state():
+    assert fundamentals_l3_triggers.evaluate_bulk_deal_sell_trigger({}, None)["trigger_type"] == "bulk_deal_sell"
+
+
+def test_evaluate_bulk_deal_buy_trigger_uses_event_headline_as_reasoning():
+    result = fundamentals_l3_triggers.evaluate_bulk_deal_buy_trigger({"headline": "Bought 500 shares via block deals at 20.0 -- X"}, None)
+    assert "500 shares" in result["reasoning"]
+
+
+def test_bulk_deal_buy_and_sell_are_in_supported_filing_types_and_evaluators():
+    for filing_type, evaluator in (
+        ("bulk_deal_buy", fundamentals_l3_triggers.evaluate_bulk_deal_buy_trigger),
+        ("bulk_deal_sell", fundamentals_l3_triggers.evaluate_bulk_deal_sell_trigger),
+    ):
+        assert filing_type in fundamentals_l3_triggers.SUPPORTED_FILING_TYPES
+        assert fundamentals_l3_triggers.TRIGGER_EVALUATORS[filing_type] is evaluator
+
+
+def test_deal_flow_load_l1_company_master_ids(monkeypatch):
+    monkeypatch.setattr(fundamentals_deal_flow, "build_l1_ticker_by_company_master_id", lambda: {"nse:A": "A", "nse:B": "B"})
+    assert fundamentals_deal_flow.load_l1_company_master_ids() == {"nse:A", "nse:B"}
+
+
+def test_deal_flow_load_recent_deals_empty_ids_skips_query(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_deal_flow, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not query with no company_master_ids"))
+    )
+    assert fundamentals_deal_flow.load_recent_deals(set()).empty
+
+
+def test_deal_flow_load_recent_deals_first_run_uses_wide_initial_window(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_deal_flow, "sql_to_df", fake_sql_to_df)
+
+    fundamentals_deal_flow.load_recent_deals({"nse:A"}, last_processed_date=None)
+
+    assert "nseindia_block_deals" in captured["query"]
+    assert "nseindia_bulk_deals" in captured["query"]
+    assert "UNION ALL" in captured["query"]
+    assert "nseindia_short_selling" not in captured["query"]  # deliberately excluded, see module docstring
+    assert str(fundamentals_deal_flow.DEAL_FLOW_INITIAL_LOOKBACK_DAYS) in captured["query"]
+    assert captured["params"] == (["nse:A"], ["nse:A"])
+    assert "date::date" in captured["query"]  # defensive cast, same convention as other NSE date comparisons
+
+
+def test_deal_flow_load_recent_deals_scans_from_watermark_not_a_fixed_window(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-30, HIGH): a fixed trailing window
+    # measured from CURRENT_DATE permanently drops anything older than the window,
+    # including an entire first-time historical backfill or any multi-day NSE
+    # stall longer than the window -- offmarket.py's own retry design explicitly
+    # anticipates stalls like that. Scanning from the watermark instead means any
+    # gap length self-heals once new deals land, regardless of how long it was.
+    captured = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_deal_flow, "sql_to_df", fake_sql_to_df)
+
+    fundamentals_deal_flow.load_recent_deals({"nse:A"}, last_processed_date=date(2026, 1, 1))
+
+    assert "CURRENT_DATE" not in captured["query"]  # not clipped to a fixed window from today
+    assert str(fundamentals_deal_flow.DEAL_FLOW_WATERMARK_OVERLAP_DAYS) in captured["query"]
+    assert captured["params"] == (["nse:A"], date(2026, 1, 1), ["nse:A"], date(2026, 1, 1))
+
+
+def test_load_last_processed_date_none_when_no_prior_events(monkeypatch):
+    monkeypatch.setattr(fundamentals_deal_flow, "sql_to_df", lambda q: pd.DataFrame([{"max_date": None}]))
+    assert fundamentals_deal_flow.load_last_processed_date() is None
+
+
+def test_load_last_processed_date_returns_max_disclosure_date(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(query):
+        captured["query"] = query
+        return pd.DataFrame([{"max_date": date(2026, 8, 20)}])
+
+    monkeypatch.setattr(fundamentals_deal_flow, "sql_to_df", fake_sql_to_df)
+    assert fundamentals_deal_flow.load_last_processed_date() == date(2026, 8, 20)
+    assert "source = 'deal_flow'" in captured["query"]
+
+
+def test_build_deal_flow_event_row_buy_shape():
+    deal = {
+        "date": date(2026, 8, 1), "symbol": "TESTCO", "client_name": "Acme Fund", "buysell": "BUY",
+        "quantity": 10000, "price": 150.0, "company_master_id": "nse:TESTCO", "deal_source": "bulk_deals",
+    }
+    event = fundamentals_deal_flow._build_deal_flow_event_row(deal, load_ts=pd.Timestamp("2026-08-01", tz="UTC"))
+
+    assert event["filing_type"] == "bulk_deal_buy"
+    assert event["company_master_id"] == "nse:TESTCO"
+    assert event["transaction_type"] == "BUY"
+    assert event["quantity"] == 10000
+    assert event["disclosure_date"] == date(2026, 8, 1)
+    assert "Bought" in event["headline"] and "Acme Fund" in event["headline"]
+    assert json.loads(event["structured_extraction_json"]) == {"investor_names": ["Acme Fund"]}
+    assert event["structured_extraction_status"] == "done"
+    assert event["news_id"] == "bulk_deals:TESTCO:2026-08-01:Acme Fund:BUY:10000:150.0"
+
+
+def test_build_deal_flow_event_row_sell_shape():
+    deal = {
+        "date": date(2026, 8, 1), "symbol": "TESTCO", "client_name": "Acme Fund", "buysell": "SELL",
+        "quantity": 500, "price": 20.0, "company_master_id": "nse:TESTCO", "deal_source": "block_deals",
+    }
+    event = fundamentals_deal_flow._build_deal_flow_event_row(deal, load_ts=pd.Timestamp("2026-08-01", tz="UTC"))
+    assert event["filing_type"] == "bulk_deal_sell"
+    assert "Sold" in event["headline"]
+
+
+def test_build_deal_flow_event_row_no_client_name_skips_investor_discovery():
+    deal = {"date": date(2026, 8, 1), "symbol": "TESTCO", "client_name": "", "buysell": "BUY", "quantity": 1, "price": 1.0, "company_master_id": "nse:TESTCO", "deal_source": "bulk_deals"}
+    event = fundamentals_deal_flow._build_deal_flow_event_row(deal, load_ts=pd.Timestamp("2026-08-01", tz="UTC"))
+    assert event["structured_extraction_json"] is None
+    assert event["structured_extraction_status"] is None
+
+
+def test_build_deal_flow_event_row_missing_buysell_returns_none():
+    deal = {"date": date(2026, 8, 1), "symbol": "TESTCO", "client_name": "X", "buysell": "", "quantity": 1, "price": 1.0, "company_master_id": "nse:TESTCO", "deal_source": "bulk_deals"}
+    assert fundamentals_deal_flow._build_deal_flow_event_row(deal, load_ts=pd.Timestamp("2026-08-01", tz="UTC")) is None
+
+
+def test_run_deal_flow_detection_no_l1_universe_returns_early(monkeypatch):
+    monkeypatch.setattr(fundamentals_deal_flow, "load_l1_company_master_ids", lambda: set())
+    monkeypatch.setattr(
+        fundamentals_deal_flow, "load_recent_deals", lambda ids: (_ for _ in ()).throw(AssertionError("must not query with no universe"))
+    )
+    result = fundamentals_deal_flow.run_deal_flow_detection()
+    assert result == {"deals_seen": 0, "events_written": 0, "buy_events": 0, "sell_events": 0}
+
+
+def test_run_deal_flow_detection_no_deals_returns_early(monkeypatch):
+    monkeypatch.setattr(fundamentals_deal_flow, "load_l1_company_master_ids", lambda: {"nse:A"})
+    monkeypatch.setattr(fundamentals_deal_flow, "load_last_processed_date", lambda: None)
+    monkeypatch.setattr(fundamentals_deal_flow, "load_recent_deals", lambda ids, **k: pd.DataFrame())
+    result = fundamentals_deal_flow.run_deal_flow_detection()
+    assert result == {"deals_seen": 0, "events_written": 0, "buy_events": 0, "sell_events": 0}
+
+
+def test_run_deal_flow_detection_passes_watermark_to_load_recent_deals(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(fundamentals_deal_flow, "load_l1_company_master_ids", lambda: {"nse:A"})
+    monkeypatch.setattr(fundamentals_deal_flow, "load_last_processed_date", lambda: date(2026, 8, 15))
+
+    def fake_load_recent_deals(ids, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_deal_flow, "load_recent_deals", fake_load_recent_deals)
+    fundamentals_deal_flow.run_deal_flow_detection()
+    assert captured["last_processed_date"] == date(2026, 8, 15)
+
+
+def test_run_deal_flow_detection_writes_events_and_counts_buy_sell(monkeypatch):
+    deals = pd.DataFrame(
+        [
+            {"date": date(2026, 8, 1), "symbol": "A", "client_name": "Acme", "buysell": "BUY", "quantity": 100, "price": 10.0, "company_master_id": "nse:A", "deal_source": "bulk_deals"},
+            {"date": date(2026, 8, 1), "symbol": "B", "client_name": "Beta", "buysell": "SELL", "quantity": 200, "price": 20.0, "company_master_id": "nse:B", "deal_source": "block_deals"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_deal_flow, "load_l1_company_master_ids", lambda: {"nse:A", "nse:B"})
+    monkeypatch.setattr(fundamentals_deal_flow, "load_last_processed_date", lambda: None)
+    monkeypatch.setattr(fundamentals_deal_flow, "load_recent_deals", lambda ids, **k: deals)
+    monkeypatch.setattr(fundamentals_deal_flow, "_ensure_events_schema", lambda: None)
+    upserts = []
+    monkeypatch.setattr(fundamentals_deal_flow, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_deal_flow.run_deal_flow_detection()
+
+    assert result == {"deals_seen": 2, "events_written": 2, "buy_events": 1, "sell_events": 1}
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_deal_flow.EVENTS_TABLE
+    assert kwargs["unique_keys"] == ["source", "news_id"]
+    assert set(df["filing_type"]) == {"bulk_deal_buy", "bulk_deal_sell"}
+
+
+def test_run_deal_flow_detection_main_exports_run_state(monkeypatch, capsys):
+    monkeypatch.setattr(
+        fundamentals_deal_flow,
+        "run_deal_flow_detection",
+        lambda: {"deals_seen": 3, "events_written": 2, "buy_events": 1, "sell_events": 1},
+    )
+    assert fundamentals_deal_flow.main() == 0
+    capsys.readouterr()
+    assert fundamentals_deal_flow.STOCKEY_RUN_STATE["source"] == "fundamentals.screens.deal_flow"
+    assert fundamentals_deal_flow.STOCKEY_RUN_STATE["rows_written"] == 2
+    assert fundamentals_deal_flow.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_load_unclassified_investor_names_includes_deal_flow_filing_types(monkeypatch):
+    # REGRESSION GUARD (PRD §12 todo #3): deal_flow's synthesized investor names
+    # must actually be discoverable by investor_classification, or they'd sit at
+    # "unknown" tier forever with nothing ever queuing them for LLM classification.
+    captured = {}
+
+    def fake_sql_to_df(query):
+        captured["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_investor_classification, "sql_to_df", fake_sql_to_df)
+    fundamentals_investor_classification.load_unclassified_investor_names()
+    assert "bulk_deal_buy" in captured["query"]
+    assert "bulk_deal_sell" in captured["query"]
+    assert "capital_raise" in captured["query"]
+
+
+# --- confluence_score.py (PRD §12 todo #4) ---
+
+def test_compute_fundamentals_trajectory_axis_no_data_is_none():
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({}) is None
+
+
+def test_compute_fundamentals_trajectory_axis_decreasing_is_true():
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": "decreasing"}) is True
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"cwip_ratio_trend_direction": "decreasing"}) is True
+
+
+def test_compute_fundamentals_trajectory_axis_increasing_is_false():
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": "increasing"}) is False
+
+
+def test_compute_fundamentals_trajectory_axis_contradiction_prefers_false():
+    # debt worsening while CWIP improves -- a real contradiction must not resolve to
+    # a claimed "True" just because one sub-signal happens to be positive.
+    row = {"net_debt_trend_direction": "increasing", "cwip_ratio_trend_direction": "decreasing"}
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis(row) is False
+
+
+def test_compute_fundamentals_trajectory_axis_both_flat_is_none():
+    row = {"net_debt_trend_direction": "flat", "cwip_ratio_trend_direction": "flat"}
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis(row) is None
+
+
+def test_compute_ownership_axis_promoter_decreasing_is_false_even_with_institutional_increasing():
+    row = {"promoter_stake_direction": "decreasing", "institutional_stake_direction": "increasing"}
+    assert fundamentals_confluence_score.compute_ownership_axis(row, set()) is False
+
+
+def test_compute_ownership_axis_pledge_increasing_is_false():
+    row = {"pledge_pct_trend_direction": "increasing"}
+    assert fundamentals_confluence_score.compute_ownership_axis(row, set()) is False
+
+
+def test_compute_ownership_axis_recent_sell_trigger_is_false():
+    assert fundamentals_confluence_score.compute_ownership_axis({}, {"bulk_deal_sell"}) is False
+    assert fundamentals_confluence_score.compute_ownership_axis({}, {"insider_sell_surprise"}) is False
+
+
+def test_compute_ownership_axis_institutional_increasing_no_red_flags_is_true():
+    row = {"institutional_stake_direction": "increasing", "promoter_stake_direction": "flat"}
+    assert fundamentals_confluence_score.compute_ownership_axis(row, set()) is True
+
+
+def test_compute_ownership_axis_no_data_at_all_is_none():
+    assert fundamentals_confluence_score.compute_ownership_axis({}, set()) is None
+
+
+def test_compute_ownership_axis_no_red_flag_but_no_accumulation_is_none():
+    row = {"promoter_stake_direction": "flat", "institutional_stake_direction": "flat"}
+    assert fundamentals_confluence_score.compute_ownership_axis(row, set()) is None
+
+
+def test_compute_event_corroboration_axis_negative_wins_over_positive():
+    result = fundamentals_confluence_score.compute_event_corroboration_axis({"insider_buy", "rating_downgrade"})
+    assert result is False
+
+
+def test_compute_event_corroboration_axis_positive_only_is_true():
+    assert fundamentals_confluence_score.compute_event_corroboration_axis({"insider_buy"}) is True
+
+
+def test_compute_event_corroboration_axis_no_classified_alerts_is_none():
+    assert fundamentals_confluence_score.compute_event_corroboration_axis(set()) is None
+    assert fundamentals_confluence_score.compute_event_corroboration_axis({"capital_raise"}) is None  # deliberately unclassified
+
+
+def test_compute_sector_cycle_axis():
+    assert fundamentals_confluence_score.compute_sector_cycle_axis("capacity_discipline") is True
+    assert fundamentals_confluence_score.compute_sector_cycle_axis("capacity_expansion") is False
+    assert fundamentals_confluence_score.compute_sector_cycle_axis("balanced") is None
+    assert fundamentals_confluence_score.compute_sector_cycle_axis(None) is None
+
+
+def test_compute_valuation_axis():
+    assert fundamentals_confluence_score.compute_valuation_axis(0.9) is True
+    assert fundamentals_confluence_score.compute_valuation_axis(1.1) is False
+    assert fundamentals_confluence_score.compute_valuation_axis(1.0) is None
+    assert fundamentals_confluence_score.compute_valuation_axis(None) is None
+
+
+def test_compute_confluence_row_counts_true_false_and_evaluable():
+    l2_row = {
+        "net_debt_trend_direction": "decreasing",  # True
+        "institutional_stake_direction": "increasing",  # ownership True
+        "promoter_stake_direction": "flat",
+        "valuation_vs_own_history_ratio": 1.5,  # False
+    }
+    row = fundamentals_confluence_score.compute_confluence_row(l2_row, "capacity_expansion", set())
+    assert row["axis_fundamentals_trajectory"] is True
+    assert row["axis_ownership"] is True
+    assert row["axis_sector_cycle"] is False
+    assert row["axis_valuation"] is False
+    assert row["axis_event_corroboration"] is None
+    assert row["confluence_count"] == 2
+    assert row["contradicting_count"] == 2
+    assert row["evaluable_count"] == 4
+
+
+def test_load_active_watchlist_company_ids_empty(monkeypatch):
+    monkeypatch.setattr(fundamentals_confluence_score, "sql_to_df", lambda q: pd.DataFrame())
+    assert fundamentals_confluence_score.load_active_watchlist_company_ids() == []
+
+
+def test_load_active_watchlist_company_ids_filters_active_status(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(q):
+        captured["query"] = q
+        return pd.DataFrame([{"company_master_id": "nse:A"}, {"company_master_id": "nse:B"}])
+
+    monkeypatch.setattr(fundamentals_confluence_score, "sql_to_df", fake_sql_to_df)
+    ids = fundamentals_confluence_score.load_active_watchlist_company_ids()
+    assert ids == ["nse:A", "nse:B"]
+    assert "status = 'active'" in captured["query"]
+
+
+def test_load_l2_state_by_ticker_empty_tickers_skips_query(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_confluence_score, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not query with no tickers"))
+    )
+    assert fundamentals_confluence_score.load_l2_state_by_ticker([]) == {}
+
+
+def test_load_l2_state_by_ticker_keyed_by_ticker(monkeypatch):
+    monkeypatch.setattr(fundamentals_confluence_score, "ensure_l2_pledge_trend_columns", lambda: None)
+    df = pd.DataFrame([{"ticker": "A", "net_debt_trend_direction": "decreasing"}])
+    monkeypatch.setattr(fundamentals_confluence_score, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_confluence_score.load_l2_state_by_ticker(["A"])
+    assert result["A"]["net_debt_trend_direction"] == "decreasing"
+
+
+def test_load_l2_state_by_ticker_calls_ensure_pledge_trend_columns_first(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-29): pledge_pct_trend_direction is a
+    # new column that only exists once run_l2_state_refresh has written it at least
+    # once since PRD §12 todo #2 shipped -- crashed with psycopg2.errors.
+    # UndefinedColumn on a real DB refreshed under the older schema.
+    calls = []
+    monkeypatch.setattr(fundamentals_confluence_score, "ensure_l2_pledge_trend_columns", lambda: calls.append(1))
+    monkeypatch.setattr(fundamentals_confluence_score, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    fundamentals_confluence_score.load_l2_state_by_ticker(["A"])
+    assert calls == [1]
+
+
+def test_load_sector_phase_by_company_id_empty_ids_skips_query(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_confluence_score, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not query with no ids"))
+    )
+    assert fundamentals_confluence_score.load_sector_phase_by_company_id([]) == {}
+
+
+def test_load_sector_phase_by_company_id_joins_sector_to_phase(monkeypatch):
+    calls = iter(
+        [
+            pd.DataFrame([{"company_master_id": "nse:A", "sector_code": "IN01"}, {"company_master_id": "nse:B", "sector_code": "IN99"}]),
+            pd.DataFrame([{"sector_code": "IN01", "phase": "capacity_discipline"}]),
+        ]
+    )
+    monkeypatch.setattr(fundamentals_confluence_score, "sql_to_df", lambda *a, **k: next(calls))
+    result = fundamentals_confluence_score.load_sector_phase_by_company_id(["nse:A", "nse:B"])
+    assert result == {"nse:A": "capacity_discipline"}  # nse:B's sector (IN99) has no phase row -- excluded, not guessed
+
+
+def test_load_recent_trigger_types_by_company_id_groups_by_company(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:A", "trigger_type": "insider_buy"},
+            {"company_master_id": "nse:A", "trigger_type": "pledge_increase"},
+            {"company_master_id": "nse:B", "trigger_type": "rating_downgrade"},
+        ]
+    )
+    monkeypatch.setattr(fundamentals_confluence_score, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_confluence_score.load_recent_trigger_types_by_company_id(["nse:A", "nse:B"])
+    assert result == {"nse:A": {"insider_buy", "pledge_increase"}, "nse:B": {"rating_downgrade"}}
+
+
+def test_run_confluence_score_refresh_no_watchlist_returns_early(monkeypatch):
+    monkeypatch.setattr(fundamentals_confluence_score, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_confluence_score, "load_active_watchlist_company_ids", lambda: [])
+    result = fundamentals_confluence_score.run_confluence_score_refresh()
+    assert result == {"rows": 0, "companies_no_l2_state": 0}
+
+
+def test_run_confluence_score_refresh_calls_ensure_table_before_anything_else(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-29): see _ensure_confluence_score_table's
+    # own docstring -- upsert_to_db's CREATE TABLE IF NOT EXISTS never fires until a
+    # write happens, so a fresh DB needs this called before ANY query against the table.
+    calls = []
+    monkeypatch.setattr(fundamentals_confluence_score, "_ensure_confluence_score_table", lambda: calls.append(1))
+    monkeypatch.setattr(fundamentals_confluence_score, "load_active_watchlist_company_ids", lambda: [])
+    fundamentals_confluence_score.run_confluence_score_refresh()
+    assert calls == [1]
+
+
+def test_run_confluence_score_refresh_degrades_gracefully_when_no_l2_state(monkeypatch):
+    # A watchlist company with no ticker mapping / no L2 row at all must not crash --
+    # every axis touching L2 fields just degrades to None, counted via companies_no_l2_state.
+    monkeypatch.setattr(fundamentals_confluence_score, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_confluence_score, "load_active_watchlist_company_ids", lambda: ["nse:NOMAP"])
+    monkeypatch.setattr(fundamentals_confluence_score, "build_l1_ticker_by_company_master_id", lambda: {})
+    monkeypatch.setattr(fundamentals_confluence_score, "load_l2_state_by_ticker", lambda tickers: {})
+    monkeypatch.setattr(fundamentals_confluence_score, "load_sector_phase_by_company_id", lambda ids: {})
+    monkeypatch.setattr(fundamentals_confluence_score, "load_recent_trigger_types_by_company_id", lambda ids: {})
+    upserts = []
+    monkeypatch.setattr(fundamentals_confluence_score, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_confluence_score.run_confluence_score_refresh()
+
+    assert result == {"rows": 1, "companies_no_l2_state": 1}
+    df, table, kwargs = upserts[0]
+    assert table == fundamentals_confluence_score.RESULTS_TABLE
+    assert kwargs["unique_keys"] == ["company_master_id", "run_date", "score_version"]
+    assert df.iloc[0]["confluence_count"] == 0
+
+
+def test_run_confluence_score_refresh_writes_full_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_confluence_score, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_confluence_score, "load_active_watchlist_company_ids", lambda: ["nse:A"])
+    monkeypatch.setattr(fundamentals_confluence_score, "build_l1_ticker_by_company_master_id", lambda: {"nse:A": "A"})
+    monkeypatch.setattr(
+        fundamentals_confluence_score,
+        "load_l2_state_by_ticker",
+        lambda tickers: {"A": {"net_debt_trend_direction": "decreasing", "institutional_stake_direction": "increasing", "promoter_stake_direction": "flat"}},
+    )
+    monkeypatch.setattr(fundamentals_confluence_score, "load_sector_phase_by_company_id", lambda ids: {"nse:A": "capacity_discipline"})
+    monkeypatch.setattr(fundamentals_confluence_score, "load_recent_trigger_types_by_company_id", lambda ids: {"nse:A": {"insider_buy"}})
+    upserts = []
+    monkeypatch.setattr(fundamentals_confluence_score, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+
+    result = fundamentals_confluence_score.run_confluence_score_refresh()
+
+    assert result == {"rows": 1, "companies_no_l2_state": 0}
+    df, _, _ = upserts[0]
+    row = df.iloc[0]
+    assert row["company_master_id"] == "nse:A"
+    assert row["score_version"] == fundamentals_confluence_score.SCORE_VERSION
+    assert row["confluence_count"] == 4  # trajectory, ownership, sector, event_corroboration all True
+    assert row["contradicting_count"] == 0
+
+
+def test_confluence_score_main_exports_run_state(monkeypatch, capsys):
+    monkeypatch.setattr(fundamentals_confluence_score, "run_confluence_score_refresh", lambda: {"rows": 5, "companies_no_l2_state": 1})
+    assert fundamentals_confluence_score.main() == 0
+    capsys.readouterr()
+    assert fundamentals_confluence_score.STOCKEY_RUN_STATE["source"] == "fundamentals.screens.confluence_score"
+    assert fundamentals_confluence_score.STOCKEY_RUN_STATE["rows_written"] == 5
+    assert fundamentals_confluence_score.STOCKEY_RUN_STATE["fallback_used"] is True
+    assert fundamentals_confluence_score.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+# --- l5_sizing.py (PRD §12 todo #8) ---
+
+def test_compute_position_size_no_adv_data_falls_back_to_equal_weight():
+    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=None)
+    assert result == {
+        "equal_weight_capital_rs": 200000.0,
+        "adv_cap_rs": None,
+        "recommended_size_rs": 200000.0,
+        "binding_constraint": "equal_weight_no_adv_data",
+    }
+
+
+def test_compute_position_size_adv_cap_binds_when_illiquid():
+    # 10% of a thin Rs 10L/day ADV = Rs 1L, below the Rs 2L equal-weight default.
+    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=1000000)
+    assert result["binding_constraint"] == "adv_liquidity_cap"
+    assert result["recommended_size_rs"] == 100000.0
+    assert result["recommended_size_rs"] < result["equal_weight_capital_rs"]
+
+
+def test_compute_position_size_equal_weight_binds_when_liquid():
+    # 10% of a deep Rs 10cr/day ADV = Rs 10L, well above the Rs 2L equal-weight default.
+    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=100000000)
+    assert result["binding_constraint"] == "equal_weight"
+    assert result["recommended_size_rs"] == 200000.0
+
+
+def test_compute_position_size_never_sizes_up_past_equal_weight():
+    # The ADV cap can only pull the size DOWN, never justify sizing above the
+    # equal-weight plan even for an extremely liquid name.
+    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=10**12)
+    assert result["recommended_size_rs"] == 200000.0
+
+
+def test_compute_position_size_respects_custom_max_pct_of_adv():
+    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=1000000, max_pct_of_adv=0.5)
+    assert result["adv_cap_rs"] == 500000.0
+    assert result["binding_constraint"] == "equal_weight"
+
+
+def test_load_open_thesis_none_when_no_open_thesis(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_l5_sizing.load_open_thesis("nse:X") is None
+
+
+def test_load_open_thesis_returns_most_recent(monkeypatch):
+    captured = {}
+
+    def fake_sql_to_df(q, params=None):
+        captured["query"] = q
+        captured["params"] = params
+        return pd.DataFrame([{"thesis_id": "abc123", "created_date": date(2026, 8, 1)}])
+
+    monkeypatch.setattr(fundamentals_l5_sizing, "sql_to_df", fake_sql_to_df)
+    result = fundamentals_l5_sizing.load_open_thesis("nse:X")
+    assert result["thesis_id"] == "abc123"
+    assert "status = 'open'" in captured["query"]
+    assert captured["params"] == ("nse:X",)
+
+
+def test_load_adv_inputs_none_when_no_l1_ticker_mapping(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "build_l1_ticker_by_company_master_id", lambda: {})
+    monkeypatch.setattr(
+        fundamentals_l5_sizing, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not query without a ticker"))
+    )
+    assert fundamentals_l5_sizing.load_adv_inputs("nse:X") is None
+
+
+def test_load_adv_inputs_none_when_no_l1_row(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    monkeypatch.setattr(fundamentals_l5_sizing, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    assert fundamentals_l5_sizing.load_adv_inputs("nse:X") is None
+
+
+def test_load_adv_inputs_none_when_metrics_missing_required_fields(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    df = pd.DataFrame([{"metrics_json": json.dumps({"p_e": 15.0})}])  # no avg_vol_1mth/cmp_rs
+    monkeypatch.setattr(fundamentals_l5_sizing, "sql_to_df", lambda q, params=None: df)
+    assert fundamentals_l5_sizing.load_adv_inputs("nse:X") is None
+
+
+def test_load_adv_inputs_computes_adv_value(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    df = pd.DataFrame([{"metrics_json": json.dumps({"avg_vol_1mth": 50000, "cmp_rs": 200.0})}])
+    monkeypatch.setattr(fundamentals_l5_sizing, "sql_to_df", lambda q, params=None: df)
+    result = fundamentals_l5_sizing.load_adv_inputs("nse:X")
+    assert result == {"avg_vol_1mth": 50000, "cmp_rs": 200.0, "adv_value_rs": 10000000.0}
+
+
+def test_get_position_size_recommendation_none_without_open_thesis(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: None)
+    result = fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=15)
+    assert result is None
+
+
+def test_get_position_size_recommendation_rejects_non_positive_position_count(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: {"thesis_id": "abc"})
+    with pytest.raises(ValueError):
+        fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=0)
+
+
+def test_get_position_size_recommendation_full_happy_path(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: {"thesis_id": "abc123"})
+    monkeypatch.setattr(
+        fundamentals_l5_sizing, "load_adv_inputs", lambda cmid: {"avg_vol_1mth": 50000, "cmp_rs": 200.0, "adv_value_rs": 10000000.0}
+    )
+
+    result = fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=15)
+
+    assert result["company_master_id"] == "nse:X"
+    assert result["thesis_id"] == "abc123"
+    assert result["equal_weight_capital_rs"] == 200000.0  # 3,000,000 / 15
+    assert result["adv_cap_rs"] == 1000000.0  # 10% of 10,000,000
+    assert result["binding_constraint"] == "equal_weight"
+    assert result["recommended_size_rs"] == 200000.0
+
+
+def test_get_position_size_recommendation_degrades_gracefully_without_adv_data(monkeypatch):
+    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: {"thesis_id": "abc123"})
+    monkeypatch.setattr(fundamentals_l5_sizing, "load_adv_inputs", lambda cmid: None)
+
+    result = fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=15)
+
+    assert result["binding_constraint"] == "equal_weight_no_adv_data"
+    assert result["avg_vol_1mth"] is None
+    assert result["cmp_rs"] is None
+    assert result["recommended_size_rs"] == 200000.0
 
 
 def test_run_l3_rule_triggers_marks_not_alert_worthy_and_skips_upsert(monkeypatch):
@@ -16509,15 +18111,26 @@ def test_compute_quarterly_scoring_computes_hit_rate_and_time_to_confirmation(mo
             {
                 "status": "resolved", "resolved_true": True, "failure_attribution": None,
                 "created_date": date(2026, 8, 1), "resolution_date": date(2026, 10, 1),
+                "company_master_id": "nse:A", "origin_tag": "systematic_screen", "source_alert_trigger_type": "insider_buy",
             },
             {
                 "status": "resolved", "resolved_true": False, "failure_attribution": "thesis_wrong",
                 "created_date": date(2026, 8, 1), "resolution_date": date(2026, 12, 31),
+                "company_master_id": "nse:B", "origin_tag": "ad_hoc", "source_alert_trigger_type": None,
             },
-            {"status": "open", "resolved_true": None, "failure_attribution": None, "created_date": date(2026, 8, 1), "resolution_date": None},
+            {
+                "status": "open", "resolved_true": None, "failure_attribution": None, "created_date": date(2026, 8, 1), "resolution_date": None,
+                "company_master_id": "nse:C", "origin_tag": "systematic_screen", "source_alert_trigger_type": "insider_buy",
+            },
         ]
     )
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, **k: theses)
+
+    def fake_sql_to_df(query, **k):
+        if "fundamentals_confluence_score" in query:
+            return pd.DataFrame()  # no scores yet -- must not crash, group reads as "none"
+        return theses
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
 
     result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 8, 11))
 
@@ -16528,6 +18141,64 @@ def test_compute_quarterly_scoring_computes_hit_rate_and_time_to_confirmation(mo
     assert result["failure_attribution_breakdown"] == {"thesis_wrong": 1}
     assert result["time_to_confirmation_days"]["count"] == 1
     assert result["time_to_confirmation_days"]["median_days"] == 61.0
+    # Below MIN_SAMPLE_SIZE_FOR_BREAKDOWN (5) -- hit_rate must read None, count must still show.
+    assert result["hit_rate_by_origin_tag"] == {"systematic_screen": {"hit_rate": None, "count": 1}, "ad_hoc": {"hit_rate": None, "count": 1}}
+    assert result["hit_rate_by_trigger_type"] == {"insider_buy": {"hit_rate": None, "count": 1}, "none": {"hit_rate": None, "count": 1}}
+    assert result["hit_rate_by_confluence_count"] == {"none": {"hit_rate": None, "count": 2}}
+
+
+def test_compute_quarterly_scoring_breakdown_shows_hit_rate_once_sample_size_clears_threshold(monkeypatch):
+    # 5 resolved theses, same origin_tag, 4 true -- exactly MIN_SAMPLE_SIZE_FOR_BREAKDOWN.
+    rows = [
+        {
+            "status": "resolved", "resolved_true": i < 4, "failure_attribution": None if i < 4 else "thesis_wrong",
+            "created_date": date(2026, 8, 1), "resolution_date": date(2026, 9, 1),
+            "company_master_id": f"nse:{i}", "origin_tag": "systematic_screen", "source_alert_trigger_type": "insider_buy",
+        }
+        for i in range(5)
+    ]
+    theses = pd.DataFrame(rows)
+
+    def fake_sql_to_df(query, **k):
+        return pd.DataFrame() if "fundamentals_confluence_score" in query else theses
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 9, 11))
+
+    assert result["hit_rate_by_origin_tag"]["systematic_screen"] == {"hit_rate": 80.0, "count": 5}
+    assert result["hit_rate_by_trigger_type"]["insider_buy"] == {"hit_rate": 80.0, "count": 5}
+
+
+def test_compute_quarterly_scoring_joins_confluence_count_by_company(monkeypatch):
+    # REGRESSION GUARD (PRD §12 todo #7, 2026-08-29): confirms the join is by
+    # company_master_id (not positional/coincidental), and that a company never
+    # scored at all reads as "none", not a fabricated 0.
+    theses = pd.DataFrame(
+        [
+            {
+                "status": "resolved", "resolved_true": True, "failure_attribution": None,
+                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 9, 1),
+                "company_master_id": "nse:SCORED", "origin_tag": "ad_hoc", "source_alert_trigger_type": None,
+            },
+            {
+                "status": "resolved", "resolved_true": False, "failure_attribution": "thesis_wrong",
+                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 9, 1),
+                "company_master_id": "nse:UNSCORED", "origin_tag": "ad_hoc", "source_alert_trigger_type": None,
+            },
+        ]
+    )
+    confluence_df = pd.DataFrame([{"company_master_id": "nse:SCORED", "confluence_count": 3}])
+
+    def fake_sql_to_df(query, **k):
+        return confluence_df if "fundamentals_confluence_score" in query else theses
+
+    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
+
+    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 9, 11))
+
+    assert result["hit_rate_by_confluence_count"]["3"]["count"] == 1
+    assert result["hit_rate_by_confluence_count"]["none"]["count"] == 1
 
 
 def test_load_open_theses_past_target_date_queries_correctly(monkeypatch):
@@ -16883,13 +18554,17 @@ def test_compute_technicals_computes_returns_and_dma_with_full_history():
 
 def test_load_adjusted_price_history_falls_back_to_bse_view_when_nse_empty(monkeypatch):
     # a BSE-only company (2026-08-15 gap fix) has nothing in advisory_adjusted_ohlcv_daily
-    # at all -- must fall back to bse_advisory_adjusted_ohlcv_daily keyed by scrip_code.
+    # at all -- must fall back to bse_advisory_adjusted_ohlcv_daily keyed by scrip_code
+    # (resolved via company_master, not assumed to equal the input ticker -- 2026-08-22 fix).
     bse_rows = pd.DataFrame({"date": pd.to_datetime(["2026-08-13", "2026-08-14"]), "adj_close": [217.95, 215.9]})
     calls = []
 
     def fake_sql_to_df(query, params=None):
         calls.append(query)
+        if "bse_scrip_code FROM company_master" in query:
+            return pd.DataFrame([{"bse_scrip_code": "500166"}])
         if "bse_advisory_adjusted_ohlcv_daily" in query:
+            assert params[0] == "500166"
             return bse_rows
         return pd.DataFrame(columns=["date", "adj_close"])  # NSE view: empty
 
@@ -16901,6 +18576,40 @@ def test_load_adjusted_price_history_falls_back_to_bse_view_when_nse_empty(monke
     assert result["adj_close"].tolist() == [217.95, 215.9]
     assert any("advisory_adjusted_ohlcv_daily" in q and "bse_" not in q for q in calls)  # NSE tried first
     assert any("bse_advisory_adjusted_ohlcv_daily" in q for q in calls)
+
+
+def test_load_adjusted_price_history_bse_fallback_resolves_scrip_code_not_reusing_ticker(monkeypatch):
+    # BUG FOUND LIVE 2026-08-22: a company can have a real nse_ticker in
+    # company_master with ZERO NSE price rows, while its actual history lives
+    # under a DIFFERENT identifier (BSE scrip code). Confirmed live: BGWTATO --
+    # nse_ticker='BGWTATO' (zero rows either NSE series) vs bse_scrip_code=
+    # '504646' (247 real rows). Querying scrip_code='BGWTATO' (reusing the input
+    # ticker) can never match a numeric scrip code -- must resolve the true code.
+    bse_rows = pd.DataFrame({"date": pd.to_datetime(["2026-08-20"]), "adj_close": [677.25]})
+
+    def fake_sql_to_df(query, params=None):
+        if "bse_scrip_code FROM company_master" in query:
+            assert params == ("BGWTATO", "BGWTATO")
+            return pd.DataFrame([{"bse_scrip_code": "504646"}])
+        if "bse_advisory_adjusted_ohlcv_daily" in query:
+            assert params[0] == "504646"  # the RESOLVED scrip code, not "BGWTATO"
+            return bse_rows
+        return pd.DataFrame(columns=["date", "adj_close"])
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", fake_sql_to_df)
+    result = fundamentals_technicals.load_adjusted_price_history("BGWTATO")
+    assert result["adj_close"].tolist() == [677.25]
+
+
+def test_load_adjusted_price_history_returns_empty_when_no_scrip_code_resolves(monkeypatch):
+    def fake_sql_to_df(query, params=None):
+        if "bse_scrip_code FROM company_master" in query:
+            return pd.DataFrame()  # unresolved identity entirely
+        return pd.DataFrame(columns=["date", "adj_close"])
+
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", fake_sql_to_df)
+    result = fundamentals_technicals.load_adjusted_price_history("GHOST")
+    assert result.empty
 
 
 def test_load_adjusted_price_history_falls_back_to_nse_be_series_when_eq_empty(monkeypatch):
@@ -16933,10 +18642,13 @@ def test_load_adjusted_price_history_uses_nse_view_when_available(monkeypatch):
     assert result["adj_close"].tolist() == [100.0]
 
 
-def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
+def test_run_technicals_refresh_empty_l1_and_empty_watchlist_produces_zero_companies(monkeypatch):
     monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
     monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", lambda covered: pd.DataFrame())
+    upserts = []
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
     fallback_events = []
     monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
 
@@ -16944,6 +18656,48 @@ def test_run_technicals_refresh_returns_early_on_empty_l1(monkeypatch):
 
     assert result == {"companies": 0, "no_history": 0, "stale_price": 0}
     assert any(a and a[0] == "technicals_no_l1_universe" for a, k in fallback_events)
+    assert upserts[0][0].empty  # called with an empty frame -- upsert_to_db's own real implementation no-ops on this
+
+
+def test_run_technicals_refresh_empty_l1_still_scans_watchlist_only_companies(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-30, adversarial review): used to
+    # return unconditionally the moment the L1 universe snapshot was empty --
+    # before load_watchlist_only_tickers was ever called -- silently defeating
+    # the exact 2026-08-22 fix that added it (a watchlist company outside L1
+    # must still get a technicals refresh).
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: pd.DataFrame())
+    watchlist_only = pd.DataFrame([{"ticker": "REGENCERAM", "company_master_id": "nse:REGENCERAM"}])
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", lambda covered: watchlist_only)
+    full_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=260, freq="D"), "adj_close": [100.0] * 260})
+    monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: full_history)
+    upserts = []
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: None)
+
+    result = fundamentals_technicals.run_technicals_refresh()
+
+    assert result["companies"] == 1
+    assert upserts[0][0].iloc[0]["company_master_id"] == "nse:REGENCERAM"
+
+
+def test_load_watchlist_only_tickers_degrades_gracefully_on_missing_table(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-30): fundamentals_watchlist's
+    # status column is bootstrapped by notifications.py, which runs AFTER
+    # technicals in run_pipeline.py's STEPS -- a first-ever pipeline run could
+    # hit this before either exists. Must degrade, not crash the whole step.
+    events = []
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: events.append(a[0] if a else None))
+    monkeypatch.setattr(
+        fundamentals_technicals, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("relation \"fundamentals_watchlist\" does not exist"))
+    )
+
+    result = fundamentals_technicals.load_watchlist_only_tickers(set())
+
+    assert result.empty
+    assert list(result.columns) == ["ticker", "company_master_id"]
+    assert "technicals_watchlist_only_lookup_failed" in events
 
 
 def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypatch):
@@ -16952,6 +18706,7 @@ def test_run_technicals_refresh_flags_insufficient_history_and_upserts(monkeypat
     tickers = pd.DataFrame([{"ticker": "AAA", "company_name": "A Co"}, {"ticker": "BBB", "company_name": "B Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
     monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", lambda covered: pd.DataFrame())
 
     # AAA's history ends "today" (not stale) -- isolates this test to the
     # insufficient-history behavior it's actually about, independent of the
@@ -16992,6 +18747,7 @@ def test_run_technicals_refresh_flags_and_records_stale_price_series(monkeypatch
     tickers = pd.DataFrame([{"ticker": "STALECO", "company_name": "Stale Co"}, {"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
     monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", lambda covered: pd.DataFrame())
 
     fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
     # last row is 30 days old -- past STALE_PRICE_THRESHOLD_DAYS (7)
@@ -17081,6 +18837,8 @@ def test_run_technicals_refresh_records_fallback_when_bse_pipeline_looks_stale(m
     monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: False)
     tickers = pd.DataFrame([{"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
+    monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", lambda covered: pd.DataFrame())
     fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
     monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: fresh_history)
     monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: None)
@@ -17092,12 +18850,78 @@ def test_run_technicals_refresh_records_fallback_when_bse_pipeline_looks_stale(m
     assert any(a and a[0] == "technicals_bse_price_pipeline_stale_or_never_run" for a, k in fallback_events)
 
 
+def test_load_watchlist_only_tickers_excludes_already_covered_and_prefers_nse_ticker(monkeypatch):
+    # ticker is already COALESCE(nse_ticker, bse_scrip_code) in the SQL itself
+    # (see load_watchlist_only_tickers) -- this is exactly the shape sql_to_df
+    # returns.
+    df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:AAA", "ticker": "AAA"},
+            {"company_master_id": "nse:543531-BOM", "ticker": "543531"},  # no NSE ticker, COALESCE used the scrip code
+            {"company_master_id": "nse:BBB", "ticker": "BBB"},  # already covered
+        ]
+    )
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: df)
+
+    out = fundamentals_technicals.load_watchlist_only_tickers(covered_company_master_ids={"nse:BBB"})
+
+    assert set(out["company_master_id"]) == {"nse:AAA", "nse:543531-BOM"}
+    row_aaa = out[out["company_master_id"] == "nse:AAA"].iloc[0]
+    row_bse = out[out["company_master_id"] == "nse:543531-BOM"].iloc[0]
+    assert row_aaa["ticker"] == "AAA"
+    assert row_bse["ticker"] == "543531"
+
+
+def test_load_watchlist_only_tickers_drops_rows_with_no_resolvable_ticker(monkeypatch):
+    # COALESCE(nse_ticker, bse_scrip_code) comes back NaN/None when the company
+    # has neither -- nothing load_adjusted_price_history could query anyway.
+    df = pd.DataFrame([{"company_master_id": "nse:GHOST", "ticker": None}])
+    monkeypatch.setattr(fundamentals_technicals, "sql_to_df", lambda query, **k: df)
+    out = fundamentals_technicals.load_watchlist_only_tickers(covered_company_master_ids=set())
+    assert out.empty
+
+
+def test_run_technicals_refresh_computes_watchlist_only_companies_too(monkeypatch):
+    # BUG FOUND LIVE 2026-08-22: run_technicals_refresh() only ever scanned
+    # load_l1_tickers() despite this module's own docstring promising to feed
+    # the watchlist -- a watchlist company outside the current L1 snapshot got
+    # zero technicals coverage, ever, with no fallback event. Confirmed live:
+    # REGENCERAM (in L1 exactly once, zero fundamentals_technicals rows ever).
+    monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
+    monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
+    l1_tickers = pd.DataFrame([{"ticker": "INL1", "company_name": "In L1"}])
+    monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: l1_tickers)
+    monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
+    watchlist_only = pd.DataFrame([{"ticker": "REGENCERAM", "company_master_id": "nse:REGENCERAM"}])
+    captured_covered = {}
+
+    def fake_watchlist_only(covered_company_master_ids):
+        captured_covered["value"] = covered_company_master_ids
+        return watchlist_only
+
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", fake_watchlist_only)
+    fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
+    monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: fresh_history)
+    upserts = []
+    monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_technicals, "_record_fallback", lambda *a, **k: None)
+
+    result = fundamentals_technicals.run_technicals_refresh()
+
+    assert captured_covered["value"] == {"nse:INL1"}  # L1's own resolved ids passed through as "already covered"
+    assert result["companies"] == 2
+    written = upserts[0][0]
+    assert set(written["company_master_id"]) == {"nse:INL1", "nse:REGENCERAM"}
+    assert set(written["ticker"]) == {"INL1", "REGENCERAM"}
+
+
 def test_run_technicals_refresh_no_stale_prices_skips_fallback_event(monkeypatch):
     monkeypatch.setattr(fundamentals_technicals, "ensure_bse_view", lambda: None)
     monkeypatch.setattr(fundamentals_technicals, "check_bse_price_pipeline_freshness", lambda run_date: True)
     tickers = pd.DataFrame([{"ticker": "FRESHCO", "company_name": "Fresh Co"}])
     monkeypatch.setattr(fundamentals_technicals, "load_l1_tickers", lambda: tickers)
     monkeypatch.setattr(fundamentals_technicals, "map_company_master_ids_nse_or_bse", lambda tickers: tickers.map(lambda t: f"nse:{t}").astype("string"))
+    monkeypatch.setattr(fundamentals_technicals, "load_watchlist_only_tickers", lambda covered: pd.DataFrame())
     fresh_history = pd.DataFrame({"date": pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=25, freq="D"), "adj_close": [100.0] * 25})
     monkeypatch.setattr(fundamentals_technicals, "load_adjusted_price_history", lambda ticker, **k: fresh_history)
     monkeypatch.setattr(fundamentals_technicals, "upsert_to_db", lambda df, table, **k: None)
@@ -17116,8 +18940,10 @@ def test_load_price_near_prefers_adjusted_falls_back_to_raw(monkeypatch):
 
     def fake_sql_to_df(query, params=None):
         calls.append(query)
-        if "advisory_adjusted_ohlcv_daily" in query:
+        if "advisory_adjusted_ohlcv_daily" in query and "bse_" not in query:
             return pd.DataFrame()  # no adjusted data (EQ or BE) -- forces fallback
+        if "bse_scrip_code FROM company_master" in query:
+            return pd.DataFrame([{"bse_scrip_code": None}])  # no BSE identity -- skip that fallback too
         return pd.DataFrame([{"close": 42.5}])
 
     monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
@@ -17125,7 +18951,7 @@ def test_load_price_near_prefers_adjusted_falls_back_to_raw(monkeypatch):
     price = fundamentals_watchlist.load_price_near("nse:FOO", "2026-08-01")
 
     assert price == 42.5
-    assert len(calls) == 3  # tried EQ, then BE, then raw
+    assert len(calls) == 4  # tried EQ, then BE, then the BSE scrip-code lookup, then raw
     assert "series = 'EQ'" in calls[0]
     assert "series = 'BE'" in calls[1]
 
@@ -17155,6 +18981,63 @@ def test_load_price_near_returns_none_for_missing_ticker_or_date():
     assert fundamentals_watchlist.load_price_near("nse:FOO", None) is None
 
 
+def test_load_price_near_falls_back_to_bse_scrip_code_when_no_nse_data(monkeypatch):
+    # BUG FOUND LIVE 2026-08-22: no BSE-only fallback existed here at all -- a
+    # company with no NSE listing got first_seen_price=None even when real BSE
+    # price history covered the date. Confirmed live: 543531-BOM, NAPL, JYOTI,
+    # BGWTATO, KESARPE -- zero NSE rows, 246-248 BSE rows each.
+    def fake_sql_to_df(query, params=None):
+        if "bse_scrip_code FROM company_master" in query:
+            return pd.DataFrame([{"bse_scrip_code": "543531"}])
+        if "FROM bse_advisory_adjusted_ohlcv_daily" in query:
+            assert params[0] == "543531"
+            return pd.DataFrame([{"adj_close": 77.7}])
+        if "advisory_adjusted_ohlcv_daily" in query:
+            return pd.DataFrame()  # no EQ or BE data at all
+        raise AssertionError(f"unexpected query, should not reach raw fallback: {query}")
+
+    monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
+    assert fundamentals_watchlist.load_price_near("nse:543531-BOM", "2025-11-01") == 77.7
+
+
+def test_load_price_near_no_scrip_code_falls_through_to_raw(monkeypatch):
+    def fake_sql_to_df(query, params=None):
+        if "advisory_adjusted_ohlcv_daily" in query:
+            return pd.DataFrame()
+        if "bse_scrip_code FROM company_master" in query:
+            return pd.DataFrame([{"bse_scrip_code": None}])  # no BSE identity either
+        if "nseindia_ohlcv" in query:
+            return pd.DataFrame([{"close": 9.9}])
+        raise AssertionError(f"unexpected query: {query}")
+
+    monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
+    assert fundamentals_watchlist.load_price_near("nse:FOO", "2026-08-01") == 9.9
+
+
+def test_load_l3_alert_summary_by_company_uses_load_ts_not_alert_date(monkeypatch):
+    # BUG FOUND LIVE 2026-08-22: first_seen_at used to be MIN(alert_date) -- the
+    # underlying disclosed EVENT's date, not when stockey actually detected the
+    # alert. Confirmed live: GNRL's watchlist row showed "watching since
+    # 2025-11-01" (a BSE capital-raise filing's own disclosure date) even though
+    # l3_triggers.py didn't generate that alert row until 2026-08-14, ten months
+    # after the L3 alerting pipeline even existed. Must aggregate on load_ts.
+    seen = {}
+
+    def fake_sql_to_df(query, params=None):
+        seen["query"] = query
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamentals_watchlist, "sql_to_df", fake_sql_to_df)
+    fundamentals_watchlist.load_l3_alert_summary_by_company()
+
+    query = seen["query"]
+    assert "load_ts" in query
+    assert "MIN(alert_date)" not in query
+    assert "MAX(alert_date)" not in query
+    assert "first_detected_date" in query
+    assert "last_detected_date" in query
+
+
 def test_sync_watchlist_from_alerts_returns_early_on_no_alerts(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: pd.DataFrame())
@@ -17167,7 +19050,7 @@ def test_sync_watchlist_from_alerts_returns_early_on_no_alerts(monkeypatch):
 def test_sync_watchlist_from_alerts_new_company_looks_up_first_seen_price(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-03"), "alert_count": 2}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-03"), "alert_count": 2}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: pd.DataFrame())
@@ -17194,7 +19077,7 @@ def test_sync_watchlist_from_alerts_existing_company_keeps_first_seen_updates_la
     # stay exactly as originally recorded, only last_alert_at/alert_count move.
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-05"), "alert_count": 3}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-05"), "alert_count": 3}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
@@ -17226,7 +19109,7 @@ def test_sync_watchlist_from_alerts_corrects_first_seen_at_backward_when_earlier
     # BACKWARD when this happens.
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2025-05-23"), "last_alert_date": pd.Timestamp("2026-08-05"), "alert_count": 4}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2025-05-23"), "last_detected_date": pd.Timestamp("2026-08-05"), "alert_count": 4}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     # existing row was frozen at 2026-08-06 -- LATER than the true first alert date
@@ -17260,7 +19143,7 @@ def test_sync_watchlist_from_alerts_moves_first_seen_at_forward_when_the_support
     # visible via the same fallback event as the backward case.
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-10"), "last_alert_date": pd.Timestamp("2026-08-10"), "alert_count": 1}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-10"), "last_detected_date": pd.Timestamp("2026-08-10"), "alert_count": 1}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
@@ -17285,7 +19168,7 @@ def test_sync_watchlist_from_alerts_moves_first_seen_at_forward_when_the_support
 def test_sync_watchlist_from_alerts_leaves_first_seen_at_alone_when_unchanged(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     existing = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": pd.Timestamp("2026-08-01"), "first_seen_price": 100.0}])
@@ -17304,7 +19187,7 @@ def test_sync_watchlist_from_alerts_leaves_first_seen_at_alone_when_unchanged(mo
 def test_sync_watchlist_from_alerts_flags_missing_price_without_failing(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_alert_date": pd.Timestamp("2026-08-01"), "last_alert_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: pd.DataFrame())
@@ -17887,6 +19770,7 @@ def test_get_watchlist_attaches_strategies_per_company(monkeypatch):
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise", "rating_downgrade"]})
 
     result = fundamentals_api_queries.get_watchlist()
@@ -17907,6 +19791,7 @@ def test_get_watchlist_attaches_draft_thesis_per_company(monkeypatch):
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
 
     result = fundamentals_api_queries.get_watchlist()
@@ -17928,9 +19813,107 @@ def test_get_watchlist_selects_price_data_stale(monkeypatch):
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     fundamentals_api_queries.get_watchlist()
     assert "tech.price_data_stale" in captured["query"]
-    assert "SELECT close, price_data_stale FROM fundamentals_technicals" in captured["query"]
+    assert "SELECT close, price_data_stale, as_of_date FROM fundamentals_technicals" in captured["query"]
+    assert "fundamentals_confluence_score" in captured["query"]
+
+
+def test_get_watchlist_calls_ensure_confluence_score_table_before_querying(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-29): get_watchlist()'s new
+    # confluence-score LEFT JOIN LATERAL 500'd every request with
+    # psycopg2.errors.UndefinedTable on a DB where confluence_score.py had never
+    # completed a real run yet -- upsert_to_db's own CREATE TABLE IF NOT EXISTS
+    # only fires on a write, never a read. This pins the same defensive-call fix
+    # _ensure_draft_table() already established for fundamentals_l4_thesis_draft.
+    calls = []
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: calls.append(1))
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    fundamentals_api_queries.get_watchlist()
+    assert calls == [1]
+
+
+def test_get_watchlist_flags_no_fresh_price_yet_on_same_day_coincidence(monkeypatch):
+    # BUG FOUND LIVE 2026-08-26: DBCORP's watchlist row had current_price ==
+    # first_seen_price with current_price_as_of == first_seen_at (the adjusted
+    # price series' routine ~1-day publish lag coinciding with the company's
+    # first_seen_at date) -- get_watchlist() returned this indistinguishably from
+    # a real "no move", same underlying gap already fixed in the digest email
+    # (notifications.py's _no_move_data_yet). The frontend shouldn't have to
+    # reimplement this date comparison itself, same reasoning as price_data_stale
+    # already being precomputed here rather than left as a raw date pair.
+    df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:DBCORP", "first_seen_at": date(2026, 8, 24), "first_seen_price": 206.80,
+                "current_price": 206.80, "current_price_as_of": date(2026, 8, 24), "alert_count": 1,
+            }
+        ]
+    )
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist()
+
+    assert result[0]["no_fresh_price_yet"] is True
+
+
+def test_get_watchlist_no_fresh_price_yet_false_when_price_date_advanced(monkeypatch):
+    # Same first_seen_at, but current_price_as_of has actually moved forward a
+    # day -- must NOT flag a real move as "no fresh price yet".
+    df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:DBCORP", "first_seen_at": date(2026, 8, 24), "first_seen_price": 206.80,
+                "current_price": 205.43, "current_price_as_of": date(2026, 8, 25), "alert_count": 1,
+            }
+        ]
+    )
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist()
+
+    assert result[0]["no_fresh_price_yet"] is False
+
+
+def test_get_watchlist_no_fresh_price_yet_false_when_current_price_as_of_missing(monkeypatch):
+    # No technicals row joined at all (tech.as_of_date is NULL) -- must not raise
+    # and must not flag, same null-safety price_data_stale already gets.
+    df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 24), "first_seen_price": 100.0,
+                "current_price": None, "current_price_as_of": None, "alert_count": 1,
+            }
+        ]
+    )
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist()
+
+    assert result[0]["no_fresh_price_yet"] is False
 
 
 def test_get_watchlist_empty_watchlist_skips_strategies_query(monkeypatch):
@@ -17950,11 +19933,117 @@ def test_get_watchlist_company_with_no_strategies_gets_empty_list(monkeypatch):
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
 
     result = fundamentals_api_queries.get_watchlist()
 
     assert result[0]["strategies"] == []
+
+
+def test_get_watchlist_return_summary_equal_weight_average(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "first_seen_price": 100.0, "current_price": 110.0, "current_price_as_of": date(2026, 8, 27), "alert_count": 1},
+            {"company_master_id": "nse:BAR", "first_seen_at": date(2026, 8, 1), "first_seen_price": 200.0, "current_price": 180.0, "current_price_as_of": date(2026, 8, 27), "alert_count": 1},
+        ]
+    )
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist_return_summary()
+
+    # FOO +10%, BAR -10% -- equal-weight average is 0%, not value-weighted.
+    assert result["net_return_pct"] == pytest.approx(0.0)
+    assert result["included_count"] == 2
+    assert result["excluded_count"] == 0
+    assert result["total_count"] == 2
+
+
+def test_get_watchlist_return_summary_excludes_no_fresh_price_yet(monkeypatch):
+    # Same DBCORP-class coincidence get_watchlist() itself flags -- must not let a
+    # fake 0.0% drag the average down.
+    df = pd.DataFrame(
+        [
+            {"company_master_id": "nse:DBCORP", "first_seen_at": date(2026, 8, 24), "first_seen_price": 206.80, "current_price": 206.80, "current_price_as_of": date(2026, 8, 24), "alert_count": 1},
+            {"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "first_seen_price": 100.0, "current_price": 120.0, "current_price_as_of": date(2026, 8, 27), "alert_count": 1},
+        ]
+    )
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist_return_summary()
+
+    assert result["net_return_pct"] == pytest.approx(20.0)
+    assert result["included_count"] == 1
+    assert result["excluded_count"] == 1
+    assert result["total_count"] == 2
+
+
+def test_get_watchlist_return_summary_excludes_missing_prices(monkeypatch):
+    df = pd.DataFrame(
+        [{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "first_seen_price": None, "current_price": None, "current_price_as_of": None, "alert_count": 1}]
+    )
+
+    def fake_sql_to_df(q, params=None):
+        return pd.DataFrame() if "fundamentals_l4_thesis_draft" in q else df
+
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
+
+    result = fundamentals_api_queries.get_watchlist_return_summary()
+
+    assert result["net_return_pct"] is None
+    assert result["included_count"] == 0
+    assert result["excluded_count"] == 1
+
+
+def test_get_watchlist_return_summary_empty_watchlist(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
+    result = fundamentals_api_queries.get_watchlist_return_summary()
+    assert result == {"status": "active", "net_return_pct": None, "included_count": 0, "excluded_count": 0, "total_count": 0}
+
+
+def test_api_watchlist_summary_route_defaults_to_active_status(monkeypatch):
+    captured = {}
+
+    def fake_summary(status="active"):
+        captured["status"] = status
+        return {"status": status, "net_return_pct": None, "included_count": 0, "excluded_count": 0, "total_count": 0}
+
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist_return_summary", fake_summary)
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/summary")
+    assert r.status_code == 200
+    assert captured["status"] == "active"
+
+
+def test_api_watchlist_summary_route_status_all_passes_none(monkeypatch):
+    captured = {}
+
+    def fake_summary(status="active"):
+        captured["status"] = status
+        return {"status": status, "net_return_pct": None, "included_count": 0, "excluded_count": 0, "total_count": 0}
+
+    monkeypatch.setattr(fundamentals_api_queries, "get_watchlist_return_summary", fake_summary)
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/summary?status=all")
+    assert r.status_code == 200
+    assert captured["status"] is None
 
 
 def test_get_watchlist_detail_returns_none_when_not_found(monkeypatch):
@@ -17974,6 +20063,7 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
     call_order = iter(["watchlist", "alerts", "thesis", "draft"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: {"ticker": "FOO"})
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: {"close": 100})
     monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: {"sector_code": "IN01"})
@@ -18001,6 +20091,7 @@ def test_get_watchlist_detail_draft_thesis_none_when_no_draft(monkeypatch):
     call_order = iter(["watchlist", "alerts", "thesis", "draft"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_l2_state_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_latest_technicals_for_company", lambda cmid: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_sector_context_for_company", lambda cmid: None)
@@ -18023,6 +20114,7 @@ def test_get_draft_theses_returns_active_watchlist_drafts(monkeypatch):
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
 
     result = fundamentals_api_queries.get_draft_theses()
 
@@ -18038,6 +20130,7 @@ def test_get_draft_theses_returns_active_watchlist_drafts(monkeypatch):
 def test_get_draft_theses_empty_when_none(monkeypatch):
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: pd.DataFrame())
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     assert fundamentals_api_queries.get_draft_theses() == []
 
 
@@ -18074,6 +20167,7 @@ def test_get_watchlist_shows_draft_thesis_for_a_non_active_row(monkeypatch):
 
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", fake_sql_to_df)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
+    monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "load_satisfied_strategies_by_company", lambda: {})
 
     result = fundamentals_api_queries.get_watchlist(status="invalidated")
@@ -18204,6 +20298,45 @@ def _capturing_get_watchlist(captured):
         return []
 
     return _fn
+
+
+def test_api_watchlist_sizing_route_happy_path(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals_api_queries,
+        "get_position_sizing",
+        lambda cmid, *, total_capital_rs, target_position_count: {
+            "company_master_id": cmid, "thesis_id": "abc", "recommended_size_rs": 200000.0, "binding_constraint": "equal_weight",
+        },
+    )
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/nse:X/sizing?total_capital_rs=3000000&target_position_count=15")
+    assert r.status_code == 200
+    assert r.json()["recommended_size_rs"] == 200000.0
+
+
+def test_api_watchlist_sizing_route_404_when_no_open_thesis(monkeypatch):
+    monkeypatch.setattr(fundamentals_api_queries, "get_position_sizing", lambda cmid, **k: None)
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/nse:X/sizing?total_capital_rs=3000000&target_position_count=15")
+    assert r.status_code == 404
+
+
+def test_api_watchlist_sizing_route_400_on_invalid_position_count(monkeypatch):
+    def raise_value_error(cmid, **k):
+        raise ValueError("target_position_count must be positive")
+
+    monkeypatch.setattr(fundamentals_api_queries, "get_position_sizing", raise_value_error)
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/nse:X/sizing?total_capital_rs=3000000&target_position_count=0")
+    assert r.status_code == 400
+
+
+def test_api_watchlist_sizing_route_422_when_required_params_missing():
+    # total_capital_rs/target_position_count have no server-side default -- FastAPI
+    # itself must reject an incomplete request, not silently assume a sleeve size.
+    client = TestClient(fundamentals_api_app)
+    r = client.get("/api/watchlist/nse:X/sizing")
+    assert r.status_code == 422
 
 
 def test_api_watchlist_route_defaults_to_active_status(monkeypatch):
@@ -18481,9 +20614,15 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 14
+    assert len(fundamentals_run_pipeline.STEPS) == 16  # +2 2026-08-29: deal_flow (todo #3), confluence_score (todo #4)
     assert fundamentals_run_pipeline.STEPS[-1] == "fundamentals.screens.notifications"
     assert "fundamentals.screens.investor_classification" in fundamentals_run_pipeline.STEPS
+    assert fundamentals_run_pipeline.STEPS.index("fundamentals.screens.deal_flow") < fundamentals_run_pipeline.STEPS.index(
+        "fundamentals.screens.investor_classification"
+    )
+    assert fundamentals_run_pipeline.STEPS.index("fundamentals.screens.l1_universe") < fundamentals_run_pipeline.STEPS.index(
+        "fundamentals.screens.deal_flow"
+    )
     # 2026-08-15: the deleveraging screen (fundamentals.collectors.screenerin's standalone step) was
     # retired -- its output table had zero readers. The module itself is not a pipeline step anymore.
     assert "fundamentals.collectors.screenerin" not in fundamentals_run_pipeline.STEPS
@@ -18619,12 +20758,24 @@ def test_send_email_includes_html_part_when_given(monkeypatch):
 
 
 def test_load_full_watchlist_empty_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(fundamentals_notifications, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: pd.DataFrame())
     assert fundamentals_notifications.load_full_watchlist() == []
 
 
+def test_load_full_watchlist_calls_ensure_confluence_score_table_before_querying(monkeypatch):
+    # REGRESSION GUARD (BUG FOUND LIVE 2026-08-29) -- same UndefinedTable crash as
+    # get_watchlist()'s own, see that test's docstring.
+    calls = []
+    monkeypatch.setattr(fundamentals_notifications, "_ensure_confluence_score_table", lambda: calls.append(1))
+    monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: pd.DataFrame())
+    fundamentals_notifications.load_full_watchlist()
+    assert calls == [1]
+
+
 def test_load_full_watchlist_attaches_strategies_per_company(monkeypatch):
     df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
+    monkeypatch.setattr(fundamentals_notifications, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
     monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {"nse:FOO": ["capital_raise"]})
     monkeypatch.setattr(fundamentals_notifications, "load_current_drafts_by_company", lambda: {})
@@ -18636,6 +20787,7 @@ def test_load_full_watchlist_attaches_strategies_per_company(monkeypatch):
 
 def test_load_full_watchlist_attaches_draft_thesis_per_company(monkeypatch):
     df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 2}])
+    monkeypatch.setattr(fundamentals_notifications, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
     monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {})
     draft = {"prediction_text": "p", "confidence_score": 55}
@@ -18648,6 +20800,7 @@ def test_load_full_watchlist_attaches_draft_thesis_per_company(monkeypatch):
 
 def test_load_full_watchlist_missing_draft_thesis_is_none(monkeypatch):
     df = pd.DataFrame([{"company_master_id": "nse:BAR", "first_seen_at": date(2026, 8, 1), "alert_count": 1}])
+    monkeypatch.setattr(fundamentals_notifications, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_notifications, "sql_to_df", lambda q: df)
     monkeypatch.setattr(fundamentals_notifications, "load_satisfied_strategies_by_company", lambda: {})
     monkeypatch.setattr(fundamentals_notifications, "load_current_drafts_by_company", lambda: {})
@@ -18667,10 +20820,12 @@ def test_load_full_watchlist_selects_price_data_stale(monkeypatch):
         captured["query"] = q
         return pd.DataFrame()
 
+    monkeypatch.setattr(fundamentals_notifications, "_ensure_confluence_score_table", lambda: None)
     monkeypatch.setattr(fundamentals_notifications, "sql_to_df", fake_sql_to_df)
     fundamentals_notifications.load_full_watchlist()
     assert "tech.price_data_stale" in captured["query"]
-    assert "SELECT close, price_data_stale FROM fundamentals_technicals" in captured["query"]
+    assert "SELECT close, price_data_stale, as_of_date FROM fundamentals_technicals" in captured["query"]
+    assert "fundamentals_confluence_score" in captured["query"]
 
 
 def test_build_daily_digest_content_empty_watchlist():
@@ -18771,6 +20926,44 @@ def test_build_daily_digest_content_fresh_price_unaffected_by_stale_flag(monkeyp
     assert "(+10.0%)" in text_body
     assert 'class="pos"' in html_body
     assert "stale" not in text_body
+
+
+def test_build_daily_digest_content_same_day_entry_shows_no_fresh_price_not_zero_pct(monkeypatch):
+    # BUG FOUND LIVE 2026-08-26: DBCORP's digest row read "Rs.206.80 -> Rs.206.80
+    # (+0.0%)" -- a real, confident-looking "no move" that was actually just a
+    # 1-day publish lag (advisory_adjusted_ohlcv_daily always runs a trading day
+    # behind nseindia_ohlcv) coinciding with the company's first_seen_at date, so
+    # entry price and "current" price resolved to the literal same row.
+    # price_data_stale doesn't catch this -- the gap is 1 day, not >7. Reproduces
+    # the exact DBCORP shape: first_seen_at == current_price_as_of, same price.
+    rows = [
+        {
+            "company_master_id": "nse:DBCORP", "company_name": "D.B. Corp Ltd.", "first_seen_at": date(2026, 8, 24),
+            "first_seen_price": 206.80, "current_price": 206.80, "current_price_as_of": date(2026, 8, 24),
+            "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None, "price_data_stale": False,
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "+0.0%" not in text_body
+    assert "+0.0%" not in html_body
+    assert "no fresh price yet" in text_body
+    assert "no fresh price yet" in html_body
+
+
+def test_build_daily_digest_content_next_day_entry_shows_real_pct_not_no_fresh_price(monkeypatch):
+    # Same first_seen_at as above but current_price_as_of has actually advanced a
+    # day -- must NOT trip the no-fresh-price guard, a real move should still
+    # render normally.
+    rows = [
+        {
+            "company_master_id": "nse:DBCORP", "company_name": "D.B. Corp Ltd.", "first_seen_at": date(2026, 8, 24),
+            "first_seen_price": 206.80, "current_price": 205.43, "current_price_as_of": date(2026, 8, 25),
+            "alert_count": 1, "narrative_text": "n", "suggested_watch_until": None, "price_data_stale": False,
+        }
+    ]
+    _, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
+    assert "no fresh price yet" not in text_body
+    assert "-0.7%" in text_body
 
 
 def test_build_daily_digest_content_escapes_html_special_characters():
@@ -19650,12 +21843,51 @@ def test_check_invalidated_none_when_opposing_trigger_came_first():
 
 
 def test_check_invalidated_none_for_trigger_type_with_no_mapped_opposite():
-    history = [{"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1)}, {"trigger_type": "institutional_first_entry", "alert_date": date(2026, 9, 1)}]
+    # capital_raise/auditor_change are BOTH still genuinely unmapped (structural,
+    # one-off facts -- see INVALIDATING_TRIGGER_TYPES' own docstring) -- NOT
+    # institutional_first_entry, which now has two mapped opposites (2026-08-29,
+    # PRD §12 todo #5, see the tests below).
+    history = [{"trigger_type": "capital_raise", "alert_date": date(2026, 8, 1)}, {"trigger_type": "auditor_change", "alert_date": date(2026, 9, 1)}]
     assert fundamentals_watchlist_exit._check_invalidated(history) is None
 
 
 def test_check_invalidated_empty_history():
     assert fundamentals_watchlist_exit._check_invalidated([]) is None
+
+
+def test_check_invalidated_institutional_entry_by_pledge_increase():
+    # REGRESSION GUARD (PRD §12 todo #5, 2026-08-29): institutional_first_entry
+    # used to have no invalidation partner at all.
+    history = [
+        {"trigger_type": "institutional_first_entry", "alert_date": date(2026, 8, 1)},
+        {"trigger_type": "pledge_increase", "alert_date": date(2026, 9, 1)},
+    ]
+    reason = fundamentals_watchlist_exit._check_invalidated(history)
+    assert reason is not None
+    assert "pledge_increase" in reason and "institutional_first_entry" in reason
+
+
+def test_check_invalidated_institutional_entry_by_bulk_deal_sell():
+    history = [
+        {"trigger_type": "institutional_first_entry", "alert_date": date(2026, 8, 1)},
+        {"trigger_type": "bulk_deal_sell", "alert_date": date(2026, 9, 1)},
+    ]
+    assert fundamentals_watchlist_exit._check_invalidated(history) is not None
+
+
+def test_check_invalidated_deleveraging_and_turnaround_by_pledge_increase():
+    for original in ("rating_confirms_deleveraging", "results_confirm_turnaround"):
+        history = [{"trigger_type": original, "alert_date": date(2026, 8, 1)}, {"trigger_type": "pledge_increase", "alert_date": date(2026, 9, 1)}]
+        assert fundamentals_watchlist_exit._check_invalidated(history) is not None
+
+
+def test_check_invalidated_insider_buy_not_invalidated_by_bulk_deal_sell():
+    # bulk_deal_sell does NOT invalidate insider_buy specifically -- it can't
+    # confirm the SAME named insider sold (no promoter/insider category flag in
+    # bulk/block-deal data, see deal_flow.py's own module docstring). Only
+    # insider_sell_surprise (a real PIT/SAST-sourced signal) invalidates insider_buy.
+    history = [{"trigger_type": "insider_buy", "alert_date": date(2026, 8, 1)}, {"trigger_type": "bulk_deal_sell", "alert_date": date(2026, 9, 1)}]
+    assert fundamentals_watchlist_exit._check_invalidated(history) is None
 
 
 def test_check_price_flagged_rally():

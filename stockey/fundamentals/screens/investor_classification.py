@@ -140,8 +140,12 @@ def effective_tier(row: dict) -> str | None:
 def load_unclassified_investor_names(limit: int | None = None) -> list[dict]:
     """Every (investor_key, investor_name_display, source, news_id) not yet in
     fundamentals_investor_classification, pulled from structured-extracted
-    capital_raise events' investor_names array. A name seen in multiple filings this
-    run is only queued once (first occurrence wins first_seen_source/news_id).
+    capital_raise events' investor_names array, PLUS (2026-08-29, PRD §12 todo #3)
+    fundamentals/screens/deal_flow.py's synthetic bulk_deal_buy/bulk_deal_sell
+    events -- both populate the same investor_names JSON shape (a one-element list,
+    for deal_flow) so this query needed no structural change, only a wider
+    filing_type IN (...). A name seen in multiple filings this run is only queued
+    once (first occurrence wins first_seen_source/news_id).
 
     "Already classified" is presence of ANY row for that investor_key, regardless of
     classification_status -- a 'failed' row (see run_investor_classification) counts
@@ -151,7 +155,7 @@ def load_unclassified_investor_names(limit: int | None = None) -> list[dict]:
         """
         SELECT source, news_id, structured_extraction_json
         FROM fundamentals_events
-        WHERE filing_type = 'capital_raise'
+        WHERE filing_type IN ('capital_raise', 'bulk_deal_buy', 'bulk_deal_sell')
           AND structured_extraction_status = 'done'
           AND structured_extraction_json IS NOT NULL
         ORDER BY load_ts ASC NULLS LAST

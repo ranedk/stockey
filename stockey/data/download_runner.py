@@ -42,6 +42,13 @@ DOWNLOADER_STEPS = [
     # parser) -- BSE's bhavcopy is a single plain-CSV request, no ZIP/multi-report
     # complexity to split across two modules.
     {"module": "data.bseindia.bhavcopy", "args": [], "purpose": "bse_market_wide"},
+    # Block/bulk deals + short-selling (2026-08-29 revival, PRD §12 todo #1) --
+    # fundamentals-screener deal-flow signal (ownership-axis confluence, new L3
+    # triggers), not systrader's PRIMARY series. purpose is deliberately its own
+    # non-CRITICAL tag (see download_runner.CRITICAL_PURPOSES) -- a bad NSE day
+    # here must not fail the critical market-data path, same reasoning as
+    # bse_market_wide above.
+    {"module": "data.nseindia.offmarket", "args": [], "purpose": "fundamentals_deal_flow"},
 ]
 # nseindia.earnings_events and nseindia.recent_events are BORDERLINE (LLM-free,
 # useful for FnO event-vol later per DATA_INVENTORY.md) -- frozen, not deleted:
@@ -58,6 +65,11 @@ PARSER_STEPS = [
     # refreshed) -- purely derived and idempotent, safe to recompute every run.
     {"module": "data.nseindia.corporate_action_events", "args": [], "purpose": "corporate_action_normalize"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
+    # No dependency on anything after it -- placed before benchmark_sync only to
+    # preserve benchmark_sync as the literal last parser step (it depends on the
+    # rest of the chain having already run; offmarket_parser depends on nothing
+    # here and has nothing depending on it).
+    {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "fundamentals_deal_flow"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
 ]
 

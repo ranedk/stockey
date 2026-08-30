@@ -329,11 +329,63 @@ def load_open_theses_past_target_date(*, as_of_date=None) -> pd.DataFrame:
     )
 
 
+# PRD §12 todo #7 (2026-08-29): a group's hit_rate reads as None below this count,
+# even though its raw count is still shown -- the source spec is explicit that
+# signal-level hit rates are noise below real sample size ("Not to be measured:
+# ... at the individual-signal level. Sample size makes these noise that will read
+# as evidence"). Never hide the count itself; only withhold the percentage a human
+# could mistake for a real read.
+MIN_SAMPLE_SIZE_FOR_BREAKDOWN = 5
+
+
+def _hit_rate_breakdown(resolved: pd.DataFrame, group_column: str) -> dict[str, dict[str, object]]:
+    """{group_value: {"hit_rate": pct-or-None, "count": n}} over a resolved-theses
+    slice, grouped by an arbitrary column (origin_tag, source_alert_trigger_type,
+    or a confluence_count bucket merged in beforehand). None group values (e.g. an
+    ad_hoc thesis with no source_alert_trigger_type) become the string "none" --
+    an honest, visible bucket, not silently dropped."""
+    breakdown: dict[str, dict[str, object]] = {}
+    working = resolved.copy()
+    working[group_column] = working[group_column].fillna("none").astype(str)
+    for group_value, group_df in working.groupby(group_column):
+        count = int(len(group_df))
+        hit_rate = round(float(group_df["resolved_true"].mean()) * 100, 1) if count >= MIN_SAMPLE_SIZE_FOR_BREAKDOWN else None
+        breakdown[group_value] = {"hit_rate": hit_rate, "count": count}
+    return breakdown
+
+
+def _load_latest_confluence_count_by_company() -> dict[str, object]:
+    """company_master_id -> latest confluence_count. Deliberately the LATEST score,
+    not the score as of each thesis's own created_date -- confluence_score.py
+    (PRD §12 todo #4) shipped the same day as this breakdown, with no real
+    historical depth yet to join against point-in-time. Revisit once there's
+    enough confluence_score history for a created_date-aligned join to mean
+    something different from "the latest one anyway"."""
+    df = sql_to_df(
+        """
+        SELECT DISTINCT ON (company_master_id) company_master_id, confluence_count
+        FROM fundamentals_confluence_score
+        ORDER BY company_master_id, run_date DESC
+        """
+    )
+    if df.empty:
+        return {}
+    return dict(zip(df["company_master_id"], df["confluence_count"]))
+
+
 def compute_quarterly_scoring(*, as_of_date=None) -> dict[str, object]:
     """fundamental_basic_goal.md sec 5's primary outcome measure -- forecast accuracy,
-    not returns. Computed from whatever has actually been resolved; calibration-by-
-    signal-type is deferred until enough same-signal resolved theses exist to say
-    anything (source PRD's own target is 60-100 scored forecasts over two years)."""
+    not returns. Computed from whatever has actually been resolved.
+
+    hit_rate_by_origin_tag / hit_rate_by_trigger_type / hit_rate_by_confluence_count
+    (2026-08-29, PRD §12 todo #7): the calibration-by-signal-type breakdown this
+    function's own docstring used to defer "until enough same-signal resolved
+    theses exist" -- now computed unconditionally (each group's hit_rate is None,
+    not hidden, below MIN_SAMPLE_SIZE_FOR_BREAKDOWN, so an empty/thin breakdown is
+    visibly thin rather than absent). This is what actually tells you whether a
+    high confluence_count means anything, once enough theses resolve to say so --
+    the entire reason PRD §12's confluence score is falsifiable rather than a
+    second, unaudited conviction score."""
     as_of_date = as_of_date or pd.Timestamp.now(tz="UTC").date()
     all_theses = sql_to_df("SELECT * FROM fundamentals_l4_thesis")
     if all_theses.empty:
@@ -345,6 +397,9 @@ def compute_quarterly_scoring(*, as_of_date=None) -> dict[str, object]:
             "hit_rate": None,
             "failure_attribution_breakdown": {},
             "time_to_confirmation_days": {},
+            "hit_rate_by_origin_tag": {},
+            "hit_rate_by_trigger_type": {},
+            "hit_rate_by_confluence_count": {},
         }
 
     resolved = all_theses[all_theses["status"] == "resolved"]
@@ -353,6 +408,9 @@ def compute_quarterly_scoring(*, as_of_date=None) -> dict[str, object]:
     hit_rate = None
     failure_breakdown: dict[str, int] = {}
     time_to_confirmation: dict[str, object] = {}
+    hit_rate_by_origin_tag: dict[str, dict[str, object]] = {}
+    hit_rate_by_trigger_type: dict[str, dict[str, object]] = {}
+    hit_rate_by_confluence_count: dict[str, dict[str, object]] = {}
     if not resolved.empty:
         hit_rate = round(float(resolved["resolved_true"].mean()) * 100, 1)
         false_resolved = resolved[resolved["resolved_true"] == False]  # noqa: E712 -- pandas boolean column comparison
@@ -367,6 +425,19 @@ def compute_quarterly_scoring(*, as_of_date=None) -> dict[str, object]:
                 "count": int(len(days)),
             }
 
+        hit_rate_by_origin_tag = _hit_rate_breakdown(resolved, "origin_tag")
+        hit_rate_by_trigger_type = _hit_rate_breakdown(resolved, "source_alert_trigger_type")
+
+        confluence_by_company = _load_latest_confluence_count_by_company()
+        resolved_with_confluence = resolved.copy()
+        confluence_col = resolved_with_confluence["company_master_id"].map(confluence_by_company)
+        # A mix of real ints and NaN forces the column to float64 (pandas has no
+        # nullable-int dtype by default) -- "3.0" would be a confusing group label
+        # next to origin_tag/trigger_type's plain string ones. Format known values
+        # as clean ints before _hit_rate_breakdown's fillna("none") handles the rest.
+        resolved_with_confluence["confluence_count"] = confluence_col.apply(lambda v: str(int(v)) if pd.notna(v) else None)
+        hit_rate_by_confluence_count = _hit_rate_breakdown(resolved_with_confluence, "confluence_count")
+
     return {
         "as_of_date": str(as_of_date),
         "total_theses": int(len(all_theses)),
@@ -375,6 +446,9 @@ def compute_quarterly_scoring(*, as_of_date=None) -> dict[str, object]:
         "hit_rate": hit_rate,
         "failure_attribution_breakdown": failure_breakdown,
         "time_to_confirmation_days": time_to_confirmation,
+        "hit_rate_by_origin_tag": hit_rate_by_origin_tag,
+        "hit_rate_by_trigger_type": hit_rate_by_trigger_type,
+        "hit_rate_by_confluence_count": hit_rate_by_confluence_count,
     }
 
 

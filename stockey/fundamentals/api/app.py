@@ -94,11 +94,37 @@ def watchlist(status: str = "active") -> list[dict]:
     return queries.get_watchlist(status=None if status == "all" else status)
 
 
+@app.get("/api/watchlist/summary")
+def watchlist_summary(status: str = "active") -> dict:
+    # Declared BEFORE /api/watchlist/{company_master_id} -- FastAPI matches path
+    # routes in declaration order, so a literal /summary segment must come first or
+    # it would be captured as a company_master_id instead.
+    return queries.get_watchlist_return_summary(status=None if status == "all" else status)
+
+
 @app.get("/api/watchlist/{company_master_id}")
 def watchlist_detail(company_master_id: str) -> dict:
     result = queries.get_watchlist_detail(company_master_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"{company_master_id} is not on the watchlist")
+    return result
+
+
+@app.get("/api/watchlist/{company_master_id}/sizing")
+def watchlist_sizing(company_master_id: str, total_capital_rs: float, target_position_count: int) -> dict:
+    # PRD §12 todo #8 -- a CALCULATOR, not a decision: 404s if this company has no
+    # OPEN L4 thesis (a human hasn't committed to it yet), same "no capital act
+    # without the one deliberate human gate" boundary as portfolio create/resolve
+    # below. total_capital_rs/target_position_count are REQUIRED query params (no
+    # server-side default) -- FastAPI 422s a request that omits either rather than
+    # this API silently assuming a sleeve size or position count on the caller's
+    # behalf.
+    try:
+        result = queries.get_position_sizing(company_master_id, total_capital_rs=total_capital_rs, target_position_count=target_position_count)
+    except ValueError as exc:  # target_position_count <= 0 -- same translation pattern as ThesisValidationError below
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"{company_master_id} has no open L4 thesis to size a position for")
     return result
 
 

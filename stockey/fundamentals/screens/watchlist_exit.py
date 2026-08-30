@@ -68,16 +68,38 @@ def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = 
     )
 
 # Direct contradictions only -- deliberately NOT exhaustive. A trigger_type not
-# listed here (institutional_first_entry, capital_raise, auditor_change,
-# related_party_transaction, results_delayed, llm_flagged) has no single natural
-# opposite in this trigger set; forcing one would be inventing a relationship the
-# data doesn't actually support, the same trap this codebase avoids everywhere else
-# (e.g. investor_classification.py's own "unknown" tier being an honest default
-# rather than a guessed skill rating).
+# listed here (capital_raise, auditor_change, related_party_transaction,
+# results_delayed, llm_flagged) has no single natural opposite in this trigger set;
+# forcing one would be inventing a relationship the data doesn't actually support,
+# the same trap this codebase avoids everywhere else (e.g. investor_
+# classification.py's own "unknown" tier being an honest default rather than a
+# guessed skill rating). Each is reviewed on its own (PRD §12 todo #5, 2026-08-29):
+#   - capital_raise: a structural, one-off fact ("money came in") -- no event in
+#     this taxonomy represents "the raise didn't happen after all".
+#   - auditor_change / related_party_transaction: disclosed facts, not reversible
+#     by a later positive event -- there's no "the auditor change turned out fine"
+#     trigger_type.
+#   - results_delayed: purely a TIMING red flag, distinct from results_decline/
+#     results_confirm_turnaround (which judge quality, not timing) -- this system
+#     has no "results_on_time" reassurance trigger_type to pair it with. A real gap
+#     if one is ever added, not filled here with an inexact substitute.
+#
+# institutional_first_entry (2026-08-29, PRD §12 todo #5) now has TWO --
+# pledge_increase and bulk_deal_sell (both new todo #2/#3 triggers) are each a
+# plausible "look again" signal against a claimed fresh institutional entry: a
+# rising pledge suggests promoter-side financial stress despite the claimed
+# validation, and a large bulk/block SELL on the same name is at least consistent
+# with that same institutional money exiting (though, per deal_flow.py's own
+# documented limitation, NOT proof of it -- bulk/block deals carry no promoter/
+# institution category flag, so this is corroborative, not certain, same as every
+# other entry in this dict). bulk_deal_sell is deliberately NOT added to insider_buy
+# -- that pairing would need the SAME named insider selling, which nothing in the
+# bulk/block-deal data source can confirm (see deal_flow.py's module docstring).
 INVALIDATING_TRIGGER_TYPES: dict[str, set[str]] = {
-    "rating_confirms_deleveraging": {"rating_downgrade"},
-    "results_confirm_turnaround": {"results_decline"},
+    "rating_confirms_deleveraging": {"rating_downgrade", "pledge_increase"},
+    "results_confirm_turnaround": {"results_decline", "pledge_increase"},
     "insider_buy": {"insider_sell_surprise"},
+    "institutional_first_entry": {"bulk_deal_sell", "pledge_increase"},
 }
 
 # First-cut, undocumented-in-any-spec placeholders, same "easy to tune once

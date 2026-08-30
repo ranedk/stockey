@@ -539,6 +539,52 @@ def compute_institutional_stake(shareholding: dict[str, object]) -> dict[str, ob
     return {"institutional_pct": latest, "institutional_stake_direction": direction, "institutional_first_entry": first_entry}
 
 
+PLEDGE_INCREASE_THRESHOLD_PP = 2.0  # percentage points; below this is noise/rounding drift, not a real re-pledge
+
+
+def load_prior_pledge_levels(company_ids: list[int]) -> dict[int, float]:
+    """Most recent ALREADY-STORED pledge_pct per company, one row per company_id
+    (the latest by run_date), read BEFORE this run's new fundamentals_l2_state rows
+    are written. Unlike promoter/institutional stake (which get their own multi-
+    quarter trend from screener.in's shareholding-pattern table every run,
+    independent of anything we've stored), pledge_pct is only ever a single
+    CURRENT cross-sectional snapshot (fetch_pledge_levels, PLEDGE_QUERY) -- screener.in
+    exposes no pledge history at all. Diffing against our OWN last stored snapshot
+    is the only way to detect a rising pledge, so this table doubles as its own
+    history here, same append-only convention every other consumer of this table
+    relies on."""
+    if not company_ids:
+        return {}
+    df = sql_to_df(
+        f"""
+        SELECT DISTINCT ON (company_id) company_id, pledge_pct
+        FROM {RESULTS_TABLE}
+        WHERE company_id = ANY(%s)
+        ORDER BY company_id, run_date DESC
+        """,  # noqa: S608 -- RESULTS_TABLE is a fixed internal constant, not user input
+        params=(list(company_ids),),
+    )
+    if df.empty:
+        return {}
+    return {int(row["company_id"]): float(row["pledge_pct"]) for _, row in df.iterrows() if pd.notna(row["pledge_pct"])}
+
+
+def compute_pledge_trend(current_pledge_pct: float, prior_pledge_pct: float | None) -> dict[str, object]:
+    """Compares this run's pledge_pct against the last STORED snapshot for the same
+    company (see load_prior_pledge_levels) -- None prior (first-ever L2 row for this
+    company) means no trend can be claimed, not a claimed "flat"/"increasing"."""
+    if prior_pledge_pct is None:
+        return {"pledge_pct_prior": None, "pledge_pct_delta_pp": None, "pledge_pct_trend_direction": None}
+    delta = round(current_pledge_pct - prior_pledge_pct, 4)
+    if delta >= PLEDGE_INCREASE_THRESHOLD_PP:
+        direction = "increasing"
+    elif delta <= -PLEDGE_INCREASE_THRESHOLD_PP:
+        direction = "decreasing"
+    else:
+        direction = "flat"
+    return {"pledge_pct_prior": prior_pledge_pct, "pledge_pct_delta_pp": delta, "pledge_pct_trend_direction": direction}
+
+
 def fetch_pledge_levels(session) -> dict[int, float]:
     """Companies with any promoter pledge, market-wide -- anyone not in this dict is
     treated as 0.0 (unpledged), the overwhelmingly common case. See module docstring
@@ -791,16 +837,44 @@ def pull_crawl_forward(company_master_ids: list[str]) -> dict[str, object]:
 
 
 def build_l2_state_row(
-    company: dict[str, object], pledge_levels: dict[int, float], valuation_levels: dict[int, dict[str, float]], detail: dict[str, object]
+    company: dict[str, object],
+    pledge_levels: dict[int, float],
+    valuation_levels: dict[int, dict[str, float]],
+    detail: dict[str, object],
+    prior_pledge_levels: dict[int, float] | None = None,
+    *,
+    pledge_data_available: bool = True,
 ) -> dict[str, object]:
     valuation = valuation_levels.get(company["company_id"])
+    current_pledge_pct = pledge_levels.get(company["company_id"], 0.0)
+    prior_pledge_pct = (prior_pledge_levels or {}).get(company["company_id"])
+    # BUG FOUND LIVE 2026-08-30 (adversarial review, HIGH): fetch_pledge_levels
+    # already defaults an absent company to 0.0 ("unpledged, the overwhelmingly
+    # common case" -- its own docstring), which is fine for a static snapshot
+    # field but becomes dangerous once compute_pledge_trend diffs against it: a
+    # TOTAL fetch_pledge_levels failure (run_l2_state_refresh's own except
+    # Exception -> pledge_levels = {}) is indistinguishable from "every company
+    # in the market is genuinely unpledged" -- every company would get pledge_pct
+    # =0.0 stored, then the NEXT successful run would see a real non-zero pledge
+    # against that false 0.0 "prior" and manufacture an "increasing" trend for the
+    # entire universe simultaneously, cascading into false pledge_increase alerts
+    # and (via watchlist_exit.py's widened INVALIDATING_TRIGGER_TYPES) false
+    # thesis invalidations. pledge_pct itself keeps its pre-existing behavior
+    # (still defaults to 0.0 on failure, unchanged scope); only the NEW trend
+    # fields refuse to trust a fetch that didn't actually happen.
+    pledge_trend = (
+        compute_pledge_trend(current_pledge_pct, prior_pledge_pct)
+        if pledge_data_available
+        else {"pledge_pct_prior": prior_pledge_pct, "pledge_pct_delta_pp": None, "pledge_pct_trend_direction": None}
+    )
     return {
         "company_id": company["company_id"],
         "company_name": company["company_name"],
         "ticker": company["ticker"],
         **compute_debt_trajectory(detail["balance_sheet"], detail["profit_loss"], ticker=company["ticker"]),
         **compute_cwip_ratio(detail["balance_sheet"]),
-        "pledge_pct": pledge_levels.get(company["company_id"], 0.0),
+        "pledge_pct": current_pledge_pct,
+        **pledge_trend,
         **compute_promoter_stake(detail["shareholding"]),
         **compute_institutional_stake(detail["shareholding"]),
         "sector_cycle_phase": None,
@@ -867,6 +941,52 @@ def _build_institutional_entry_event_row(row: dict[str, object], *, latest_perio
     }
 
 
+def _build_pledge_increase_event_row(row: dict[str, object], *, run_date, load_ts) -> dict[str, object]:
+    """One synthetic fundamentals_events row for a detected promoter-pledge rise --
+    same reasoning as _build_institutional_entry_event_row (no exchange filing
+    necessarily exists for this; pledge_pct is a screener.in snapshot, not an event
+    feed), so this is how L2 hands a purely-state-discovered fact to the same
+    l3_triggers evaluation machinery every filing-sourced event goes through.
+    news_id is keyed on run_date (not a filing period -- pledge_pct has no period
+    label of its own), which also naturally de-dupes same-day re-runs."""
+    ticker = row["ticker"]
+    company_master_id = map_company_master_ids_nse_or_bse(pd.Series([ticker])).iloc[0]
+    run_date_label = run_date.date() if hasattr(run_date, "date") else run_date
+    return {
+        "source": "l2_state",
+        "news_id": f"pledge_increase:{ticker}:{run_date_label}",
+        "company_master_id": company_master_id,
+        "isin": None,
+        "filing_type": "pledge_increase",
+        "headline": (
+            f"Promoter pledge rose {row.get('pledge_pct_delta_pp')}pp to {row.get('pledge_pct')}% "
+            f"(from {row.get('pledge_pct_prior')}%, screener.in snapshot vs this pipeline's own last stored reading)"
+        ),
+        "subcategory": None,
+        "disclosure_date": run_date_label,
+        "announcement_timestamp": load_ts,
+        "quantity": row.get("pledge_pct_delta_pp"),
+        "insider_name": None,
+        "transaction_type": None,
+        "attachment_name": None,
+        "detail_url": None,
+        "detection_source": "l2_state_pledge_snapshot",
+        "enrichment_status": "not_applicable",  # no document exists for this filing_type, same as institutional_entry
+        "sources": "l2_state",
+        "raw_json": json.dumps(
+            {
+                "pledge_pct": row.get("pledge_pct"),
+                "pledge_pct_prior": row.get("pledge_pct_prior"),
+                "pledge_pct_delta_pp": row.get("pledge_pct_delta_pp"),
+                "ticker": ticker,
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+        "load_ts": load_ts,
+    }
+
+
 def ensure_l2_valuation_columns_are_numeric() -> None:
     """One-time migration (re-audit 2026-08-18): pe/valuation_vs_own_history_ratio/
     valuation_sector_percentile were always None before VALUATION_QUERY existed
@@ -891,6 +1011,31 @@ def ensure_l2_valuation_columns_are_numeric() -> None:
     )
 
 
+def ensure_l2_pledge_trend_columns() -> None:
+    """BUG FOUND LIVE 2026-08-29: pledge_pct_prior/pledge_pct_delta_pp/pledge_pct_
+    trend_direction (compute_pledge_trend, PRD §12 todo #2) are new columns that
+    only exist once upsert_to_db's own ADD COLUMN IF NOT EXISTS has fired against a
+    real write -- i.e. only after run_l2_state_refresh completes at least once
+    since this feature shipped. A READER that runs first must not crash waiting for
+    that: fundamentals/screens/confluence_score.py's own load_l2_state_by_ticker hit
+    exactly this, UndefinedColumn, on a DB where L2 had been refreshed under the
+    OLD schema but not yet since this feature landed. Called defensively from both
+    run_l2_state_refresh (proactive) and confluence_score.py's reader (defensive) --
+    same dual-call pattern fundamentals_confluence_score's own _ensure_confluence_
+    score_table established the same day for an analogous gap."""
+    apply_schema_migration(
+        migration_id="20260829_l2_state_add_pledge_trend_columns",
+        description=f"{RESULTS_TABLE}: add pledge_pct_prior/pledge_pct_delta_pp/pledge_pct_trend_direction if missing.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"ALTER TABLE {RESULTS_TABLE} ADD COLUMN IF NOT EXISTS pledge_pct_prior DOUBLE PRECISION",
+            f"ALTER TABLE {RESULTS_TABLE} ADD COLUMN IF NOT EXISTS pledge_pct_delta_pp DOUBLE PRECISION",
+            f"ALTER TABLE {RESULTS_TABLE} ADD COLUMN IF NOT EXISTS pledge_pct_trend_direction TEXT",
+        ],
+    )
+
+
 def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str, object]:
     """Build one L2 state row per DUE L1-universe company, keyed by (company_id,
     run_date, state_vector_version) -- append-only across refreshes (docs/
@@ -902,6 +1047,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     estimate. limit is applied AFTER the due-filter, not before, so a caller asking
     for N companies gets N genuinely-due ones, not N that might all be skipped."""
     ensure_l2_valuation_columns_are_numeric()
+    ensure_l2_pledge_trend_columns()
     universe = load_l1_universe()
     if universe.empty:
         _record_no_universe_fallback()
@@ -924,12 +1070,19 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     except Exception as exc:  # noqa: BLE001 -- see above
         valuation_levels = {}
         _record_market_wide_query_fallback("valuation", exc)
+    try:
+        prior_pledge_levels = load_prior_pledge_levels(universe["company_id"].tolist())
+    except Exception as exc:  # noqa: BLE001 -- a failed prior-snapshot lookup must not sink the whole run;
+        # every company just reads back as "no trend claimable" (None prior), same as a company's first-ever row.
+        prior_pledge_levels = {}
+        _record_market_wide_query_fallback("prior_pledge", exc)
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
     load_ts = pd.Timestamp.now(tz="UTC")
     rows: list[dict[str, object]] = []
     failed_companies: list[str] = []
     institutional_entry_events: list[dict[str, object]] = []
+    pledge_increase_events: list[dict[str, object]] = []
     crawled: list[tuple] = []
     for _, company in universe.iterrows():
         ticker = company["ticker"]
@@ -941,7 +1094,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             failed_companies.append(ticker)
             _record_company_fetch_fallback(ticker, exc)
             continue
-        row = build_l2_state_row(company, pledge_levels, valuation_levels, detail)
+        row = build_l2_state_row(company, pledge_levels, valuation_levels, detail, prior_pledge_levels)
         row["run_date"] = run_date
         row["state_vector_version"] = STATE_VECTOR_VERSION
         row["load_ts"] = load_ts
@@ -958,6 +1111,14 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             periods = detail.get("shareholding", {}).get("periods") or []
             latest_period = periods[-1] if periods else str(run_date.date())
             institutional_entry_events.append(_build_institutional_entry_event_row(row, latest_period=latest_period, load_ts=load_ts))
+
+        # PRD §12 todo #2 (2026-08-29): pledge_pct has no history source of its own
+        # (see load_prior_pledge_levels), so -- same as institutional_first_entry --
+        # this is detected purely inside L2 and synthesized into a fundamentals_events
+        # row so it flows through the SAME l3_triggers evaluation machinery as every
+        # exchange-filed event, rather than needing its own bespoke alert path.
+        if row.get("pledge_pct_trend_direction") == "increasing":
+            pledge_increase_events.append(_build_pledge_increase_event_row(row, run_date=run_date, load_ts=load_ts))
 
     # Sector-relative valuation percentile needs every company's PE at once (it's a
     # cross-company rank, unlike every other field above which is purely per-company)
@@ -979,9 +1140,12 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         # THIS cycle is confirmed durably written -- see the loop above for why.
         for company_id, ticker in crawled:
             _mark_crawled(company_id, ticker)
-    if institutional_entry_events:
+    if institutional_entry_events or pledge_increase_events:
         _ensure_events_schema()
-        upsert_to_db(pd.DataFrame(institutional_entry_events), EVENTS_TABLE, unique_keys=["source", "news_id"])
+        if institutional_entry_events:
+            upsert_to_db(pd.DataFrame(institutional_entry_events), EVENTS_TABLE, unique_keys=["source", "news_id"])
+        if pledge_increase_events:
+            upsert_to_db(pd.DataFrame(pledge_increase_events), EVENTS_TABLE, unique_keys=["source", "news_id"])
     _record_deferred_fields_fallback()
     return {
         "rows": len(rows),
@@ -989,6 +1153,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         "checks_deferred": list(DEFERRED_FIELDS),
         "companies": [row["company_name"] for row in rows][:20],
         "institutional_first_entries": len(institutional_entry_events),
+        "pledge_increases": len(pledge_increase_events),
         "companies_due": int(len(universe)),
     }
 

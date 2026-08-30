@@ -19,6 +19,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 | BSE price adjustment | `data/bseindia/price_adjustment.py` | `bseindia_adjustment_factors` (written, price-step-derived only — no BSE-side corporate-actions feed to corroborate against); `bse_advisory_adjusted_ohlcv_daily` is a VIEW over it × `bseindia_ohlcv`, keyed by `scrip_code` (BSE's real identity key, not its ticker text) |
 | NSE indices | `nseindia/indices_{downloader,parser}` | `nseindia_indices` |
 | NSE calendar | `nseindia/holidays` | `nseindia_holidays`, `dim_trading_days` |
+| NSE off-market deals | `data/nseindia/{offmarket,offmarket_parser}.py` (revived 2026-08-29, see "Retired 2026-08-15" below for history) | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_short_selling` — fundamentals-screener deal-flow signal (PRD §12), not systrader's PRIMARY series |
 | Dhan broker | `dhanlive/*` (incl. auth/web_login) | `master_dhan_instruments`, `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` (1-min bars) |
 | RBI/FBIL | `rbi/*` | `rbi_bank_rates`, `rbi_currency_rates`, `fbil_gsec_par` |
 | Identity | `company_master`, `nseindia/security_history` | `company_master`, `dim_security*` |
@@ -66,6 +67,13 @@ retired:
   the whole `data/nseindia/offmarket.py`/`offmarket_parser.py` collector
   deleted (it was also independently broken: NSE download-trigger timeouts
   on every recent run, see `docs/DATA_COVERAGE.md`'s log-sweep note).
+  **REVIVED 2026-08-29** (fundamentals PRD §12 todo #1: the ownership-axis
+  confluence signal needs secondary-market deal-flow, which nothing else in
+  this inventory captures) — same module names, same three tables, root
+  cause fixed (the old downloader skipped the homepage-warmup navigation
+  every other nseindia collector does before a deep-page `nse_goto`, and
+  requested up to 365 days of deals in one CSV; now capped at 30 days/request
+  with a homepage visit first). See the "Collectors and tables" table below.
 - `master_sharpely_funds` — `sharpelydata/scrip_master.py` no longer
   requests instrumentType 0/1 (non-stock entities) from the sharpely API at
   all, only the equity type it actually stores.
@@ -138,8 +146,17 @@ Plus, for the fundamentals-screener carve-out:
 No BSE price or corporate-action data — `company_master` currently has zero
 BSE-only companies (everything tracked is NSE-listed or NSE+BSE
 cross-listed, and a cross-listed company's corporate actions are already
-covered by the NSE feed). No macro data beyond RBI/FBIL rates. No insider/
-deal-flow data at all (block/bulk-deals, short-selling collection retired
-2026-08-15 — see above). No fundamentals data in stockey's own pure-TA
-scope — that's `fundamentals/`'s job, a separate carve-out with its own
-PRD.
+covered by the NSE feed). No macro data beyond RBI/FBIL rates. No
+litigation/regulatory-action data (SEBI orders, tax/GST notices). Block/bulk
+deals and short-selling ARE now collected again (`data/nseindia/offmarket.py`,
+revived 2026-08-29 — see "Retired 2026-08-15" above for the history), and
+block/bulk deals feed two new fundamentals L3 triggers
+(`fundamentals/screens/deal_flow.py`, PRD §12 todo #3) — but no promoter-name
+identification exists anywhere in this pipeline (only `promoter_pct`, a
+percentage, not a name string), so a bulk/block deal can never be classified
+as "promoter selling" specifically, only as a named client's buy/sell —
+deliberately not guessed at from `client_name` string-matching. `short_selling`
+is collected but not yet used by any fundamentals trigger (anonymous
+aggregate, no client_name — a different kind of signal, needing its own
+spike/baseline design). No fundamentals data in stockey's own pure-TA scope — that's `fundamentals/`'s
+job, a separate carve-out with its own PRD.

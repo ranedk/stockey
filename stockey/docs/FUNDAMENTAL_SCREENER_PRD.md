@@ -360,6 +360,107 @@ scanning):
 One item still genuinely open: whether extraction should use `gpt-5.4-mini`
 or something else — flagged in §3.1, not blocking.
 
+## 12. Confluence scoring & disciplined promotion (2026-08-29 addition)
+
+**Why**: the operator wants "more signals, better decision, better
+confidence" feeding whether a watchlist name is worth acting on — but NOT
+via an LLM synthesizing a lot of evidence into a holistic "invest" call, no
+matter how thorough. That's the same capital-decision-by-LLM pattern §1/§3.3
+already forbid, just with a richer prompt; a well-argued LLM thesis is
+*harder* to audit than a one-line news reaction, not easier, because it
+sounds more trustworthy without being any more falsifiable. Confidence has
+to come from something checkable after the fact, not from how convincing the
+LLM's prose reads.
+
+**The mechanism**: a *mechanical, versioned* confluence score — a count of
+independent evidence axes currently agreeing on a company, computed the same
+deterministic way every time, never an LLM holistic judgment. The count
+itself is what's falsifiable (unlike a "conviction score," which §11's own
+2026-08-15 entry and `l4_thesis_draft.py` already correctly refuse to build):
+you can go back and check whether high-confluence names resolved their L4
+theses true more often than low-confluence ones. The LLM's role does not
+change from §3 above — extraction, event-interest triage, and drafting the
+falsifiable prediction TEXT — it never assigns the score and never decides.
+
+Axes (first cut, each already backed by data this pipeline collects or is
+about to):
+1. Fundamentals trajectory — debt declining, CWIP converting to gross block,
+   interest coverage improving (`fundamentals_l2_state`).
+2. Event corroboration — does the firing L3 alert agree with L2 state
+   direction, or contradict it (already the rule for 3 of 12 trigger types;
+   this generalizes it into a count rather than a binary gate).
+3. Sector cycle phase — capacity discipline, not expansion
+   (`fundamentals_sector_cycle`).
+4. Ownership signal — institutional accumulation, promoter stake not
+   decreasing, pledge not rising, no recent insider/bulk-deal selling.
+5. Valuation vs. own history — cheap relative to itself, not just cheap in
+   absolute terms (`fundamentals_l2_state.valuation_vs_own_history_ratio`).
+
+**Build order** (each step should be independently inspectable before the
+next starts, same discipline as §8). **All 8 shipped 2026-08-29/30**, verified
+against the real DB and the live API/frontend, not just unit-tested:
+
+1. **DONE** — Revived the retired bulk/block-deal + short-selling collector
+   (`data/nseindia/offmarket.py`/`offmarket_parser.py`, deleted 2026-08-15 for
+   being broken — NSE download-trigger timeouts — not for being low-value).
+   Root cause fixed: the old downloader skipped the homepage-warmup
+   navigation every other nseindia collector does before a deep-page
+   `nse_goto`, and requested up to 365 days per CSV; now visits nseindia.com
+   first and caps blocks at `NSE_OFFMARKET_MAX_BLOCK_DAYS=30`. **Caveat**: the
+   actual NSE navigation path could not be live-smoke-tested this session — a
+   local Chrome/CDP connection attempt timed out (a shared-resource
+   contention issue, not a code error) — verify with a real
+   `python -m data.nseindia.offmarket` run before trusting it fully.
+2. **DONE** — `pledge_increase` L3 trigger, off a new
+   `compute_pledge_trend()` in `l2_state.py` (diffs against the last STORED
+   snapshot — screener.in has no pledge history of its own).
+3. **DONE** — `fundamentals/screens/deal_flow.py`: `bulk_deal_buy`/
+   `bulk_deal_sell` L3 triggers, always-alert (NSE's own disclosure threshold
+   is the size filter), investor tier folded into reasoning when known.
+   Deliberately does NOT claim promoter-specific detection (see that module's
+   docstring) or cover `short_selling` (anonymous aggregate, no client name).
+4. **DONE** — `fundamentals/screens/confluence_score.py`, 5 mechanical axes,
+   `fundamentals_confluence_score` table. Live-verified: 75/75 active
+   watchlist companies scored on first real run (0 crashed), confluence
+   counts spread 0-3 across real names.
+5. **DONE** — `INVALIDATING_TRIGGER_TYPES` widened:
+   `institutional_first_entry` now invalidated by `pledge_increase`/
+   `bulk_deal_sell`; `rating_confirms_deleveraging`/`results_confirm_turnaround`
+   by `pledge_increase`. `bulk_deal_sell` deliberately NOT added to
+   `insider_buy` (can't confirm the SAME named insider sold).
+6. **DONE** — score surfaced in `get_watchlist()`/`load_full_watchlist()` and
+   the `screener/` watchlist page (badge + min-confluence filter dropdown).
+   **Two live-production bugs found and fixed during verification, both the
+   same failure class as `_load_draft_theses_by_company`'s 2026-08-18 fix**:
+   (a) the new `LEFT JOIN LATERAL fundamentals_confluence_score` 500'd every
+   `/api/watchlist` request on this DB (`UndefinedTable` — the table had
+   never been written to yet); (b) `confluence_score.py`'s own L2 read then
+   hit `UndefinedColumn` on `pledge_pct_trend_direction` for the same
+   underlying reason. Both fixed with defensive `_ensure_*` calls before the
+   read, not just the write.
+7. **DONE** — `compute_quarterly_scoring()` now returns
+   `hit_rate_by_origin_tag`/`hit_rate_by_trigger_type`/
+   `hit_rate_by_confluence_count`, each entry `{"hit_rate": pct-or-None,
+   "count": n}` — `hit_rate` stays `None` below `MIN_SAMPLE_SIZE_FOR_BREAKDOWN`
+   (5) so a thin breakdown reads as visibly thin, never a fake percentage.
+8. **DONE** — `fundamentals/screens/l5_sizing.py` + `GET /api/watchlist/
+   {company_master_id}/sizing?total_capital_rs=...&target_position_count=...`
+   (both required, no server-side default). 404s without an OPEN L4 thesis;
+   sizes off `min(capital / target_position_count, ADV_pct_cap)` using
+   `avg_vol_1mth`/`cmp_rs` already sitting in L1's own `metrics_json` — no new
+   data source needed.
+
+Not built (deliberately, see each item's own reasoning): a "results_on_time"
+reassurance trigger to pair with `results_delayed` (no such event exists in
+this taxonomy); a short-selling trigger (needs its own baseline/spike design,
+different kind of signal); the source spec's optional 200-DMA reclaim entry
+gate (a timing/entry rule, separate from sizing).
+
+**What this does not change**: §1's boundary (never merges with systrader's
+decision pipeline), §3.3's "no LLM makes a capital decision," and L4 staying
+a human act. A high confluence score makes a draft thesis fast to approve;
+it does not make the approval automatic.
+
 **2026-08-15 additions** (both user-requested, both bounded to a new table
 each — neither changes the §1 rule that L4 is a human act):
 

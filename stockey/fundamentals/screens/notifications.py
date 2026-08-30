@@ -51,6 +51,7 @@ import boto3
 import pandas as pd
 from environs import Env
 
+from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 from fundamentals.screens.l4_thesis_draft import load_current_drafts_by_company, run_l4_thesis_drafting
 from fundamentals.screens.signal_pointers import load_satisfied_strategies_by_company
 from fundamentals.screens.watch_summary import run_watch_summary_refresh
@@ -137,15 +138,24 @@ def load_full_watchlist() -> list[dict]:
     digest is "here's your current watchlist", the exact place the "crowding"
     complaint this feature fixes was actually about; stale/invalidated/price_flagged
     companies stay fully queryable, just not in this standing summary), company name
-    joined from the latest L1 universe run and current_price from the latest
-    technicals run (same two joins fundamentals/api/queries.py's get_watchlist()
-    does, kept as their own small query here rather than importing the API layer --
-    screens/ modules stay independent of api/, not the other way around)."""
+    joined from the latest L1 universe run, current_price from the latest
+    technicals run, and confluence_count/contradicting_count/evaluable_count from
+    the latest confluence_score run (same three joins fundamentals/api/queries.py's
+    get_watchlist() does, kept as their own small query here rather than importing
+    the API layer -- screens/ modules stay independent of api/, not the other way
+    around).
+
+    BUG FOUND LIVE 2026-08-29: same UndefinedTable crash as fundamentals/api/
+    queries.py's get_watchlist() -- see that function's own docstring for the
+    fix (_ensure_confluence_score_table() called defensively first, same
+    established pattern as _ensure_draft_table())."""
+    _ensure_confluence_score_table()
     df = sql_to_df(
         """
         SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
                w.alert_count, w.narrative_text, w.suggested_watch_until, l1.company_name,
-               tech.close AS current_price, tech.price_data_stale
+               tech.close AS current_price, tech.price_data_stale, tech.as_of_date AS current_price_as_of,
+               conf.confluence_count, conf.contradicting_count, conf.evaluable_count
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
@@ -153,10 +163,22 @@ def load_full_watchlist() -> list[dict]:
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
-            SELECT close, price_data_stale FROM fundamentals_technicals
+            SELECT close, price_data_stale, as_of_date FROM fundamentals_technicals
             WHERE company_master_id = w.company_master_id
             ORDER BY run_date DESC LIMIT 1
         ) tech ON TRUE
+        LEFT JOIN LATERAL (
+            -- PRD §12 todo #6 (2026-08-29) -- same third join fundamentals/api/
+            -- queries.py's get_watchlist() has, kept in sync per this function's
+            -- own "same two joins" convention (now three). Not yet rendered in the
+            -- digest body itself (see this module's docstring) -- available on the
+            -- row for a future enhancement, same staged approach the draft L4
+            -- thesis confidence score used before it got its own digest column.
+            SELECT confluence_count, contradicting_count, evaluable_count
+            FROM fundamentals_confluence_score
+            WHERE company_master_id = w.company_master_id
+            ORDER BY run_date DESC LIMIT 1
+        ) conf ON TRUE
         WHERE w.status = 'active'
         ORDER BY w.last_alert_at DESC NULLS LAST
         """
@@ -197,7 +219,25 @@ def _price_change_pct(first_seen_price, current_price) -> float | None:
     return (current_price - first_seen_price) / first_seen_price * 100
 
 
-def _price_change_cell_html(first_seen_price, current_price, *, price_data_stale: bool = False) -> str:
+def _no_move_data_yet(first_seen_at, current_price_as_of) -> bool:
+    """BUG FOUND LIVE 2026-08-26: DBCORP showed "Rs.206.80 -> Rs.206.80 (+0.0%)"
+    -- a real, false "no move" reading, not the >7-day staleness
+    price_data_stale already guards against. Root cause: advisory_adjusted_
+    ohlcv_daily always runs a trading day behind nseindia_ohlcv (NSE's bhavcopy
+    for day D isn't published in time for the same evening's adjustment job),
+    a routine ~1-day lag that's invisible below STALE_PRICE_THRESHOLD_DAYS. It
+    only becomes misleading when a company's first_seen_at happens to equal the
+    latest available adjusted-price date -- entry price and "current" price
+    then resolve to the literal same row, so the digest reports a confident
+    "+0.0%" when in fact there has been zero fresh data to compare against yet."""
+    if first_seen_at is None or current_price_as_of is None or pd.isna(first_seen_at) or pd.isna(current_price_as_of):
+        return False
+    return pd.Timestamp(current_price_as_of).date() == pd.Timestamp(first_seen_at).date()
+
+
+def _price_change_cell_html(
+    first_seen_price, current_price, *, price_data_stale: bool = False, first_seen_at=None, current_price_as_of=None
+) -> str:
     from_str = _fmt_price(first_seen_price)
     to_str = _fmt_price(current_price)
     # BUG FOUND LIVE 2026-08-18 (re-audit): watchlist_exit.py was fixed on
@@ -210,6 +250,8 @@ def _price_change_cell_html(first_seen_price, current_price, *, price_data_stale
     # a real watchlist company showed "+66.1%" off a close that was 3.6 months old.
     if price_data_stale:
         return f'{from_str} &rarr; {to_str} <span class="stale">(stale price)</span>'
+    if _no_move_data_yet(first_seen_at, current_price_as_of):
+        return f'{from_str} &rarr; {to_str} <span class="stale">(no fresh price yet)</span>'
     pct = _price_change_pct(first_seen_price, current_price)
     if pct is None:
         return f"{from_str} &rarr; {to_str}"
@@ -218,11 +260,15 @@ def _price_change_cell_html(first_seen_price, current_price, *, price_data_stale
     return f'{from_str} &rarr; {to_str} <span class="{css_class}">({sign}{pct:.1f}%)</span>'
 
 
-def _price_change_text(first_seen_price, current_price, *, price_data_stale: bool = False) -> str:
+def _price_change_text(
+    first_seen_price, current_price, *, price_data_stale: bool = False, first_seen_at=None, current_price_as_of=None
+) -> str:
     from_str = _fmt_price(first_seen_price)
     to_str = _fmt_price(current_price)
     if price_data_stale:
         return f"{from_str} -> {to_str} (stale price, not a real move)"
+    if _no_move_data_yet(first_seen_at, current_price_as_of):
+        return f"{from_str} -> {to_str} (no fresh price yet, not a real move)"
     pct = _price_change_pct(first_seen_price, current_price)
     if pct is None:
         return f"{from_str} -> {to_str}"
@@ -340,7 +386,7 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         text_lines.append(f"--- {ticker} ({company_name}) ---")
         text_lines.append(
             f"Watching since {_fmt_plain(row.get('first_seen_at'))} at "
-            f"{_price_change_text(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale)} "
+            f"{_price_change_text(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale, first_seen_at=row.get('first_seen_at'), current_price_as_of=row.get('current_price_as_of'))} "
             f"today -- {row.get('alert_count') or 0} event(s)."
         )
         if strategies:
@@ -376,7 +422,7 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
             f'<span style="color:#64748b;font-size:12px">{html.escape(company_name)}</span>'
             f'<div>{strategy_badges_html}</div></td>'
             f"<td>{html.escape(_fmt_plain(row.get('first_seen_at')))}</td>"
-            f"<td>{_price_change_cell_html(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale)}</td>"
+            f"<td>{_price_change_cell_html(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale, first_seen_at=row.get('first_seen_at'), current_price_as_of=row.get('current_price_as_of'))}</td>"
             f'<td><span class="badge">{row.get("alert_count") or 0} events</span></td>'
             f"<td>{html.escape(_fmt_plain(row.get('suggested_watch_until')))}</td>"
             "</tr>"

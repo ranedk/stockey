@@ -12,23 +12,25 @@ trail, so there's nothing else to translate here.
 
 Steps run in dependency order (docs/FUNDAMENTAL_SCREENER_PRD.md sec 8's numbered
 steps): sector reference -> L1 universe -> L2 state -> event collectors -> OCR ->
-structured extraction -> investor classification -> sector capital-cycle -> L3 rule
-triggers -> L3 LLM triage -> descriptive technicals -> watchlist/narrative/email
-pipeline. investor_classification runs right after structured_extraction (needs its
-investor_names output). l3_triggers's capital_raise trigger still fires
-unconditionally regardless of classification status (a raise is alert-worthy either
-way -- see evaluate_capital_raise_trigger), but as of 2026-08-13 its REASONING now
-also names the investor tier when known (fundamentals_investor_classification),
-which is why investor_classification staying before l3_triggers in this list is a
-soft ordering preference, not just incidental -- running l3_triggers first would
-still work, just with tiers_by_key empty for that pass (evaluated again, richer, on
-the next run once investor_classification catches up).
-L2 state MUST stay before l3_triggers (already true) for a second reason as of
-2026-08-13, not just its original "state used to corroborate events" one: L2's own
-refresh now writes synthetic institutional_first_entry events straight into
-fundamentals_events (no exchange filing exists for this trigger -- see
-fundamentals/screens/l2_state.py's own docstring), which l3_triggers then has to
-pick up in the SAME run. The last step
+structured extraction -> deal flow -> investor classification -> sector
+capital-cycle -> L3 rule triggers -> L3 LLM triage -> descriptive technicals ->
+watchlist/narrative/email pipeline. investor_classification runs right after
+structured_extraction AND deal_flow (needs both their investor_names output).
+l3_triggers's capital_raise/bulk_deal_buy/bulk_deal_sell triggers still fire
+unconditionally regardless of classification status (alert-worthy either way -- see
+those evaluators), but their REASONING also names the investor tier when known
+(fundamentals_investor_classification), which is why investor_classification staying
+before l3_triggers in this list is a soft ordering preference, not just incidental --
+running l3_triggers first would still work, just with tiers_by_key empty for that
+pass (evaluated again, richer, on the next run once investor_classification catches
+up).
+L2 state and deal_flow MUST both stay before l3_triggers (already true) for a second
+reason beyond "state used to corroborate events": both write SYNTHETIC events
+straight into fundamentals_events (institutional_first_entry/pledge_increase from
+L2, bulk_deal_buy/bulk_deal_sell from deal_flow -- no exchange filing exists for any
+of these, see each module's own docstring), which l3_triggers then has to pick up in
+the SAME run. deal_flow also needs L1 universe (the step above it) already refreshed
+to know which companies' deals are in scope. The last step
 (notifications.run_watchlist_notification_pipeline) MUST run last: it depends on L3
 alerts, L2 state, technicals, and sector context all being current for that run.
 That step internally chains watchlist sync -> narrative regen -> fundamentals.
@@ -88,9 +90,23 @@ STEPS: list[str] = [
     "fundamentals.collectors.rating_agencies",
     "fundamentals.collectors.ocr_pipeline",
     "fundamentals.collectors.structured_extraction",
-    "fundamentals.screens.investor_classification",  # needs structured_extraction's investor_names, runs right after it
+    # Needs fundamentals_l1_universe (l1_universe step above) to scope which
+    # companies' deals matter; writes synthetic bulk_deal_buy/bulk_deal_sell events
+    # (PRD §12 todo #3, 2026-08-29) that investor_classification below discovers
+    # investor names from, same as structured_extraction's capital_raise events.
+    "fundamentals.screens.deal_flow",
+    "fundamentals.screens.investor_classification",  # needs structured_extraction's + deal_flow's investor_names, runs right after both
     "fundamentals.screens.sector_cycle",
     "fundamentals.screens.l3_triggers",
+    # Needs sector_cycle's fresh phases and l3_triggers' fresh alerts (both above).
+    # Scoped to fundamentals_watchlist WHERE status='active' -- reads that table's
+    # state as of the END of the PREVIOUS run (notifications' own internal
+    # watchlist-sync, this run's copy, hasn't happened yet -- it's deliberately
+    # last). One-cycle staleness, same "eventually consistent next run" tolerance
+    # investor_classification's own catch-up already has -- not worth reaching
+    # into notifications.py's internal call chain to close for a confluence READ,
+    # not a decision (PRD §12 todo #4, 2026-08-29).
+    "fundamentals.screens.confluence_score",
     "fundamentals.screens.llm_triage",
     "fundamentals.screens.technicals",
     "fundamentals.screens.notifications",  # must run last -- see module docstring
