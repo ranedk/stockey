@@ -192,21 +192,30 @@ func Panama(front, second core.Series, rolls []time.Time) (core.Series, []Gap, e
 	}
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Date.Before(gaps[j].Date) })
 
-	// Walk backwards, carrying the basis of every roll that lies STRICTLY
-	// ahead of the current bar. The roll bar itself must not include its own
-	// basis: that is precisely what makes its difference from the previous bar
-	// come out as the real overnight P&L rather than the splice.
-	out := make([]float64, front.Len())
+	return ApplyGaps(front, gaps), gaps, nil
+}
+
+// ApplyGaps back-adjusts any series with splices measured elsewhere — the
+// opens, say, when the gaps were measured on the closes. A bar's open and
+// close belong to the same contract, so they take the same adjustment; using
+// separately measured gaps for each would put a fake overnight move in.
+//
+// Walking backwards, each bar carries the basis of every roll STRICTLY ahead
+// of it. The roll bar itself must not include its own basis: that is precisely
+// what makes its difference from the previous bar come out as the real
+// overnight P&L rather than the splice.
+func ApplyGaps(s core.Series, gaps []Gap) core.Series {
+	out := make([]float64, s.Len())
 	cum := 0.0
 	g := len(gaps) - 1
-	for i := front.Len() - 1; i >= 0; i-- {
-		for g >= 0 && gaps[g].Date.After(front.Times[i]) {
+	for i := s.Len() - 1; i >= 0; i-- {
+		for g >= 0 && gaps[g].Date.After(s.Times[i]) {
 			cum += gaps[g].Basis
 			g--
 		}
-		out[i] = front.Values[i] + cum
+		out[i] = s.Values[i] + cum
 	}
-	return core.New(front.Times, out), gaps, nil
+	return core.New(s.Times, out)
 }
 
 // Carry is the annualized price-unit carry Carver's rule expects: what the

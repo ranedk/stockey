@@ -46,6 +46,8 @@ cmd/run                   Daily production runner → prints the order sheet
 cmd/stage                 CLI: Weinstein stage read per ticker (REPORTING ONLY)
 cmd/api                   HTTP API serving screener/'s stage-analysis page
 cmd/coi                   COI pattern: cache | scan | study (matched controls)
+cmd/carver                Pre-registered verification of EWMAC + carry on
+                          the two-sleeve universe, with its two controls
 cmd/futures               Futures curve report: what cleaning kept, the rolls
                           found, the stitch check, and what is unusable
 cmd/rulelab               scalars | corr characterise the library WITHOUT
@@ -174,10 +176,16 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       read and is NOT burned. Also recorded there: the pre-registered shuffle
       control was a straw man (160%/day turnover) that made all four dead rules
       look brilliant — a control must be matched on turnover too
+- [x] Verified EWMAC + carry on the two-sleeve Indian universe (`cmd/carver`,
+      LEDGER row 16, pre-registered): neither sleeve beats owning it. Futures
+      SR −0.02 against an always-long control at 0.50; ETFs SR 1.09 against
+      1.28, with time-shifted forecasts scoring within 0.03%/month of the real
+      system. Carry alone is −6.2%/yr — its story does not hold on equity index
+      futures, where the basis is a financing cost rather than hedgers paying
+      to shed risk. Construction gate failed, holdout NOT burned
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
-      matched-control baseline — nothing to combine yet: EWMAC and carry are
-      the only rules that have not been rejected, and neither has been scored
-      on real data
+      matched-control baseline — on hold: every rule tested so far has failed
+      its controls, so there is nothing yet worth combining
 - [x] Futures stitching (`internal/futures`, `cmd/futures report`): curve
       cleaning that rejects recycled security ids (six of NIFTY's nine slots
       are option series) and collapses duplicate streams, roll detection by

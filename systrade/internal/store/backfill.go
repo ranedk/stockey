@@ -146,6 +146,23 @@ func (s *Store) ListFuturesContracts(ctx context.Context, underlyings []string) 
 	return out, rows.Err()
 }
 
+// BackfillOpens loads a backfilled OPEN series by ticker, aligned to the same
+// dates BackfillCloses returns. The engine fills at the open after a decision
+// close, so a backtest that cannot load opens cannot run without reintroducing
+// look-ahead.
+func (s *Store) BackfillOpens(ctx context.Context, ticker string) (core.Series, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT date, open FROM systrader_ohlcv_daily
+		WHERE ticker = $1 AND close IS NOT NULL AND close > 0
+		  AND open IS NOT NULL AND open > 0
+		ORDER BY date ASC`, ticker)
+	if err != nil {
+		return core.Series{}, err
+	}
+	defer rows.Close()
+	return scanSeries(rows.Next, rows.Scan, rows.Err)
+}
+
 // FuturesSlot is one Dhan security-id's daily history for a futures
 // underlying, together with the expiry of the contract that id named when the
 // backfill ran.

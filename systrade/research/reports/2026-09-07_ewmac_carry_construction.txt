@@ -1,0 +1,58 @@
+construction window 2015-01-01..2021-12-31 | capital Rs 2.00 cr | vol target 20% | costs x1
+rules: ewmac16/32/64 + carry, equal forecast weights, FDM 1.35, IDM derived point-in-time
+decision bar (pre-registered): monthly paired t > 2.0 vs BOTH controls on the holdout;
+workspace Bonferroni bar for context: t = 4.08 at M = 1114
+
+========== FUTURES SLEEVE ==========
+  NIFTY: 139 splices from calendar+ladder rolls, carry over 35 days
+  BANKNIFTY: 139 splices from calendar+ladder rolls, carry over 35 days
+  GOLDM: 139 splices from calendar+ladder rolls, carry over 31 days
+  SILVERM: 45 splices from calendar+ladder rolls, carry over 91 days
+  4 instruments: [NIFTY BANKNIFTY GOLDM SILVERM]
+
+  book                       ann ret  ann vol      SR     skew     maxDD    cost SR
+  ewmac+carry                 -0.32%   17.64%   -0.02    -0.16     50.7%       0.17
+  always-long control         12.67%   25.47%    0.50    -0.26     38.7%       0.04
+  time-shift control          -4.32%    6.56%   -0.64        -        -          -
+
+  paired monthly, rule minus control      mean        t  months won
+  vs always-long (beta control)        -1.103%    -1.17       45.2%
+  vs time-shifted forecasts             0.357%     0.52       48.8%
+
+  post-hoc decomposition (decides nothing):
+  ewmac only (16/32/64)    ann    0.68%  SR  0.03  maxDD  51.0%  vs always-long  -0.961%/mo t=-1.07
+  carry only (4/4 instruments have a curve) ann   -6.23%  SR -0.28  maxDD  73.9%  vs always-long  -1.577%/mo t=-0.99
+
+  per instrument:
+  symbol        avg |pos|  max |pos|  turnover/yr four-block test
+  NIFTY              9.07      48.00         7.66           PASS
+  BANKNIFTY          6.76      40.00         7.93           PASS
+  GOLDM             18.99     122.00        24.45           PASS
+  SILVERM           24.42     131.00         7.67           PASS
+
+========== ETF / CASH SLEEVE ==========
+  GILT5YBEES EXCLUDED: only 179 bars in the window
+  SILVERBEES EXCLUDED: only 0 bars in the window
+  6 instruments: [NIFTYBEES JUNIORBEES BANKBEES GOLDBEES MON100 LTGILTBEES]
+
+  book                       ann ret  ann vol      SR     skew     maxDD    cost SR
+  ewmac+carry                 11.05%   10.17%    1.09     5.89     12.5%       0.07
+  always-long control         13.14%   10.28%    1.28     0.14     14.5%       0.03
+  time-shift control          10.80%    8.93%    1.19        -        -          -
+
+  paired monthly, rule minus control      mean        t  months won
+  vs always-long (beta control)        -0.160%    -0.57       44.0%
+  vs time-shifted forecasts             0.027%     0.10       48.8%
+
+  post-hoc decomposition (decides nothing):
+  ewmac only (16/32/64)    ann   11.05%  SR  1.09  maxDD  12.5%  vs always-long  -0.160%/mo t=-0.57
+
+  per instrument:
+  symbol        avg |pos|  max |pos|  turnover/yr four-block test
+  NIFTYBEES      43290.19  133577.00         3.14           PASS
+  JUNIORBEES     11615.76   40195.00         4.39           PASS
+  BANKBEES       11942.91   33995.00         3.85           PASS
+  GOLDBEES      128282.38  607553.00         6.04           PASS
+  MON100         61384.71  275770.00         6.18           PASS
+  LTGILTBEES    362976.53  949149.00         1.76           PASS
+

@@ -256,3 +256,53 @@ func TestReport_PrintsBustedWarning(t *testing.T) {
 		t.Fatalf("Report() should surface the bust prominently, got:\n%s", report)
 	}
 }
+
+// TestUnsetInstrumentWeightsStillTrades guards the bug where the daily loop
+// read cfg.InstrumentWeights directly instead of the normalized weights: with
+// no weights configured every target came out zero, and the engine reported a
+// clean run with a flat equity curve rather than failing.
+func TestUnsetInstrumentWeightsStillTrades(t *testing.T) {
+	insts := []*data.Instrument{
+		trendingInstrument("AAA", 400, 1.0),
+		trendingInstrument("BBB", 400, -1.0),
+	}
+	cfg := Config{
+		Capital: 1e7, VolTargetPct: 0.2, Compounding: true, FDM: 1.0,
+		Rules: []RuleSpec{{Rule: rules.EWMAC{Fast: 16}, Weight: 1}},
+		// InstrumentWeights deliberately unset.
+	}
+	res, err := Run(cfg, insts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var traded float64
+	for _, ir := range res.Instruments {
+		traded += ir.AvgAbsPos
+	}
+	if traded == 0 {
+		t.Fatal("engine held nothing with InstrumentWeights unset — equal weights are the documented default")
+	}
+	if res.EndCapital == cfg.Capital {
+		t.Error("capital never moved: the run traded nothing")
+	}
+}
+
+// trendingInstrument builds a clean trending series with opens, enough for the
+// slowest rule in these tests to warm up.
+func trendingInstrument(sym string, n int, drift float64) *data.Instrument {
+	times := make([]time.Time, n)
+	closes := make([]float64, n)
+	opens := make([]float64, n)
+	start := time.Date(2018, 1, 1, 0, 0, 0, 0, time.UTC)
+	p := 1000.0
+	for i := range closes {
+		p += drift + 3*math.Sin(float64(i)/9)
+		times[i], closes[i], opens[i] = start.AddDate(0, 0, i), p, p-drift/2
+	}
+	o := core.New(times, opens)
+	return &data.Instrument{
+		Meta:   data.Meta{Symbol: sym, PointValue: 1, Block: 1, SpreadPoints: 0.1},
+		Prices: core.New(times, closes),
+		Opens:  &o,
+	}
+}

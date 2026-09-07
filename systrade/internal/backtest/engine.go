@@ -310,8 +310,14 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 				ivv := p.vol.Values[i] * p.inst.Meta.PointValue
 				vs := sizing.VolScalar(dailyCashVolTarget, ivv)
 				sub := sizing.Subsystem(vs, p.forecast.Values[i])
-				w := cfg.InstrumentWeights[p.inst.Meta.Symbol]
-				targets[pi] = portfolio.Target(sub, w, idm)
+				// normW, not cfg.InstrumentWeights: the raw map is unnormalized
+				// and, when the caller configures none, EMPTY. Reading it
+				// directly gave every instrument a weight of zero and produced
+				// a backtest that traded nothing at all while reporting a
+				// clean run — no error, no warning, a flat equity curve and
+				// 0.00% for every metric. Found 2026-09-07 by the first
+				// portfolio that did not set weights explicitly.
+				targets[pi] = portfolio.Target(sub, normW[pi], idm)
 			}
 
 			// Pass 2: gross-leverage cap — a cash account cannot borrow.
