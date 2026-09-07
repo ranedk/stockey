@@ -71,7 +71,7 @@ func main() {
 		for i := range cd.Close {
 			if i >= len(cd.Close)-5 { // show the tail
 				fmt.Printf("%s  o=%.2f h=%.2f l=%.2f c=%.2f v=%.0f\n",
-					time.Unix(int64(cd.Timestamp[i]), 0).Format("2006-01-02"),
+					dhan.BarDate(cd.Timestamp[i]).Format("2006-01-02"),
 					cd.Open[i], cd.High[i], cd.Low[i], cd.Close[i], cd.Volume[i])
 			}
 		}
@@ -197,11 +197,10 @@ func backfill(ctx context.Context, c *dhan.Client, group string, defaultStart ti
 		}
 		rows := make([]store.BackfillRow, 0, len(cd.Close))
 		for i := range cd.Close {
-			ts := time.Unix(int64(cd.Timestamp[i]), 0).In(time.Local)
 			rows = append(rows, store.BackfillRow{
 				Ticker: t.ticker, SecurityID: t.securityID,
 				Segment: t.segment, Instrument: t.instrument, Expiry: t.expiry,
-				Date: time.Date(ts.Year(), ts.Month(), ts.Day(), 0, 0, 0, 0, time.UTC),
+				Date: dhan.BarDate(cd.Timestamp[i]),
 				Open: cd.Open[i], High: cd.High[i], Low: cd.Low[i],
 				Close: cd.Close[i], Volume: cd.Volume[i],
 			})

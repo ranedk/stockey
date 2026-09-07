@@ -51,7 +51,10 @@ func LoadToken() (token, clientID string, err error) {
 	if err := json.Unmarshal(raw, &tc); err != nil {
 		return "", "", fmt.Errorf("dhan: token cache corrupt: %w", err)
 	}
-	exp, err := time.ParseInLocation("2006-01-02T15:04:05", tc.ExpiryTime, time.Local)
+	// The cache writes a bare IST wall-clock time. Parsed as UTC it reads 5.5
+	// hours later than it is, so an expired token looks live for most of an
+	// evening — the same class of bug as BarDate's.
+	exp, err := time.ParseInLocation("2006-01-02T15:04:05", tc.ExpiryTime, IST)
 	if err != nil {
 		exp, err = time.Parse(time.RFC3339, tc.ExpiryTime)
 	}
@@ -151,6 +154,29 @@ type Candles struct {
 	Close     []float64 `json:"close"`
 	Volume    []float64 `json:"volume"`
 	Timestamp []float64 `json:"timestamp"` // epoch seconds; Dhan returns floats
+}
+
+// IST is the exchange's clock. Written as a fixed offset rather than loaded
+// from the tzdata database on purpose: India has never observed DST, so the
+// offset is exact for every timestamp Dhan will ever send, and a fixed zone
+// cannot fail on a host with no zoneinfo installed.
+//
+// This constant exists because its absence corrupted an entire table. Dhan
+// stamps a daily bar at the START of the IST trading day; read through
+// time.Local on a UTC host, 2026-08-07 00:00 IST becomes 2026-08-06 18:30 UTC
+// and the bar is filed under the previous calendar day. Every bar in
+// systrader_ohlcv_daily was one day early, and one in five landed on a Sunday
+// (Monday's bar), until 2026-09-07.
+var IST = time.FixedZone("IST", 5*3600+1800)
+
+// BarDate converts one of Dhan's epoch-second candle timestamps into the
+// trading date the bar belongs to: the IST calendar date, carried as UTC
+// midnight because that is what every date column in this project stores.
+// Never derive a bar date any other way — in particular never through
+// time.Local, which is whatever the host happens to be set to.
+func BarDate(epochSeconds float64) time.Time {
+	t := time.Unix(int64(epochSeconds), 0).In(IST)
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 func (c *Client) HistoricalDaily(ctx context.Context, securityID, exchangeSegment, instrument string, from, to time.Time) (*Candles, error) {

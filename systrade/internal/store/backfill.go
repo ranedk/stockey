@@ -6,6 +6,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/ranedk/systrader/internal/core"
@@ -143,4 +144,53 @@ func (s *Store) ListFuturesContracts(ctx context.Context, underlyings []string) 
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// FuturesSlot is one Dhan security-id's daily history for a futures
+// underlying, together with the expiry of the contract that id named when the
+// backfill ran.
+//
+// "Slot" rather than "contract" on purpose: Dhan's history for a futures
+// security id is not that contract's own life. See internal/futures for what
+// these series actually are and how much of them survives cleaning.
+type FuturesSlot struct {
+	Ticker     string
+	SecurityID int64
+	Expiry     time.Time
+	Closes     core.Series
+}
+
+// FuturesSlots loads every stored slot for an underlying, ordered by expiry —
+// which is the order of curve positions, since the whole ladder shifts
+// together at each roll.
+func (s *Store) FuturesSlots(ctx context.Context, underlying string) ([]FuturesSlot, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ticker, security_id, expiry
+		FROM systrader_ohlcv_daily
+		WHERE ticker LIKE $1 AND expiry IS NOT NULL
+		ORDER BY expiry ASC`, underlying+"-%")
+	if err != nil {
+		return nil, err
+	}
+	var slots []FuturesSlot
+	for rows.Next() {
+		var sl FuturesSlot
+		if err := rows.Scan(&sl.Ticker, &sl.SecurityID, &sl.Expiry); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		slots = append(slots, sl)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range slots {
+		ser, err := s.BackfillCloses(ctx, slots[i].Ticker)
+		if err != nil {
+			return nil, fmt.Errorf("futures slot %s: %w", slots[i].Ticker, err)
+		}
+		slots[i].Closes = ser
+	}
+	return slots, nil
 }

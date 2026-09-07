@@ -36,6 +36,8 @@ internal/parallel         Generic worker-pool Map
 internal/sleeve           Long-only cross-sectional equity backtest + its
                           matched controls (beta, shuffle, stable-shuffle)
 internal/bars             Daily OHLCV + the read-postgres-once bar cache
+internal/futures          Curve cleaning (recycled ids, duplicate streams),
+                          roll detection, Panama stitching, splice-free carry
 internal/patterns/coi     External "COI" 3-bar reversal pattern — RESEARCH
                           ONLY, rejected (LEDGER rows 11-13), never a rules.Rule
 
@@ -44,6 +46,8 @@ cmd/run                   Daily production runner → prints the order sheet
 cmd/stage                 CLI: Weinstein stage read per ticker (REPORTING ONLY)
 cmd/api                   HTTP API serving screener/'s stage-analysis page
 cmd/coi                   COI pattern: cache | scan | study (matched controls)
+cmd/futures               Futures curve report: what cleaning kept, the rolls
+                          found, the stitch check, and what is unusable
 cmd/rulelab               scalars | corr characterise the library WITHOUT
                           returns; trial runs the pre-registered backtest
                           (that one IS a trial — see cmd/rulelab/trial.go)
@@ -174,8 +178,19 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       matched-control baseline — nothing to combine yet: EWMAC and carry are
       the only rules that have not been rejected, and neither has been scored
       on real data
-- [ ] Futures stitching (Panama over Dhan slot splices, roll = expiry calendar)
-      + carry from position-1/position-2 basis (splice-safe, see data_notes)
+- [x] Futures stitching (`internal/futures`, `cmd/futures report`): curve
+      cleaning that rejects recycled security ids (six of NIFTY's nine slots
+      are option series) and collapses duplicate streams, roll detection by
+      expiry calendar snapped to the ladder, Panama back-adjustment measured
+      from the same-day basis, and splice-free carry annualized by the listed
+      expiry gap (SILVERM's ladder is quarterly, not monthly). NIFTY,
+      BANKNIFTY, GOLDM and SILVERM produce usable series; CRUDEOILM is refused
+      — irregular rolls with no reference to check them against. Details and
+      the limits of each detector: `docs/data_notes.md`
+- [x] Fixed a UTC/IST bug that stamped every `systrader_ohlcv_daily` bar one
+      day early since 2015 (one row in five on a Sunday). Source fixed in
+      `dhan.BarDate`, data repaired by `db/2026-09-07_fix_backfill_date_shift.sql`,
+      verified 6,165/6,165 against stockey's own table
 - [ ] Matched-control baseline harness; bootstrap weight estimation
 - [ ] Handcrafting helper (correlation grouping → weights + FDM/IDM)
 - [ ] Instrument universe finalization (blocked on capital, A1)
