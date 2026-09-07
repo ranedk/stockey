@@ -124,9 +124,20 @@ func (r *Registry) Burn(name, configHash, note string) error {
 // --- LEDGER M-accounting -----------------------------------------------------
 
 // CountM counts experiment rows in research/LEDGER.md (markdown table rows
-// after the header/separator). Batch rows may declare "trials=N" in the
-// story column to count a whole scan (e.g. a TimesFM forecastability sweep
-// over 200 symbols) as N trials, per law_1_story.md batching.
+// after the header/separator). Batch rows may declare "trials=N" in the story
+// column to count a whole scan (e.g. a TimesFM forecastability sweep over 200
+// symbols) as N trials, per law_1_story.md batching.
+//
+// Two details that a naive reading gets wrong, both found by comparing this
+// counter against the M values written into the ledger's own prose:
+//
+//   - A row may declare trials MORE THAN ONCE when it reports two batches
+//     (row 9 does: 585 monitor runs and 174 split runs). Every declaration on
+//     the row counts. Reading only the first silently discarded 174 trials.
+//   - "trials=0" is legal and means zero. Rows that consult no performance
+//     number — a forecast-scalar fit, a correlation study — test no hypothesis
+//     and must not inflate the bar. A row with no declaration at all still
+//     counts 1: an ordinary experiment.
 func CountM(ledgerPath string) (int, error) {
 	f, err := os.Open(ledgerPath)
 	if err != nil {
@@ -135,6 +146,7 @@ func CountM(ledgerPath string) (int, error) {
 	defer f.Close()
 	m := 0
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // ledger rows run long
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if !strings.HasPrefix(line, "|") || strings.HasPrefix(line, "|-") ||
@@ -142,14 +154,24 @@ func CountM(ledgerPath string) (int, error) {
 			strings.Contains(line, "---|") {
 			continue
 		}
-		n := 1
-		if k := strings.Index(line, "trials="); k >= 0 {
-			fmt.Sscanf(line[k:], "trials=%d", &n)
-			if n < 1 {
-				n = 1
+		declared := false
+		rest := line
+		for {
+			k := strings.Index(rest, "trials=")
+			if k < 0 {
+				break
 			}
+			rest = rest[k+len("trials="):]
+			var n int
+			if _, err := fmt.Sscanf(rest, "%d", &n); err != nil || n < 0 {
+				continue
+			}
+			declared = true
+			m += n
 		}
-		m += n
+		if !declared {
+			m++
+		}
 	}
 	return m, sc.Err()
 }

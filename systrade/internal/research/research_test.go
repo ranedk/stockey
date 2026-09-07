@@ -88,3 +88,26 @@ func TestSplitFirewall(t *testing.T) {
 		t.Fatal("holdout membership wrong")
 	}
 }
+
+func TestCountM_SumsEveryTrialsDeclarationOnARow(t *testing.T) {
+	// Row 9 of the real ledger reports two batches on one line. Counting only
+	// the first understated M by 174 trials.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "LEDGER.md")
+	body := `| # | Date | Rule | Story | Dataset | Result | Decision |
+|---|------|------|-------|---------|--------|----------|
+| 1 | d | plain row, no declaration | s | ds | r | dec |
+| 2 | d | two batches (trials=585) and (trials=174) | s | ds | r | dec |
+| 3 | d | characterisation only, trials=0 | s | ds | r | dec |
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := CountM(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 1 + 585 + 174 + 0; got != want {
+		t.Errorf("CountM = %d, want %d (1 undeclared + 585 + 174 + an explicit zero)", got, want)
+	}
+}

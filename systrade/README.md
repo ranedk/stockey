@@ -17,6 +17,9 @@ docs/open_questions.md    Questions you must answer; edit inline
 docs/instruments_india.md Indian instrument analysis & two-sleeve design
 docs/rule_ideas.md        Phase-2 rules (breakout, TimesFM…) + innovations
 research/LEDGER.md        Append-only record of every experiment (M-counter)
+research/preregistrations Design, periods, controls and decision rule of a
+                          trial, written BEFORE it runs
+research/reports/         Raw output of the runs the ledger rows summarize
 
 internal/core             Series math: EWMA, EWMA-std, price-unit volatility
 internal/data             Instrument metadata, cost model, CSV loading
@@ -30,6 +33,8 @@ internal/portfolio        Instrument weights, IDM (≤2.5), rounding, inertia,
 internal/backtest         Daily engine (compounding, costs), metrics
                           (SR/skew/DD/turnover/cost-drag), Bonferroni stats
 internal/parallel         Generic worker-pool Map
+internal/sleeve           Long-only cross-sectional equity backtest + its
+                          matched controls (beta, shuffle, stable-shuffle)
 internal/bars             Daily OHLCV + the read-postgres-once bar cache
 internal/patterns/coi     External "COI" 3-bar reversal pattern — RESEARCH
                           ONLY, rejected (LEDGER rows 11-13), never a rules.Rule
@@ -39,9 +44,9 @@ cmd/run                   Daily production runner → prints the order sheet
 cmd/stage                 CLI: Weinstein stage read per ticker (REPORTING ONLY)
 cmd/api                   HTTP API serving screener/'s stage-analysis page
 cmd/coi                   COI pattern: cache | scan | study (matched controls)
-cmd/rulelab               Rule library characterisation WITHOUT returns:
-                          scalars | corr (forecast distribution + correlation
-                          groups for handcrafted weights)
+cmd/rulelab               scalars | corr characterise the library WITHOUT
+                          returns; trial runs the pre-registered backtest
+                          (that one IS a trial — see cmd/rulelab/trial.go)
 ```
 
 ## Quickstart
@@ -156,11 +161,19 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       correlations pooled and within-symbol, complete-linkage grouping.
       Result: breakout duplicates EWMAC (ρ 0.84–0.94), meanrev512 is minus
       ewmac64_256 (ρ −0.95), acceleration is the only distinct family
-- [ ] Backtest the surviving families (acceleration ×3, meanrev1280) against a
-      matched-control baseline — a TRIAL: needs its own ledger row and a fresh
-      holdout declared before it runs
+- [x] Backtested the surviving families (acceleration ×3, meanrev1280) against
+      matched controls on the construction window — pre-registered in
+      `research/preregistrations/`, harness `internal/sleeve`, LEDGER row 15.
+      **All four REJECTED**: every one loses to a same-universe equal-weight
+      book before costs as well as after, and is indistinguishable from a
+      turnover-matched random ranking. The 2022-01→2026-06 holdout was never
+      read and is NOT burned. Also recorded there: the pre-registered shuffle
+      control was a straw man (160%/day turnover) that made all four dead rules
+      look brilliant — a control must be matched on turnover too
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
-      matched-control baseline
+      matched-control baseline — nothing to combine yet: EWMAC and carry are
+      the only rules that have not been rejected, and neither has been scored
+      on real data
 - [ ] Futures stitching (Panama over Dhan slot splices, roll = expiry calendar)
       + carry from position-1/position-2 basis (splice-safe, see data_notes)
 - [ ] Matched-control baseline harness; bootstrap weight estimation

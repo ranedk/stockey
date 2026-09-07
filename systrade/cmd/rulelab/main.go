@@ -6,7 +6,11 @@
 //	rulelab corr      pairwise correlation between the library's forecasts,
 //	                  plus correlation groups for handcrafted weighting
 //
-// Neither subcommand computes a P&L, a hit rate, or a forward return, and
+//	rulelab trial     the pre-registered backtest of the surviving rules
+//	                  against two matched controls — this one DOES score
+//	                  against returns, and is a trial (see trial.go)
+//
+// scalars and corr compute no P&L, no hit rate and no forward return, and
 // that is the point: forecast-distribution fitting and correlation structure
 // are the two things Carver calibrates on the whole sample precisely because
 // they consult no performance number. Nothing here is a trial, nothing here
@@ -59,13 +63,15 @@ func main() {
 		runScalars(os.Args[2:])
 	case "corr":
 		runCorr(os.Args[2:])
+	case "trial":
+		runTrial(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: rulelab scalars|corr [flags]")
+	fmt.Fprintln(os.Stderr, "usage: rulelab scalars|corr|trial [flags]")
 	os.Exit(2)
 }
 
