@@ -138,3 +138,195 @@ func PriceUnitVol(prices Series, span, minPeriods int) Series {
 	}
 	return v
 }
+
+// SMA computes a simple (arithmetic) moving average over a trailing window
+// of `window` observations. Strict: a single NaN inside the window makes
+// that output NaN too — no silent skipping, the window must be fully
+// populated. internal/stage's Weinstein classifier depends on this being a
+// genuine simple average (not EWMA, which already exists in this package):
+// Weinstein's method is published against a 30-week SIMPLE average, and
+// substituting EWMA would silently turn a well-established, literature-
+// verified method into an untested variant (see internal/stage's doc comment
+// on why that distinction matters for research/LEDGER.md's M-accounting).
+func SMA(s Series, window int) Series {
+	if window <= 0 {
+		panic("core: SMA window must be positive")
+	}
+	out := make([]float64, s.Len())
+	sum := 0.0
+	nanCount := 0
+	for i := 0; i < s.Len(); i++ {
+		if v := s.Values[i]; math.IsNaN(v) {
+			nanCount++
+		} else {
+			sum += v
+		}
+		if i >= window {
+			if old := s.Values[i-window]; math.IsNaN(old) {
+				nanCount--
+			} else {
+				sum -= old
+			}
+		}
+		if i >= window-1 && nanCount == 0 {
+			out[i] = sum / float64(window)
+		} else {
+			out[i] = math.NaN()
+		}
+	}
+	return New(s.Times, out)
+}
+
+// ResampleWeeklyLast reduces a series to one point per ISO week: the LAST
+// observation seen in that week, stamped with its actual date (not assumed
+// Friday — a holiday-shortened week just ends on whatever day last traded).
+// Input must be sorted ascending by time, as every series in this package is.
+// internal/stage's Weinstein classifier is defined on this weekly-close
+// convention.
+func ResampleWeeklyLast(s Series) Series {
+	var times []time.Time
+	var vals []float64
+	haveGroup := false
+	var groupYear, groupWeek int
+	var lastT time.Time
+	var lastV float64
+	for i := 0; i < s.Len(); i++ {
+		y, w := s.Times[i].ISOWeek()
+		if haveGroup && (y != groupYear || w != groupWeek) {
+			times = append(times, lastT)
+			vals = append(vals, lastV)
+		}
+		groupYear, groupWeek = y, w
+		lastT, lastV = s.Times[i], s.Values[i]
+		haveGroup = true
+	}
+	if haveGroup {
+		times = append(times, lastT)
+		vals = append(vals, lastV)
+	}
+	return New(times, vals)
+}
+
+// AlignByTime returns a series on `base`'s dates, where value[i] is
+// `other`'s value at that exact date if present, else NaN.
+//
+// BUG FOUND LIVE 2026-08-21 (code review): this package's own convention
+// (see the header comment) assumes every series for an instrument is
+// positionally aligned by index -- true for anything DERIVED inside this
+// package (EWMA, SMA, resampling, ...), but NOT automatically true for two
+// series pulled from independent sources with different filters (e.g.
+// store.AdjustedCloses filters adj_close > 0 while store.AdjustedVolume
+// filters adj_volume >= 0 on the same table -- they can silently drop
+// different dates). internal/stage.Classify used to pair such series by a
+// length check alone, which can't catch "same length, different dates"
+// silently mispairing the two. Any caller combining series from outside
+// this package must run them through AlignByTime first; do not just check
+// .Len().
+func AlignByTime(base Series, other Series) Series {
+	idx := make(map[time.Time]float64, other.Len())
+	for i, t := range other.Times {
+		idx[t] = other.Values[i]
+	}
+	out := make([]float64, base.Len())
+	for i, t := range base.Times {
+		if v, ok := idx[t]; ok {
+			out[i] = v
+		} else {
+			out[i] = math.NaN()
+		}
+	}
+	return New(base.Times, out)
+}
+
+// ResampleWeeklySum reduces a series to one point per ISO week: the SUM of
+// that week's values. NaN entries are treated as contributing nothing (a
+// missing day just means less was seen that week, not that the week is
+// unknown) UNLESS every value in the week is NaN, in which case the week is
+// NaN too. Intended for weekly volume (internal/stage's VolumeRatio field).
+func ResampleWeeklySum(s Series) Series {
+	var times []time.Time
+	var vals []float64
+	haveGroup := false
+	var groupYear, groupWeek int
+	var lastT time.Time
+	var sum float64
+	var sawValue bool
+	flush := func() {
+		times = append(times, lastT)
+		if sawValue {
+			vals = append(vals, sum)
+		} else {
+			vals = append(vals, math.NaN())
+		}
+	}
+	for i := 0; i < s.Len(); i++ {
+		y, w := s.Times[i].ISOWeek()
+		if haveGroup && (y != groupYear || w != groupWeek) {
+			flush()
+			sum, sawValue = 0, false
+		}
+		groupYear, groupWeek = y, w
+		lastT = s.Times[i]
+		if v := s.Values[i]; !math.IsNaN(v) {
+			sum += v
+			sawValue = true
+		}
+		haveGroup = true
+	}
+	if haveGroup {
+		flush()
+	}
+	return New(times, vals)
+}
+
+// RollingMax returns the maximum over a trailing window of `window`
+// observations. Strict in the same way as SMA: a single NaN anywhere in the
+// window makes that output NaN — a range computed off a partially-populated
+// window is a different statistic, and the breakout rule that consumes this
+// would silently widen or narrow its denominator without saying so.
+func RollingMax(s Series, window int) Series {
+	return rollingExtreme(s, window, func(a, b float64) bool { return a >= b })
+}
+
+// RollingMin is RollingMax's mirror; same strictness.
+func RollingMin(s Series, window int) Series {
+	return rollingExtreme(s, window, func(a, b float64) bool { return a <= b })
+}
+
+// rollingExtreme is the shared monotonic-deque scan: `dominates(a, b)` reports
+// whether a incoming value a makes an older value b useless (>= for a max,
+// <= for a min), which is what lets the window be maintained in O(1) amortized
+// per bar instead of rescanning it.
+func rollingExtreme(s Series, window int, dominates func(a, b float64) bool) Series {
+	if window <= 0 {
+		panic("core: rolling window must be positive")
+	}
+	out := make([]float64, s.Len())
+	dq := make([]int, 0, window) // indices, values monotonic by `dominates`
+	nanCount := 0
+	for i := 0; i < s.Len(); i++ {
+		v := s.Values[i]
+		if math.IsNaN(v) {
+			nanCount++
+		} else {
+			for len(dq) > 0 && dominates(v, s.Values[dq[len(dq)-1]]) {
+				dq = dq[:len(dq)-1]
+			}
+			dq = append(dq, i)
+		}
+		if i >= window {
+			if old := s.Values[i-window]; math.IsNaN(old) {
+				nanCount--
+			}
+			if len(dq) > 0 && dq[0] <= i-window {
+				dq = dq[1:]
+			}
+		}
+		if i >= window-1 && nanCount == 0 {
+			out[i] = s.Values[dq[0]]
+		} else {
+			out[i] = math.NaN()
+		}
+	}
+	return New(s.Times, out)
+}

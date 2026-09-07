@@ -13,18 +13,43 @@ we already run.
    under-reaction premium as EWMAC but a *path-independent* trigger — reacts to
    levels, not smoothed velocity. Corr with EWMAC ~0.6–0.7 yet adds value in
    Carver's own later work (it's his favorite second trend family). Positive
-   skew, cheap, trivially continuous. **First rule to add.**
+   skew, cheap, trivially continuous. ~~**First rule to add.**~~
+
+   **MEASURED 2026-09-07 (LEDGER row 14) — the correlation claim above is wrong
+   on NSE equities.** Breakout is EWMAC read at roughly 5x the lookback:
+   breakout80 vs ewmac16_64 rho=0.94, breakout160 vs ewmac32_128 0.94,
+   breakout320 vs ewmac64_256 0.93, breakout40 vs ewmac16_64 0.84 (pooled over
+   2.68M liquid symbol-days; the within-symbol averages agree to +/-0.03). Every
+   variation breaches the admission protocol's rho>0.7 duplicate bar against the
+   very family it was supposed to diversify. It stays implemented
+   (`rules.Breakout`) because it remains the natural proxy if it ever proves
+   cheaper to trade, but it is NOT a second trend family and must not be handed
+   its own weight.
 
 2. **Acceleration (momentum-of-momentum).** Forecast ∝ EWMAC_N(t) −
    EWMAC_N(t − N). Story: fresh trends outperform stale ones (herding builds
    gradually); catches turns earlier, exits exhausted trends. Corr with EWMAC
    level ~0.3–0.5. Moderate turnover — must pass the speed limit per instrument.
 
+   **MEASURED 2026-09-07 (LEDGER row 14): confirmed, and it is the only rule in
+   the library that is genuinely distinct.** accel16 vs the EWMAC family
+   ρ = 0.33 / 0.00 / -0.13 for fast 16/32/64, and only 0.42 against accel32 —
+   the three spans are not even one family among themselves. Whether that
+   independence is worth anything is a returns question, still untested.
+
 3. **Long-term mean reversion / value.** Forecast ∝ −(price − 5yr average) ÷
    vol, very slow. Story: multi-year overshoot reverts (De Bondt–Thaler);
    this is the classic *negatively correlated* complement to trend (corr ≈ −0.2
    to 0). Tiny turnover, works on asset-class indices. Negative skew flavor —
    weight accordingly (Law 15).
+
+   **MEASURED 2026-09-07 (LEDGER row 14) — "complement" is false here.** At a
+   2-year window it is not weakly negative but almost exactly minus slow trend:
+   meanrev512 vs ewmac64_256 ρ = -0.95. A rule that is the negative of one we
+   already run adds no diversification; giving it a weight just nets down trend
+   exposure, which the trend weight itself could do more honestly. Only the
+   5-year window (meanrev1280, ρ = -0.69 against ewmac64_256) is far enough away
+   to be a separate group, and even that is mostly the same bet inverted.
 
 4. **Cross-sectional momentum (equity sleeve).** Rank stocks/sectors by 6–12m
    vol-adjusted return, skip last month; forecast from rank z-score, long-tilt
@@ -46,6 +71,21 @@ we already run.
 8. **Seasonality** (gold festive demand, agri harvest cycles). Weak prior,
    heavy M-risk (12 months × K assets = many implicit tests). Only with a
    pre-registered hypothesis.
+
+## Regime classifiers (NOT `rules.Rule` — reporting only)
+
+**Weinstein 4-stage weekly classifier** (`internal/stage`, `cmd/stage`,
+`research/LEDGER.md` row 10). Discrete Basing/Advancing/Topping/Declining
+label from a 30-week SMA + its slope — deliberately does NOT implement
+`rules.Rule` (no continuous forecast, nothing here may touch sizing per
+corollary 1) and ships as regime-tagged reporting per innovation #7 below
+(Law 16: visible to a human, never wired into position switching). All
+parameters are Weinstein's own published ones, fixed ahead of any NSE test —
+see the ledger row and `internal/stage`'s doc comment for the M-accounting
+rationale. If this is ever promoted to influence positions, that means
+recasting it as a continuous vol-standardized forecast and running it
+through the normal admission protocol below — not wiring the discrete label
+in directly.
 
 ## TimesFM as a rule (the ML experiment)
 

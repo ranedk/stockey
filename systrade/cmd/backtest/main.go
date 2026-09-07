@@ -86,6 +86,16 @@ func runReal(tickers []string, capital, volTarget float64, weekly bool) {
 			fmt.Printf("skip %s: %v\n", tk, err)
 			continue
 		}
+		// 2026-08-22: this run always sets ExecuteAtOpen (below), which now
+		// REQUIRES Opens on every instrument (backtest.Run fails the whole
+		// batch otherwise, by design — see engine.go's 2026-08-22 fix). An
+		// instrument that fell back past adjusted-OHLC has no Opens; better
+		// to drop it from this run and say so than to silently degrade its
+		// fills to same-day closes, which used to happen with no visibility.
+		if opens == nil {
+			fmt.Printf("skip %s: no Opens available (fell back to %s) — ExecuteAtOpen requires Opens on every instrument\n", tk, src)
+			continue
+		}
 		instruments = append(instruments, &data.Instrument{
 			Meta: data.Meta{Symbol: tk, PointValue: 1, Block: 1, LongOnly: true,
 				// cash-equity cost model: ~5bps spread+impact, ₹0 brokerage

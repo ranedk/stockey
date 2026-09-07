@@ -1,0 +1,133 @@
+// Command api serves a small HTTP API over systrader's REPORTING-ONLY
+// research outputs, for the screener/ Nuxt frontend (a sibling repo already
+// wired to stockey's separate fundamentals API on port 8000 -- this is a
+// second, independent backend the same frontend also calls, not a proxy
+// through stockey; stockey owns no research/signal logic per its own
+// CLAUDE.md boundary).
+//
+// Starts with one endpoint: GET /api/stage, backed by internal/stageapi
+// (internal/stage's Weinstein classifier run over the full adjusted-price
+// universe). More systrader outputs can grow onto this same server later.
+//
+// NOT hardened for public exposure -- no auth, permissive CORS. Personal
+// single-user tool meant to run on localhost/trusted network next to the
+// Nuxt dev server, same trust model stockey's fundamentals API documents
+// for itself.
+//
+//	go run ./cmd/api                    # listens on :8090
+//	API_PORT=9000 go run ./cmd/api      # override
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+
+	"github.com/ranedk/systrader/internal/stageapi"
+	"github.com/ranedk/systrader/internal/store"
+)
+
+func main() {
+	_ = godotenv.Load()
+	port := getenv("API_PORT", "8090")
+
+	ctx := context.Background()
+	st, err := store.Open(ctx)
+	if err != nil {
+		log.Fatalf("api: cannot open store: %v", err)
+	}
+	defer st.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", handleHealth)
+	mux.HandleFunc("GET /api/stage", handleStage(st))
+
+	addr := ":" + port
+	log.Printf("systrader api listening on %s", addr)
+	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleStage serves GET /api/stage?stages=1,2,3,4&min_bars=260&max_stale_days=21.
+// All params optional; stageapi.Options.withDefaults fills in the rest.
+func handleStage(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		opts := stageapi.Options{
+			MinBars:      atoiOr(q.Get("min_bars"), 0),
+			MaxStaleDays: atoiOr(q.Get("max_stale_days"), 0),
+			Stages:       parseStages(q.Get("stages")),
+		}
+		result, err := stageapi.List(r.Context(), st, opts, time.Now())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func parseStages(raw string) []int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []int
+	for _, part := range strings.Split(raw, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(part)); err == nil && n >= 1 && n <= 4 {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func atoiOr(raw string, def int) int {
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// withCORS is deliberately permissive (Access-Control-Allow-Origin: *) --
+// see package doc comment on the trust model this assumes.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}

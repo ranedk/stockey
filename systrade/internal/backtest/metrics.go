@@ -19,6 +19,12 @@ type Metrics struct {
 	MaxDDPct     float64 // max % drawdown from peak equity
 	CostDragSR   float64 // annual costs expressed in Sharpe units
 	DeflatedSR   float64 // Sharpe × 0.75 (Law 7 pessimism factor)
+	// Busted is true if compounding capital hit zero/negative before the run
+	// ended. BustedDay is the index where that happened (-1 if never).
+	// AnnReturnPct/AnnVolPct/Sharpe/TStat/Skew/CostDragSR are computed ONLY
+	// over the days before the bust when Busted is true — see ComputeMetrics.
+	Busted    bool
+	BustedDay int
 }
 
 // ComputeMetrics measures everything in PERCENT RETURNS ON RUNNING EQUITY.
@@ -32,36 +38,67 @@ func ComputeMetrics(res *Result, capital float64) Metrics {
 	if n == 0 || capital <= 0 || len(eq) != n {
 		return Metrics{}
 	}
-	rets := make([]float64, n)
-	var avgEquity float64
-	for i, v := range pnl {
+
+	// BUG FOUND LIVE 2026-08-22 (code review): once compounding capital
+	// floors to 0 (engine.go's bust handling), every subsequent day computed
+	// base<=0 and silently left rets[i] at Go's zero value — an exact 0%
+	// return — instead of marking it invalid. That drags Sharpe/AnnVolPct/
+	// Skew toward "flat and safe" in precisely the metrics this file's own
+	// header comment says must never be inflated OR deflated, masking a
+	// blow-up as a quiet, low-risk run. A "return" on zero capital is
+	// undefined, not zero — once busted, there is nothing left to compound or
+	// lose. Stop computing return-days at the bust; Busted/BustedDay make it
+	// impossible for Report() to print a misleadingly clean number without
+	// also saying why. MaxDDPct still uses the FULL equity series (correctly
+	// shows -100% on a bust — that's real information, not noise to exclude).
+	bustedDay := -1
+	for i := range pnl {
 		base := capital
 		if i > 0 {
 			base = eq[i-1]
 		}
-		if base > 0 {
-			rets[i] = v / base
+		if base <= 0 {
+			bustedDay = i
+			break
 		}
+	}
+	validDays := n
+	if bustedDay >= 0 {
+		validDays = bustedDay
+	}
+
+	m := Metrics{Days: n, Busted: bustedDay >= 0, BustedDay: bustedDay}
+	m.MaxDDPct = maxDrawdownPct(eq, capital) * 100
+	if validDays == 0 {
+		return m // busted on day 0 — nothing precedes it to measure
+	}
+
+	rets := make([]float64, validDays)
+	var avgEquity float64
+	for i := 0; i < validDays; i++ {
+		base := capital
+		if i > 0 {
+			base = eq[i-1]
+		}
+		rets[i] = pnl[i] / base
 		avgEquity += eq[i]
 	}
-	avgEquity /= float64(n)
+	avgEquity /= float64(validDays)
 	mean, sd := meanStd(rets)
-	m := Metrics{Days: n}
 	m.AnnReturnPct = mean * 256 * 100
 	m.AnnVolPct = sd * 16 * 100
 	if sd > 0 {
 		m.Sharpe = mean / sd * 16
-		m.TStat = mean / (sd / math.Sqrt(float64(n)))
+		m.TStat = mean / (sd / math.Sqrt(float64(validDays)))
 	}
 	m.Skew = skew(rets, mean, sd)
-	m.MaxDDPct = maxDrawdownPct(eq, capital) * 100
 	m.DeflatedSR = m.Sharpe * 0.75
 
 	var costCash float64
 	for _, ir := range res.Instruments {
 		costCash += ir.CostCash
 	}
-	years := float64(n) / 256.0
+	years := float64(validDays) / 256.0
 	annVolCash := sd * 16 * avgEquity
 	if years > 0 && annVolCash > 0 {
 		m.CostDragSR = (costCash / years) / annVolCash
@@ -71,6 +108,10 @@ func ComputeMetrics(res *Result, capital float64) Metrics {
 
 func (m Metrics) Report(ledgerM int) string {
 	var b strings.Builder
+	if m.Busted {
+		fmt.Fprintf(&b, "⚠⚠ BUSTED at day %d of %d — capital hit zero. Every statistic below is computed ONLY over the %d days before the bust and does NOT represent the full run.\n",
+			m.BustedDay, m.Days, m.BustedDay)
+	}
 	fmt.Fprintf(&b, "days=%d  annRet=%.1f%%  annVol=%.1f%%  SR=%.2f (deflated %.2f)\n",
 		m.Days, m.AnnReturnPct, m.AnnVolPct, m.Sharpe, m.DeflatedSR)
 	fmt.Fprintf(&b, "tStat=%.2f  skew=%.2f  maxDD=%.1f%%  costDrag=%.3f SR/yr", m.TStat, m.Skew, m.MaxDDPct, m.CostDragSR)

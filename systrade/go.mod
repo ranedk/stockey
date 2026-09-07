@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/joho/godotenv v1.5.1
+	github.com/magefile/mage v1.17.2
 )
 
 require (

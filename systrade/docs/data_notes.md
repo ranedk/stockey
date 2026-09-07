@@ -14,7 +14,8 @@ split/bonus-adjusted via `cum_adj_factor`, `ca_flag` marks adjustment events,
   `cmd/backtest` now prefers adjusted and labels any raw fallback loudly.
 - Adjustment is splits/bonuses only — dividends are NOT in the price series
   (total-return needs `events_dividend` separately).
-- The old `nseindia_ohlcv_adjusted` (2 symbols) is a dead stub; ignore it.
+- The old `nseindia_ohlcv_adjusted` dead stub was confirmed empty and dropped
+  from stockey entirely on 2026-08-14; it no longer exists to sync or ignore.
 
 ## Sync reconciliation (why it exists)
 
@@ -81,3 +82,24 @@ go run ./cmd/dhan backfill -from 2015-01-01   # start date when table is empty
 Incremental: each series resumes from its stored `max(date)+1`; upserts are
 idempotent. Rate-limited to ~3 req/s. Run daily after `sync_from_stockey.sh`
 (the token must be fresh — see README, Dhan auth).
+
+## What the NSE equity universe does to a forecast (measured 2026-09-07)
+
+From `rulelab scalars` over 2.68M liquid symbol-days, 2013-07→2026-06
+(LEDGER row 14, no returns involved):
+
+- **Trend forecasts are not centred on zero here.** Mean RAW EWMAC is +0.43 /
+  +0.80 / +1.41 for fast 16 / 32 / 64 against a mean absolute value of 2.26 /
+  3.37 / 4.97 — the slower the rule, the more of its average forecast is a
+  standing long. On a 13-year equity bull market that is exactly what one
+  should expect, and it is the same beta that LEDGER row 4 found masquerading
+  as selection alpha. Any equity backtest of a trend rule that does not carry
+  a matched control is measuring that drift, not the rule.
+- The mirror shows up in mean reversion (mean raw −0.14 / −0.18): price sits
+  above its multi-year average most of the time, so the rule is structurally
+  short this universe.
+- **Trend per unit of vol is weaker on single stocks than on Carver's futures
+  portfolio**: our measured EWMAC scalars are 7-18% above his published ones
+  (4.43/2.97/2.01 vs 3.75/2.65/1.87), i.e. a given trend produces a smaller
+  raw forecast here. Idiosyncratic stock vol in the denominator is the obvious
+  candidate; nothing here tests that.

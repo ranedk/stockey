@@ -77,7 +77,7 @@ both sides.
 | nseindia_ohlcv | `data/nseindia/bhavcopy_history.py` | raw OHLC; source of adjusted opens |
 | nseindia_indices | `data/nseindia/indices_downloader.py` | mixed-case index names ("Nifty 50"); PE/PB/div yield = carry inputs |
 | dhan_ohlcv_daily | `data/dhanlive/ohlcv_pull.py` | fallback only (2021+ coverage) |
-| dhan_ohlcv_intraday | `data/dhanlive/ohlcv.py` (via `sync_many_intraday`) | 1-min bars, live in the cloud DB (not a local-only landing zone as originally planned) — **not currently in `sync_from_stockey.sh`'s table lists**, so systrader has no access to it yet; add it there when needed |
+| dhan_ohlcv_intraday | `data/dhanlive/ohlcv.py` (via `sync_many_intraday`) | 1-min bars, live in the cloud DB (not a local-only landing zone as originally planned) — **not currently in `sync_from_stockey.sh`'s table lists**, so systrader has no access to it yet; add it there when needed. Superseded by a fuller plan: see `docs/HF_DATA_PLATFORM_PLAN.md` (Phase 2 syncs this table as a first step toward systrader owning all Dhan HF collection) |
 | master_dhan_instruments | `data/dhanlive/scrip_master.py` | security ids, lots, expiries |
 | dim_security | `data/nseindia/security_history.py` | identity mapping |
 | nseindia_corporate_actions_bc_raw / nseindia_corporate_actions_normalized | `data/nseindia/bhavcopy_parser.py` / `data/nseindia/adjusted_prices.py` | `_bc_raw` (bhavcopy CA feed) is the comprehensive corporate-actions source; `_normalized` derives from it |

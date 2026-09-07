@@ -20,7 +20,9 @@ research/LEDGER.md        Append-only record of every experiment (M-counter)
 
 internal/core             Series math: EWMA, EWMA-std, price-unit volatility
 internal/data             Instrument metadata, cost model, CSV loading
-internal/rules            Rule interface + EWMAC + carry (scaled, capped ±20)
+internal/rules            Rule interface + EWMAC + carry (Carver's published
+                          scalars) + breakout, acceleration, mean reversion
+                          (scalars measured here) — all scaled, capped ±20
 internal/combine          Forecast weights + FDM (≤2.5) → combined forecast
 internal/sizing           Vol targeting: cash vol target, vol scalar, subsystem
 internal/portfolio        Instrument weights, IDM (≤2.5), rounding, inertia,
@@ -28,9 +30,18 @@ internal/portfolio        Instrument weights, IDM (≤2.5), rounding, inertia,
 internal/backtest         Daily engine (compounding, costs), metrics
                           (SR/skew/DD/turnover/cost-drag), Bonferroni stats
 internal/parallel         Generic worker-pool Map
+internal/bars             Daily OHLCV + the read-postgres-once bar cache
+internal/patterns/coi     External "COI" 3-bar reversal pattern — RESEARCH
+                          ONLY, rejected (LEDGER rows 11-13), never a rules.Rule
 
 cmd/backtest              Full pipeline on synthetic data (demo/harness check)
 cmd/run                   Daily production runner → prints the order sheet
+cmd/stage                 CLI: Weinstein stage read per ticker (REPORTING ONLY)
+cmd/api                   HTTP API serving screener/'s stage-analysis page
+cmd/coi                   COI pattern: cache | scan | study (matched controls)
+cmd/rulelab               Rule library characterisation WITHOUT returns:
+                          scalars | corr (forecast distribution + correlation
+                          groups for handcrafted weights)
 ```
 
 ## Quickstart
@@ -39,6 +50,28 @@ cmd/run                   Daily production runner → prints the order sheet
 go test ./...        # includes the no-look-ahead property test
 go run ./cmd/backtest   # synthetic demo (numbers meaningless by design)
 ```
+
+## Long-running services (cmd/api)
+
+`cmd/api` is kept alive via [mage](https://magefile.org/) targets rather than
+a bare `go run` — the server does NOT hot-reload, so running code and
+committed code can silently diverge until something restarts it (bit us once
+already, on stockey's side, when a fundamentals API process served 15-day-old
+code — see `mage:api Restart`'s doc comment in `magefile.go`).
+
+```bash
+go install github.com/magefile/mage@latest   # once
+mage -l                # list targets
+mage api:ensure         # start if not already healthy; no-op otherwise
+mage api:restart        # force-restart -- run this after any code change
+mage api:stop
+```
+
+`scripts/ensure_api_alive.sh` wraps `mage api:ensure` with the PATH cron
+needs; it's registered in the OS-level user crontab (`crontab -e`, every 5
+min, flock-guarded) the same way `scripts/sync_from_stockey.sh` already is —
+see that crontab entry for the exact line. Logs: `logs/api.log` (server),
+`logs/api_cron.log` (cron wrapper). Pidfile: `run/api.pid`.
 
 When real data arrives: drop CSVs (date,open,high,low,close,volume) in
 `data/`, write `config.json` (schema at top of `cmd/run/main.go`), then:
@@ -107,9 +140,27 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       daily/weekly schedules, Law-1 story enforcement (`rules.Validate`),
       holdout-burn registry + walk-forward + ledger M-accounting
       (`internal/research`), property tests for all of the above
-- [ ] Indicator library for the adaptive-ensemble spec (storied signals only;
-      correlation report) + combination policies (handcrafted | Hedge | ML)
-      judged vs matched-control baseline
+- [x] Evaluated an externally-supplied 3-bar reversal pattern ("COI",
+      `rahul_ta_1.py`) — Go port at parity with the original, matched-control
+      harness, REJECTED (no edge vs control; the apparent edge was the
+      lower-Bollinger-band oversold condition, not the candle pattern).
+      Four operator-requested follow-ups and one pattern-free re-test of the
+      only surviving direction (relative strength on washout days) closed the
+      family: LEDGER rows 11-13. Left behind: `internal/bars` research cache,
+      `cmd/coi`
+- [x] Indicator library implemented and characterised WITHOUT returns
+      (LEDGER row 14, `cmd/rulelab`, report in `research/reports/`):
+      `rules.Breakout`/`Acceleration`/`MeanReversion` with stories written
+      before the code, forecast scalars measured off the forecast distribution
+      (EWMAC control lands within 7-18% of Carver's published table), pairwise
+      correlations pooled and within-symbol, complete-linkage grouping.
+      Result: breakout duplicates EWMAC (ρ 0.84–0.94), meanrev512 is minus
+      ewmac64_256 (ρ −0.95), acceleration is the only distinct family
+- [ ] Backtest the surviving families (acceleration ×3, meanrev1280) against a
+      matched-control baseline — a TRIAL: needs its own ledger row and a fresh
+      holdout declared before it runs
+- [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
+      matched-control baseline
 - [ ] Futures stitching (Panama over Dhan slot splices, roll = expiry calendar)
       + carry from position-1/position-2 basis (splice-safe, see data_notes)
 - [ ] Matched-control baseline harness; bootstrap weight estimation

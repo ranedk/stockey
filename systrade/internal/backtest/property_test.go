@@ -227,6 +227,60 @@ func TestOpenFillAccounting(t *testing.T) {
 	}
 }
 
+// BUG FOUND LIVE 2026-08-22 (code review): ExecuteAtOpen used to silently
+// fall back to same-day-close fills whenever an instrument's Opens was nil,
+// reintroducing the exact look-ahead bias the flag exists to prevent, with
+// no error or visibility. Must now fail fast at Run().
+func TestExecuteAtOpenRequiresOpensOnEveryInstrument(t *testing.T) {
+	cfg := demoConfig()
+	cfg.ExecuteAtOpen = true
+	inst := &data.Instrument{
+		Meta:   data.Meta{Symbol: "A", PointValue: 1, Block: 1},
+		Prices: randomWalk(31, 300, 100, 0.01),
+		// Opens deliberately left nil.
+	}
+	if _, err := Run(cfg, []*data.Instrument{inst}); err == nil {
+		t.Fatal("ExecuteAtOpen with a nil-Opens instrument must be rejected, not silently degraded")
+	}
+}
+
+// A per-day gap INSIDE an existing Opens series (as opposed to a
+// structurally-nil one) still degrades to a close fill — that's unavoidable
+// with a genuine data gap — but must now be counted, not silent.
+func TestExecuteAtOpenDegradedOpenFillsCounted(t *testing.T) {
+	prices := core.New(days(300), make([]float64, 300))
+	for i := range prices.Values {
+		prices.Values[i] = 100 + float64(i%7)
+	}
+	opens := withOpens(prices)
+	// Poison a handful of days' opens so the pending-fill loop must fall back.
+	poisoned := 0
+	for _, i := range []int{50, 51, 120} {
+		opens.Values[i] = math.NaN()
+		poisoned++
+	}
+	cfg := Config{
+		Capital: 1_000_000, VolTargetPct: 0.20, Compounding: false,
+		Rules:             []RuleSpec{{Rule: constRule{goodStory}, Weight: 1}},
+		FDM:               1.0,
+		InstrumentWeights: map[string]float64{"A": 1.0},
+		IDM:               1.0,
+		ExecuteAtOpen:     true,
+	}
+	inst := &data.Instrument{
+		Meta:   data.Meta{Symbol: "A", PointValue: 1, Block: 1, FeePerBlock: 1},
+		Prices: prices,
+		Opens:  opens,
+	}
+	res, err := Run(cfg, []*data.Instrument{inst})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Instruments["A"].DegradedOpenFills; got == 0 {
+		t.Fatal("expected DegradedOpenFills > 0 with poisoned Opens values, got 0 (the fallback is silent again)")
+	}
+}
+
 // Law 1 mechanically enforced: no story, no backtest.
 func TestStoryRequired(t *testing.T) {
 	cfg := demoConfig()

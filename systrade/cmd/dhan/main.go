@@ -51,8 +51,18 @@ func main() {
 		from := fs.String("from", "2016-01-01", "from date")
 		to := fs.String("to", time.Now().Format("2006-01-02"), "to date")
 		_ = fs.Parse(os.Args[2:])
-		f, _ := time.Parse("2006-01-02", *from)
-		t, _ := time.Parse("2006-01-02", *to)
+		// BUG FOUND LIVE 2026-08-21 (code review): discarded parse errors used
+		// to silently resolve a typo'd date to the zero time (0001-01-01),
+		// requesting "from the beginning of time" instead of failing on the
+		// bad flag.
+		f, ferr := time.Parse("2006-01-02", *from)
+		if ferr != nil {
+			fatal(fmt.Errorf("-from %q: %w", *from, ferr))
+		}
+		t, terr := time.Parse("2006-01-02", *to)
+		if terr != nil {
+			fatal(fmt.Errorf("-to %q: %w", *to, terr))
+		}
 		cd, err := c.HistoricalDaily(ctx, *sec, *seg, *inst, f, t)
 		if err != nil {
 			fatal(err)

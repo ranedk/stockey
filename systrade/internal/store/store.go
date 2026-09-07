@@ -73,6 +73,27 @@ func (s *Store) AdjustedCloses(ctx context.Context, symbol string) (core.Series,
 	return scanSeries(rows.Next, rows.Scan, rows.Err)
 }
 
+// AdjustedVolume loads the corporate-action-adjusted volume series for a
+// symbol from advisory_adjusted_ohlcv_daily's adj_volume column (raw volume
+// divided by the cumulative price-adjustment factor, so a share that has
+// since split shows pre-split-equivalent volume — consistent with adj_close).
+// EQ series only, same rationale as AdjustedCloses. Used by internal/stage's
+// VolumeRatio field; nil-safe for callers that pass this through as *core.
+// Series (Classify treats a missing/short volume series as "no confirmation
+// data," never as an error).
+func (s *Store) AdjustedVolume(ctx context.Context, symbol string) (core.Series, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT date, adj_volume FROM advisory_adjusted_ohlcv_daily
+		WHERE symbol = $1 AND series = 'EQ'
+		  AND adj_volume IS NOT NULL AND adj_volume >= 0
+		ORDER BY date ASC`, symbol)
+	if err != nil {
+		return core.Series{}, err
+	}
+	defer rows.Close()
+	return scanSeries(rows.Next, rows.Scan, rows.Err)
+}
+
 // AdjustedOHLC loads adjusted open AND close series for a symbol: raw
 // opens/closes from nseindia_ohlcv (bhavcopy, 2013+) × cum_adj_factor from
 // the advisory table. Opens exist so backtests can fill at open(T+1) after
@@ -124,6 +145,79 @@ func (s *Store) AdjustedSymbols(ctx context.Context, minBars int) ([]string, err
 		SELECT symbol FROM advisory_adjusted_ohlcv_daily
 		WHERE series = 'EQ'
 		GROUP BY symbol HAVING count(*) >= $1 ORDER BY symbol`, minBars)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// IntradayCloses loads 1-min-granularity OHLCV close bars for a ticker from
+// dhan_ohlcv_intraday (HF_DATA_PLATFORM_PLAN.md Phase 2 — synced via the
+// SEPARATE scripts/sync_intraday_from_stockey.sh, not the daily sync_from_
+// stockey.sh; see that script's own header for why). intervalMinutes matches
+// the source's own bar granularity (1 for raw 1-min bars — no other interval
+// has been confirmed present as of this writing).
+//
+// COVERAGE CAVEAT (confirmed live 2026-08-22): this is a curated ~635-ticker
+// universe, NOT full NSE coverage — RELIANCE, for one, is absent. No active
+// collector for this table was found anywhere in stockey's current codebase
+// (no cron entry, empty STOCKEY_SYMBOLS, no live enqueue call for its queue-
+// task handler) despite the data being fresh through the same day as this
+// sync — the mechanism keeping it current is not yet understood. Confirm a
+// symbol has coverage before relying on it; don't assume universe parity
+// with the daily adjusted series.
+//
+// Deliberately does NOT reuse scanSeries: that helper normalizes to whole
+// dates and dedupes same-day rows, which would silently collapse an entire
+// day's worth of 1-min bars into one.
+func (s *Store) IntradayCloses(ctx context.Context, ticker string, intervalMinutes int, from, to time.Time) (core.Series, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT timestamp, close FROM dhan_ohlcv_intraday
+		WHERE ticker = $1 AND interval_minutes = $2
+		  AND timestamp >= $3 AND timestamp <= $4
+		  AND close IS NOT NULL AND close > 0
+		ORDER BY timestamp ASC`, ticker, intervalMinutes, from, to)
+	if err != nil {
+		return core.Series{}, err
+	}
+	defer rows.Close()
+	var times []time.Time
+	var vals []float64
+	for rows.Next() {
+		var t time.Time
+		var v float64
+		if err := rows.Scan(&t, &v); err != nil {
+			return core.Series{}, err
+		}
+		times = append(times, t)
+		vals = append(vals, v)
+	}
+	if err := rows.Err(); err != nil {
+		return core.Series{}, err
+	}
+	if len(times) == 0 {
+		return core.Series{}, fmt.Errorf("store: no intraday bars for %s (interval=%dm, %s–%s)", ticker, intervalMinutes, from.Format("2006-01-02"), to.Format("2006-01-02"))
+	}
+	return core.New(times, vals), nil
+}
+
+// IntradayTickers lists distinct tickers with at least minBars bars at the
+// given interval — the actual (curated, not full-universe) coverage, per
+// IntradayCloses's caveat.
+func (s *Store) IntradayTickers(ctx context.Context, intervalMinutes int, minBars int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT ticker FROM dhan_ohlcv_intraday
+		WHERE interval_minutes = $1
+		GROUP BY ticker HAVING count(*) >= $2 ORDER BY ticker`, intervalMinutes, minBars)
 	if err != nil {
 		return nil, err
 	}

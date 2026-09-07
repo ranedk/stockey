@@ -3,6 +3,7 @@ package backtest
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,5 +194,65 @@ func TestVolTargetLawEnforced(t *testing.T) {
 		Prices: randomWalk(3, 300, 100, 0.01)}
 	if _, err := Run(cfg, []*data.Instrument{inst}); err == nil {
 		t.Fatal("vol target 80% should be rejected (Law 10)")
+	}
+}
+
+// BUG FOUND LIVE 2026-08-22 (code review): once compounding capital floored
+// to 0, every subsequent day's "return" silently computed as exactly 0%
+// (Go's zero value, never explicitly set) instead of being marked invalid —
+// dragging Sharpe/vol/skew toward "flat and safe" instead of showing the
+// blow-up. ComputeMetrics must now stop at the bust and say so.
+func TestComputeMetrics_BustedStopsReturnComputationAtBust(t *testing.T) {
+	capital := 1000.0
+	times := days(4)
+	pnl := []float64{-500, -500, 999, 999} // days 2-3 are unreachable post-bust
+	eq := []float64{500, 0, 500, 1500}     // eq[1]=0 -> base for day 2 is <=0
+	res := &Result{
+		Daily:       core.New(times, pnl),
+		Equity:      core.New(times, eq),
+		Instruments: map[string]*InstrumentResult{},
+	}
+
+	m := ComputeMetrics(res, capital)
+
+	if !m.Busted {
+		t.Fatal("expected Busted=true")
+	}
+	if m.BustedDay != 2 {
+		t.Fatalf("expected BustedDay=2 (base=eq[1]=0 at day 2), got %d", m.BustedDay)
+	}
+	// The pre-bust days are a real disaster (-50%, then -100% of what's
+	// left) -- the OLD bug would have diluted this toward 0 with two extra
+	// silent 0%-return days instead of stopping.
+	if m.AnnReturnPct >= 0 {
+		t.Fatalf("expected a strongly negative annualized return reflecting the bust, got %.1f%%", m.AnnReturnPct)
+	}
+	if math.Abs(m.MaxDDPct-100) > 0.01 {
+		t.Fatalf("expected MaxDDPct=100 (eq hit exactly 0 against a 1000 peak), got %.2f", m.MaxDDPct)
+	}
+}
+
+func TestComputeMetrics_NormalRunLeavesBustedFalse(t *testing.T) {
+	inst := &data.Instrument{
+		Meta:   data.Meta{Symbol: "A", PointValue: 10, Block: 1},
+		Prices: randomWalk(7, 1000, 5000, 0.01),
+	}
+	res, err := Run(demoConfig(), []*data.Instrument{inst})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Metrics.Busted {
+		t.Fatalf("a normal run should not be Busted, got BustedDay=%d", res.Metrics.BustedDay)
+	}
+	if res.Metrics.BustedDay != -1 {
+		t.Fatalf("BustedDay should be -1 when never busted, got %d", res.Metrics.BustedDay)
+	}
+}
+
+func TestReport_PrintsBustedWarning(t *testing.T) {
+	m := Metrics{Days: 10, Busted: true, BustedDay: 3}
+	report := m.Report(1)
+	if !strings.Contains(report, "BUSTED at day 3") {
+		t.Fatalf("Report() should surface the bust prominently, got:\n%s", report)
 	}
 }

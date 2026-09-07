@@ -82,7 +82,16 @@ SQL
 }
 
 src_has_table() {
-  [ "$(psql "$SRC" -tAc "select count(*) from pg_tables where schemaname='public' and tablename='$1'")" = "1" ]
+  # BUG FOUND LIVE 2026-08-21: this used to check pg_tables only, which
+  # excludes VIEWS. advisory_adjusted_ohlcv_daily (systrader's PRIMARY equity
+  # series) became a view over nseindia_ohlcv + nseindia_adjustment_factors
+  # on 2026-08-14's pure-TA cutover (was a written table before that) -- this
+  # check silently started reporting it "absent at source" and skipping it
+  # ever since, with no error, because pg_tables genuinely doesn't have a row
+  # for it. to_regclass resolves any relation kind (table, view, matview) in
+  # one check, so it can't drift out of sync with a future table<->view
+  # change on the source side again.
+  [ "$(psql "$SRC" -tAc "select case when to_regclass('public.$1') is not null then 1 else 0 end")" = "1" ]
 }
 
 dst_has_table() {

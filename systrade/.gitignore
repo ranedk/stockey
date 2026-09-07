@@ -6,3 +6,7 @@ data/*.csv
 systrader
 /backtest
 /run
+/bin
+
+# Research bar cache: regenerable in 9s via `go run ./cmd/coi cache`, 258MB
+data/cache/

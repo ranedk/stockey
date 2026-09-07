@@ -51,8 +51,12 @@ type Config struct {
 	// Between decisions positions are held — cheaper, slower, Law 15's bias.
 	Schedule Schedule
 
-	// ExecuteAtOpen: decisions made at close(T) fill at open(T+1) (needs
-	// Instrument.Opens; instruments without opens fall back to close fills).
+	// ExecuteAtOpen: decisions made at close(T) fill at open(T+1). REQUIRES
+	// every instrument to have Instrument.Opens -- Run() fails fast if any
+	// instrument is missing it (2026-08-22: used to silently fall back to
+	// close fills per instrument, reintroducing look-ahead bias with no
+	// error). A per-day gap inside an existing Opens series still degrades to
+	// a close fill, but is counted via InstrumentResult.DegradedOpenFills.
 	// False = legacy model: fill at the decision close itself.
 	ExecuteAtOpen bool
 
@@ -84,6 +88,12 @@ type InstrumentResult struct {
 	AvgAbsPos    float64
 	Turnover     float64 // round trips per year of average position
 	MaxAbsPos    float64
+	// DegradedOpenFills counts pending ExecuteAtOpen fills where the day's
+	// Opens value was missing/NaN/<=0 and the close price was used instead --
+	// see Run()'s ExecuteAtOpen validation: every instrument is REQUIRED to
+	// have an Opens series when ExecuteAtOpen is set, so this only counts
+	// per-day gaps inside an existing series, not a structurally-absent one.
+	DegradedOpenFills int
 }
 
 type Result struct {
@@ -117,6 +127,24 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 	for _, rs := range cfg.Rules {
 		if err := rules.Validate(rs.Rule); err != nil {
 			return nil, err // Law 1: no story, no backtest
+		}
+	}
+	// BUG FOUND LIVE 2026-08-22 (code review): the pending-fill loop used to
+	// silently fall back to same-day-close fills whenever an instrument's
+	// Opens was nil, defeating ExecuteAtOpen's whole purpose (Law 7: assume
+	// look-ahead first) with no error, warning, or way to tell which
+	// instruments were affected. A portfolio mixing instruments with and
+	// without Opens got inconsistent execution assumptions per instrument,
+	// silently. Fail fast here instead: ExecuteAtOpen requires Opens on every
+	// instrument, structurally, before the simulation starts -- the only
+	// remaining fallback path (see the pending-fill loop below) is now a
+	// genuine per-day data gap inside an existing series, which is counted
+	// via DegradedOpenFills rather than silent.
+	if cfg.ExecuteAtOpen {
+		for _, inst := range instruments {
+			if inst.Opens == nil {
+				return nil, fmt.Errorf("backtest: ExecuteAtOpen requires Opens on every instrument (missing for %s) -- provide Opens or set ExecuteAtOpen=false; a silent close-fill fallback would quietly reintroduce the look-ahead bias this flag exists to prevent", inst.Meta.Symbol)
+			}
 		}
 	}
 	volSpan := cfg.VolSpan
@@ -206,11 +234,20 @@ func Run(cfg Config, instruments []*data.Instrument) (*Result, error) {
 			st := &state[pi]
 			pv := p.inst.Meta.PointValue
 			if st.hasPrice && st.pending {
-				openP := price // fall back to close fill if no open exists
-				if p.inst.Opens != nil && i < p.inst.Opens.Len() {
+				// Opens is guaranteed non-nil here (Run()'s upfront check) --
+				// this only degrades to a close fill on a genuine per-day gap
+				// (short series, NaN, or <=0) inside an existing series, and
+				// that gap is now counted, not silent.
+				openP := price
+				haveValidOpen := false
+				if i < p.inst.Opens.Len() {
 					if v := p.inst.Opens.Values[i]; !math.IsNaN(v) && v > 0 {
 						openP = v
+						haveValidOpen = true
 					}
+				}
+				if !haveValidOpen {
+					irs[pi].DegradedOpenFills++
 				}
 				if st.pos != 0 {
 					move := (openP - st.lastPrice) * pv * st.pos
@@ -430,7 +467,6 @@ func pearson(a, b []float64) float64 {
 	}
 	return cov / math.Sqrt(vx*vy)
 }
-
 
 func filledNaN(n int) []float64 {
 	v := make([]float64, n)

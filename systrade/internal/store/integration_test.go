@@ -121,6 +121,40 @@ func TestIntegrationLotSize(t *testing.T) {
 	}
 }
 
+// HF_DATA_PLATFORM_PLAN.md Phase 2: the point of this test is validating
+// systrader can actually consume/query the synced intraday data, not just
+// that the sync script ran. 3MINDIA is a real ticker confirmed present in
+// the curated intraday universe (RELIANCE is NOT — see IntradayCloses's own
+// coverage caveat).
+func TestIntegrationIntradayCloses(t *testing.T) {
+	s, ctx := openOrSkip(t)
+	from := time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Now()
+	ser, err := s.IntradayCloses(ctx, "3MINDIA", 1, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ser.Len() < 1000 {
+		t.Fatalf("3MINDIA 1-min bars: %d, want >=1000 given the synced date range", ser.Len())
+	}
+	for i := range ser.Values {
+		if ser.Values[i] <= 0 {
+			t.Fatalf("non-positive intraday close at %v", ser.Times[i])
+		}
+		if i > 0 && !ser.Times[i].After(ser.Times[i-1]) {
+			t.Fatalf("timestamps out of order at index %d: %v then %v", i, ser.Times[i-1], ser.Times[i])
+		}
+	}
+
+	tickers, err := s.IntradayTickers(ctx, 1, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tickers) < 100 {
+		t.Fatalf("only %d intraday tickers with >=1000 bars, expected hundreds (curated universe, confirmed 635 total)", len(tickers))
+	}
+}
+
 func TestIntegrationBackfillReaders(t *testing.T) {
 	s, ctx := openOrSkip(t)
 	ser, err := s.BackfillCloses(ctx, "GOLDBEES")
