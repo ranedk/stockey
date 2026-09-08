@@ -41,6 +41,14 @@ type Obs struct {
 	Sym      int32
 	Forecast float64
 	FwdRet   float64
+	// Selected marks an EVENT signal — a pattern that either fired on this
+	// name today or did not. When any observation in a bucket-day is
+	// selected, those names become the long side instead of the top fifth by
+	// forecast, and a bucket-day where nothing fired is skipped rather than
+	// filled with the least-bad alternative. This is how a discrete screener
+	// (a candle pattern, a breakout alert) is measured against the same
+	// same-day, same-bucket control as a continuous rule.
+	Selected bool
 
 	Turnover float64 // 60-bar median traded value
 	Vol      float64 // trailing realized volatility
@@ -69,6 +77,7 @@ type Bucket struct {
 	Label     string
 	Days      int
 	Names     float64 // mean names per day in this bucket
+	Held      float64 // mean names actually held per day (the long side)
 	Edge      float64 // mean daily edge: top-forecast names minus the bucket's own mean
 	// BottomEdge is the same statistic for the BOTTOM forecast fifth. A real
 	// signal is roughly monotone: if the top wins and the bottom does not
@@ -92,6 +101,7 @@ type Bucket struct {
 	secondSum float64
 	secondN   int
 	nameSum   float64
+	heldSum   float64
 }
 
 // YearsPositive reports how many of the years in which this bucket traded had
@@ -129,8 +139,22 @@ type Result struct {
 	Dimensions   int
 }
 
-// Run computes the per-bucket edges. days must be sorted ascending.
+// Run computes the per-bucket edges for a CONTINUOUS rule: the long side is
+// the top fifth of each bucket by forecast.
 func Run(days []Day, dims []Dimension, ruleName string, horizon int) Result {
+	return run(days, dims, ruleName, horizon, false)
+}
+
+// RunEvent computes them for a DISCRETE screener: the long side is whatever
+// the pattern marked Selected, and a bucket-day it did not fire on is skipped
+// rather than filled with the least-bad alternative. The mode is explicit
+// because "nothing fired today" and "this rule has no opinion today" look
+// identical in the data and mean opposite things.
+func RunEvent(days []Day, dims []Dimension, name string, horizon int) Result {
+	return run(days, dims, name, horizon, true)
+}
+
+func run(days []Day, dims []Dimension, ruleName string, horizon int, event bool) Result {
 	res := Result{Rule: ruleName, Horizon: horizon, Days: len(days), Dimensions: len(dims)}
 	if len(days) == 0 {
 		return res
@@ -152,7 +176,7 @@ func Run(days []Day, dims []Dimension, ruleName string, horizon int) Result {
 	for _, d := range days {
 		res.Observations += len(d.Obs)
 		// The unsliced yardstick: one bucket holding the whole day.
-		add(get("(none)", "whole universe"), d, allIndices(len(d.Obs)), mid)
+		add(get("(none)", "whole universe"), d, allIndices(len(d.Obs)), mid, event)
 
 		for _, dim := range dims {
 			labels := dim.Assign(d)
@@ -164,7 +188,7 @@ func Run(days []Day, dims []Dimension, ruleName string, horizon int) Result {
 				byLabel[l] = append(byLabel[l], i)
 			}
 			for l, idx := range byLabel {
-				add(get(dim.Name, l), d, idx, mid)
+				add(get(dim.Name, l), d, idx, mid, event)
 			}
 		}
 	}
@@ -177,6 +201,7 @@ func Run(days []Day, dims []Dimension, ruleName string, horizon int) Result {
 		b.BottomEdge = b.botSum / float64(b.Days)
 		b.VolRatio = b.volSum / float64(b.Days)
 		b.Names = b.nameSum / float64(b.Days)
+		b.Held = b.heldSum / float64(b.Days)
 		if b.firstN > 0 {
 			b.FirstHalf = b.firstSum / float64(b.firstN)
 		} else {
@@ -208,17 +233,34 @@ func Run(days []Day, dims []Dimension, ruleName string, horizon int) Result {
 // add records one bucket-day: the mean forward return of the top-forecast
 // names inside this bucket, minus the mean of every name in it. Same day, same
 // bucket, so the market's move and the bucket's own drift both cancel.
-func add(b *Bucket, d Day, idx []int, mid time.Time) {
+func add(b *Bucket, d Day, idx []int, mid time.Time, event bool) {
 	if len(idx) < minNamesPerBucket {
 		return
 	}
 	sorted := append([]int(nil), idx...)
-	sort.Slice(sorted, func(i, j int) bool {
-		return d.Obs[sorted[i]].Forecast > d.Obs[sorted[j]].Forecast
-	})
+	// Event mode: the pattern picked the names, so no ranking is needed and a
+	// day it did not fire on is not an observation.
+	fired := 0
+	for _, k := range idx {
+		if d.Obs[k].Selected {
+			fired++
+		}
+	}
+	if event {
+		sort.Slice(sorted, func(i, j int) bool {
+			return boolScore(d.Obs[sorted[i]].Selected) > boolScore(d.Obs[sorted[j]].Selected)
+		})
+	} else {
+		sort.Slice(sorted, func(i, j int) bool {
+			return d.Obs[sorted[i]].Forecast > d.Obs[sorted[j]].Forecast
+		})
+	}
 	n := int(math.Round(topFraction * float64(len(sorted))))
+	if event {
+		n = fired
+	}
 	if n < 1 {
-		n = 1
+		return
 	}
 	var top, bottom, all, topVol, allVol float64
 	for i, k := range sorted {
@@ -239,7 +281,14 @@ func add(b *Bucket, d Day, idx []int, mid time.Time) {
 
 	b.Days++
 	b.sum += edge
-	b.botSum += bottom/float64(n) - mean
+	b.heldSum += float64(n)
+	if event {
+		// "The worst fifth by forecast" means nothing when the pattern did the
+		// choosing: there is no ordering to invert.
+		b.botSum = math.NaN()
+	} else {
+		b.botSum += bottom/float64(n) - mean
+	}
 	if meanVol > 0 {
 		b.volSum += (topVol / float64(n)) / meanVol
 	} else {
@@ -256,6 +305,13 @@ func add(b *Bucket, d Day, idx []int, mid time.Time) {
 		b.secondSum += edge
 		b.secondN++
 	}
+}
+
+func boolScore(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func allIndices(n int) []int {

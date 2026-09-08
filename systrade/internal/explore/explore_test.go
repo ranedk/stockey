@@ -138,3 +138,41 @@ func (r *rng) normal() float64 {
 	}
 	return s - 6
 }
+
+// TestEventSignalUsesTheNamesThatFired checks the mode a discrete screener
+// needs: the pattern chooses the long side, and a day it did not fire on is
+// not an observation at all.
+func TestEventSignalUsesTheNamesThatFired(t *testing.T) {
+	mk := func(fire bool, ret float64) Obs {
+		return Obs{Forecast: 0, FwdRet: ret, Selected: fire, Sector: "A", Vol: 1}
+	}
+	// Day 1: two names fire and earn 10%, eight do not and earn 0%.
+	d1 := Day{Date: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
+	for i := 0; i < 2; i++ {
+		d1.Obs = append(d1.Obs, mk(true, 0.10))
+	}
+	for i := 0; i < 8; i++ {
+		d1.Obs = append(d1.Obs, mk(false, 0))
+	}
+	// Day 2: nothing fires. It must not contribute.
+	d2 := Day{Date: time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)}
+	for i := 0; i < 10; i++ {
+		d2.Obs = append(d2.Obs, mk(false, 0.50))
+	}
+
+	res := RunEvent([]Day{d1, d2}, []Dimension{CategoryDimension("sector", func(o Obs) string { return o.Sector })}, "event", 20)
+	b := res.Overall
+	if b.Days != 1 {
+		t.Fatalf("recorded %d bucket-days, want 1 — the day nothing fired is not an observation", b.Days)
+	}
+	// Edge = 10% minus the day's mean of 2%.
+	if math.Abs(b.Edge-0.08) > 1e-12 {
+		t.Errorf("edge = %.4f, want 0.08 (10%% earned against a 2%% universe)", b.Edge)
+	}
+	if math.Abs(b.Held-2) > 1e-9 {
+		t.Errorf("held %.1f names, want the 2 that fired", b.Held)
+	}
+	if !math.IsNaN(b.BottomEdge) {
+		t.Errorf("bottom edge = %.4f; a pattern that chose its own names has no ordering to invert", b.BottomEdge)
+	}
+}

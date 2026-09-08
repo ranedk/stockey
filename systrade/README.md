@@ -17,6 +17,7 @@ docs/open_questions.md    Questions you must answer; edit inline
 docs/instruments_india.md Indian instrument analysis & two-sleeve design
 docs/rule_ideas.md        Phase-2 rules (breakout, TimesFM…) + innovations
 research/LEDGER.md        Append-only record of every experiment (M-counter)
+docs/strategies/          Frozen specs for strategies awaiting paper data
 docs/RESEARCH_PROTOCOL.md Two-track process (explore freely, confirm
                           elsewhere) — DRAFT, awaiting operator sign-off
 research/preregistrations Design, periods, controls and decision rule of a
@@ -207,7 +208,9 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       of days and move nothing
 - [ ] Paper-trade one frozen configuration forward — the only honest evidence
       left for the trend result, and the gate `docs/RESEARCH_PROTOCOL.md` and
-      Law 4 both point at
+      Law 4 both point at. Spec written and frozen:
+      `docs/strategies/2026-09-08_trend_quintile.md` (Rs 10cr floor, ewmac32,
+      top quintile, equal weight, 20-day rebalance, with its kill criteria)
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
       matched-control baseline — on hold: every rule tested so far has failed
       its controls, so there is nothing yet worth combining
