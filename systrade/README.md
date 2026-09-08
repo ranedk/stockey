@@ -19,7 +19,7 @@ docs/rule_ideas.md        Phase-2 rules (breakout, TimesFM…) + innovations
 research/LEDGER.md        Append-only record of every experiment (M-counter)
 docs/strategies/          Frozen specs for strategies awaiting paper data
 docs/RESEARCH_PROTOCOL.md Two-track process (explore freely, confirm
-                          elsewhere) — DRAFT, awaiting operator sign-off
+                          elsewhere) — ADOPTED 2026-09-08, amends Laws 2 and 4
 research/preregistrations Design, periods, controls and decision rule of a
                           trial, written BEFORE it runs
 research/reports/         Raw output of the runs the ledger rows summarize

@@ -1,8 +1,10 @@
 # Research protocol — two tracks
 
-**Status: DRAFT, proposed 2026-09-08, not yet law.** It amends how Laws 2 and 4
-of `TRADING_BIBLE.md` are applied. Until the operator signs off, the bible as
-written still governs; this file describes what `cmd/slice` already assumes.
+**Status: ADOPTED 2026-09-08 by the operator.** It amends how Laws 2 and 4 of
+`TRADING_BIBLE.md` are applied, and those laws now carry the amendment inline.
+Where this file and the bible disagree on research process, this file governs;
+on everything else — stories, matched controls, blending, sizing, no
+discretionary override — the bible is unchanged and absolute.
 
 ## Why the previous process was guaranteed to fail
 

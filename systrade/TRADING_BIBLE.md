@@ -5,6 +5,12 @@ study of it. **Every design decision, line of code, and backtest in this repo mu
 comply.** A condensed version is installed as the `trading-bible` skill; this file is
 the annotated reference. When code and bible conflict, the code is wrong.
 
+**Amended 2026-09-08 by the operator.** Laws 2 and 4 now defer to
+`docs/RESEARCH_PROTOCOL.md` on how the multiple-testing bar is computed and on
+how out-of-sample evidence is generated. The original wording is preserved
+below with the amendment marked, because a law whose history is invisible is
+one nobody can argue with later. Everything else stands unchanged.
+
 ---
 
 ## Part I — Research discipline (Ch 3–4: Fitting, Portfolio Allocation)
@@ -31,6 +37,22 @@ backtest" found by scanning is the *expected output of scanning noise*, not
 evidence. Batching runs differently does not reduce M: the best-of-50-batches
 of 10 is the best-of-500.
 
+**AMENDED 2026-09-08.** The counting stands; the bar changes. A single
+workspace-wide Bonferroni was being applied across unrelated research families
+— by 2026-09 M had reached 1114, of which 855 were imported cron *monitoring*
+runs, so every new idea faced t = 4.08 because a factor-IC monitor had run
+nightly for two months. That is arithmetic punishment, not discipline. From
+now on:
+
+- **Correct within the family that was actually searched**, using FDR at 10%
+  plus a deflated Sharpe that accounts for the number of configurations tried
+  in THAT family. Report the workspace-wide bar alongside, for context.
+- **Every experiment still gets a ledger row**, and M is still counted and
+  still published. Nothing here reduces what must be written down.
+- **Exploration rows declare `trials=0`** and make no significance claim of any
+  kind. They are logged precisely so a mined dataset can never later be
+  mistaken for a fresh one.
+
 ### Law 3: Edge = performance − matched baseline
 Never quote raw win rates or raw Sharpe. A pattern that wins 80% while random
 entries in the same stocks/period win 90% has NEGATIVE edge. Baselines must match
@@ -45,6 +67,25 @@ The backtester's matched-control harness exists for this.
   special").
 - A holdout set is burned the moment it influences a decision twice.
 - Cheapest honest data: paper-trade the frozen rule forward.
+
+**AMENDED 2026-09-08.** Three changes, all in `docs/RESEARCH_PROTOCOL.md`:
+
+- **Slicing on a NAMED attribute is allowed** — liquidity tier, sector, size,
+  volatility state, market regime — and is not what "per-instrument tweaks"
+  forbids. Carver's rule comes from a 40-instrument futures book where fitting
+  gold separately is obviously overfitting; it was being applied to a
+  3,000-stock cross-section as though it were the same situation. What stays
+  forbidden is choosing the slice *because it scored well* and then quoting
+  that slice's statistic as evidence. Explore freely, confirm elsewhere.
+- **Purged walk-forward replaces the one-shot holdout as the default.** Fit on
+  an expanding window, score the next block, purge the forward-return overlap
+  so no observation sits on both sides. Thirteen years burned once per family
+  is about five decisions before the evidence runs out; we were rationing
+  evidence rather than generating it. A true one-shot holdout remains available
+  and remains burned on use.
+- **Forward paper trading is the gate before any capital moves**, which this
+  law's own last line already said. It is the only evidence budget that
+  regenerates, and the only one that cannot be mined.
 
 ### Law 5: Don't select — blend
 Selecting the best variation by backtest Sharpe destroys value (Carver's gold
