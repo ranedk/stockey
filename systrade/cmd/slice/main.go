@@ -46,6 +46,10 @@ func main() {
 		runCost(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "coi" {
+		runCOI(os.Args[2:])
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "explore" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
@@ -94,19 +98,24 @@ func main() {
 	}
 
 	res := explore.Run(days, dims, rule.Name(), *horizon)
-	print(res, mcaps, sectors)
+	printResult(res, mcaps, sectors, false)
 }
 
-func print(res explore.Result, mcaps map[string][]store.MCapPoint, sectors map[string]string) {
+func printResult(res explore.Result, mcaps map[string][]store.MCapPoint, sectors map[string]string, event bool) {
 	fmt.Printf("EXPLORATION — %s, %d-day forward return, entries at the open after the decision close\n",
 		res.Rule, res.Horizon)
 	fmt.Printf("%d decision days, %d symbol-days, %d dimensions, %d buckets examined\n",
 		res.Days, res.Observations, res.Dimensions, len(res.Buckets))
 	fmt.Println()
-	fmt.Println("Statistic: mean forward return of the top-forecast fifth INSIDE a bucket, minus the")
-	fmt.Println("mean of every name in that same bucket on that same day. Each slice is its own")
-	fmt.Println("control, so the market's move and the slice's own drift both cancel.")
-	fmt.Println("'bottom' is the same for the WORST-forecast fifth: a real ordering loses there.")
+	if event {
+		fmt.Println("Statistic: mean forward return of the names the pattern FIRED on inside a bucket,")
+		fmt.Println("minus the mean of every name in that same bucket on that same day.")
+	} else {
+		fmt.Println("Statistic: mean forward return of the top-forecast fifth INSIDE a bucket, minus the")
+		fmt.Println("mean of every name in that same bucket on that same day. Each slice is its own")
+		fmt.Println("control, so the market's move and the slice's own drift both cancel.")
+		fmt.Println("'bottom' is the same for the WORST-forecast fifth: a real ordering loses there.")
+	}
 	fmt.Println("'vol x' is how volatile the selected names are relative to their bucket — well")
 	fmt.Println("above 1.0 means the edge may be risk premium, not selection (LEDGER row 4).")
 	fmt.Println()
@@ -118,14 +127,23 @@ func print(res explore.Result, mcaps map[string][]store.MCapPoint, sectors map[s
 
 	o := res.Overall
 	pos, tot := o.YearsPositive()
+	second := "bottom"
+	if event {
+		second = "held"
+	}
 	header := func(first string) {
 		fmt.Printf("%-28s %6s %7s %8s %8s %8s %8s %6s %6s\n",
-			first, "names", "days", "edge", "bottom", "1st half", "2nd half", "vol x", "yrs +")
+			first, "names", "days", "edge", second, "1st half", "2nd half", "vol x", "yrs +")
 	}
 	row := func(label string, b explore.Bucket) {
 		p, t := b.YearsPositive()
-		fmt.Printf("%-28s %6.0f %7d %7.3f%% %7.3f%% %7.3f%% %7.3f%% %6.2f %4d/%d\n",
-			truncate(label, 28), b.Names, b.Days, 100*b.Edge, 100*b.BottomEdge,
+		secondVal := 100 * b.BottomEdge
+		format := "%-28s %6.0f %7d %7.3f%% %7.3f%% %7.3f%% %7.3f%% %6.2f %4d/%d\n"
+		if event {
+			secondVal = b.Held
+			format = "%-28s %6.0f %7d %7.3f%% %8.1f %7.3f%% %7.3f%% %6.2f %4d/%d\n"
+		}
+		fmt.Printf(format, truncate(label, 28), b.Names, b.Days, 100*b.Edge, secondVal,
 			100*b.FirstHalf, 100*b.SecondHal, b.VolRatio, p, t)
 	}
 	header("unsliced yardstick")

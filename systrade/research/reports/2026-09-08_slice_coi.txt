@@ -1,0 +1,179 @@
+102448 COI confirmations across 2321 symbols
+
+EXPLORATION — the COI pattern, sliced. LEDGER rows 11-13 already rejected it;
+this asks whether any slice of the universe hides an exception.
+
+Every indicator the screener uses is computed for EVERY liquid name, not just
+the ones that fired, so each bucket holds the pattern's setups AND every other
+name in the same indicator state that day. 'edge' is what the pattern added
+over them; 'held' is how many setups fired per bucket-day.
+EXPLORATION — COI (full variant), 20-day forward return, entries at the open after the decision close
+3016 decision days, 2510028 symbol-days, 16 dimensions, 90 buckets examined
+
+Statistic: mean forward return of the names the pattern FIRED on inside a bucket,
+minus the mean of every name in that same bucket on that same day.
+'vol x' is how volatile the selected names are relative to their bucket — well
+above 1.0 means the edge may be risk premium, not selection (LEDGER row 4).
+
+NO BUCKET BELOW IS A RESULT. With this many buckets the best one is what noise
+looks like. Read the halves and the years: an edge that lives in one of them is
+the shape of LEDGER row 13's dead effect. Take a MECHANISM from here, then test
+it where this command has not looked.
+
+unsliced yardstick            names    days     edge     held 1st half 2nd half  vol x  yrs +
+whole universe                  834    2961  -0.283%     34.6  -0.022%  -0.542%   1.00    3/13
+
+--- 20-EMA slope (the dial) ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     172    2249  -0.408%      5.9  -0.102%  -0.671%   1.08    3/13
+Q2                              171    2290  -0.140%      7.3   0.138%  -0.381%   1.03    6/13
+Q3                              169    2470  -0.152%      8.7  -0.123%  -0.178%   1.00    5/13
+Q4                              169    2652  -0.667%      9.4  -0.819%  -0.529%   1.01    1/13
+Q5 (highest)                    168    2785   0.042%      9.3   0.555%  -0.436%   1.02    7/13
+                             spread 0.708% between the widest and narrowest bucket
+
+--- BB slope diff ('very important') ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+bands converging                431    2848  -0.318%     19.7   0.025%  -0.650%   1.00    2/13
+bands diverging                 409    2848  -0.138%     16.2   0.113%  -0.380%   1.02    5/13
+                             spread 0.180% between the widest and narrowest bucket
+
+--- MACD 1st derivative ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     184    1123   0.311%      2.9   0.775%   0.037%   1.21    9/13
+Q2                              175    1586  -0.145%      5.2   0.405%  -0.553%   1.04    6/13
+Q3                              171    2046   0.049%      8.2   0.212%  -0.088%   1.02    7/13
+Q4                              168    2514  -0.286%     12.2  -0.034%  -0.521%   1.02    4/13
+Q5 (highest)                    167    2895   0.002%     15.0   0.256%  -0.246%   1.00    5/13
+                             spread 0.597% between the widest and narrowest bucket
+
+--- MACD vs signal ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+MACD above                      415    2876  -0.245%     19.8   0.051%  -0.530%   1.01    3/13
+MACD below                      431    2759  -0.136%     16.5   0.167%  -0.422%   1.01    4/13
+                             spread 0.108% between the widest and narrowest bucket
+
+--- band width ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     169    2655   0.098%      7.7   0.256%  -0.047%   1.04    7/13
+Q2                              170    2597  -0.067%      8.1  -0.158%   0.015%   1.02    4/13
+Q3                              170    2543  -0.051%      8.2   0.273%  -0.337%   1.01    6/13
+Q4                              170    2528  -0.303%      8.1   0.049%  -0.614%   1.01    3/13
+Q5 (highest)                    170    2577  -0.779%      7.6  -0.376%  -1.136%   1.01    3/13
+                             spread 0.877% between the widest and narrowest bucket
+
+--- drop from 120-bar high ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     170    2650  -0.327%      7.2  -0.162%  -0.476%   1.01    3/13
+Q2                              169    2621  -0.026%      8.0   0.114%  -0.152%   1.01    7/13
+Q3                              170    2557  -0.585%      8.3  -0.724%  -0.462%   1.01    1/13
+Q4                              171    2514  -0.247%      8.3  -0.011%  -0.453%   1.02    4/13
+Q5 (highest)                    170    2492  -0.242%      8.2   0.377%  -0.795%   1.03    5/13
+                             spread 0.559% between the widest and narrowest bucket
+
+--- liquidity ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     171    2545  -0.329%      6.9   0.071%  -0.682%   1.04    2/13
+Q2                              170    2544  -0.141%      7.3   0.212%  -0.449%   1.03    3/13
+Q3                              170    2565  -0.237%      7.7  -0.186%  -0.281%   1.01    5/13
+Q4                              170    2589  -0.207%      8.5   0.084%  -0.467%   0.99    4/13
+Q5 (highest)                    169    2590  -0.137%      9.5  -0.008%  -0.255%   1.00    5/13
+                             spread 0.192% between the widest and narrowest bucket
+
+--- lower band ('important') ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+away from it                    748    2947  -0.281%     32.3   0.003%  -0.561%   1.00    3/13
+touching the band               120    1440  -0.197%      5.0   0.171%  -0.502%   1.07    5/13
+                             spread 0.083% between the widest and narrowest bucket
+
+--- market breadth ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+breadth 20-40%                  786     496  -0.321%     36.4  -0.101%  -0.655%   1.01    2/9
+breadth 40-60%                  849     912  -0.236%     34.9   0.173%  -0.636%   1.00    3/12
+breadth 60-80%                  825     826  -0.263%     32.7  -0.218%  -0.316%   1.00    3/11
+breadth <20% (washout)          831      89  -1.432%     43.4  -1.176%  -1.888%   1.02    0/6
+breadth >80% (broad rally)      861     638  -0.188%     34.0   0.386%  -0.488%   1.01    4/8
+                             spread 1.244% between the widest and narrowest bucket
+
+--- own trend ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+above 200DMA                    508    2878  -0.322%     21.8  -0.172%  -0.466%   1.01    3/13
+below 200DMA                    350    2630  -0.175%     15.1   0.055%  -0.400%   1.01    3/13
+                             spread 0.147% between the widest and narrowest bucket
+
+--- own volatility ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     169    2633  -0.085%      7.2  -0.151%  -0.025%   1.02    4/13
+Q2                              169    2601   0.102%      7.8   0.150%   0.058%   1.00    7/13
+Q3                              169    2536   0.059%      8.1   0.296%  -0.157%   1.00    6/13
+Q4                              170    2510  -0.372%      8.5  -0.065%  -0.639%   1.00    4/13
+Q5 (highest)                    170    2553  -0.670%      8.4  -0.115%  -1.156%   1.00    3/13
+                             spread 0.772% between the widest and narrowest bucket
+
+--- price level ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                     171    2484  -0.234%      7.7   0.116%  -0.540%   1.01    6/13
+Q2                              171    2481  -0.578%      8.4  -0.348%  -0.779%   1.04    2/13
+Q3                              169    2594  -0.117%      8.1   0.183%  -0.394%   1.01    5/13
+Q4                              169    2629  -0.131%      7.9   0.011%  -0.260%   1.02    6/13
+Q5 (highest)                    169    2649  -0.106%      7.8  -0.181%  -0.038%   1.02    4/13
+                             spread 0.472% between the widest and narrowest bucket
+
+--- sector ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+IN0101 (SOLARINDS, PIDILITI…     68    1898  -0.244%      4.0  -0.267%  -0.228%   1.04    5/13
+IN0102 (SAHYADRI, DALBHARAT…     21    1117  -0.261%      2.2  -0.553%  -0.057%   1.01    3/13
+IN0103 (HINDZINC, VEDL, LLO…     22    1205   0.017%      2.5  -0.199%   0.182%   1.03    7/13
+IN0104 (CHEVIOT)                  8     362  -0.494%      1.6   0.589%  -0.880%   1.03    5/11
+IN0201 (BAJAJ-AUTO, EICHERM…     47    1703  -0.486%      3.2  -0.019%  -0.797%   1.00    3/13
+IN0202 (DIXON, SYMPHONY, LG…     47    1827  -0.180%      2.9  -0.016%  -0.302%   1.00    6/13
+IN0203 (PAGEIND, BOMDYEING,…     26    1146  -0.579%      2.3   0.302%  -1.056%   1.03    4/13
+IN0204 (GRETEX, TIPSMUSIC, …     16     927   0.066%      1.7   0.506%  -0.282%   1.01    8/13
+IN0205 (DLF, LOTUSDEV, BRIG…     23    1143  -0.189%      2.2   0.041%  -0.342%   1.01    5/13
+IN0206 (IRCTC, BLS, EIHOTEL)     37    1519  -0.126%      2.6   0.343%  -0.410%   1.00    5/13
+IN0301 (COALINDIA, BPCL, AE…     22    1347   0.009%      2.2   0.099%  -0.072%   1.01    7/13
+IN0401 (ITC, NESTLEIND, VBL)     55    1894  -0.109%      3.2   0.178%  -0.319%   1.00    7/13
+IN0501 (HDFCBANK, BAJFINANC…     98    2184  -0.265%      5.6  -0.087%  -0.409%   1.00    5/13
+IN0601 (SUNPHARMA, DIVISLAB…     65    2049  -0.246%      3.7   0.185%  -0.570%   1.02    3/13
+IN0701 (NBCC, ITDCEM, ENGIN…     29    1360  -0.515%      2.5  -0.172%  -0.772%   1.01    3/13
+IN0702 (HAL, BEL, CUMMINSIN…    106    2155  -0.302%      5.7  -0.006%  -0.515%   1.01    4/13
+IN0801 (TCS, INFY, OFSS)         41    1658  -0.098%      2.9   0.192%  -0.315%   1.02    7/13
+IN0901 (ADANIPORTS, CONCOR,…     32    1490  -0.223%      2.4  -0.408%  -0.091%   1.01    5/13
+IN1001 (HFCL, STLTECH, TTML)     13     850  -0.554%      1.7   0.317%  -1.158%   1.01    7/13
+IN1101 (CLEANMAX, ENERGYDEV)     16    1025  -0.599%      2.0  -0.869%  -0.394%   1.01    5/13
+IN1102 (WABAG, NAMOEWASTE, …      6      48  -0.296%      1.6     NaN%  -0.296%   1.02    1/3
+IN1201 (3MINDIA, TTKHLTCARE…      6     119   0.739%      1.1  -4.501%   0.784%   1.02    3/6
+                             spread 1.338% between the widest and narrowest bucket
+
+--- size (mcap) ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+Q1 (lowest)                      19     912  -0.870%      2.0  -0.037%  -1.303%   1.02    4/13
+Q2                               20     917  -0.268%      2.1  -0.356%  -0.225%   1.01    3/13
+Q3                               19     989   0.079%      2.0   0.545%  -0.143%   1.03    6/13
+Q4                               20     945   0.012%      2.0   0.516%  -0.227%   1.03    7/13
+Q5 (highest)                     18    1032  -0.068%      2.1  -0.438%   0.134%   1.02    5/13
+                             spread 0.949% between the widest and narrowest bucket
+
+--- upper band ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+flat or falling                 425    2820  -0.219%     18.9   0.109%  -0.532%   1.01    2/13
+rising                          419    2841  -0.212%     17.3  -0.016%  -0.400%   1.00    3/13
+                             spread 0.007% between the widest and narrowest bucket
+
+--- year ---
+bucket                        names    days     edge     held 1st half 2nd half  vol x  yrs +
+2014                            518     168   0.103%     21.1   0.103%     NaN%   0.97    1/1
+2015                            525     237  -0.202%     19.7  -0.202%     NaN%   0.99    0/1
+2016                            555     239  -0.309%     23.3  -0.309%     NaN%   0.99    0/1
+2017                            688     247  -0.202%     24.7  -0.202%     NaN%   1.01    0/1
+2018                            701     240   0.614%     26.1   0.614%     NaN%   1.03    1/1
+2019                            518     244   0.036%     18.5   0.036%     NaN%   0.98    1/1
+2020                            616     242  -0.318%     27.6  -0.347%  -0.298%   0.97    0/1
+2021                            898     246  -0.672%     34.7     NaN%  -0.672%   1.00    0/1
+2022                            963     244  -0.474%     39.7     NaN%  -0.474%   1.01    0/1
+2023                           1071     246  -0.776%     43.4     NaN%  -0.776%   1.04    0/1
+2024                           1284     244  -0.592%     52.5     NaN%  -0.592%   1.00    0/1
+2025                           1301     247  -0.202%     58.8     NaN%  -0.202%   1.00    0/1
+2026                           1342     117  -0.838%     76.0     NaN%  -0.838%   1.07    0/1
+                             spread 1.452% between the widest and narrowest bucket
+

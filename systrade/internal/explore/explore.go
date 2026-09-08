@@ -56,6 +56,12 @@ type Obs struct {
 	Mcap     float64 // latest reported market cap on or before this date, 0 if unknown
 	Sector   string  // static attribute, "" if unknown
 	AboveSMA bool    // the symbol's own 200-day trend state
+	// Extra carries caller-defined attributes — the indicator state a
+	// specific screener cares about, computed for EVERY name rather than only
+	// the ones that fired, so a slice on "names touching the lower band" holds
+	// the pattern's candidates and the control side by side. A fixed array
+	// rather than a map: this struct exists 2.5 million times.
+	Extra [8]float64
 }
 
 // Day is one decision day's cross-section.

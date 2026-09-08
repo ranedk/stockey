@@ -164,8 +164,11 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       lower-Bollinger-band oversold condition, not the candle pattern).
       Four operator-requested follow-ups and one pattern-free re-test of the
       only surviving direction (relative strength on washout days) closed the
-      family: LEDGER rows 11-13. Left behind: `internal/bars` research cache,
-      `cmd/coi`
+      family: LEDGER rows 11-13. Re-examined a fourth time with the slicing
+      method in 2026-09 (`cmd/slice coi`, LEDGER row 19) against a control the
+      earlier rounds lacked — every indicator computed for every liquid name,
+      not just the ones that fired — and 75 of 91 buckets came back negative.
+      Left behind: `internal/bars` research cache, `cmd/coi`
 - [x] Indicator library implemented and characterised WITHOUT returns
       (LEDGER row 14, `cmd/rulelab`, report in `research/reports/`):
       `rules.Breakout`/`Acceleration`/`MeanReversion` with stories written
