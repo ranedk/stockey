@@ -17,6 +17,8 @@ docs/open_questions.md    Questions you must answer; edit inline
 docs/instruments_india.md Indian instrument analysis & two-sleeve design
 docs/rule_ideas.md        Phase-2 rules (breakout, TimesFM…) + innovations
 research/LEDGER.md        Append-only record of every experiment (M-counter)
+docs/RESEARCH_PROTOCOL.md Two-track process (explore freely, confirm
+                          elsewhere) — DRAFT, awaiting operator sign-off
 research/preregistrations Design, periods, controls and decision rule of a
                           trial, written BEFORE it runs
 research/reports/         Raw output of the runs the ledger rows summarize
@@ -36,6 +38,8 @@ internal/parallel         Generic worker-pool Map
 internal/sleeve           Long-only cross-sectional equity backtest + its
                           matched controls (beta, shuffle, stable-shuffle)
 internal/bars             Daily OHLCV + the read-postgres-once bar cache
+internal/explore          Where and when a rule worked: per-slice edges with
+                          each slice as its own control (EXPLORATION only)
 internal/futures          Curve cleaning (recycled ids, duplicate streams),
                           roll detection, Panama stitching, splice-free carry
 internal/patterns/coi     External "COI" 3-bar reversal pattern — RESEARCH
@@ -46,6 +50,8 @@ cmd/run                   Daily production runner → prints the order sheet
 cmd/stage                 CLI: Weinstein stage read per ticker (REPORTING ONLY)
 cmd/api                   HTTP API serving screener/'s stage-analysis page
 cmd/coi                   COI pattern: cache | scan | study (matched controls)
+cmd/slice                 Slice explorer: a rule's edge by liquidity, size,
+                          vol, price, sector, trend state, breadth and year
 cmd/carver                Pre-registered verification of EWMAC + carry on
                           the two-sleeve universe, with its two controls
 cmd/futures               Futures curve report: what cleaning kept, the rolls
@@ -183,6 +189,16 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       system. Carry alone is −6.2%/yr — its story does not hold on equity index
       futures, where the basis is a financing cost rather than hedgers paying
       to shed risk. Construction gate failed, holdout NOT burned
+- [x] Slice explorer (`cmd/slice`, `internal/explore`, LEDGER row 17): the
+      first tool here that asks WHERE a rule worked. Found that cross-sectional
+      trend — never previously tested on this universe — is monotone, not
+      explained by taking more risk, and **inverts in washout regimes**, where
+      the same signal's bottom fifth gains what its top fifth loses. A
+      hypothesis, not a result: 62 buckets were examined and the sample is
+      already mined
+- [ ] Pre-register and confirm the breadth-conditioned trend hypothesis:
+      costs first (the edge lives in the illiquid, low-priced tail), then
+      purged walk-forward for stability, then forward-only paper trading
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
       matched-control baseline — on hold: every rule tested so far has failed
       its controls, so there is nothing yet worth combining
