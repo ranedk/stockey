@@ -5,9 +5,12 @@
 // through stockey; stockey owns no research/signal logic per its own
 // CLAUDE.md boundary).
 //
-// Starts with one endpoint: GET /api/stage, backed by internal/stageapi
-// (internal/stage's Weinstein classifier run over the full adjusted-price
-// universe). More systrader outputs can grow onto this same server later.
+// Endpoints:
+//
+//	GET /api/stage         internal/stage's Weinstein classifier over the
+//	                       full adjusted-price universe (reporting only)
+//	GET /api/paper         every tracked paper strategy, forward record first
+//	GET /api/paper/{name}  one strategy: order sheet, book, NAV vs benchmarks
 //
 // NOT hardened for public exposure -- no auth, permissive CORS. Personal
 // single-user tool meant to run on localhost/trusted network next to the
@@ -30,6 +33,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/ranedk/systrader/internal/paperapi"
 	"github.com/ranedk/systrader/internal/stageapi"
 	"github.com/ranedk/systrader/internal/store"
 )
@@ -48,11 +52,40 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/stage", handleStage(st))
+	mux.HandleFunc("GET /api/paper", handlePaperList(st))
+	mux.HandleFunc("GET /api/paper/{name}", handlePaperDetail(st))
 
 	addr := ":" + port
 	log.Printf("systrader api listening on %s", addr)
 	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// handlePaperList serves every tracked strategy. The forward record sorts
+// first even when it is empty: an empty forward record is the honest state of
+// a strategy frozen today, and burying it under an in-sample reference curve
+// would be the whole point of the exercise thrown away.
+func handlePaperList(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out, err := paperapi.List(r.Context(), st)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"strategies": out})
+	}
+}
+
+func handlePaperDetail(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		out, err := paperapi.Detail(r.Context(), st, name)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	}
 }
 

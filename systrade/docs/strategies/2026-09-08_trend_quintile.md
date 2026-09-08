@@ -79,7 +79,23 @@ like in-sample, and it is not fragile to the arbitrary choices".
 - **Frozen:** no parameter, universe or weighting change during the window. A
   change means a new spec, a new clock, and a note saying why.
 
-## 6. What is needed to run it
+## 6. How it is tracked (live from 2026-09-08)
+
+- `cmd/paper` recomputes the whole record from the start date on every run and
+  rewrites `systrader_paper_nav`, `systrader_paper_holding`,
+  `systrader_paper_order` and `systrader_paper_pending`. Idempotent by
+  construction: running twice changes nothing and a missed day fills itself in.
+- `scripts/paper_daily.sh` runs it every weekday at 20:15 IST, half an hour
+  after the day's adjusted prices land.
+- screener/'s **Paper** page shows the order sheet for the next session, the
+  current book, and the strategy against both benchmarks — with the in-sample
+  reference curve kept in a separate, explicitly labelled section so it can
+  never be read as evidence.
+- A second track, `trend-quintile-reference`, runs the same frozen rules from
+  2022-01-01 purely to draw that reference curve. It is a backtest and is
+  labelled as one everywhere it appears.
+
+## 7. What is needed to run it
 
 - The daily order sheet: eligible universe, forecasts, target quintile,
   the trades implied by the current book, on a 20-day clock.

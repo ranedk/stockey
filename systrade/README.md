@@ -41,6 +41,9 @@ internal/sleeve           Long-only cross-sectional equity backtest + its
 internal/bars             Daily OHLCV + the read-postgres-once bar cache
 internal/explore          Where and when a rule worked: per-slice edges with
                           each slice as its own control (EXPLORATION only)
+internal/paper            Forward paper record: order sheet, book, NAV vs two
+                          benchmarks — recomputed from the start date each run
+internal/paperapi         That record, shaped for the screener frontend
 internal/futures          Curve cleaning (recycled ids, duplicate streams),
                           roll detection, Panama stitching, splice-free carry
 internal/patterns/coi     External "COI" 3-bar reversal pattern — RESEARCH
@@ -49,8 +52,10 @@ internal/patterns/coi     External "COI" 3-bar reversal pattern — RESEARCH
 cmd/backtest              Full pipeline on synthetic data (demo/harness check)
 cmd/run                   Daily production runner → prints the order sheet
 cmd/stage                 CLI: Weinstein stage read per ticker (REPORTING ONLY)
-cmd/api                   HTTP API serving screener/'s stage-analysis page
+cmd/api                   HTTP API serving screener/'s stage-analysis and
+                          paper-trading pages
 cmd/coi                   COI pattern: cache | scan | study (matched controls)
+cmd/paper                 Daily forward record for a frozen strategy
 cmd/slice                 Slice explorer: a rule's edge by liquidity, size,
                           vol, price, sector, trend state, breadth and year
 cmd/carver                Pre-registered verification of EWMAC + carry on
@@ -209,11 +214,16 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       mined from this sample scoring well on that same sample is what mining
       produces. Row 17's regime conditioning did NOT survive — washouts are 3%
       of days and move nothing
-- [ ] Paper-trade one frozen configuration forward — the only honest evidence
+- [x] Paper-trading the frozen configuration forward — the only honest evidence
       left for the trend result, and the gate `docs/RESEARCH_PROTOCOL.md` and
-      Law 4 both point at. Spec written and frozen:
-      `docs/strategies/2026-09-08_trend_quintile.md` (Rs 10cr floor, ewmac32,
-      top quintile, equal weight, 20-day rebalance, with its kill criteria)
+      Law 4 both point at. Spec frozen in
+      `docs/strategies/2026-09-08_trend_quintile.md`; `cmd/paper` recomputes the
+      order sheet, book and NAV against an equal-weight and a random-ranking
+      book every weekday (`scripts/paper_daily.sh`, 20:15 IST), and screener/'s
+      Paper page shows it. Record starts 2026-09-08; judgement is pre-committed
+      to wait 12 months and 12 rebalances
+- [ ] First evaluation of the paper record — not before 12 months and 12
+      rebalances have passed, per the spec's own binding terms
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
       matched-control baseline — on hold: every rule tested so far has failed
       its controls, so there is nothing yet worth combining
