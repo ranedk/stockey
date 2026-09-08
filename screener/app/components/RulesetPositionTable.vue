@@ -9,6 +9,13 @@ function toggle(id: string) {
   expanded.value = expanded.value === id ? null : id
 }
 
+/** Gain since entry. The stop-room bar below says how much rope is left; this
+ *  says whether the position is actually working. */
+function positionReturn(p: RulesetPosition): number | null {
+  if (p.entry_price === null || p.last_price === null || p.entry_price <= 0) return null
+  return p.last_price / p.entry_price - 1
+}
+
 function axes(p: RulesetPosition): string {
   if (p.confluence_count === null || p.evaluable_count === null) return '—'
   return `${p.confluence_count}/${p.evaluable_count}`
@@ -47,6 +54,7 @@ function daysToTarget(p: RulesetPosition): number | null {
       <thead class="border-b border-slate-200 bg-slate-50 text-left text-slate-500">
         <tr>
           <th class="px-3 py-2 font-medium">Ticker</th>
+          <th class="px-3 py-2 text-right font-medium">P&amp;L</th>
           <th class="px-3 py-2 font-medium">Opened</th>
           <th class="px-3 py-2 text-right font-medium">Entry</th>
           <th class="px-3 py-2 text-right font-medium">Last</th>
@@ -74,6 +82,7 @@ function daysToTarget(p: RulesetPosition): number | null {
               <span v-if="p.entry_decision === 'reject'" class="ml-1 text-[10px] text-rose-500">vetoed</span>
               <span v-else-if="p.kind === 'shadow'" class="ml-1 text-[10px] text-slate-400">no money</span>
             </td>
+            <td class="px-3 py-2 text-right"><ReturnValue :value="positionReturn(p)" :digits="1" /></td>
             <td class="px-3 py-2 text-slate-500">{{ formatDate(p.opened_at) }}</td>
             <td class="px-3 py-2 text-right text-slate-600">
               {{ p.entry_price === null ? '—' : formatPrice(p.entry_price) }}
@@ -112,7 +121,7 @@ function daysToTarget(p: RulesetPosition): number | null {
             </td>
           </tr>
           <tr v-if="expanded === p.position_id" class="border-b border-slate-100 bg-slate-50/60">
-            <td colspan="9" class="px-3 py-3">
+            <td colspan="10" class="px-3 py-3">
               <dl class="grid gap-3 text-xs sm:grid-cols-3">
                 <div>
                   <dt class="font-medium text-slate-700">Prediction</dt>

@@ -19,6 +19,43 @@ const showRejected = ref(true)
 
 const accepted = computed(() => (data.value?.positions ?? []).filter(p => p.entry_decision !== 'reject'))
 const rejected = computed(() => (data.value?.positions ?? []).filter(p => p.entry_decision === 'reject'))
+
+/**
+ * Book-level P&L over the OPEN accepted positions.
+ *
+ * Weighted by position_size_rs where the sizer has produced one, equal-weighted
+ * otherwise — an unsized position still exists and still moves, and dropping it
+ * would quietly flatter or punish the total depending on which way it went.
+ * Positions with no entry or last price contribute nothing and are counted as
+ * unpriced rather than as zeroes.
+ */
+const bookPnl = computed(() => {
+  let weighted = 0
+  let weight = 0
+  let up = 0
+  let down = 0
+  let unpriced = 0
+  for (const p of accepted.value) {
+    if (p.status !== 'open') continue
+    if (p.entry_price === null || p.last_price === null || p.entry_price <= 0) {
+      unpriced++
+      continue
+    }
+    const ret = p.last_price / p.entry_price - 1
+    const w = p.position_size_rs && p.position_size_rs > 0 ? p.position_size_rs : 1
+    weighted += ret * w
+    weight += w
+    if (ret >= 0) up++
+    else down++
+  }
+  return {
+    ret: weight > 0 ? weighted / weight : null,
+    up,
+    down,
+    unpriced,
+    sized: accepted.value.some(p => p.position_size_rs && p.position_size_rs > 0),
+  }
+})
 </script>
 
 <template>
@@ -40,6 +77,27 @@ const rejected = computed(() => (data.value?.positions ?? []).filter(p => p.entr
         committed · {{ data.book_used }}/{{ data.book_capacity }} slots
         (₹{{ Math.round(data.capital_per_position_rs).toLocaleString('en-IN') }} each)
       </span>
+    </div>
+
+    <div v-if="data && bookPnl.ret !== null" class="mt-3 flex flex-wrap items-end gap-x-10 gap-y-3 border-t border-slate-100 pt-3">
+      <div>
+        <div class="text-xs text-slate-500">Open book, since entry</div>
+        <ReturnValue :value="bookPnl.ret" size="lg" :digits="1" />
+        <div class="mt-0.5 text-[11px] text-slate-400">
+          {{ bookPnl.sized ? 'weighted by position size' : 'equal-weighted' }}
+        </div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-500">Positions up / down</div>
+        <div class="text-2xl font-semibold tabular-nums">
+          <span class="text-emerald-600">{{ bookPnl.up }}</span>
+          <span class="text-slate-300"> / </span>
+          <span class="text-rose-600">{{ bookPnl.down }}</span>
+        </div>
+        <div v-if="bookPnl.unpriced" class="mt-0.5 text-[11px] text-slate-400">
+          {{ bookPnl.unpriced }} not priced yet
+        </div>
+      </div>
     </div>
 
     <p class="mt-1 text-xs text-slate-400">

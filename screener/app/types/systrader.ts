@@ -33,6 +33,7 @@ export interface PaperSummary {
   book: string
   nav: number
   total_return: number
+  day_return: number
   days: number
   holdings: number
   max_drawdown: number
@@ -48,6 +49,11 @@ export interface PaperNavPoint {
 export interface PaperHolding {
   symbol: string
   weight: number
+  entry_date: string | null
+  entry_price: number | null
+  last_price: number | null
+  // Gain since the position was FIRST opened -- top-ups and trims do not reset it.
+  return: number | null
 }
 
 export interface PaperOrder {
@@ -88,11 +94,16 @@ export interface PaperStrategy {
   summaries: PaperSummary[] | null
   nav: PaperNavPoint[] | null
   holdings: PaperHolding[] | null
+  winners: number
+  losers: number
   holdings_as_of: string
   pending: PaperPending
   last_orders: PaperOrder[] | null
   last_orders_date: string
   spec: PaperSpec
+  // The same rules run over history. Nested under the strategy rather than
+  // listed beside it: it is a backtest, not a second strategy.
+  reference?: PaperStrategy | null
 }
 
 export interface PaperListResponse {
