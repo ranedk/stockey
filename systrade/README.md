@@ -196,9 +196,18 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       the same signal's bottom fifth gains what its top fifth loses. A
       hypothesis, not a result: 62 buckets were examined and the sample is
       already mined
-- [ ] Pre-register and confirm the breadth-conditioned trend hypothesis:
-      costs first (the edge lives in the illiquid, low-priced tail), then
-      purged walk-forward for stability, then forward-only paper trading
+- [x] Cost-screened the trend hypothesis (LEDGER row 18, `cmd/slice cost`).
+      It survives: 26.7%/yr at SR 1.18 vs an equal-weight book at 15%/0.75
+      (+0.77%/mo, t=4.36) and vs a turnover-matched random ranking (+0.80%,
+      t=4.47), holds at 2x costs, holds in both halves, and sits on a flat
+      9-point parameter plateau. Almost certainly the documented Indian
+      cross-sectional momentum premium, re-found. NOT promoted: a hypothesis
+      mined from this sample scoring well on that same sample is what mining
+      produces. Row 17's regime conditioning did NOT survive — washouts are 3%
+      of days and move nothing
+- [ ] Paper-trade one frozen configuration forward — the only honest evidence
+      left for the trend result, and the gate `docs/RESEARCH_PROTOCOL.md` and
+      Law 4 both point at
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
       matched-control baseline — on hold: every rule tested so far has failed
       its controls, so there is nothing yet worth combining
@@ -218,4 +227,4 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
 - [ ] Matched-control baseline harness; bootstrap weight estimation
 - [ ] Handcrafting helper (correlation grouping → weights + FDM/IDM)
 - [ ] Instrument universe finalization (blocked on capital, A1)
-- [ ] Paper-trade mode; later: live execution via Dhan orders API
+- [ ] Live execution via Dhan orders API (after, and only after, paper data)

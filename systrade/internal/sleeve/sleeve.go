@@ -51,6 +51,13 @@ type Config struct {
 	// Seeds for the cross-sectional shuffle control; results are averaged
 	// over them. Declared in the pre-registration, never drawn at random.
 	Seeds []int64
+	// RebalanceEvery: trade only every Nth decision day and hold in between
+	// (0 or 1 = every day). A cross-sectional quintile book rebalanced daily
+	// turns over its whole membership every time the ranking twitches, which
+	// is a turnover fantasy rather than a portfolio. Every book, controls
+	// included, follows the same schedule — a control that trades on a
+	// different clock is not a control.
+	RebalanceEvery int
 }
 
 // Book is one traded book's daily record.
@@ -110,20 +117,29 @@ func Run(days []Day, ruleNames []string, cfg Config) ([]RuleResult, error) {
 		}
 
 		var eligibleTotal, eligibleDays float64
+		tradedDays := 0
 		for _, d := range days {
 			syms, u, rets := sliceRule(d, k)
 			if len(syms) < 2 {
 				continue
 			}
+			hold := cfg.RebalanceEvery > 1 && tradedDays%cfg.RebalanceEvery != 0
+			tradedDays++
 			eligibleTotal += float64(len(syms))
 			eligibleDays++
 
 			w := normalize(u)
+			if hold {
+				w = carry(syms, prevSignal)
+			}
 			prevSignal = step(&out[k].Signal, d.Date, syms, w, rets, prevSignal, cfg)
 
 			eq := make([]float64, len(syms))
 			for i := range eq {
 				eq[i] = 1 / float64(len(syms))
+			}
+			if hold {
+				eq = carry(syms, prevEqual)
 			}
 			prevEqual = step(&out[k].EqualWeight, d.Date, syms, eq, rets, prevEqual, cfg)
 
@@ -132,8 +148,11 @@ func Run(days []Day, ruleNames []string, cfg Config) ([]RuleResult, error) {
 			// information about which stock. Averaged over the declared seeds.
 			var gross, net, turn float64
 			for s := range cfg.Seeds {
-				sw := append([]float64(nil), w...)
+				sw := append([]float64(nil), normalize(u)...)
 				rngs[s].Shuffle(len(sw), func(a, b int) { sw[a], sw[b] = sw[b], sw[a] })
+				if hold {
+					sw = carry(syms, prevShuffled[s])
+				}
 				var one Book
 				prevShuffled[s] = step(&one, d.Date, syms, sw, rets, prevShuffled[s], cfg)
 				gross += one.Gross[0]
@@ -148,7 +167,10 @@ func Run(days []Day, ruleNames []string, cfg Config) ([]RuleResult, error) {
 
 			var sGross, sNet, sTurn float64
 			for s, seed := range cfg.Seeds {
-				sw := stablePermute(w, syms, seed)
+				sw := stablePermute(normalize(u), syms, seed)
+				if hold {
+					sw = carry(syms, prevStable[s])
+				}
 				var one Book
 				prevStable[s] = step(&one, d.Date, syms, sw, rets, prevStable[s], cfg)
 				sGross += one.Gross[0]
@@ -202,6 +224,25 @@ func symKey(sym int32, seed int64) uint64 {
 	x *= 0x94D049BB133111EB
 	x ^= x >> 31
 	return x
+}
+
+// carry returns yesterday's holdings as today's target: a hold day trades
+// nothing, so turnover for it must come out at zero. Names that left the
+// eligible set are dropped (they are liquidated, and step charges for that);
+// names that joined get nothing until the next rebalance.
+func carry(syms []int32, prev weights) []float64 {
+	out := make([]float64, len(syms))
+	var sum float64
+	for i, s := range syms {
+		out[i] = prev[s]
+		sum += out[i]
+	}
+	if sum > 0 {
+		for i := range out {
+			out[i] /= sum
+		}
+	}
+	return out
 }
 
 // weights is a book's holdings between days, keyed by symbol.

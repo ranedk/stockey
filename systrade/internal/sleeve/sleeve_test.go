@@ -156,3 +156,35 @@ func TestPairedMonthlyUsesOnlySharedMonths(t *testing.T) {
 		t.Errorf("a constant positive difference has no variance: t = %v", p.T)
 	}
 }
+
+func TestRebalanceScheduleActuallyHolds(t *testing.T) {
+	// Five days, a signal that flips its preference every day. Rebalancing
+	// every 5 days must trade on day one and then sit still, whatever the
+	// ranking does in between.
+	var days []Day
+	for i := 0; i < 5; i++ {
+		a, b := 1.0, 3.0
+		if i%2 == 1 {
+			a, b = 3.0, 1.0
+		}
+		days = append(days, day(i,
+			Obs{Sym: 1, U: []float64{a}, Ret: 0.01},
+			Obs{Sym: 2, U: []float64{b}, Ret: 0.01},
+		))
+	}
+	c := cfg()
+	c.RebalanceEvery = 5
+	res, err := Run(days, []string{"r"}, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := res[0].Signal
+	if b.Turnover[0] == 0 {
+		t.Error("day one should buy the book")
+	}
+	for i := 1; i < len(b.Turnover); i++ {
+		if b.Turnover[i] > 1e-12 {
+			t.Errorf("day %d traded %.6f on a hold day — the schedule is not being honoured", i, b.Turnover[i])
+		}
+	}
+}

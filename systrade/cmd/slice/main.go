@@ -1,6 +1,7 @@
-// Command slice asks where and when a rule worked.
+// Command slice asks where and when a rule worked, and what it costs to trade.
 //
-//	slice -rule ewmac32_128 -horizon 20
+//	slice explore -rule ewmac32_128 -horizon 20
+//	slice cost    -rule ewmac32_128
 //
 // This is EXPLORATION. It prints no verdict and no p-value on a winning
 // bucket, because the best of sixty buckets shows t ~ 3 on noise and this
@@ -41,6 +42,13 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "cost" {
+		runCost(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "explore" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	cache := flag.String("cache", defaultCache, "bar cache file")
 	ruleName := flag.String("rule", "ewmac32_128", "rule to explore (see -list)")
 	list := flag.Bool("list", false, "list available rules and exit")
