@@ -11,14 +11,18 @@ const { data, status, error, refresh } = await useAsyncData(
   { watch: [companyMasterId] },
 )
 
-const showAddForm = ref(false)
-const resolvingThesisId = ref<string | null>(null)
-
-const openThesis = computed(() => data.value?.portfolio.find((t) => t.status === 'open') ?? null)
-const mostRecentAlert = computed(() => {
-  const alerts = data.value?.alerts ?? []
-  return alerts.length ? alerts[alerts.length - 1] : null
-})
+// The human add/resolve forms were removed 2026-09-04 with the human forecast register.
+// Positions are opened by the nightly ruleset and their forecasts resolved unattended, so
+// this section is now a read-only view of what the machine decided and why.
+const openPosition = computed(
+  () => data.value?.portfolio.find((t) => t.status === 'open' && t.entry_decision !== 'reject') ?? null,
+)
+const vetoed = computed(
+  () => data.value?.portfolio.find((t) => t.entry_decision === 'reject') ?? null,
+)
+const resolvedForecasts = computed(
+  () => (data.value?.portfolio ?? []).filter((t) => t.resolution_date !== null),
+)
 
 const priceDeltaTone = computed(() => {
   if (!data.value) return 'neutral'
@@ -49,15 +53,6 @@ const DIRECTION_TONE: Record<string, 'good' | 'bad' | 'neutral'> = {
 }
 function directionTone(direction: string | null): 'good' | 'bad' | 'neutral' {
   return direction ? DIRECTION_TONE[direction] || 'neutral' : 'neutral'
-}
-
-async function onCreated() {
-  showAddForm.value = false
-  await refresh()
-}
-async function onResolved() {
-  resolvingThesisId.value = null
-  await refresh()
 }
 </script>
 
@@ -114,53 +109,59 @@ async function onResolved() {
       <p v-else class="mt-2 text-sm italic text-slate-400">Narrative not generated yet -- run the watch_summary pipeline.</p>
     </section>
 
-    <!-- Portfolio: the one manual action -->
+    <ConfluencePanel :confluence="data.confluence ?? null" />
+
+    <!-- Portfolio: machine-decided, read-only -->
     <section class="rounded-lg border border-slate-200 bg-white p-5">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Portfolio</h2>
 
-      <div v-if="openThesis" class="mt-3">
-        <BadgePill label="open position" tone="good" />
-        <p class="mt-2 text-sm text-slate-800">{{ openThesis.prediction_text }}</p>
-        <p class="mt-1 text-xs text-slate-500">target: {{ formatDate(openThesis.target_date) }} · invalidation: {{ openThesis.invalidation_criteria }}</p>
-        <button
-          v-if="resolvingThesisId !== openThesis.thesis_id"
-          class="mt-3 rounded border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
-          @click="resolvingThesisId = openThesis.thesis_id"
-        >
-          Remove from portfolio
-        </button>
-        <PortfolioResolveForm
-          v-else
-          class="mt-3"
-          :thesis-id="openThesis.thesis_id"
-          @resolved="onResolved"
-          @cancel="resolvingThesisId = null"
-        />
+      <div v-if="openPosition" class="mt-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <BadgePill label="open position" tone="good" />
+          <BadgePill v-if="openPosition.kind === 'shadow'" label="no money committed" tone="neutral" />
+        </div>
+        <p class="mt-2 text-sm text-slate-800">{{ openPosition.prediction_text }}</p>
+        <p class="mt-1 text-xs text-slate-500">
+          target: {{ formatDate(openPosition.target_date) }}
+          <template v-if="openPosition.stop_pct"> · stop: {{ openPosition.stop_pct }}%</template>
+          <template v-if="openPosition.metric_name">
+            · resolves on <code>{{ openPosition.metric_name }} {{ openPosition.metric_operator }} {{ openPosition.metric_threshold }}</code>
+          </template>
+          <template v-else> · no machine-checkable metric — will be judged</template>
+        </p>
+        <p v-if="openPosition.invalidation_criteria" class="mt-1 text-xs text-slate-500">
+          invalidation: {{ openPosition.invalidation_criteria }}
+        </p>
+        <p v-if="openPosition.adjudicator_reason" class="mt-2 text-xs text-slate-400">
+          adjudicator: {{ openPosition.adjudicator_reason }}
+        </p>
+
+        <!-- L5 sizing sits inside the open-position branch on purpose: the endpoint 404s
+             without one, and an accepted position is the gate sizing sits behind. -->
+        <PositionSizingPanel :company-master-id="data.watchlist.company_master_id" />
       </div>
 
-      <div v-else-if="!showAddForm" class="mt-3">
-        <p class="text-sm text-slate-500">Not in your portfolio.</p>
-        <button class="mt-2 rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white" @click="showAddForm = true">
-          Add to portfolio
-        </button>
+      <div v-else-if="vetoed" class="mt-3">
+        <BadgePill label="vetoed by the adjudicator" tone="warn" />
+        <p class="mt-2 text-xs text-slate-500">
+          The mechanical ruleset passed this name and the adjudicator rejected it. It is
+          tracked anyway, so the veto itself can be scored.
+        </p>
+        <p v-if="vetoed.adjudicator_reason" class="mt-2 text-sm text-slate-700">{{ vetoed.adjudicator_reason }}</p>
       </div>
-      <PortfolioAddForm
-        v-else
-        class="mt-3"
-        :company-master-id="data.watchlist.company_master_id"
-        :prefill-text="data.watchlist.narrative_text || ''"
-        :source-alert="mostRecentAlert ? { source: mostRecentAlert.source, newsId: mostRecentAlert.news_id, triggerType: mostRecentAlert.trigger_type } : null"
-        @created="onCreated"
-        @cancel="showAddForm = false"
-      />
 
-      <div v-if="data.portfolio.filter((t) => t.status !== 'open').length" class="mt-4 border-t border-slate-100 pt-3">
-        <p class="text-xs font-medium text-slate-500">History</p>
+      <p v-else class="mt-3 text-sm text-slate-500">
+        Not in the portfolio. The nightly ruleset decides this — there is nothing to add by hand.
+      </p>
+
+      <div v-if="resolvedForecasts.length" class="mt-4 border-t border-slate-100 pt-3">
+        <p class="text-xs font-medium text-slate-500">Resolved forecasts</p>
         <ul class="mt-2 space-y-1 text-xs text-slate-500">
-          <li v-for="t in data.portfolio.filter((th) => th.status !== 'open')" :key="t.thesis_id">
-            {{ formatDate(t.created_date) }} → {{ formatDate(t.resolution_date) }}:
+          <li v-for="t in resolvedForecasts" :key="t.position_id">
+            {{ formatDate(t.opened_at) }} → {{ formatDate(t.resolution_date) }}:
             {{ t.resolved_true ? 'came true' : 'did not come true' }}
             <span v-if="t.failure_attribution">({{ t.failure_attribution }})</span>
+            <span class="text-slate-400"> · {{ t.resolution_method }}</span>
           </li>
         </ul>
       </div>

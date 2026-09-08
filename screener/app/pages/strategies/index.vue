@@ -13,6 +13,13 @@ const { data, status, error } = await useAsyncData('strategies', () => api.get<S
       watched under it. A company can satisfy more than one at once -- click into a
       strategy to see who, or open a company to see every strategy it satisfies.
     </p>
+    <PipelineNote layer="L3" title="What a 'strategy' is here">
+      Each one is a trigger evaluator: a filing or market event — a rating action, an insider or
+      SAST deal, a pledge change, a bulk deal, a results surprise — paired with the L2 state that
+      makes it worth acting on. The rule never relaxes: a trigger on an unprimed company raises
+      nothing. Counts below are companies currently alerted under each trigger, not historical
+      hit rates, and none of them sizes or places anything.
+    </PipelineNote>
 
     <div v-if="error" class="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
       Could not reach the API ({{ error.message }}).

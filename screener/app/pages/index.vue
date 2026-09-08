@@ -14,6 +14,16 @@ const showQuery = ref(false)
       Every company that currently passes the L1 fundamental screen. This is the
       pool the rest of the pipeline (alerts, watchlist, narratives) draws from.
     </p>
+    <PipelineNote layer="L1" title="The universe filter">
+      One screener.in query, applied at crawl time rather than as a filter over everything
+      afterwards. A company is in the universe when <em>all</em> of these hold: market cap between
+      ₹100 cr and ₹5,000 cr; one-month average traded value above ₹10 lakh a day; FII + DII holding
+      under 20%; fewer than 50,000 shareholders; two-year cash conversion (cash from operations ÷
+      operating profit) of at least 0.6; debtor days no higher than three years ago; and contingent
+      liabilities under 25% of net worth. Companies with an auditor change or a problematic
+      related-party record are then excluded. The intent is small, under-owned, cash-generating
+      businesses — everything downstream only ever looks at names that pass here.
+    </PipelineNote>
 
     <div v-if="error" class="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
       Could not reach the API ({{ error.message }}). Is `uvicorn fundamentals.api.app:app` running?

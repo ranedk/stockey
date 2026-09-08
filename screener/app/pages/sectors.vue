@@ -32,6 +32,12 @@ const growthTone: Record<string, 'good' | 'bad' | 'neutral' | 'warn'> = {
       which watchlist companies sit in each one. Descriptive only -- not a ranked
       recommendation.
     </p>
+    <PipelineNote layer="L1" title="Where the sector view comes from">
+      Capital-cycle phase per sector, computed only over companies in the L1 universe — capacity
+      growth (capital work-in-progress and fixed-asset additions) read against demand growth
+      (sales). It describes where a sector sits in its own investment cycle; it does not rank
+      sectors, score them, or feed any selection decision.
+    </PipelineNote>
     <p class="mt-1 text-xs text-slate-400">
       Capacity is derived from gross block, a weak-to-meaningless proxy for
       asset-light sectors (e.g. Financial Services, IT/Services) that aren't
