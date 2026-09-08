@@ -101,11 +101,33 @@ type Order struct {
 	FillPrice  float64
 }
 
+// Entry is what a position cost and what it is worth now — the two numbers a
+// human wants beside a ticker.
+//
+// EntryPrice is the fill at which the position was FIRST opened, and it
+// survives later top-ups and trims: "up 8% since we bought it" is the question
+// people actually ask, and a weighted-average cost that moves every rebalance
+// answers a different one.
+type Entry struct {
+	Date      time.Time
+	Price     float64
+	LastPrice float64
+}
+
+// Return is the position's gain since it was opened.
+func (e Entry) Return() float64 {
+	if e.Price <= 0 || e.LastPrice <= 0 {
+		return 0
+	}
+	return e.LastPrice/e.Price - 1
+}
+
 // Book is one tracked portfolio.
 type Book struct {
 	Name     string
 	NAV      []NavPoint
 	Holdings map[string]float64 // weights as of the last computed day
+	Entries  map[string]Entry   // cost basis and last mark, same keys as Holdings
 	Orders   []Order
 }
 
@@ -129,7 +151,7 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 	}
 	tr := &Track{Spec: spec, Books: map[string]*Book{}}
 	for _, n := range []string{BookStrategy, BookEqual, BookRandom} {
-		tr.Books[n] = &Book{Name: n, Holdings: map[string]float64{}}
+		tr.Books[n] = &Book{Name: n, Holdings: map[string]float64{}, Entries: map[string]Entry{}}
 	}
 	navs := map[string]float64{BookStrategy: 100, BookEqual: 100, BookRandom: 100}
 
@@ -191,12 +213,45 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 				Turnover: turnover, Cost: cost, Holdings: len(end), Rebalanced: rebalance,
 			})
 			b.Holdings = end
+			updateEntries(b, end, prices, d.Date, rebalance)
 		}
 	}
 	if len(days) > 0 {
 		tr.NextRebal = nextRebalanceIndexDate(days, spec.RebalanceEvery)
 	}
 	return tr, nil
+}
+
+// updateEntries keeps each position's cost basis in step with the book: a name
+// that just arrived records what it was bought at, a name that left is
+// forgotten, and everything still held is marked to today's close.
+func updateEntries(b *Book, weights map[string]float64, prices map[string]Obs, date time.Time, rebalance bool) {
+	for sym := range b.Entries {
+		if _, held := weights[sym]; !held {
+			delete(b.Entries, sym)
+		}
+	}
+	for sym := range weights {
+		o, ok := prices[sym]
+		e, existed := b.Entries[sym]
+		if !existed {
+			// New position. Weights only change at a rebalance, so the fill is
+			// that day's open; the close is a fallback for the impossible case
+			// of a name appearing without one.
+			price := 0.0
+			if ok {
+				price = o.Open
+				if price <= 0 {
+					price = o.Close
+				}
+			}
+			e = Entry{Date: date, Price: price, LastPrice: price}
+		}
+		if ok && o.Close > 0 {
+			e.LastPrice = o.Close
+		}
+		b.Entries[sym] = e
+	}
 }
 
 // targetWeights is where the three books differ, and the only place they do.

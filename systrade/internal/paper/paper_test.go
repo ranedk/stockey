@@ -181,3 +181,29 @@ func TestPendingSheetExitsWhatLeftTheTopQuintile(t *testing.T) {
 		t.Error("a sheet five days out must not read as due")
 	}
 }
+
+func TestEntryPriceSurvivesTopUpsAndIsForgottenOnExit(t *testing.T) {
+	// Six days at 1%/day with a rebalance every three: the book is topped up
+	// on day four, and the entry price must still be day one's.
+	days := mkDays(6, 10, 0.01)
+	tr, err := Compute(spec(), days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := tr.Books[BookStrategy]
+	for sym, e := range b.Entries {
+		if !e.Date.Equal(days[0].Date) {
+			t.Errorf("%s records entry on %s, want day one — a top-up is not a new position",
+				sym, e.Date.Format("2006-01-02"))
+		}
+		// Bought at day one's open (100) and marked at day six's close.
+		want := days[5].Obs[0].Close/days[0].Obs[0].Open - 1
+		if math.Abs(e.Return()-want) > 1e-9 {
+			t.Errorf("%s return %.4f, want %.4f", sym, e.Return(), want)
+		}
+	}
+	if len(b.Entries) != len(b.Holdings) {
+		t.Errorf("%d entries against %d holdings — they must track the same names",
+			len(b.Entries), len(b.Holdings))
+	}
+}

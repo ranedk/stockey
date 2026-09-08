@@ -31,13 +31,19 @@ func (s *Store) EnsurePaperTables(ctx context.Context) error {
 			PRIMARY KEY (strategy, book, date)
 		);
 		CREATE TABLE IF NOT EXISTS systrader_paper_holding (
-			strategy text NOT NULL,
-			book     text NOT NULL,
-			date     date NOT NULL,
-			symbol   text NOT NULL,
-			weight   double precision NOT NULL,
+			strategy    text NOT NULL,
+			book        text NOT NULL,
+			date        date NOT NULL,
+			symbol      text NOT NULL,
+			weight      double precision NOT NULL,
+			entry_date  date,
+			entry_price double precision,
+			last_price  double precision,
 			PRIMARY KEY (strategy, book, date, symbol)
 		);
+		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS entry_date date;
+		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS entry_price double precision;
+		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS last_price double precision;
 		CREATE TABLE IF NOT EXISTS systrader_paper_order (
 			strategy    text NOT NULL,
 			book        text NOT NULL,
@@ -97,7 +103,9 @@ func (s *Store) SavePaperTrack(ctx context.Context, tr *paper.Track) error {
 		if len(b.NAV) > 0 {
 			last := b.NAV[len(b.NAV)-1].Date
 			for sym, w := range b.Holdings {
-				holdRows = append(holdRows, []any{name, book, last, sym, w})
+				e := b.Entries[sym]
+				holdRows = append(holdRows, []any{name, book, last, sym, w,
+					nilIfZeroTime(e.Date), nilIfZero(e.Price), nilIfZero(e.LastPrice)})
 			}
 		}
 		for _, o := range b.Orders {
@@ -111,7 +119,7 @@ func (s *Store) SavePaperTrack(ctx context.Context, tr *paper.Track) error {
 		return err
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"systrader_paper_holding"},
-		[]string{"strategy", "book", "date", "symbol", "weight"},
+		[]string{"strategy", "book", "date", "symbol", "weight", "entry_date", "entry_price", "last_price"},
 		pgx.CopyFromRows(holdRows)); err != nil {
 		return err
 	}
@@ -180,6 +188,13 @@ func (s *Store) PendingSheet(ctx context.Context, strategy string) (PaperPending
 	return out, rows.Err()
 }
 
+func nilIfZeroTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
 func nilIfZero(v float64) any {
 	if v == 0 {
 		return nil
@@ -220,10 +235,15 @@ func (s *Store) PaperNav(ctx context.Context, strategy string) ([]PaperNavRow, e
 	return out, rows.Err()
 }
 
-// PaperHoldingRow is one position in the current book.
+// PaperHoldingRow is one position in the current book, with what it cost and
+// what it is worth.
 type PaperHoldingRow struct {
-	Symbol string  `json:"symbol"`
-	Weight float64 `json:"weight"`
+	Symbol     string     `json:"symbol"`
+	Weight     float64    `json:"weight"`
+	EntryDate  *time.Time `json:"entry_date"`
+	EntryPrice *float64   `json:"entry_price"`
+	LastPrice  *float64   `json:"last_price"`
+	Return     *float64   `json:"return"`
 }
 
 // PaperHoldings returns one book's latest positions, heaviest first.
@@ -241,9 +261,10 @@ func (s *Store) PaperHoldings(ctx context.Context, strategy, book string) ([]Pap
 	}
 	asOf := *latest
 	rows, err := s.pool.Query(ctx, `
-		SELECT symbol, weight FROM systrader_paper_holding
+		SELECT symbol, weight, entry_date, entry_price, last_price
+		FROM systrader_paper_holding
 		WHERE strategy = $1 AND book = $2 AND date = $3
-		ORDER BY weight DESC, symbol ASC`, strategy, book, asOf)
+		ORDER BY symbol ASC`, strategy, book, asOf)
 	if err != nil {
 		return nil, asOf, err
 	}
@@ -251,8 +272,12 @@ func (s *Store) PaperHoldings(ctx context.Context, strategy, book string) ([]Pap
 	var out []PaperHoldingRow
 	for rows.Next() {
 		var r PaperHoldingRow
-		if err := rows.Scan(&r.Symbol, &r.Weight); err != nil {
+		if err := rows.Scan(&r.Symbol, &r.Weight, &r.EntryDate, &r.EntryPrice, &r.LastPrice); err != nil {
 			return nil, asOf, err
+		}
+		if r.EntryPrice != nil && r.LastPrice != nil && *r.EntryPrice > 0 {
+			ret := *r.LastPrice/(*r.EntryPrice) - 1
+			r.Return = &ret
 		}
 		out = append(out, r)
 	}

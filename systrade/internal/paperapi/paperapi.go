@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/ranedk/systrader/internal/paper"
 	"github.com/ranedk/systrader/internal/store"
@@ -21,6 +22,7 @@ type Summary struct {
 	Book        string  `json:"book"`
 	NAV         float64 `json:"nav"`
 	TotalReturn float64 `json:"total_return"`
+	DayReturn   float64 `json:"day_return"`
 	Days        int     `json:"days"`
 	Holdings    int     `json:"holdings"`
 	MaxDrawdown float64 `json:"max_drawdown"`
@@ -36,20 +38,35 @@ type NavPoint struct {
 
 // Strategy is the full payload for one tracked strategy.
 type Strategy struct {
-	Name           string                  `json:"name"`
-	IsForward      bool                    `json:"is_forward"`
-	Start          string                  `json:"start"`
-	Days           int                     `json:"days"`
-	AsOf           string                  `json:"as_of"`
-	Summaries      []Summary               `json:"summaries"`
-	Nav            []NavPoint              `json:"nav"`
-	Holdings       []store.PaperHoldingRow `json:"holdings"`
-	HoldingsAsOf   string                  `json:"holdings_as_of"`
-	Pending        store.PaperPending      `json:"pending"`
-	LastOrders     []store.PaperOrderRow   `json:"last_orders"`
-	LastOrdersDate string                  `json:"last_orders_date"`
-	Spec           SpecView                `json:"spec"`
+	Name      string                  `json:"name"`
+	IsForward bool                    `json:"is_forward"`
+	Start     string                  `json:"start"`
+	Days      int                     `json:"days"`
+	AsOf      string                  `json:"as_of"`
+	Summaries []Summary               `json:"summaries"`
+	Nav       []NavPoint              `json:"nav"`
+	Holdings  []store.PaperHoldingRow `json:"holdings"`
+	// Winners and Losers count the open positions currently up and down. The
+	// split says something the average does not: a book carried by two names
+	// and a book where most positions work look identical on return alone.
+	Winners        int                   `json:"winners"`
+	Losers         int                   `json:"losers"`
+	HoldingsAsOf   string                `json:"holdings_as_of"`
+	Pending        store.PaperPending    `json:"pending"`
+	LastOrders     []store.PaperOrderRow `json:"last_orders"`
+	LastOrdersDate string                `json:"last_orders_date"`
+	Spec           SpecView              `json:"spec"`
+	// Reference is the same frozen rules run over history, when a
+	// "<name>-reference" track exists. It hangs off the strategy rather than
+	// sitting beside it in the list: it is not a second strategy, it is this
+	// one's backtest, and listing it as a peer invites exactly the confusion
+	// the label on it exists to prevent.
+	Reference *Strategy `json:"reference,omitempty"`
 }
+
+// ReferenceSuffix marks a track as the in-sample reference for the strategy
+// whose name it extends.
+const ReferenceSuffix = "-reference"
 
 // SpecView is the frozen configuration, echoed so the page can state exactly
 // what is being tracked without anyone having to open the repo.
@@ -79,14 +96,22 @@ func specView(s paper.Spec) SpecView {
 	}
 }
 
-// List returns every tracked strategy, forward record first.
+// List returns every tracked strategy with its reference attached, forward
+// records first.
 func List(ctx context.Context, st *store.Store) ([]Strategy, error) {
 	names, err := st.PaperStrategies(ctx)
 	if err != nil {
 		return nil, err
 	}
+	have := map[string]bool{}
+	for _, n := range names {
+		have[n] = true
+	}
 	out := make([]Strategy, 0, len(names))
 	for _, n := range names {
+		if strings.HasSuffix(n, ReferenceSuffix) {
+			continue // attached to its own strategy below, never listed alone
+		}
 		s, err := Detail(ctx, st, n)
 		if err != nil {
 			return nil, err
@@ -152,6 +177,16 @@ func Detail(ctx context.Context, st *store.Store, name string) (Strategy, error)
 	if s.Holdings, s.HoldingsAsOf, err = holdings(ctx, st, name); err != nil {
 		return s, err
 	}
+	for _, h := range s.Holdings {
+		if h.Return == nil {
+			continue
+		}
+		if *h.Return >= 0 {
+			s.Winners++
+		} else {
+			s.Losers++
+		}
+	}
 	if s.Pending, err = st.PendingSheet(ctx, name); err != nil {
 		return s, err
 	}
@@ -162,6 +197,17 @@ func Detail(ctx context.Context, st *store.Store, name string) (Strategy, error)
 	s.LastOrders = orders
 	if !orderDate.IsZero() {
 		s.LastOrdersDate = orderDate.Format("2006-01-02")
+	}
+
+	// Attach the reference track, one level deep only.
+	if !strings.HasSuffix(name, ReferenceSuffix) {
+		ref, err := Detail(ctx, st, name+ReferenceSuffix)
+		if err != nil {
+			return s, err
+		}
+		if ref.Days > 0 {
+			s.Reference = &ref
+		}
 	}
 	return s, nil
 }
@@ -193,6 +239,7 @@ func summarize(book string, rows []store.PaperNavRow) Summary {
 		cost += r.Cost
 	}
 	last := rows[len(rows)-1]
+	s.DayReturn = last.Return
 	s.NAV = last.NAV
 	s.Holdings = last.Holdings
 	s.TotalReturn = last.NAV/100 - 1
