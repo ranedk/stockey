@@ -222,6 +222,14 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       book every weekday (`scripts/paper_daily.sh`, 20:15 IST), and screener/'s
       Paper page shows it. Record starts 2026-09-08; judgement is pre-committed
       to wait 12 months and 12 rebalances
+- [x] Attacked the strategy's known failure mode before the record began
+      (LEDGER rows 20-21): volatility scaling, a 200-day regime floor, and six
+      per-position stop rules. **All rejected.** Every exposure overlay lost to
+      simply holding that much constantly, on both return and drawdown; no stop
+      reduced drawdown and tight trailing stops increased it. Exiting at random
+      beat exiting the fallers by ~2 points a year — a stop in a momentum book
+      sells the names about to mean-revert. `internal/paper` gained variable
+      exposure and stop rules to make any of it testable
 - [ ] First evaluation of the paper record — not before 12 months and 12
       rebalances have passed, per the spec's own binding terms
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same

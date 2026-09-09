@@ -58,6 +58,21 @@ type Spec struct {
 	// the average exposure of the overlay being tested, so the comparison is
 	// like for like.
 	ConstantExposure float64
+	// Stop is the per-position exit rule. Law 8 says a systems trader needs
+	// none — "the forecast is the entry and the exit" — and that argument
+	// assumes a forecast that adjusts continuously, so a position shrinks as
+	// its trend weakens. This book's selection is frozen for twenty days at a
+	// time, which is exactly the condition the argument does not cover, so the
+	// claim is worth testing rather than assuming.
+	Stop StopKind
+	// StopLevel is the fractional distance for a fixed-percentage stop, or the
+	// multiple of annualised volatility for a vol-scaled one.
+	StopLevel float64
+	// RandomExitRate drives the control: exit positions at the same rate as a
+	// real stop but chosen at random. Without it, "stops cut the drawdown"
+	// cannot be told apart from "exiting anything at this rate cuts the
+	// drawdown", which is the mistake row 20 caught for exposure rules.
+	RandomExitRate float64
 	// ExposureDaily decides WHEN the overlay may act: every day, or only on
 	// the selection rebalance clock.
 	//
@@ -67,6 +82,64 @@ type Spec struct {
 	// benefit. The published volatility-scaling work rescales monthly, so
 	// daily is the deviation, not the default.
 	ExposureDaily bool
+}
+
+// StopKind is the per-position exit rule.
+type StopKind int
+
+const (
+	// StopNone is Law 8's own answer: the rebalance is the only exit.
+	StopNone StopKind = iota
+	// StopFixed exits when the close falls StopLevel below the ENTRY price.
+	StopFixed
+	// StopTrailing exits when the close falls StopLevel below the position's
+	// highest close since entry.
+	StopTrailing
+	// StopVolFixed and StopVolTrailing are the same two rules with the
+	// distance set to StopLevel x the position's own annualised volatility,
+	// so a jumpy stock is given more room than a quiet one. Carver's own
+	// stop-loss convention is half the annualised volatility.
+	StopVolFixed
+	StopVolTrailing
+	// StopRandom exits positions at RandomExitRate per position per day,
+	// chosen by a fixed hash rather than by price. The control.
+	StopRandom
+)
+
+func (s StopKind) String() string {
+	switch s {
+	case StopFixed:
+		return "fixed from entry"
+	case StopTrailing:
+		return "trailing from high"
+	case StopVolFixed:
+		return "vol-scaled from entry"
+	case StopVolTrailing:
+		return "vol-scaled trailing"
+	case StopRandom:
+		return "random exits (control)"
+	default:
+		return "none"
+	}
+}
+
+// ParseStop maps a flag value to a stop rule.
+func ParseStop(s string) (StopKind, error) {
+	switch s {
+	case "", "none":
+		return StopNone, nil
+	case "fixed":
+		return StopFixed, nil
+	case "trailing":
+		return StopTrailing, nil
+	case "volfixed":
+		return StopVolFixed, nil
+	case "voltrailing":
+		return StopVolTrailing, nil
+	case "random":
+		return StopRandom, nil
+	}
+	return StopNone, fmt.Errorf("paper: unknown stop %q (none|fixed|trailing|volfixed|voltrailing|random)", s)
 }
 
 // Overlay is the exposure rule.
@@ -175,6 +248,10 @@ type Obs struct {
 	Forecast  float64
 	Turnover  float64
 	Eligible  bool
+	// AnnVol is the symbol's annualised volatility at the previous close, used
+	// only by the vol-scaled stops: a jumpy stock needs more room than a quiet
+	// one before a fall means anything.
+	AnnVol float64
 }
 
 // Day is one trading date's cross-section.
@@ -221,6 +298,8 @@ type Entry struct {
 	Date      time.Time
 	Price     float64
 	LastPrice float64
+	// HighPrice is the highest close since entry, for a trailing stop.
+	HighPrice float64
 }
 
 // Return is the position's gain since it was opened.
@@ -238,6 +317,14 @@ type Book struct {
 	Holdings map[string]float64 // weights as of the last computed day
 	Entries  map[string]Entry   // cost basis and last mark, same keys as Holdings
 	Orders   []Order
+	// pendingExits are positions whose stop was breached at yesterday's close
+	// and which are sold at today's open — the same decide-at-close,
+	// fill-at-next-open convention as everything else here. Filling at the
+	// stop price itself would assume an intraday fill this daily data cannot
+	// support, and would flatter every result.
+	pendingExits map[string]bool
+	// Stopped counts exits taken by the stop rule rather than by a rebalance.
+	Stopped int
 }
 
 // Track is the whole forward record.
@@ -261,7 +348,8 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 	}
 	tr := &Track{Spec: spec, Books: map[string]*Book{}}
 	for _, n := range []string{BookStrategy, BookEqual, BookRandom} {
-		tr.Books[n] = &Book{Name: n, Holdings: map[string]float64{}, Entries: map[string]Entry{}}
+		tr.Books[n] = &Book{Name: n, Holdings: map[string]float64{},
+			Entries: map[string]Entry{}, pendingExits: map[string]bool{}}
 	}
 	navs := map[string]float64{BookStrategy: 100, BookEqual: 100, BookRandom: 100}
 
@@ -314,6 +402,27 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 				return o.Open / o.PrevClose
 			})
 
+			// `held` is what the book actually owned at the open, and every
+			// trade today is measured against it. Deleting stopped names from
+			// `drifted` and then comparing `drifted` with itself made stop-outs
+			// free — the exits happened and no turnover was ever charged.
+			held := drifted
+
+			// Yesterday's stop breaches are sold at today's open, before
+			// anything else happens.
+			if name == BookStrategy && len(b.pendingExits) > 0 {
+				after := make(map[string]float64, len(drifted))
+				for sym, w := range drifted {
+					if b.pendingExits[sym] {
+						b.Stopped++
+						continue
+					}
+					after[sym] = w
+				}
+				drifted = after
+				b.pendingExits = map[string]bool{}
+			}
+
 			var turnover, cost float64
 			target := drifted
 			// Selection changes only on the rebalance clock. Exposure is
@@ -325,11 +434,11 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 			if name == BookStrategy {
 				target = rescale(target, exposure)
 			}
-			if changed(drifted, target) {
-				turnover = turnoverBetween(drifted, target)
+			if changed(held, target) {
+				turnover = turnoverBetween(held, target)
 				cost = turnover * spec.CostBpsRoundTrip / 2 / 10000
 				if rebalance {
-					b.Orders = append(b.Orders, ordersBetween(d.Date, name, drifted, target, prices)...)
+					b.Orders = append(b.Orders, ordersBetween(d.Date, name, held, target, prices)...)
 				}
 			}
 
@@ -360,6 +469,9 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 			})
 			b.Holdings = end
 			updateEntries(b, end, prices, d.Date, rebalance)
+			if name == BookStrategy {
+				b.pendingExits = breachedStops(spec, b, prices, di)
+			}
 		}
 
 		// Today's readings, available from tomorrow onwards.
@@ -395,13 +507,63 @@ func updateEntries(b *Book, weights map[string]float64, prices map[string]Obs, d
 					price = o.Close
 				}
 			}
-			e = Entry{Date: date, Price: price, LastPrice: price}
+			e = Entry{Date: date, Price: price, LastPrice: price, HighPrice: price}
 		}
 		if ok && o.Close > 0 {
 			e.LastPrice = o.Close
+			if o.Close > e.HighPrice {
+				e.HighPrice = o.Close
+			}
 		}
 		b.Entries[sym] = e
 	}
+}
+
+// breachedStops lists the positions whose stop was hit at today's close. They
+// are sold at tomorrow's open.
+//
+// A stop that never fires and a stop rule that is switched off look identical
+// in the output, so the caller reports Book.Stopped alongside the returns:
+// "the stop did not help" and "the stop never triggered" are different claims.
+func breachedStops(spec Spec, b *Book, prices map[string]Obs, dayIndex int) map[string]bool {
+	out := map[string]bool{}
+	if spec.Stop == StopNone {
+		return out
+	}
+	for sym := range b.Holdings {
+		e, ok := b.Entries[sym]
+		if !ok || e.LastPrice <= 0 {
+			continue
+		}
+		if spec.Stop == StopRandom {
+			// Deterministic pseudo-random exits at the configured rate: the
+			// control for "would exiting ANYTHING this often have helped?"
+			if spec.RandomExitRate > 0 &&
+				float64(symKey(sym, spec.RandomSeed+int64(dayIndex))%1_000_000)/1_000_000 < spec.RandomExitRate {
+				out[sym] = true
+			}
+			continue
+		}
+
+		var reference, distance float64
+		switch spec.Stop {
+		case StopFixed:
+			reference, distance = e.Price, spec.StopLevel
+		case StopTrailing:
+			reference, distance = e.HighPrice, spec.StopLevel
+		case StopVolFixed:
+			reference, distance = e.Price, spec.StopLevel*prices[sym].AnnVol
+		case StopVolTrailing:
+			reference, distance = e.HighPrice, spec.StopLevel*prices[sym].AnnVol
+		}
+		if reference <= 0 || distance <= 0 || math.IsNaN(distance) {
+			continue
+		}
+		if e.LastPrice <= reference*(1-distance) {
+			out[sym] = true
+		}
+	}
+	return out
 }
 
 // ExposurePoint records how much of the book was invested on a given day.

@@ -49,6 +49,9 @@ func main() {
 	targetVol := flag.Float64("target-vol", 0, "annualised volatility the vol overlay aims at (0 = spec default)")
 	daily := flag.Bool("exposure-daily", false, "let the overlay act every day rather than on the rebalance clock")
 	constant := flag.Float64("constant-exposure", 0, "for -overlay=constant: the fixed fraction to hold")
+	stop := flag.String("stop", "", "per-position stop: none | fixed | trailing | volfixed | voltrailing | random")
+	stopLevel := flag.Float64("stop-level", 0, "stop distance: a fraction for fixed/trailing, a multiple of annualised vol for the vol-scaled ones")
+	exitRate := flag.Float64("random-exit-rate", 0, "for -stop=random: exits per position per day")
 	flag.Parse()
 
 	spec := paper.FrozenSpec()
@@ -69,6 +72,17 @@ func main() {
 		spec.TargetVol = *targetVol
 	}
 	spec.ExposureDaily = *daily
+	if *stop != "" {
+		k, err := paper.ParseStop(*stop)
+		fatalIf(err)
+		spec.Stop = k
+	}
+	if *stopLevel > 0 {
+		spec.StopLevel = *stopLevel
+	}
+	if *exitRate > 0 {
+		spec.RandomExitRate = *exitRate
+	}
 	if *constant > 0 {
 		spec.ConstantExposure = *constant
 	}
@@ -136,7 +150,11 @@ func report(spec paper.Spec, t *paper.Track, sheet paper.PendingSheet) {
 	if t.Spec.ExposureDaily {
 		clock = "daily"
 	}
-	fmt.Printf("overlay: %s, acting %s\n", t.Spec.Overlay, clock)
+	fmt.Printf("overlay: %s, acting %s | stop: %s", t.Spec.Overlay, clock, t.Spec.Stop)
+	if t.Spec.Stop != paper.StopNone {
+		fmt.Printf(" (%d exits taken)", t.Books[paper.BookStrategy].Stopped)
+	}
+	fmt.Println()
 	fmt.Printf("%-16s %9s %9s %8s %8s %9s %8s %9s\n",
 		"book", "NAV", "return", "ann vol", "maxDD", "holdings", "cost/yr", "exposure")
 	names := []string{paper.BookStrategy, paper.BookEqual, paper.BookRandom}
@@ -231,9 +249,13 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, from, to t
 			}
 			f, t60 := fc[i-1], turnover[i-1] // decided at yesterday's close
 			eligible := !math.IsNaN(f) && !math.IsNaN(t60) && t60 >= spec.MinTurnover
+			annVol := math.NaN()
+			if v := vol.Values[i-1]; !math.IsNaN(v) && closes[i-1] > 0 {
+				annVol = v / closes[i-1] * 16 // daily price vol -> annualised fraction
+			}
 			byDate[d] = append(byDate[d], paper.Obs{
 				Symbol: ser.Symbol, Open: b.Open, Close: b.Close, PrevClose: closes[i-1],
-				Forecast: f, Turnover: t60, Eligible: eligible,
+				Forecast: f, Turnover: t60, Eligible: eligible, AnnVol: annVol,
 			})
 		}
 		return nil

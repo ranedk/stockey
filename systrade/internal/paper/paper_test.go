@@ -404,3 +404,97 @@ func TestCashDoesNotSilentlyReinvestItself(t *testing.T) {
 			tradedWhileFlat, flatDays)
 	}
 }
+
+func stopSpec(k StopKind, level float64) Spec {
+	s := spec()
+	s.Stop = k
+	s.StopLevel = level
+	s.RebalanceEvery = 100 // one selection, so only the stop can sell
+	return s
+}
+
+func TestFixedStopExitsAtTheNextOpenNotAtTheStopPrice(t *testing.T) {
+	// Up a little, then a 12% fall through a 10% stop. The exit must happen at
+	// the NEXT open — assuming a fill at the stop price itself would be an
+	// intraday fantasy on daily bars, and would flatter every result.
+	days := mkDaysVarying(10, []float64{0.01, 0.01, -0.12, 0.01, 0.01})
+	tr, err := Compute(stopSpec(StopFixed, 0.10), days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := tr.Books[BookStrategy]
+	if b.Stopped == 0 {
+		t.Fatal("a 12% fall through a 10% stop triggered nothing")
+	}
+	// Day 2 (index 2) breaches; the sale lands on day 3.
+	if b.NAV[2].Turnover > 1e-9 {
+		t.Error("the book traded on the day the stop was breached; the fill is the next open")
+	}
+	if b.NAV[3].Turnover < 1e-9 {
+		t.Error("the book did not sell on the day after the breach")
+	}
+	if len(b.Holdings) != 0 {
+		t.Errorf("%d positions still held after every name stopped out", len(b.Holdings))
+	}
+}
+
+func TestTrailingStopMeasuresFromTheHighNotTheEntry(t *testing.T) {
+	// Up 30%, then down 12%: nothing is below its ENTRY, but everything is 12%
+	// off its high. A fixed stop must hold; a trailing stop must sell.
+	// The trailing day matters: a breach on the final bar is sold on a day that
+	// does not exist, so the fixture has to run one bar past the fall.
+	rets := []float64{0.10, 0.10, 0.08, -0.12, 0.0}
+	fixed, err := Compute(stopSpec(StopFixed, 0.10), mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixed.Books[BookStrategy].Stopped != 0 {
+		t.Error("a fixed stop fired on a position that is well above its entry price")
+	}
+	trailing, err := Compute(stopSpec(StopTrailing, 0.10), mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trailing.Books[BookStrategy].Stopped == 0 {
+		t.Error("a trailing stop ignored a 12% fall from the high")
+	}
+}
+
+func TestVolScaledStopGivesJumpyNamesMoreRoom(t *testing.T) {
+	// Same 15% fall, two different volatilities: at half the annualised vol,
+	// the calm name's stop is closer and should trigger while the jumpy one
+	// holds.
+	build := func(annVol float64) []Day {
+		days := mkDaysVarying(10, []float64{0.01, -0.15, 0.0})
+		for i := range days {
+			for j := range days[i].Obs {
+				days[i].Obs[j].AnnVol = annVol
+			}
+		}
+		return days
+	}
+	calm, err := Compute(stopSpec(StopVolFixed, 0.5), build(0.20)) // stop at 10%
+	if err != nil {
+		t.Fatal(err)
+	}
+	jumpy, err := Compute(stopSpec(StopVolFixed, 0.5), build(0.80)) // stop at 40%
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calm.Books[BookStrategy].Stopped == 0 {
+		t.Error("the calm name's 10% stop ignored a 15% fall")
+	}
+	if jumpy.Books[BookStrategy].Stopped != 0 {
+		t.Error("the jumpy name's 40% stop fired on a 15% fall")
+	}
+}
+
+func TestNoStopMeansNoExits(t *testing.T) {
+	tr, err := Compute(stopSpec(StopNone, 0), mkDaysVarying(10, []float64{0.01, -0.30, -0.30}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Books[BookStrategy].Stopped != 0 {
+		t.Error("positions were stopped out with no stop rule configured")
+	}
+}

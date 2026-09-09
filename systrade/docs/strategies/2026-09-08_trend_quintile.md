@@ -40,6 +40,17 @@ mechanism, and a known failure mode.
 punish a book holding the prior winners. The backtest's −41% drawdown is that,
 and a live one will feel worse than a backtested one.
 
+**This was attacked, and the attacks failed** (LEDGER rows 20 and 21, tested
+2026-09-09 while the forward record was one day old and had produced no results
+to react to). Volatility scaling and a 200-day regime floor were both beaten,
+on return AND on drawdown, by simply holding that much of the book constantly —
+the timing in them destroyed value rather than adding it. Per-position stops
+were worse: none reduced the drawdown, tight trailing stops INCREASED it
+(−50.9% against −37.8%), and exiting positions at random beat exiting the ones
+that had fallen by nearly two points a year. So the drawdown stays, deliberately,
+as the price of the premium. The strategy remains fully invested with no stop,
+and that decision was taken before any forward data existed.
+
 ## 3. What the backtest said, and what it is worth
 
 At the Rs 10 crore floor, 50bps round trip, 2013-2026: 20.11%/yr, SR 0.93,
