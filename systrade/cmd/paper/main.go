@@ -54,7 +54,10 @@ func main() {
 	exitRate := flag.Float64("random-exit-rate", 0, "for -stop=random: exits per position per day")
 	rebalance := flag.Int("rebalance", 0, "trading days between rebalances (0 = spec default)")
 	holdCount := flag.Int("hold-count", 0, "hold a fixed number of names instead of a quantile")
-	signal := flag.String("signal", "ewmac32", "selection signal: ewmac32 | ewmac16 | ret5")
+	signal := flag.String("signal", "ewmac32", "selection signal: ewmac32 | ewmac16 | ret5 | reversal20 | reversal60")
+	signal2 := flag.String("signal2", "reversal20", "the second signal, used by -mode=switch and -mode=blend")
+	mode := flag.String("mode", "single", "selection mode: single | switch | blend")
+	switchBreadth := flag.Float64("switch-breadth", 0.40, "for -mode=switch: use the second signal below this share of the universe in an uptrend")
 	flag.Parse()
 
 	spec := paper.FrozenSpec()
@@ -94,6 +97,12 @@ func main() {
 	}
 	sig, err := parseSignal(*signal)
 	fatalIf(err)
+	sig2, err := parseSignal(*signal2)
+	fatalIf(err)
+	m, err := paper.ParseMode(*mode)
+	fatalIf(err)
+	spec.Mode = m
+	spec.SwitchBreadth = *switchBreadth
 	if *constant > 0 {
 		spec.ConstantExposure = *constant
 	}
@@ -108,7 +117,7 @@ func main() {
 	fmt.Printf("%s: loading adjusted bars %s..%s\n", spec.Name,
 		from.Format("2006-01-02"), to.Format("2006-01-02"))
 
-	all, err := buildDays(ctx, st, spec, sig, from, to, true)
+	all, err := buildDays(ctx, st, spec, sig, sig2, from, to, true)
 	fatalIf(err)
 	if len(all) == 0 {
 		fatal(fmt.Errorf("no price data at all in %s..%s", from.Format("2006-01-02"), to.Format("2006-01-02")))
@@ -161,7 +170,11 @@ func report(spec paper.Spec, t *paper.Track, sheet paper.PendingSheet) {
 	if t.Spec.ExposureDaily {
 		clock = "daily"
 	}
-	fmt.Printf("book: rebalance every %d days, ", t.Spec.RebalanceEvery)
+	fmt.Printf("selection: %s", t.Spec.Mode)
+	if t.Spec.Mode == paper.ModeSwitch {
+		fmt.Printf(" below %.0f%% breadth", 100*t.Spec.SwitchBreadth)
+	}
+	fmt.Printf("\nbook: rebalance every %d days, ", t.Spec.RebalanceEvery)
 	if t.Spec.HoldCount > 0 {
 		fmt.Printf("top %d names\n", t.Spec.HoldCount)
 	} else {
@@ -235,6 +248,15 @@ func parseSignal(name string) (signalFn, error) {
 		return ewmacSignal(32), nil
 	case "ewmac16":
 		return ewmacSignal(16), nil
+	case "reversal20", "reversal60", "reversal120":
+		w := map[string]int{"reversal20": 20, "reversal60": 60, "reversal120": 120}[name]
+		return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
+			inst := &data.Instrument{
+				Meta:   data.Meta{Symbol: ser.Symbol, PointValue: 1, Block: 1, LongOnly: true},
+				Prices: closes,
+			}
+			return rules.Forecast(rules.Reversal{Window: w}, inst, vol).Values
+		}, nil
 	case "ret5inv":
 		// The mirror of ret5, to tell a mechanism from an accident: if buying
 		// last week's winners loses, buying last week's losers should win by
@@ -279,7 +301,7 @@ func ewmacSignal(fast int) signalFn {
 	}
 }
 
-func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
+func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
 	byDate := map[time.Time][]paper.Obs{}
 	err := st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
 		n := len(ser.Bars)
@@ -294,6 +316,8 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal sig
 		prices := core.New(times, closes)
 		vol := core.PriceUnitVol(prices, 36, 10)
 		fc := signal(ser, prices, vol)
+		fc2 := signal2(ser, prices, vol)
+		sma := core.SMA(prices, 200).Values
 		turnover := bars.MedianTurnover(ser.Bars, spec.TurnoverWindow)
 
 		// Bars before the start date are kept when `all` is set: the order
@@ -321,6 +345,8 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal sig
 			byDate[d] = append(byDate[d], paper.Obs{
 				Symbol: ser.Symbol, Open: b.Open, Close: b.Close, PrevClose: closes[i-1],
 				Forecast: f, Turnover: t60, Eligible: eligible, AnnVol: annVol,
+				Forecast2: fc2[i-1],
+				AboveSMA:  !math.IsNaN(sma[i-1]) && closes[i-1] > sma[i-1],
 			})
 		}
 		return nil

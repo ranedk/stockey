@@ -34,7 +34,13 @@ type Spec struct {
 	// HoldCount fixes the number of names instead, when non-zero. A quintile
 	// of a growing universe is a growing book; a fixed count is not, and the
 	// two answer different questions about concentration.
-	HoldCount        int
+	HoldCount int
+	// Mode decides how the book uses its two signals: one of them, a switch
+	// between them on market breadth, or a constant blend of both.
+	Mode SelectionMode
+	// SwitchBreadth is the share of the universe in an uptrend below which a
+	// switching book uses its SECOND signal instead of its first.
+	SwitchBreadth    float64
 	RebalanceEvery   int     // trading days between rebalances
 	CostBpsRoundTrip float64 // charged as half per side on turnover
 	RandomSeed       int64   // for the random-ranking benchmark
@@ -144,6 +150,66 @@ func ParseStop(s string) (StopKind, error) {
 		return StopRandom, nil
 	}
 	return StopNone, fmt.Errorf("paper: unknown stop %q (none|fixed|trailing|volfixed|voltrailing|random)", s)
+}
+
+// SelectionMode decides how a book uses its two signals.
+type SelectionMode int
+
+const (
+	// ModeSingle ranks by the primary signal and ignores the second.
+	ModeSingle SelectionMode = iota
+	// ModeSwitch ranks by the SECOND signal on days when market breadth is
+	// below SwitchBreadth, and by the first otherwise.
+	ModeSwitch
+	// ModeBlend always holds half the book from each signal. It is the CONTROL
+	// for ModeSwitch: two signals held together diversify, and diversification
+	// alone will improve a book whether or not the switching does anything.
+	// Without this, "the switch works" cannot be told from "owning both works".
+	ModeBlend
+)
+
+func (m SelectionMode) String() string {
+	switch m {
+	case ModeSwitch:
+		return "switch on breadth"
+	case ModeBlend:
+		return "constant blend (control)"
+	default:
+		return "single signal"
+	}
+}
+
+// ParseMode maps a flag value to a selection mode.
+func ParseMode(s string) (SelectionMode, error) {
+	switch s {
+	case "", "single":
+		return ModeSingle, nil
+	case "switch":
+		return ModeSwitch, nil
+	case "blend":
+		return ModeBlend, nil
+	}
+	return ModeSingle, fmt.Errorf("paper: unknown mode %q (single|switch|blend)", s)
+}
+
+// breadthOf is the share of the eligible universe in an uptrend — the regime
+// reading a switching book acts on. Counted from the same cross-section the
+// book selects from, so it needs no second data source and no alignment.
+func breadthOf(d Day) float64 {
+	var up, n float64
+	for _, o := range d.Obs {
+		if !o.Eligible {
+			continue
+		}
+		n++
+		if o.AboveSMA {
+			up++
+		}
+	}
+	if n == 0 {
+		return 1
+	}
+	return up / n
 }
 
 // Overlay is the exposure rule.
@@ -256,6 +322,11 @@ type Obs struct {
 	// only by the vol-scaled stops: a jumpy stock needs more room than a quiet
 	// one before a fall means anything.
 	AnnVol float64
+	// Forecast2 is the alternate signal, for a book that switches or blends.
+	Forecast2 float64
+	// AboveSMA is the name's own 200-day trend state, from which the day's
+	// breadth — the share of the universe in an uptrend — is counted.
+	AboveSMA bool
 }
 
 // Day is one trading date's cross-section.
@@ -736,13 +807,55 @@ func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 			return symKey(eligible[i].Symbol, spec.RandomSeed) < symKey(eligible[j].Symbol, spec.RandomSeed)
 		})
 	default:
-		sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
+		switch spec.Mode {
+		case ModeSwitch:
+			if breadthOf(d) < spec.SwitchBreadth {
+				sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast2 > eligible[j].Forecast2 })
+			} else {
+				sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
+			}
+		case ModeBlend:
+			return blendWeights(eligible, n)
+		default:
+			sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
+		}
 	}
 	out := make(map[string]float64, n)
 	for _, o := range eligible[:n] {
 		out[o.Symbol] = 1 / float64(n)
 	}
 	return out
+}
+
+// blendWeights holds half the book from each signal's own top names, every
+// day. A name topping both lists is held once, at a double weight, which is
+// what "both signals like it" should mean.
+func blendWeights(eligible []Obs, n int) map[string]float64 {
+	half := n / 2
+	if half < 1 {
+		half = 1
+	}
+	out := map[string]float64{}
+	add := func(o Obs) { out[o.Symbol] += 1 / float64(2*half) }
+
+	byFirst := append([]Obs(nil), eligible...)
+	sort.Slice(byFirst, func(i, j int) bool { return byFirst[i].Forecast > byFirst[j].Forecast })
+	for _, o := range byFirst[:min(half, len(byFirst))] {
+		add(o)
+	}
+	bySecond := append([]Obs(nil), eligible...)
+	sort.Slice(bySecond, func(i, j int) bool { return bySecond[i].Forecast2 > bySecond[j].Forecast2 })
+	for _, o := range bySecond[:min(half, len(bySecond))] {
+		add(o)
+	}
+	return out
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // symKey is splitmix64 over (symbol, seed): a deterministic random ranking

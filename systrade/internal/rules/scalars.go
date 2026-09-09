@@ -41,6 +41,8 @@ var (
 	breakoutScalars = map[int]float64{40: 37.5, 80: 38.6, 160: 39.2, 320: 39.6}
 	accelScalars    = map[int]float64{16: 6.89, 32: 4.68, 64: 3.05}
 	meanrevScalars  = map[int]float64{512: 19.1, 1280: 19.4}
+	// Measured 2026-09-09 on the same universe, same procedure.
+	reversalScalars = map[int]float64{20: 11.5, 60: 9.63, 120: 8.72}
 )
 
 func lookupScalar(name string, table map[int]float64, key int) float64 {
@@ -58,6 +60,7 @@ func lookupScalar(name string, table map[int]float64, key int) float64 {
 func Library() []Rule {
 	return []Rule{
 		EWMAC{Fast: 16}, EWMAC{Fast: 32}, EWMAC{Fast: 64},
+		Reversal{Window: 20}, Reversal{Window: 60}, Reversal{Window: 120},
 		Breakout{N: 40}, Breakout{N: 80}, Breakout{N: 160}, Breakout{N: 320},
 		Acceleration{Fast: 16}, Acceleration{Fast: 32}, Acceleration{Fast: 64},
 		MeanReversion{Window: 512}, MeanReversion{Window: 1280},
