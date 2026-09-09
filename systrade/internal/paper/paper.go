@@ -34,6 +34,99 @@ type Spec struct {
 	RebalanceEvery   int     // trading days between rebalances
 	CostBpsRoundTrip float64 // charged as half per side on turnover
 	RandomSeed       int64   // for the random-ranking benchmark
+
+	// Overlay decides HOW MUCH of the book to own. Selection answers "which
+	// stocks"; this answers "how much", and they are separate questions —
+	// which is the whole reason the earlier washout test found nothing. It
+	// could only ever change what was held, never how much, so the one lever
+	// that addresses a crash was not on the table.
+	Overlay Overlay
+	// TargetVol is the annualised volatility the vol-scaling overlay aims at.
+	// Set to the strategy's own long-run realised volatility, so it describes
+	// what the book already does rather than being a number chosen to make a
+	// backtest look better.
+	TargetVol float64
+	// VolLookback is the window of the strategy's OWN daily returns used to
+	// estimate current volatility (126 days ~ six months, the published
+	// convention).
+	VolLookback int
+	// TrendWindow is the moving average the market-regime filter uses on an
+	// equal-weight index of the eligible universe (200 days, the canonical
+	// filter, not a number we picked).
+	TrendWindow int
+	// ConstantExposure is the fixed fraction OverlayConstant holds. Set it to
+	// the average exposure of the overlay being tested, so the comparison is
+	// like for like.
+	ConstantExposure float64
+	// ExposureDaily decides WHEN the overlay may act: every day, or only on
+	// the selection rebalance clock.
+	//
+	// Not a free parameter so much as a fork in the design, and both ends are
+	// defensible: acting daily catches a crash as it happens, acting on the
+	// rebalance clock keeps the turnover of a 160-name book from eating the
+	// benefit. The published volatility-scaling work rescales monthly, so
+	// daily is the deviation, not the default.
+	ExposureDaily bool
+}
+
+// Overlay is the exposure rule.
+type Overlay int
+
+const (
+	// OverlayNone is always fully invested — the unprotected book.
+	OverlayNone Overlay = iota
+	// OverlayVolScaled holds less when the strategy's own volatility runs
+	// above target. Momentum volatility is persistent, and crashes come out
+	// of its high-volatility stretches, so this shrinks the book BEFORE the
+	// worst of a crash rather than after it.
+	OverlayVolScaled
+	// OverlayRegimeFloor is flat whenever the universe's own equal-weight
+	// index sits below its 200-day average. The canonical trend filter.
+	OverlayRegimeFloor
+	// OverlayBoth takes the smaller of the two exposures.
+	OverlayBoth
+	// OverlayConstant holds a fixed fraction of the book every day, and is the
+	// CONTROL every other overlay has to beat.
+	//
+	// Any rule that reduces average exposure will reduce drawdown — that is
+	// arithmetic, not skill. The question is whether it reduces drawdown MORE
+	// than simply owning that much all the time would, and whether it gives up
+	// less return doing it. Without this control, "cut the drawdown by a
+	// quarter" reads as a discovery when it may only mean "owned a quarter
+	// less". Law 3, applied to exposure instead of selection.
+	OverlayConstant
+)
+
+func (o Overlay) String() string {
+	switch o {
+	case OverlayVolScaled:
+		return "vol-scaled"
+	case OverlayRegimeFloor:
+		return "regime-floor"
+	case OverlayBoth:
+		return "vol-scaled + regime-floor"
+	case OverlayConstant:
+		return "constant exposure (control)"
+	default:
+		return "none"
+	}
+}
+
+// ParseOverlay maps a flag value to an overlay.
+func ParseOverlay(s string) (Overlay, error) {
+	switch s {
+	case "", "none":
+		return OverlayNone, nil
+	case "vol":
+		return OverlayVolScaled, nil
+	case "regime":
+		return OverlayRegimeFloor, nil
+	case "both":
+		return OverlayBoth, nil
+	case "constant":
+		return OverlayConstant, nil
+	}
+	return OverlayNone, fmt.Errorf("paper: unknown overlay %q (none|vol|regime|both)", s)
 }
 
 // FrozenSpec is the configuration signed off on 2026-09-08. The Rs 10 crore
@@ -49,6 +142,19 @@ func FrozenSpec() Spec {
 		RebalanceEvery:   20,
 		CostBpsRoundTrip: 50,
 		RandomSeed:       20260908,
+
+		// Overlay defaults. None of these three numbers was searched for:
+		// 126 days is the published six-month convention for the volatility
+		// estimate, 200 days is the canonical trend filter, and the 20% target
+		// is the strategy's OWN long-run realised volatility measured over
+		// 2013-2026 (19.85%, rounded) — a description of what the book does,
+		// not a level chosen to flatter a backtest.
+		Overlay:          OverlayNone,
+		TargetVol:        0.20,
+		VolLookback:      126,
+		TrendWindow:      200,
+		ExposureDaily:    false,
+		ConstantExposure: 1,
 	}
 }
 
@@ -86,6 +192,9 @@ type NavPoint struct {
 	Cost       float64 // charged that day, as a fraction of NAV
 	Holdings   int
 	Rebalanced bool
+	// Exposure is the share of capital actually invested that day; the rest
+	// sits in cash earning nothing, which is deliberately conservative.
+	Exposure float64
 }
 
 // Order is one intended trade at a rebalance. Weights are fractions of NAV;
@@ -135,6 +244,7 @@ type Book struct {
 type Track struct {
 	Spec      Spec
 	Books     map[string]*Book
+	Exposure  []ExposurePoint
 	Dates     []time.Time
 	NextRebal time.Time // zero if the next rebalance date is not yet known
 	LastRebal time.Time
@@ -155,12 +265,33 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 	}
 	navs := map[string]float64{BookStrategy: 100, BookEqual: 100, BookRandom: 100}
 
+	// Exposure inputs, both built from information available BEFORE the day
+	// they are used on:
+	//   baseRet    the unprotected book's daily returns, for the vol estimate.
+	//              Scaling off the SCALED book's own volatility would be
+	//              self-referential — halve the book and its volatility halves,
+	//              which then says to double it again.
+	//   marketIdx  an equal-weight index of the eligible universe, the "market"
+	//              this strategy actually fishes in, for the trend filter.
+	var baseRet []float64
+	marketIdx := []float64{100}
+	lastExposure := 1.0
+
 	for di, d := range days {
 		tr.Dates = append(tr.Dates, d.Date)
 		rebalance := di%spec.RebalanceEvery == 0
 		if rebalance {
 			tr.LastRebal = d.Date
 		}
+		// Exposure for today, from yesterday's information. On the rebalance
+		// clock it is only allowed to move on a rebalance day; in between the
+		// book keeps whatever exposure it last set.
+		exposure := exposureFor(spec, baseRet, marketIdx)
+		if !spec.ExposureDaily && !rebalance && di > 0 {
+			exposure = lastExposure
+		}
+		lastExposure = exposure
+		tr.Exposure = append(tr.Exposure, ExposurePoint{Date: d.Date, Exposure: exposure})
 		prices := make(map[string]Obs, len(d.Obs))
 		for _, o := range d.Obs {
 			prices[o.Symbol] = o
@@ -185,11 +316,21 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 
 			var turnover, cost float64
 			target := drifted
+			// Selection changes only on the rebalance clock. Exposure is
+			// checked EVERY day: a crash filter that waits nineteen days for
+			// the next rebalance is not a crash filter.
 			if rebalance {
 				target = targetWeights(name, spec, d)
+			}
+			if name == BookStrategy {
+				target = rescale(target, exposure)
+			}
+			if changed(drifted, target) {
 				turnover = turnoverBetween(drifted, target)
 				cost = turnover * spec.CostBpsRoundTrip / 2 / 10000
-				b.Orders = append(b.Orders, ordersBetween(d.Date, name, drifted, target, prices)...)
+				if rebalance {
+					b.Orders = append(b.Orders, ordersBetween(d.Date, name, drifted, target, prices)...)
+				}
 			}
 
 			// The rest of the session, held at the new weights.
@@ -208,13 +349,22 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 
 			prev := navs[name]
 			navs[name] = prev * (1 + rPre) * (1 - cost) * (1 + rPost)
+			bookExposure := 1.0
+			if name == BookStrategy {
+				bookExposure = exposure
+			}
 			b.NAV = append(b.NAV, NavPoint{
 				Date: d.Date, NAV: navs[name], Return: navs[name]/prev - 1,
 				Turnover: turnover, Cost: cost, Holdings: len(end), Rebalanced: rebalance,
+				Exposure: bookExposure,
 			})
 			b.Holdings = end
 			updateEntries(b, end, prices, d.Date, rebalance)
 		}
+
+		// Today's readings, available from tomorrow onwards.
+		baseRet = append(baseRet, unscaledReturn(spec, d, prices))
+		marketIdx = append(marketIdx, marketIdx[len(marketIdx)-1]*(1+equalWeightReturn(d)))
 	}
 	if len(days) > 0 {
 		tr.NextRebal = nextRebalanceIndexDate(days, spec.RebalanceEvery)
@@ -252,6 +402,134 @@ func updateEntries(b *Book, weights map[string]float64, prices map[string]Obs, d
 		}
 		b.Entries[sym] = e
 	}
+}
+
+// ExposurePoint records how much of the book was invested on a given day.
+type ExposurePoint struct {
+	Date     time.Time
+	Exposure float64
+}
+
+// exposureFor computes today's exposure from data that ends yesterday.
+//
+// Both rules can only ever REDUCE exposure — neither borrows. A cash equity
+// account cannot lever, and a risk overlay that can double the book is a
+// different animal with a different failure mode.
+func exposureFor(spec Spec, baseRet []float64, marketIdx []float64) float64 {
+	e := 1.0
+	if spec.Overlay == OverlayVolScaled || spec.Overlay == OverlayBoth {
+		if v := realisedVol(baseRet, spec.VolLookback); v > 0 && spec.TargetVol > 0 {
+			e = math.Min(e, spec.TargetVol/v)
+		}
+	}
+	if spec.Overlay == OverlayConstant {
+		return math.Max(0, math.Min(1, spec.ConstantExposure))
+	}
+	if spec.Overlay == OverlayRegimeFloor || spec.Overlay == OverlayBoth {
+		if !aboveTrend(marketIdx, spec.TrendWindow) {
+			e = 0
+		}
+	}
+	return math.Max(0, math.Min(1, e))
+}
+
+// realisedVol annualises the standard deviation of the last `window` daily
+// returns. Not enough history yet means no opinion, which reads as "fully
+// invested" rather than "flat": an overlay that starts by sitting out because
+// it has not warmed up would be making a claim it cannot support.
+func realisedVol(rets []float64, window int) float64 {
+	if window <= 1 || len(rets) < window {
+		return 0
+	}
+	tail := rets[len(rets)-window:]
+	var sum float64
+	for _, r := range tail {
+		sum += r
+	}
+	mean := sum / float64(len(tail))
+	var ss float64
+	for _, r := range tail {
+		ss += (r - mean) * (r - mean)
+	}
+	return math.Sqrt(ss/float64(len(tail)-1)) * math.Sqrt(252)
+}
+
+// aboveTrend reports whether the market index closed above its own moving
+// average. Same "no opinion until warmed up" rule as realisedVol.
+func aboveTrend(idx []float64, window int) bool {
+	if window <= 1 || len(idx) < window+1 {
+		return true
+	}
+	tail := idx[len(idx)-window:]
+	var sum float64
+	for _, v := range tail {
+		sum += v
+	}
+	return idx[len(idx)-1] > sum/float64(len(tail))
+}
+
+// unscaledReturn is what the top-quintile book would have earned today with no
+// overlay — the series the volatility estimate is built from.
+func unscaledReturn(spec Spec, d Day, prices map[string]Obs) float64 {
+	w := targetWeights(BookStrategy, spec, d)
+	if len(w) == 0 {
+		return 0
+	}
+	return weightedReturn(w, prices, func(o Obs) float64 {
+		if o.PrevClose <= 0 || o.Close <= 0 {
+			return 0
+		}
+		return o.Close/o.PrevClose - 1
+	})
+}
+
+// equalWeightReturn is the eligible universe's own equal-weight move today.
+func equalWeightReturn(d Day) float64 {
+	var sum float64
+	var n int
+	for _, o := range d.Obs {
+		if !o.Eligible || o.PrevClose <= 0 || o.Close <= 0 {
+			continue
+		}
+		sum += o.Close/o.PrevClose - 1
+		n++
+	}
+	if n == 0 {
+		return 0
+	}
+	return sum / float64(n)
+}
+
+// rescale makes the weights sum to `exposure` rather than to 1. The remainder
+// is cash and earns nothing.
+func rescale(w map[string]float64, exposure float64) map[string]float64 {
+	var sum float64
+	for _, v := range w {
+		sum += v
+	}
+	out := make(map[string]float64, len(w))
+	if sum <= 0 || exposure <= 0 {
+		return out
+	}
+	for k, v := range w {
+		out[k] = v / sum * exposure
+	}
+	return out
+}
+
+// changed reports whether two weight sets differ enough to be worth a trade.
+// The tolerance is a rounding guard, not a no-trade band: a genuine exposure
+// change of any size is acted on, and its cost is charged.
+func changed(a, b map[string]float64) bool {
+	if len(a) != len(b) {
+		return true
+	}
+	for k, v := range a {
+		if math.Abs(b[k]-v) > 1e-12 {
+			return true
+		}
+	}
+	return false
 }
 
 // targetWeights is where the three books differ, and the only place they do.
@@ -327,11 +605,18 @@ func weightedReturn(w map[string]float64, prices map[string]Obs, ret func(Obs) f
 	return out
 }
 
-// drift moves weights by a price factor and renormalizes, so a book that
-// traded nothing still adds to 1 tomorrow.
+// drift moves weights by a price factor and renormalizes against the WHOLE
+// portfolio, cash included.
+//
+// The cash sleeve is why this is not a one-liner. Renormalising the holdings to
+// sum to 1 quietly reinvests the cash every single day, and an overlay holding
+// 94% then has to sell 6% again the next morning: a book that never traded
+// showed a full six points of turnover daily, which cost 3.8% a year and made
+// volatility scaling look far worse than it is. Found 2026-09-09, by the cost
+// being implausible rather than by the numbers looking wrong.
 func drift(w map[string]float64, prices map[string]Obs, factor func(Obs) float64) map[string]float64 {
 	out := make(map[string]float64, len(w))
-	var sum float64
+	var invested, grown float64
 	for sym, weight := range w {
 		f := 1.0
 		if o, ok := prices[sym]; ok {
@@ -340,11 +625,15 @@ func drift(w map[string]float64, prices map[string]Obs, factor func(Obs) float64
 			}
 		}
 		out[sym] = weight * f
-		sum += out[sym]
+		invested += weight
+		grown += out[sym]
 	}
-	if sum > 0 {
+	// Cash is whatever was not invested, and it earns nothing.
+	cash := math.Max(0, 1-invested)
+	total := grown + cash
+	if total > 0 {
 		for sym := range out {
-			out[sym] /= sum
+			out[sym] /= total
 		}
 	}
 	return out

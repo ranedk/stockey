@@ -45,6 +45,10 @@ func main() {
 	dry := flag.Bool("dry", false, "compute and print, write nothing")
 	start := flag.String("start", "", "override the spec's start date")
 	name := flag.String("name", "", "override the strategy name (use with -start for the in-sample reference track)")
+	overlay := flag.String("overlay", "", "exposure overlay: none | vol | regime | both")
+	targetVol := flag.Float64("target-vol", 0, "annualised volatility the vol overlay aims at (0 = spec default)")
+	daily := flag.Bool("exposure-daily", false, "let the overlay act every day rather than on the rebalance clock")
+	constant := flag.Float64("constant-exposure", 0, "for -overlay=constant: the fixed fraction to hold")
 	flag.Parse()
 
 	spec := paper.FrozenSpec()
@@ -55,6 +59,18 @@ func main() {
 	}
 	if *name != "" {
 		spec.Name = *name
+	}
+	if *overlay != "" {
+		o, err := paper.ParseOverlay(*overlay)
+		fatalIf(err)
+		spec.Overlay = o
+	}
+	if *targetVol > 0 {
+		spec.TargetVol = *targetVol
+	}
+	spec.ExposureDaily = *daily
+	if *constant > 0 {
+		spec.ConstantExposure = *constant
 	}
 
 	ctx := context.Background()
@@ -116,17 +132,38 @@ func report(spec paper.Spec, t *paper.Track, sheet paper.PendingSheet) {
 	last := t.Dates[len(t.Dates)-1]
 	fmt.Printf("\n%s — %d trading days, %s..%s\n", t.Spec.Name,
 		len(t.Dates), t.Dates[0].Format("2006-01-02"), last.Format("2006-01-02"))
-	fmt.Printf("%-16s %9s %9s %9s %8s\n", "book", "NAV", "return", "holdings", "cost/yr")
+	clock := "rebalance clock"
+	if t.Spec.ExposureDaily {
+		clock = "daily"
+	}
+	fmt.Printf("overlay: %s, acting %s\n", t.Spec.Overlay, clock)
+	fmt.Printf("%-16s %9s %9s %8s %8s %9s %8s %9s\n",
+		"book", "NAV", "return", "ann vol", "maxDD", "holdings", "cost/yr", "exposure")
 	names := []string{paper.BookStrategy, paper.BookEqual, paper.BookRandom}
 	for _, n := range names {
 		b := t.Books[n]
 		p := b.NAV[len(b.NAV)-1]
-		var cost float64
+		var cost, sum, ss, peak, dd, expo float64
+		peak = b.NAV[0].NAV
 		for _, x := range b.NAV {
 			cost += x.Cost
+			sum += x.Return
+			ss += x.Return * x.Return
+			expo += x.Exposure
+			if x.NAV > peak {
+				peak = x.NAV
+			}
+			if d := x.NAV/peak - 1; d < dd {
+				dd = d
+			}
 		}
-		annCost := cost / float64(len(b.NAV)) * 252
-		fmt.Printf("%-16s %9.2f %8.2f%% %9d %7.2f%%\n", n, p.NAV, 100*(p.NAV/100-1), p.Holdings, 100*annCost)
+		n1 := float64(len(b.NAV))
+		mean := sum / n1
+		vol := math.Sqrt(math.Max(0, ss/n1-mean*mean)) * math.Sqrt(252)
+		years := n1 / 252
+		ann := math.Pow(p.NAV/100, 1/years) - 1
+		fmt.Printf("%-16s %9.2f %8.2f%% %7.2f%% %7.1f%% %9d %7.2f%% %8.0f%%\n",
+			n, p.NAV, 100*ann, 100*vol, 100*dd, p.Holdings, 100*cost/n1*252, 100*expo/n1)
 	}
 
 	fmt.Printf("\nnext rebalance in %d trading days\n", t.DaysToNextRebalance())

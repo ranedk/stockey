@@ -207,3 +207,200 @@ func TestEntryPriceSurvivesTopUpsAndIsForgottenOnExit(t *testing.T) {
 			len(b.Entries), len(b.Holdings))
 	}
 }
+
+// mkDaysVarying builds days whose daily return follows the supplied sequence,
+// so a fixture can create volatility or a downtrend on demand.
+func mkDaysVarying(m int, rets []float64) []Day {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	price := make([]float64, m)
+	for i := range price {
+		price[i] = 100
+	}
+	var days []Day
+	for d, ret := range rets {
+		day := Day{Date: start.AddDate(0, 0, d)}
+		for i := 0; i < m; i++ {
+			prev := price[i]
+			close := prev * (1 + ret)
+			price[i] = close
+			day.Obs = append(day.Obs, Obs{
+				Symbol: string(rune('A' + i)), Open: prev, Close: close, PrevClose: prev,
+				Forecast: float64(i), Turnover: 1e9, Eligible: true,
+			})
+		}
+		days = append(days, day)
+	}
+	return days
+}
+
+func overlaySpec(o Overlay) Spec {
+	s := spec()
+	s.Overlay = o
+	s.TargetVol = 0.15
+	s.VolLookback = 10
+	s.TrendWindow = 10
+	return s
+}
+
+func TestVolScalingShrinksTheBookWhenItGetsJumpy(t *testing.T) {
+	// Ten quiet days, then ten violent ones. The overlay must be fully
+	// invested through the quiet stretch and well under 1 after the jumps.
+	rets := make([]float64, 0, 30)
+	for i := 0; i < 12; i++ {
+		rets = append(rets, 0.0005)
+	}
+	for i := 0; i < 18; i++ {
+		if i%2 == 0 {
+			rets = append(rets, 0.05)
+		} else {
+			rets = append(rets, -0.045)
+		}
+	}
+	tr, err := Compute(overlaySpec(OverlayVolScaled), mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	early := tr.Exposure[11].Exposure
+	late := tr.Exposure[len(tr.Exposure)-1].Exposure
+	if early < 0.99 {
+		t.Errorf("exposure %.3f during the quiet stretch, want fully invested", early)
+	}
+	if late > 0.35 {
+		t.Errorf("exposure %.3f after the book started swinging 5%% a day, want a much smaller book", late)
+	}
+}
+
+func TestVolScalingNeverLevers(t *testing.T) {
+	// A book far calmer than target must not be geared up: this is a cash
+	// account, and an overlay that can borrow is a different animal.
+	rets := make([]float64, 40)
+	for i := range rets {
+		rets[i] = 0.0001
+		if i%2 == 0 {
+			rets[i] = -0.00005
+		}
+	}
+	tr, err := Compute(overlaySpec(OverlayVolScaled), mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range tr.Exposure {
+		if e.Exposure > 1+1e-12 {
+			t.Fatalf("exposure %.3f on %s exceeds fully invested", e.Exposure, e.Date.Format("2006-01-02"))
+		}
+	}
+}
+
+func TestRegimeFloorGoesFlatBelowTheTrend(t *testing.T) {
+	// Fifteen days up, then a sustained decline that drags the index under its
+	// own average.
+	var rets []float64
+	for i := 0; i < 15; i++ {
+		rets = append(rets, 0.01)
+	}
+	for i := 0; i < 15; i++ {
+		rets = append(rets, -0.02)
+	}
+	tr, err := Compute(overlaySpec(OverlayRegimeFloor), mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.Exposure[14].Exposure; got != 1 {
+		t.Errorf("exposure %.2f while the market was rising, want 1", got)
+	}
+	if got := tr.Exposure[len(tr.Exposure)-1].Exposure; got != 0 {
+		t.Errorf("exposure %.2f after a sustained decline, want 0", got)
+	}
+}
+
+func TestCashEarnsNothing(t *testing.T) {
+	// Half invested through a 10% day must earn 5%, not 10%.
+	days := mkDaysVarying(10, []float64{0.10, 0.10})
+	sp := overlaySpec(OverlayNone)
+	tr, err := Compute(sp, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := tr.Books[BookStrategy].NAV[1].Return
+
+	// Same fixture, but force half exposure by targeting half the realised vol.
+	sp2 := overlaySpec(OverlayVolScaled)
+	sp2.VolLookback = 1 // no history: the overlay has no opinion
+	tr2, err := Compute(sp2, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(tr2.Books[BookStrategy].NAV[1].Return-full) > 1e-12 {
+		t.Error("with no volatility history the overlay must not change anything")
+	}
+	if tr.Books[BookStrategy].NAV[1].Exposure != 1 {
+		t.Error("the unprotected book must record full exposure")
+	}
+}
+
+func TestOverlayLeavesTheControlsAlone(t *testing.T) {
+	// The benchmarks must stay fully invested: they answer "is picking better
+	// than not picking", and scaling them would fold two questions into one.
+	var rets []float64
+	for i := 0; i < 15; i++ {
+		rets = append(rets, 0.01)
+	}
+	for i := 0; i < 15; i++ {
+		rets = append(rets, -0.02)
+	}
+	tr, err := Compute(overlaySpec(OverlayBoth), mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, book := range []string{BookEqual, BookRandom} {
+		for _, p := range tr.Books[book].NAV {
+			if p.Exposure != 1 {
+				t.Fatalf("%s ran at %.2f exposure; controls are always fully invested", book, p.Exposure)
+			}
+		}
+	}
+}
+
+// TestCashDoesNotSilentlyReinvestItself pins the bug that made the volatility
+// overlay look 3.8% a year worse than it is: renormalising the holdings to sum
+// to 1 each day reinvests the cash, so a book that traded nothing reported a
+// full (1 - exposure) of turnover every morning.
+func TestCashDoesNotSilentlyReinvestItself(t *testing.T) {
+	sp := overlaySpec(OverlayRegimeFloor)
+	sp.RebalanceEvery = 100 // one rebalance, then pure holding
+	sp.TrendWindow = 10
+	sp.ExposureDaily = true // the overlay must be free to act, or nothing goes flat
+
+	// Rise long enough to be above trend, then fall enough to go flat, then
+	// keep falling: once flat, the book must trade nothing at all.
+	var rets []float64
+	for i := 0; i < 15; i++ {
+		rets = append(rets, 0.01)
+	}
+	for i := 0; i < 20; i++ {
+		rets = append(rets, -0.02)
+	}
+	tr, err := Compute(sp, mkDaysVarying(10, rets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := tr.Books[BookStrategy]
+
+	var flatDays, tradedWhileFlat int
+	for i, p := range b.NAV {
+		if p.Exposure != 0 || i == 0 {
+			continue
+		}
+		flatDays++
+		if p.Turnover > 1e-9 {
+			tradedWhileFlat++
+		}
+	}
+	if flatDays == 0 {
+		t.Fatal("fixture never went flat — the test proves nothing")
+	}
+	if tradedWhileFlat > 1 {
+		t.Errorf("%d of %d flat days generated turnover; a book holding cash trades nothing",
+			tradedWhileFlat, flatDays)
+	}
+}
