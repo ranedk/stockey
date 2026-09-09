@@ -26,11 +26,15 @@ import (
 // docs/strategies/2026-09-08_trend_quintile.md; changing any field here means
 // a different strategy, a new spec document and a new clock.
 type Spec struct {
-	Name             string
-	Start            time.Time
-	MinTurnover      float64 // 60-bar median traded value, INR
-	TurnoverWindow   int
-	Quantile         int     // 5 = hold the top fifth by forecast
+	Name           string
+	Start          time.Time
+	MinTurnover    float64 // 60-bar median traded value, INR
+	TurnoverWindow int
+	Quantile       int // 5 = hold the top fifth by forecast
+	// HoldCount fixes the number of names instead, when non-zero. A quintile
+	// of a growing universe is a growing book; a fixed count is not, and the
+	// two answer different questions about concentration.
+	HoldCount        int
 	RebalanceEvery   int     // trading days between rebalances
 	CostBpsRoundTrip float64 // charged as half per side on turnover
 	RandomSeed       int64   // for the random-ranking benchmark
@@ -706,8 +710,14 @@ func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 		return map[string]float64{}
 	}
 	n := len(eligible) / spec.Quantile
+	if spec.HoldCount > 0 {
+		n = spec.HoldCount
+	}
 	if n < 1 {
 		n = 1
+	}
+	if n > len(eligible) {
+		n = len(eligible)
 	}
 	switch book {
 	case BookEqual:

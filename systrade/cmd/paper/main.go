@@ -52,6 +52,9 @@ func main() {
 	stop := flag.String("stop", "", "per-position stop: none | fixed | trailing | volfixed | voltrailing | random")
 	stopLevel := flag.Float64("stop-level", 0, "stop distance: a fraction for fixed/trailing, a multiple of annualised vol for the vol-scaled ones")
 	exitRate := flag.Float64("random-exit-rate", 0, "for -stop=random: exits per position per day")
+	rebalance := flag.Int("rebalance", 0, "trading days between rebalances (0 = spec default)")
+	holdCount := flag.Int("hold-count", 0, "hold a fixed number of names instead of a quantile")
+	signal := flag.String("signal", "ewmac32", "selection signal: ewmac32 | ewmac16 | ret5")
 	flag.Parse()
 
 	spec := paper.FrozenSpec()
@@ -83,6 +86,14 @@ func main() {
 	if *exitRate > 0 {
 		spec.RandomExitRate = *exitRate
 	}
+	if *rebalance > 0 {
+		spec.RebalanceEvery = *rebalance
+	}
+	if *holdCount > 0 {
+		spec.HoldCount = *holdCount
+	}
+	sig, err := parseSignal(*signal)
+	fatalIf(err)
 	if *constant > 0 {
 		spec.ConstantExposure = *constant
 	}
@@ -97,7 +108,7 @@ func main() {
 	fmt.Printf("%s: loading adjusted bars %s..%s\n", spec.Name,
 		from.Format("2006-01-02"), to.Format("2006-01-02"))
 
-	all, err := buildDays(ctx, st, spec, from, to, true)
+	all, err := buildDays(ctx, st, spec, sig, from, to, true)
 	fatalIf(err)
 	if len(all) == 0 {
 		fatal(fmt.Errorf("no price data at all in %s..%s", from.Format("2006-01-02"), to.Format("2006-01-02")))
@@ -149,6 +160,12 @@ func report(spec paper.Spec, t *paper.Track, sheet paper.PendingSheet) {
 	clock := "rebalance clock"
 	if t.Spec.ExposureDaily {
 		clock = "daily"
+	}
+	fmt.Printf("book: rebalance every %d days, ", t.Spec.RebalanceEvery)
+	if t.Spec.HoldCount > 0 {
+		fmt.Printf("top %d names\n", t.Spec.HoldCount)
+	} else {
+		fmt.Printf("top 1/%d of the universe\n", t.Spec.Quantile)
 	}
 	fmt.Printf("overlay: %s, acting %s | stop: %s", t.Spec.Overlay, clock, t.Spec.Stop)
 	if t.Spec.Stop != paper.StopNone {
@@ -208,10 +225,62 @@ func printSheet(sheet paper.PendingSheet) {
 // buildDays turns the adjusted price history into the daily cross-sections the
 // tracker walks. Forecasts and eligibility are lagged one bar: the decision is
 // made at a close and filled at the NEXT open.
-func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, from, to time.Time, all bool) ([]paper.Day, error) {
-	byDate := map[time.Time][]paper.Obs{}
-	rule := rules.EWMAC{Fast: 32}
+// signalFn turns one symbol's history into the selection score, one value per
+// bar, NaN where it is not yet defined.
+type signalFn func(ser bars.Series, closes core.Series, vol core.Series) []float64
 
+func parseSignal(name string) (signalFn, error) {
+	switch name {
+	case "ewmac32":
+		return ewmacSignal(32), nil
+	case "ewmac16":
+		return ewmacSignal(16), nil
+	case "ret5inv":
+		// The mirror of ret5, to tell a mechanism from an accident: if buying
+		// last week's winners loses, buying last week's losers should win by
+		// about as much. A diagnostic, not a candidate — a book that has to
+		// buy whatever just fell hardest is the least tradeable thing there is.
+		base, _ := parseSignal("ret5")
+		return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
+			out := base(ser, closes, vol)
+			for i := range out {
+				out[i] = -out[i]
+			}
+			return out
+		}, nil
+	case "ret5":
+		// Literally "last week's momentum": the trailing five-bar return, raw.
+		// Not volatility-normalised, because the proposal being tested is the
+		// plain one — normalising it is a different rule and would need its
+		// own row.
+		return func(ser bars.Series, closes core.Series, _ core.Series) []float64 {
+			v := closes.Values
+			out := make([]float64, len(v))
+			for i := range out {
+				if i < 5 || v[i-5] <= 0 {
+					out[i] = math.NaN()
+					continue
+				}
+				out[i] = v[i]/v[i-5] - 1
+			}
+			return out
+		}, nil
+	}
+	return nil, fmt.Errorf("unknown signal %q (ewmac32 | ewmac16 | ret5)", name)
+}
+
+func ewmacSignal(fast int) signalFn {
+	return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
+		inst := &data.Instrument{
+			Meta:   data.Meta{Symbol: ser.Symbol, PointValue: 1, Block: 1, LongOnly: true},
+			Prices: closes,
+		}
+		return rules.Forecast(rules.EWMAC{Fast: fast}, inst, vol).Values
+	}
+}
+
+func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
+	byDate := map[time.Time][]paper.Obs{}
 	err := st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
 		n := len(ser.Bars)
 		if n < 150 {
@@ -223,12 +292,8 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, from, to t
 			times[i], closes[i] = b.Date, b.Close
 		}
 		prices := core.New(times, closes)
-		inst := &data.Instrument{
-			Meta:   data.Meta{Symbol: ser.Symbol, PointValue: 1, Block: 1, LongOnly: true},
-			Prices: prices,
-		}
 		vol := core.PriceUnitVol(prices, 36, 10)
-		fc := rules.Forecast(rule, inst, vol).Values
+		fc := signal(ser, prices, vol)
 		turnover := bars.MedianTurnover(ser.Bars, spec.TurnoverWindow)
 
 		// Bars before the start date are kept when `all` is set: the order
