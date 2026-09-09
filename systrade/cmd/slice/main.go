@@ -1,7 +1,8 @@
 // Command slice asks where and when a rule worked, and what it costs to trade.
 //
 //	slice explore -rule ewmac32_128 -horizon 20
-//	slice cost    -rule ewmac32_128
+//	slice cost     -rule ewmac32_128
+//	slice drawdown -rule ewmac32_128
 //
 // This is EXPLORATION. It prints no verdict and no p-value on a winning
 // bucket, because the best of sixty buckets shows t ~ 3 on noise and this
@@ -48,6 +49,10 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "coi" {
 		runCOI(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "drawdown" {
+		runDrawdown(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "explore" {

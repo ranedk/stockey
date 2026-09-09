@@ -230,6 +230,12 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       beat exiting the fallers by ~2 points a year — a stop in a momentum book
       sells the names about to mean-revert. `internal/paper` gained variable
       exposure and stop rules to make any of it testable
+- [x] Asked the better-posed version of the exit question (LEDGER row 22,
+      `cmd/slice drawdown`): at what depth does a fall stop bouncing? Measured
+      the whole curve instead of three stop levels — forward returns are flat
+      to RISING with depth in volatility units, and never flip sign. No exit
+      level exists, which explains why every stop failed rather than merely
+      agreeing with it
 - [ ] First evaluation of the paper record — not before 12 months and 12
       rebalances have passed, per the spec's own binding terms
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
