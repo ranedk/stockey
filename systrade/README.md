@@ -254,7 +254,22 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       day early since 2015 (one row in five on a Sunday). Source fixed in
       `dhan.BarDate`, data repaired by `db/2026-09-07_fix_backfill_date_shift.sql`,
       verified 6,165/6,165 against stockey's own table
-- [ ] Matched-control baseline harness; bootstrap weight estimation
+- [x] Matched-control harness, statistics half (`internal/evidence`). The
+      controls already existed, built by the same code as the books they
+      control (`sleeve` C1-C3, `paper`'s equal-weight and random ranking,
+      `carver`'s always-long and time-shift); what was missing was the
+      arithmetic the amended Laws 2 and 4 require, which no command could
+      compute. Now: a stationary block bootstrap (seeded, declared, never
+      drawn), the paired edge vs a control with a bootstrap interval and p,
+      row 24's matched-risk reading as `ScaleToRisk`, the Bailey-López de
+      Prado deflated Sharpe against the family's trial count, BH FDR within
+      the family, and `research.PurgedWalkForward`. `backtest.Metrics`'
+      "DeflatedSR" was only Law 7's flat ×0.75 and is renamed `HaircutSR`.
+      Bootstrap weight estimation holds means equal (Law 6: zero Sharpe
+      adjustment under ten years), so it is long-only minimum variance on
+      resampled correlations — the cross-check on handcrafted weights, never
+      their source; on a clean case it reproduces the tree's 25/25/50.
+      Tooling only, tested on synthetic data: no market data read, no LEDGER row
 - [ ] Handcrafting helper (correlation grouping → weights + FDM/IDM)
 - [ ] Instrument universe finalization (blocked on capital, A1)
 - [ ] Live execution via Dhan orders API (after, and only after, paper data)

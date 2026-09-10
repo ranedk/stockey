@@ -111,3 +111,25 @@ func TestCountM_SumsEveryTrialsDeclarationOnARow(t *testing.T) {
 		t.Errorf("CountM = %d, want %d (1 undeclared + 585 + 174 + an explicit zero)", got, want)
 	}
 }
+
+func TestPurgedWalkForwardLeavesAGapAndKeepsTheBlocks(t *testing.T) {
+	plain := WalkForward(d(2013, 7, 1), d(2021, 12, 31), 4, 1)
+	purged := PurgedWalkForward(d(2013, 7, 1), d(2021, 12, 31), 4, 1, 30)
+	if len(plain) != len(purged) {
+		t.Fatalf("purging changed the fold count: %d vs %d", len(plain), len(purged))
+	}
+	for i, w := range purged {
+		if !w.ValStart.Equal(plain[i].ValStart) || !w.ValEnd.Equal(plain[i].ValEnd) {
+			t.Fatalf("fold %d: purging moved the validation block", i)
+		}
+		if got := w.ValStart.Sub(w.FitEnd); got != 30*24*time.Hour {
+			t.Fatalf("fold %d: gap %v, want 30 days", i, got)
+		}
+		// A fit date's 30-day label must end before the block starts.
+		for day := w.FitStart; w.InFit(day); day = day.AddDate(0, 0, 1) {
+			if label := day.AddDate(0, 0, 30); label.After(w.ValStart) {
+				t.Fatalf("fold %d: fit date %v has a label reaching %v, inside the block", i, day, label)
+			}
+		}
+	}
+}

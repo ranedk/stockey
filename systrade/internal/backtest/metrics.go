@@ -18,7 +18,7 @@ type Metrics struct {
 	Skew         float64
 	MaxDDPct     float64 // max % drawdown from peak equity
 	CostDragSR   float64 // annual costs expressed in Sharpe units
-	DeflatedSR   float64 // Sharpe × 0.75 (Law 7 pessimism factor)
+	HaircutSR    float64 // Sharpe × 0.75 (Law 7 pessimism factor) — NOT a deflated Sharpe; that is evidence.DeflatedSharpe
 	// Busted is true if compounding capital hit zero/negative before the run
 	// ended. BustedDay is the index where that happened (-1 if never).
 	// AnnReturnPct/AnnVolPct/Sharpe/TStat/Skew/CostDragSR are computed ONLY
@@ -92,7 +92,7 @@ func ComputeMetrics(res *Result, capital float64) Metrics {
 		m.TStat = mean / (sd / math.Sqrt(float64(validDays)))
 	}
 	m.Skew = skew(rets, mean, sd)
-	m.DeflatedSR = m.Sharpe * 0.75
+	m.HaircutSR = m.Sharpe * 0.75
 
 	var costCash float64
 	for _, ir := range res.Instruments {
@@ -112,8 +112,8 @@ func (m Metrics) Report(ledgerM int) string {
 		fmt.Fprintf(&b, "⚠⚠ BUSTED at day %d of %d — capital hit zero. Every statistic below is computed ONLY over the %d days before the bust and does NOT represent the full run.\n",
 			m.BustedDay, m.Days, m.BustedDay)
 	}
-	fmt.Fprintf(&b, "days=%d  annRet=%.1f%%  annVol=%.1f%%  SR=%.2f (deflated %.2f)\n",
-		m.Days, m.AnnReturnPct, m.AnnVolPct, m.Sharpe, m.DeflatedSR)
+	fmt.Fprintf(&b, "days=%d  annRet=%.1f%%  annVol=%.1f%%  SR=%.2f (x0.75 haircut %.2f)\n",
+		m.Days, m.AnnReturnPct, m.AnnVolPct, m.Sharpe, m.HaircutSR)
 	fmt.Fprintf(&b, "tStat=%.2f  skew=%.2f  maxDD=%.1f%%  costDrag=%.3f SR/yr", m.TStat, m.Skew, m.MaxDDPct, m.CostDragSR)
 	if m.CostDragSR > 0.13 {
 		b.WriteString("  ⚠ SPEED LIMIT BREACHED (Law 13: max 0.13)")

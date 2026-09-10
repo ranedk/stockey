@@ -34,9 +34,20 @@ func (s Split) InHoldout(t time.Time) bool {
 }
 
 // Window is one walk-forward fold inside the train set: fit on
-// [FitStart, FitEnd], validate on (FitEnd, ValEnd].
+// [FitStart, FitEnd], validate on (ValStart, ValEnd]. Without a purge
+// ValStart equals FitEnd; with one, the gap between them is the purge.
 type Window struct {
-	FitStart, FitEnd, ValEnd time.Time
+	FitStart, FitEnd, ValStart, ValEnd time.Time
+}
+
+// InFit reports whether t may be used to fit this fold.
+func (w Window) InFit(t time.Time) bool {
+	return !t.Before(w.FitStart) && !t.After(w.FitEnd)
+}
+
+// InVal reports whether t is scored in this fold.
+func (w Window) InVal(t time.Time) bool {
+	return t.After(w.ValStart) && !t.After(w.ValEnd)
 }
 
 // WalkForward builds expanding-window folds: fit ends grow by stepYears,
@@ -53,13 +64,31 @@ func WalkForward(trainStart, trainEnd time.Time, minFitYears, stepYears int) []W
 		if !fitEnd.Before(valEnd) {
 			break
 		}
-		out = append(out, Window{FitStart: trainStart, FitEnd: fitEnd, ValEnd: valEnd})
+		out = append(out, Window{FitStart: trainStart, FitEnd: fitEnd, ValStart: fitEnd, ValEnd: valEnd})
 		if valEnd.Equal(trainEnd) {
 			break
 		}
 		fitEnd = valEnd
 	}
 	return out
+}
+
+// PurgedWalkForward is WalkForward with the fit window cut back purgeDays
+// calendar days before each validation block begins (amended Law 4). A fit
+// observation's label is its FORWARD return; one dated inside the last
+// horizon before the block has a label that reaches into it, so fitting on it
+// would score the fold partly on data it was trained on. Set purgeDays to at
+// least the label horizon in calendar days (a 20-trading-day return needs
+// ~30). The validation blocks are unchanged, so they still tile the sample.
+//
+// No embargo after the block is needed: windows only expand forward, so no
+// fit observation ever comes after a validation block it could leak from.
+func PurgedWalkForward(trainStart, trainEnd time.Time, minFitYears, stepYears, purgeDays int) []Window {
+	ws := WalkForward(trainStart, trainEnd, minFitYears, stepYears)
+	for i := range ws {
+		ws[i].FitEnd = ws[i].ValStart.AddDate(0, 0, -purgeDays)
+	}
+	return ws
 }
 
 // --- Holdout burn registry ---------------------------------------------------

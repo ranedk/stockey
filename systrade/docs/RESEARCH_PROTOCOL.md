@@ -59,7 +59,10 @@ a story, never a result.
 - **FDR within the family, plus deflated Sharpe.** Correct for the search that
   actually happened — the variations tried in THIS family — and report the
   deflated Sharpe against the number of configurations examined. Do not apply
-  a workspace-wide Bonferroni across unrelated research families.
+  a workspace-wide Bonferroni across unrelated research families. The
+  arithmetic lives in `internal/evidence` (`PairedEdge` for each member's p
+  against its control, `Judge` for FDR + deflated Sharpe over the family) and
+  the purged folds in `research.PurgedWalkForward`.
 - **Forward paper trading is the real gate**, and Law 4 already says so
   ("cheapest honest data: paper-trade the frozen rule forward"). It is the only
   evidence budget that regenerates: every month of live paper data is new,
