@@ -102,15 +102,35 @@ case "$pub" in
   521|522|523)
     bad "Cloudflare cannot reach this box (HTTP ${pub})."
     echo
-    echo "      Everything above this line passed, so the origin is fine and the"
-    echo "      problem is the DNS record. In the Cloudflare dashboard, the record for"
-    echo "      ${HOSTNAME_PUBLIC} must point at THIS machine:"
-    echo
-    echo "          A     ${HOSTNAME_PUBLIC}  ->  $(curl -s --max-time 8 https://api.ipify.org)     (proxied)"
-    echo "          AAAA  ${HOSTNAME_PUBLIC}  ->  $(ip -6 addr show scope global | grep -oE '2[0-9a-f:]+::[0-9a-f]+' | head -1)   (proxied, or delete it)"
-    echo
-    echo "      A stale AAAA is the usual cause: Cloudflare prefers IPv6, so a wrong"
-    echo "      AAAA times out even when the A record is perfect."
+    # A 522 has two very different causes and the firewall log tells them apart:
+    # either Cloudflare never knocked (DNS points elsewhere), or it knocked on a
+    # door we did not open. Guessing between them wasted an hour once.
+    ports=$(sudo journalctl --since "6 hours ago" 2>/dev/null       | grep "UFW BLOCK" | grep -oE "SRC=[0-9.]+ .*DPT=[0-9]+"       | "${REPO}/deploy/_cf_ports.py" 2>/dev/null || true)
+    if [ -n "$ports" ]; then
+      echo "      Cloudflare IS reaching this box, and ufw is dropping it:"
+      echo "$ports" | sed 's/^/          /'
+      echo
+      echo "      Port 443 means your zone's SSL/TLS mode is Full or Full (strict), so"
+      echo "      Cloudflare speaks HTTPS to the origin — which serves only :80. Fix it in"
+      echo "      ONE of two ways:"
+      echo
+      echo "        a) Cloudflare dashboard -> SSL/TLS -> Overview -> set mode to Flexible."
+      echo "           Nothing changes on this box. The CDN-to-origin hop is then cleartext,"
+      echo "           including the basic-auth password, on every request."
+      echo
+      echo "        b) Keep Full (strict) and give the origin a certificate:"
+      echo "           dashboard -> SSL/TLS -> Origin Server -> Create Certificate, save it"
+      echo "           here, then re-run setup_nginx_proxy.sh with --origin-cert/--origin-key."
+    else
+      echo "      Nothing from Cloudflare has been blocked and nothing has reached nginx,"
+      echo "      so Cloudflare never knocked: the DNS record points somewhere else."
+      echo "      The record for ${HOSTNAME_PUBLIC} must point at THIS machine:"
+      echo
+      echo "          A     ${HOSTNAME_PUBLIC}  ->  $(curl -s --max-time 8 https://api.ipify.org)     (proxied)"
+      echo
+      echo "      If an AAAA record exists, check it too or delete it: Cloudflare prefers"
+      echo "      IPv6, so a stale AAAA times out even when the A record is perfect."
+    fi
     ;;
   530) bad "HTTP 530 — the hostname is not attached to a Cloudflare zone" ;;
   000) bad "no response at all — DNS may not have propagated yet" ;;
