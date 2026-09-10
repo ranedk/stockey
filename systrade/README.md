@@ -265,10 +265,10 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       Prado deflated Sharpe against the family's trial count, BH FDR within
       the family, and `research.PurgedWalkForward`. `backtest.Metrics`'
       "DeflatedSR" was only Law 7's flat ×0.75 and is renamed `HaircutSR`.
-      Bootstrap weight estimation holds means equal (Law 6: zero Sharpe
-      adjustment under ten years), so it is long-only minimum variance on
-      resampled correlations — the cross-check on handcrafted weights, never
-      their source; on a clean case it reproduces the tree's 25/25/50.
+      Bootstrap weight estimation follows Carver's appendix C — the
+      cross-check on handcrafted weights, never their source (a first
+      equal-means version was retired the same day; see the handcrafting
+      entry below).
       Tooling only, tested on synthetic data: no market data read, no LEDGER row
 - [x] Re-scored row 18's trend family with it (`cmd/slice family`, LEDGER row
       25, trials=0). All 14 configurations survive FDR within the family; only
@@ -278,6 +278,15 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       backtest case for the live paper track is now stated at its honest
       strength. Row 18's committed report turned out to hold only a shell
       error; it is regenerated and reproduces the row's headline numbers
-- [ ] Handcrafting helper (correlation grouping → weights + FDM/IDM)
+- [x] Handcrafting helper (`internal/handcraft`): Carver's Tables 8 and 12
+      transcribed from the book, the grouping tree, complete-linkage
+      clustering (moved out of `cmd/rulelab`), and one diversification
+      multiplier shared by FDM and IDM. Every worked example the book gives is
+      a test — 46/27/27, 42/29/29, the sixteen-asset tree of Table 11, Table
+      17's 21/8/21/50 with FDM 1.31, Table 48's IDM 1.89. Building its
+      cross-check exposed a flaw in the morning's `evidence` bootstrap: with
+      means held equal it corners any member correlated with two others (the
+      middle trend speed got 0% in every resample, contradicting Table 8 on
+      Carver's own numbers); replaced with his appendix-C method
 - [ ] Instrument universe finalization (blocked on capital, A1)
 - [ ] Live execution via Dhan orders API (after, and only after, paper data)

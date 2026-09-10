@@ -8,35 +8,48 @@ import (
 
 // Law 6 says forecast and instrument weights are HANDCRAFTED: group by
 // correlation, equal weight within groups, multiply down the tree. Carver's
-// alternative (Systematic Trading ch. 4) is bootstrapping: optimise on many
-// resamples and average the answers, which smooths away the extreme weights a
-// single optimisation produces. It lives here as the CROSS-CHECK on
-// handcrafted weights, never as their replacement.
+// alternative is bootstrapping, and this file implements it as the
+// CROSS-CHECK on handcrafted weights, never as their replacement.
 //
-// Means are held equal on purpose. The optimiser sees only the resampled
-// correlation matrix and treats every subsystem as having the same Sharpe
-// ratio and the same volatility — they are all vol-normalised to one target.
-// That is Law 6's own position (Sharpe adjustments are zero with under ten
-// years of evidence), and it removes the one input an optimiser abuses most.
-// With equal means and vols, the maximum-Sharpe portfolio is the long-only
-// minimum-variance portfolio on the correlation matrix; the bootstrap then
-// shows how much of that answer is the correlations and how much the sample.
+// It follows appendix C (p. 289): draw a sample of history, measure its
+// correlations AND its members' mean returns, run the ordinary maximum-Sharpe
+// optimisation on that sample alone, record the weights, repeat, average.
+// Members are taken as volatility-normalised (his premise), so the inputs are
+// the sample's correlation matrix and each member's Sharpe ratio on it.
+// Samples are drawn as stationary blocks so runs survive; their length is the
+// caller's, and appendix C's rule of thumb is 10% of the history.
+//
+// An earlier version held means equal and optimised correlations only, on the
+// argument that Law 6 grants no Sharpe adjustment under ten years. That was
+// wrong for this purpose. With equal means the optimum is minimum variance,
+// which is a CORNER for any member highly correlated with two others: on the
+// three trend speeds it gave the middle one 0% in every resample, an interval
+// of zero width, and on Carver's own row-11 correlations it contradicts Table
+// 8. The averaging only smooths anything because each sample's means differ —
+// that noise is the mechanism, not a leak. What survives the averaging is a
+// member that earned more across MANY samples, which is the one piece of
+// performance information the method is built to let through.
 //
 // Read it this way: where bootstrapped and handcrafted weights agree, the
-// handcrafted tree is right. Where they differ by more than the bootstrap's
-// own interval, a correlation group was drawn wrong.
+// tree is right. Where the handcrafted weight falls outside the bootstrap's
+// 10-90% range, question the grouping first and the sample second.
 
 // WeightEstimate holds one weight per column.
 type WeightEstimate struct {
-	Full []float64 // one optimisation on the whole sample — the answer not to trust
-	Mean []float64 // averaged over resamples — the bootstrapped weights
-	Low  []float64 // 10th percentile across resamples
-	High []float64 // 90th percentile across resamples
+	Full []float64 // one optimisation on the whole sample — Carver's "single period", the answer not to trust
+	Mean []float64 // averaged over samples — the bootstrapped weights
+	Low  []float64 // 10th percentile across samples
+	High []float64 // 90th percentile across samples
+	// Uninformative counts samples in which no portfolio had a positive
+	// return: they have no maximum-Sharpe answer and contribute
+	// minimum-variance weights, the answer when means carry no information.
+	Uninformative int
 }
 
-// BootstrapWeights estimates weights for aligned subsystem return columns
-// (one slice per subsystem, all the same length), resampling rows jointly.
-func BootstrapWeights(columns [][]float64, bs Bootstrap) (WeightEstimate, error) {
+// BootstrapWeights runs the bootstrap over aligned return columns (one slice
+// per member, all the same length), each sample sampleLen rows long (0 for
+// the full length).
+func BootstrapWeights(columns [][]float64, bs Bootstrap, sampleLen int) (WeightEstimate, error) {
 	k := len(columns)
 	if k == 0 {
 		return WeightEstimate{}, fmt.Errorf("evidence: no columns to weight")
@@ -50,10 +63,20 @@ func BootstrapWeights(columns [][]float64, bs Bootstrap) (WeightEstimate, error)
 	if err := bs.check(n); err != nil {
 		return WeightEstimate{}, err
 	}
-	est := WeightEstimate{Full: MinVarianceWeights(Correlation(columns, nil))}
+	if sampleLen <= 0 || sampleLen > n {
+		sampleLen = n
+	}
+	if sampleLen < 2 {
+		return WeightEstimate{}, fmt.Errorf("evidence: a sample of %d rows has no correlation", sampleLen)
+	}
+	full, _ := optimise(columns, nil)
+	est := WeightEstimate{Full: full}
 	draws := make([][]float64, k)
 	err := bs.Each(n, func(_ int, idx []int) {
-		w := MinVarianceWeights(Correlation(columns, idx))
+		w, informative := optimise(columns, idx[:sampleLen])
+		if !informative {
+			est.Uninformative++
+		}
 		for j := range w {
 			draws[j] = append(draws[j], w[j])
 		}
@@ -71,10 +94,142 @@ func BootstrapWeights(columns [][]float64, bs Bootstrap) (WeightEstimate, error)
 	return est, nil
 }
 
+// optimise is one sample's optimisation, on rows idx (nil for all).
+func optimise(columns [][]float64, idx []int) ([]float64, bool) {
+	c := Correlation(columns, idx)
+	mu := make([]float64, len(columns))
+	for j, col := range columns {
+		mu[j] = sampleSharpe(col, idx)
+	}
+	if w, ok := MaxSharpeWeights(c, mu); ok {
+		return w, true
+	}
+	return MinVarianceWeights(c), false
+}
+
+func sampleSharpe(col []float64, idx []int) float64 {
+	var x []float64
+	if idx == nil {
+		x = col
+	} else {
+		x = make([]float64, len(idx))
+		for i, r := range idx {
+			x[i] = col[r]
+		}
+	}
+	if sd := stddev(x); sd > 0 {
+		return mean(x) / sd
+	}
+	return 0
+}
+
+// MaxSharpeWeights is the long-only portfolio with the highest Sharpe ratio
+// for correlation matrix c and member Sharpe ratios mu. It is found exactly by
+// trying every support: on the optimal support the weights are proportional
+// to C_S⁻¹·μ_S with every weight positive, so the best such candidate is the
+// optimum. ok is false when no portfolio has a positive expected return.
+// Member counts here are a dozen at most, so 2^k supports is cheap.
+func MaxSharpeWeights(c [][]float64, mu []float64) ([]float64, bool) {
+	k := len(mu)
+	if k > 16 {
+		panic(fmt.Sprintf("evidence: %d members is too many to enumerate — group them first (Law 6)", k))
+	}
+	best := math.Inf(-1)
+	var bestW []float64
+	for mask := 1; mask < 1<<k; mask++ {
+		var s []int
+		for i := 0; i < k; i++ {
+			if mask&(1<<i) != 0 {
+				s = append(s, i)
+			}
+		}
+		a := make([][]float64, len(s))
+		b := make([]float64, len(s))
+		for r, i := range s {
+			a[r] = make([]float64, len(s))
+			for q, j := range s {
+				a[r][q] = c[i][j]
+			}
+			b[r] = mu[i]
+		}
+		y, ok := solve(a, b)
+		if !ok {
+			continue
+		}
+		var sum float64
+		positive := true
+		for _, v := range y {
+			if v <= 0 {
+				positive = false
+				break
+			}
+			sum += v
+		}
+		if !positive {
+			continue
+		}
+		w := make([]float64, k)
+		for r, i := range s {
+			w[i] = y[r] / sum
+		}
+		var ret, variance float64
+		for i := range w {
+			ret += w[i] * mu[i]
+			for j := range w {
+				variance += w[i] * w[j] * c[i][j]
+			}
+		}
+		if ret <= 0 || variance <= 0 {
+			continue
+		}
+		if sr := ret / math.Sqrt(variance); sr > best {
+			best, bestW = sr, w
+		}
+	}
+	return bestW, bestW != nil
+}
+
+// solve is Gaussian elimination with partial pivoting; ok is false when the
+// system is singular.
+func solve(a [][]float64, b []float64) ([]float64, bool) {
+	n := len(b)
+	m := make([][]float64, n)
+	for i := range m {
+		m[i] = append(append([]float64(nil), a[i]...), b[i])
+	}
+	for col := 0; col < n; col++ {
+		piv := col
+		for r := col + 1; r < n; r++ {
+			if math.Abs(m[r][col]) > math.Abs(m[piv][col]) {
+				piv = r
+			}
+		}
+		if math.Abs(m[piv][col]) < 1e-12 {
+			return nil, false
+		}
+		m[col], m[piv] = m[piv], m[col]
+		for r := col + 1; r < n; r++ {
+			f := m[r][col] / m[col][col]
+			for q := col; q <= n; q++ {
+				m[r][q] -= f * m[col][q]
+			}
+		}
+	}
+	x := make([]float64, n)
+	for r := n - 1; r >= 0; r-- {
+		s := m[r][n]
+		for q := r + 1; q < n; q++ {
+			s -= m[r][q] * x[q]
+		}
+		x[r] = s / m[r][r]
+	}
+	return x, true
+}
+
 // Correlation is the correlation matrix of the columns, read at rows idx
 // (nil for every row). A column with no variance in the rows read — a rule
-// that sat flat through a resample — is treated as uncorrelated with the
-// rest rather than poisoning the matrix with NaN.
+// that sat flat through a sample — is treated as uncorrelated with the rest
+// rather than poisoning the matrix with NaN.
 func Correlation(columns [][]float64, idx []int) [][]float64 {
 	k := len(columns)
 	if idx == nil {
@@ -120,8 +275,9 @@ func Correlation(columns [][]float64, idx []int) [][]float64 {
 }
 
 // MinVarianceWeights solves min w'Cw subject to w >= 0, Σw = 1 by projected
-// gradient descent onto the simplex. The subsystem counts here are a dozen at
-// most, so a method that is obviously correct beats a fast one.
+// gradient descent onto the simplex — the bootstrap's answer for a sample
+// whose means say nothing. Member counts are a dozen at most, so a method
+// that is obviously correct beats a fast one.
 func MinVarianceWeights(c [][]float64) []float64 {
 	k := len(c)
 	w := make([]float64, k)

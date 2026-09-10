@@ -4,7 +4,11 @@
 // more than 10% away from the current position).
 package portfolio
 
-import "math"
+import (
+	"math"
+
+	"github.com/ranedk/systrader/internal/handcraft"
+)
 
 const MaxIDM = 2.5
 
@@ -25,35 +29,7 @@ func Target(subsystem, instrumentWeight, idm float64) float64 {
 // result clamped to [1, MaxIDM]. Correlations are the trustworthy statistic
 // (Law 6); √N-style guesses assume zero correlation and oversize risk.
 func IDMFromCorrelation(w []float64, corr [][]float64) float64 {
-	if len(w) == 0 || len(corr) != len(w) {
-		return 1
-	}
-	var sum float64
-	for i := range w {
-		for j := range w {
-			c := corr[i][j]
-			switch {
-			case i == j:
-				c = 1
-			case math.IsNaN(c):
-				c = 1 // unknown correlation = assume the worst (Law 20)
-			case c < 0:
-				c = 0 // never let anti-correlation inflate leverage (Law 9)
-			}
-			sum += w[i] * w[j] * c
-		}
-	}
-	if sum <= 0 {
-		return 1
-	}
-	idm := 1 / math.Sqrt(sum)
-	if idm > MaxIDM {
-		idm = MaxIDM
-	}
-	if idm < 1 {
-		idm = 1
-	}
-	return idm
+	return handcraft.DiversificationMultiplier(w, corr, MaxIDM)
 }
 
 // ApplyInertia decides the new held position given the current one and the

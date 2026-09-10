@@ -20,8 +20,9 @@
 //     old "DeflatedSR", which was Law 7's flat 0.75 haircut and is now named
 //     HaircutSR, for what it is;
 //   - Benjamini-Hochberg FDR within the family (amended Law 2, q = 10%);
-//   - bootstrap weight estimation, as the cross-check on handcrafted weights
-//     (Law 6) — weights.go says why it holds means equal.
+//   - Carver's bootstrap weight estimation (appendix C), as the cross-check
+//     on handcrafted weights (Law 6) — weights.go says why an equal-means
+//     version was tried and retired.
 //
 // Everything is a pure function over aligned []float64 return series. Nothing
 // here knows what a Book is, so every harness can use it.

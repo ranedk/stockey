@@ -264,21 +264,80 @@ func TestMinVarianceSatisfiesItsOptimalityConditions(t *testing.T) {
 	}
 }
 
-func TestBootstrapWeightsAgreeWithTheTreeAndBracketTheirMean(t *testing.T) {
-	n := 260
-	a := noise(21, n, 1)
-	b := make([]float64, n)
-	e := noise(22, n, 0.1)
-	for i := range b {
-		b[i] = a[i] + e[i] // a near-duplicate of a
+// correlated draws n rows of len(mu) columns with correlation c and per-row
+// means mu (in standard-deviation units), by Cholesky factorisation.
+func correlated(seed int64, n int, c [][]float64, mu []float64) [][]float64 {
+	k := len(c)
+	l := make([][]float64, k)
+	for i := range l {
+		l[i] = make([]float64, k)
+		for j := 0; j <= i; j++ {
+			s := c[i][j]
+			for q := 0; q < j; q++ {
+				s -= l[i][q] * l[j][q]
+			}
+			if i == j {
+				l[i][j] = math.Sqrt(s)
+			} else {
+				l[i][j] = s / l[j][j]
+			}
+		}
 	}
-	c := noise(23, n, 1)
-	est, err := BootstrapWeights([][]float64{a, b, c}, Bootstrap{MeanBlock: DefaultBlock(n), Reps: 300, Seed: 5})
+	rng := rand.New(rand.NewSource(seed))
+	cols := make([][]float64, k)
+	for i := range cols {
+		cols[i] = make([]float64, n)
+	}
+	z := make([]float64, k)
+	for t := 0; t < n; t++ {
+		for i := range z {
+			z[i] = rng.NormFloat64()
+		}
+		for i := 0; i < k; i++ {
+			v := mu[i]
+			for j := 0; j <= i; j++ {
+				v += l[i][j] * z[j]
+			}
+			cols[i][t] = v
+		}
+	}
+	return cols
+}
+
+var identity2 = [][]float64{{1, 0}, {0, 1}}
+
+func TestMaxSharpeIsTheTangencyPortfolio(t *testing.T) {
+	// Uncorrelated members: weights proportional to Sharpe ratio.
+	w, ok := MaxSharpeWeights(identity2, []float64{0.1, 0.2})
+	if !ok {
+		t.Fatal("no answer")
+	}
+	near(t, "w[0]", w[0], 1.0/3, 1e-12)
+	near(t, "w[1]", w[1], 2.0/3, 1e-12)
+	// A loser is held at zero, not shorted.
+	w, _ = MaxSharpeWeights(identity2, []float64{0.1, -0.05})
+	near(t, "loser", w[1], 0, 1e-12)
+	if _, ok := MaxSharpeWeights(identity2, []float64{-0.1, -0.2}); ok {
+		t.Error("a portfolio of losers has no maximum-Sharpe answer")
+	}
+}
+
+func TestBootstrapDoesNotCollapseTheMiddleSpeed(t *testing.T) {
+	// The regression that retired the equal-means version: three members
+	// correlated like the real trend speeds, equal true Sharpe ratios.
+	// Minimum variance corners the middle at 0%; Carver's bootstrap must not.
+	c := [][]float64{{1, 0.84, 0.61}, {0.84, 1, 0.82}, {0.61, 0.82, 1}}
+	if mv := MinVarianceWeights(c); mv[1] > 1e-6 {
+		t.Fatalf("test premise: minimum variance should corner the middle, gave %v", mv)
+	}
+	cols := correlated(9, 3000, c, []float64{0.03, 0.03, 0.03})
+	est, err := BootstrapWeights(cols, Bootstrap{MeanBlock: DefaultBlock(3000), Reps: 300, Seed: 2}, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
-	near(t, "duplicates' combined weight", est.Mean[0]+est.Mean[1], 0.5, 0.05)
-	near(t, "independent rule's weight", est.Mean[2], 0.5, 0.05)
+	if est.Mean[1] < 0.05 || est.High[1] <= est.Low[1] {
+		t.Errorf("middle member %.3f [%.3f, %.3f] — still collapsing to a corner", est.Mean[1], est.Low[1], est.High[1])
+	}
 	var sum float64
 	for j := range est.Mean {
 		sum += est.Mean[j]
@@ -286,7 +345,35 @@ func TestBootstrapWeightsAgreeWithTheTreeAndBracketTheirMean(t *testing.T) {
 			t.Errorf("column %d: mean %v outside [%v, %v]", j, est.Mean[j], est.Low[j], est.High[j])
 		}
 	}
-	near(t, "Σ bootstrapped weights", sum, 1, 1e-9)
+	near(t, "Σ weights", sum, 1, 1e-9)
+}
+
+func TestBootstrapSplitsTwinsEvenlyAndDuplicatesAsOneBet(t *testing.T) {
+	b := Bootstrap{MeanBlock: 10, Reps: 400, Seed: 3}
+	est, err := BootstrapWeights(correlated(4, 2000, identity2, []float64{0.03, 0.03}), b, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "twin", est.Mean[0], 0.5, 0.1)
+	dup := [][]float64{{1, 0.97, 0}, {0.97, 1, 0}, {0, 0, 1}}
+	est, err = BootstrapWeights(correlated(21, 2600, dup, []float64{0.03, 0.03, 0.03}), b, 260)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "duplicates together", est.Mean[0]+est.Mean[1], 0.5, 0.1)
+	near(t, "independent member", est.Mean[2], 0.5, 0.1)
+}
+
+func TestAWorldOfLosersFallsBackToMinimumVariance(t *testing.T) {
+	est, err := BootstrapWeights(correlated(5, 500, identity2, []float64{-0.5, -0.5}),
+		Bootstrap{MeanBlock: 5, Reps: 50, Seed: 1}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if est.Uninformative != 50 {
+		t.Errorf("%d of 50 samples counted uninformative", est.Uninformative)
+	}
+	near(t, "fallback weight", est.Mean[0], 0.5, 1e-6)
 }
 
 func TestCorrelationSurvivesAFlatColumn(t *testing.T) {

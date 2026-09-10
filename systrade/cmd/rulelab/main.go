@@ -34,6 +34,7 @@ import (
 	"github.com/ranedk/systrader/internal/bars"
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/data"
+	"github.com/ranedk/systrader/internal/handcraft"
 	"github.com/ranedk/systrader/internal/rules"
 )
 
@@ -470,40 +471,11 @@ func printMatrix(lib []rules.Rule, corr func(a, b int) float64) {
 	}
 }
 
-// groupRules clusters by COMPLETE linkage: a group forms only if EVERY pair
-// inside it reaches the threshold. Single linkage was the obvious choice and
-// the wrong one — it chains (A~B, B~C, A independent of C all end up in one
-// group), which on this library merged trend and mean-reversion into a single
-// bucket through a string of intermediate rules.
-//
-// Absolute value on purpose: a rule that is the NEGATIVE of another carries
-// the same information and must not be handed a second, independent weight.
+// groupRules names the complete-linkage groups (handcraft.Cluster says why
+// complete, and why absolute correlation).
 func groupRules(lib []rules.Rule, corr func(a, b int) float64, thresh float64) []string {
-	k := len(lib)
-	groups := make([][]int, 0, k)
-	for i := range lib {
-		placed := false
-		for g := range groups {
-			fits := true
-			for _, j := range groups[g] {
-				v := corr(i, j)
-				if math.IsNaN(v) || math.Abs(v) < thresh {
-					fits = false
-					break
-				}
-			}
-			if fits {
-				groups[g] = append(groups[g], i)
-				placed = true
-				break
-			}
-		}
-		if !placed {
-			groups = append(groups, []int{i})
-		}
-	}
 	var out []string
-	for _, g := range groups {
+	for _, g := range handcraft.Cluster(len(lib), corr, thresh) {
 		s := lib[g[0]].Name()
 		for _, i := range g[1:] {
 			s += ", " + lib[i].Name()

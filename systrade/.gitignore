@@ -10,3 +10,6 @@ systrader
 
 # Research bar cache: regenerable in 9s via `go run ./cmd/coi cache`, 258MB
 data/cache/
+
+# Carver, Systematic Trading (copyrighted, operator-supplied reference) — never commit
+systematic-Trading.pdf
