@@ -2,6 +2,7 @@
 //
 //	slice explore -rule ewmac32_128 -horizon 20
 //	slice cost     -rule ewmac32_128
+//	slice family   (row 18's configurations, judged with internal/evidence)
 //	slice drawdown -rule ewmac32_128
 //
 // This is EXPLORATION. It prints no verdict and no p-value on a winning
@@ -45,6 +46,10 @@ const (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "cost" {
 		runCost(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "family" {
+		runFamily(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "coi" {

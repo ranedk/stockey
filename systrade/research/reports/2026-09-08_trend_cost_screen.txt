@@ -1,1 +1,46 @@
-(eval):1: command not found: go
+# Trend cost screen (LEDGER row 18) — REGENERATED 2026-09-10T10:29Z by `slice cost` (defaults).
+# The file committed with row 18 held only a shell error ("command not found: go"); this is the
+# same command on the same bar cache, rerun so the row has its evidence. Not a new trial.
+
+COST SCREEN — ewmac32_128, top/bottom quintile, rebalanced every 20 days
+2013-07-01..2026-06-30 | 50 bps round trip (and 100 bps in the sensitivity)
+
+This screen can only KILL the hypothesis, never support it: it was mined from
+this same sample (LEDGER row 17), so a good number here is what a mined
+hypothesis produces by construction. A bad one is decisive.
+
+========== liquidity floor: Rs 1 cr/day median turnover ==========
+
+  --- costs x1 ---
+  book                 ann ret  ann vol      SR     maxDD turnover/d vs equal-wt   vs shuffle
+  always-trend          26.69%   22.24%    1.18    -41.2%       3.7%   0.77% t 4.36  0.79% t 4.36
+  equal-weight          14.98%   21.87%    0.75    -64.2%       1.2%   (beta control)
+  stable-shuffle        14.65%   22.12%    0.73    -66.8%       1.2%   (selection control)
+  washout-reverse       27.19%   22.41%    1.19    -45.0%       4.0%   0.82% t 4.46  0.84% t 4.45
+  washout-neutral       26.58%   22.33%    1.17    -43.7%       3.9%   0.77% t 4.39  0.80% t 4.44
+
+  --- costs x2 ---
+  book                 ann ret  ann vol      SR     maxDD turnover/d vs equal-wt   vs shuffle
+  always-trend          23.73%   22.25%    1.07    -43.9%       3.7%   0.64% t 3.60  0.66% t 3.64
+  washout-reverse       24.00%   22.43%    1.07    -48.1%       4.0%   0.67% t 3.66  0.70% t 3.69
+  washout-neutral       23.49%   22.35%    1.06    -46.7%       3.9%   0.63% t 3.56  0.67% t 3.74
+
+========== liquidity floor: Rs 10 cr/day median turnover ==========
+
+  --- costs x1 ---
+  book                 ann ret  ann vol      SR     maxDD turnover/d vs equal-wt   vs shuffle
+  always-trend          20.11%   22.47%    0.93    -40.2%       4.0%   0.55% t 2.89  0.55% t 2.88
+  equal-weight          12.28%   21.79%    0.64    -58.3%       1.2%   (beta control)
+  stable-shuffle        12.23%   21.82%    0.64    -56.7%       1.4%   (selection control)
+  washout-reverse       20.35%   22.81%    0.93    -40.7%       4.3%   0.58% t 3.10  0.58% t 3.09
+  washout-neutral       19.89%   22.59%    0.92    -41.0%       4.2%   0.54% t 2.89  0.55% t 2.95
+
+  --- costs x2 ---
+  book                 ann ret  ann vol      SR     maxDD turnover/d vs equal-wt   vs shuffle
+  always-trend          17.11%   22.49%    0.82    -42.5%       4.0%   0.40% t 2.13  0.41% t 2.16
+  washout-reverse       17.14%   22.83%    0.81    -43.4%       4.3%   0.42% t 2.25  0.43% t 2.28
+  washout-neutral       16.76%   22.61%    0.80    -43.7%       4.2%   0.38% t 2.06  0.42% t 2.24
+
+Read it as: does the signal beat the equal-weight book (beta) AND a
+turnover-matched random ranking (selection)? Anything that fails either at
+normal costs is dead and stays dead.

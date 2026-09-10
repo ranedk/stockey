@@ -270,6 +270,14 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       resampled correlations — the cross-check on handcrafted weights, never
       their source; on a clean case it reproduces the tree's 25/25/50.
       Tooling only, tested on synthetic data: no market data read, no LEDGER row
+- [x] Re-scored row 18's trend family with it (`cmd/slice family`, LEDGER row
+      25, trials=0). All 14 configurations survive FDR within the family; only
+      five survive the deflated Sharpe, and the frozen paper configuration is
+      not one of them (DSR 0.915 against a 0.95 bar). Nothing changes — moving
+      to a neighbouring cell that scored better is pick-the-winner — but the
+      backtest case for the live paper track is now stated at its honest
+      strength. Row 18's committed report turned out to hold only a shell
+      error; it is regenerated and reproduces the row's headline numbers
 - [ ] Handcrafting helper (correlation grouping → weights + FDM/IDM)
 - [ ] Instrument universe finalization (blocked on capital, A1)
 - [ ] Live execution via Dhan orders API (after, and only after, paper data)
