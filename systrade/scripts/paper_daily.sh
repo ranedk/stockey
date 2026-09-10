@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Daily forward record for the frozen paper strategies (docs/strategies/).
+# Daily forward record for the frozen paper strategies (docs/strategies/,
+# paper.Specs).
 #
 # Recomputes each track from its start date and rewrites the tables, so this is
 # safe to run twice, safe to miss a day, and self-healing: a gap fills itself in
@@ -21,5 +22,10 @@ go run ./cmd/paper run
 # The in-sample reference curve the screener shows beside it, clearly labelled
 # there as a backtest. Recomputed too, so the two always end on the same date.
 go run ./cmd/paper run -name trend-quintile-reference -start 2022-01-01
+
+# Strategy 2: the same book with its speeds blended (Law 5), a parallel record
+# from 2026-09-10 (docs/strategies/2026-09-10_trend_speed_blend.md).
+go run ./cmd/paper run -strategy trend-speed-blend
+go run ./cmd/paper run -strategy trend-speed-blend -name trend-speed-blend-reference -start 2022-01-01
 
 echo "=== paper_daily done ==="

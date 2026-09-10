@@ -3,6 +3,8 @@
 //	slice explore -rule ewmac32_128 -horizon 20
 //	slice cost     -rule ewmac32_128
 //	slice family   (row 18's configurations, judged with internal/evidence)
+//	slice speeds   (speed-blend construction: costs and correlations only)
+//	slice blend    (the speed blend's pre-registered kill screen)
 //	slice drawdown -rule ewmac32_128
 //
 // This is EXPLORATION. It prints no verdict and no p-value on a winning
@@ -46,6 +48,14 @@ const (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "cost" {
 		runCost(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "blend" {
+		runBlend(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "speeds" {
+		runSpeeds(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "family" {
@@ -335,6 +345,9 @@ func mcapAt(pts []store.MCapPoint, d time.Time) float64 {
 }
 
 func findRule(name string) rules.Rule {
+	if b := rules.SpeedBlend(); name == b.Name() {
+		return b
+	}
 	for _, r := range rules.Library() {
 		if r.Name() == name {
 			return r

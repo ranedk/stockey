@@ -236,8 +236,10 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       to RISING with depth in volatility units, and never flip sign. No exit
       level exists, which explains why every stop failed rather than merely
       agreeing with it
-- [ ] First evaluation of the paper record — not before 12 months and 12
-      rebalances have passed, per the spec's own binding terms
+- [ ] First evaluation of the paper records — trend-quintile not before 12
+      months and 12 rebalances from 2026-09-08, trend-speed-blend likewise from
+      2026-09-10, and the one comparison between them at 2027-09-10, per the
+      specs' binding terms
 - [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
       matched-control baseline — on hold: every rule tested so far has failed
       its controls, so there is nothing yet worth combining
@@ -288,5 +290,14 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       means held equal it corners any member correlated with two others (the
       middle trend speed got 0% in every resample, contradicting Table 8 on
       Carver's own numbers); replaced with his appendix-C method
+- [x] **Second paper track: trend-speed-blend** (LEDGER row 26). Law 5 applied
+      to the live strategy — the three slow EWMAC speeds blended 40/16/44 with
+      FDM 1.10 (`rules.SpeedBlend`) instead of 32/128 picked alone. Weights
+      from correlations and costs only, frozen before any return of the blend
+      was computed; a pre-registered kill screen it survived (+0.60%/mo vs
+      equal-weight, +0.55% vs random ranking, p<0.01, both positive at 2x
+      costs); record from 2026-09-10 beside trend-quintile, which it does not
+      replace. `cmd/paper -strategy`, specs registered in `paper.Specs`, the
+      screener lists it on its own
 - [ ] Instrument universe finalization (blocked on capital, A1)
 - [ ] Live execution via Dhan orders API (after, and only after, paper data)

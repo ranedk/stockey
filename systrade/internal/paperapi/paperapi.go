@@ -85,14 +85,14 @@ type SpecView struct {
 func specView(s paper.Spec) SpecView {
 	return SpecView{
 		Universe:      fmt.Sprintf("NSE cash equity, 60-bar median turnover at or above Rs %.0f crore", s.MinTurnover/1e7),
-		Signal:        "EWMAC 32/128 — exponential moving-average crossover, volatility-normalised, long-only",
+		Signal:        s.SignalLabel,
 		Selection:     fmt.Sprintf("top %dth of the eligible universe by forecast", s.Quantile),
 		Weighting:     "equal weight across the held names, fully invested, no leverage or shorting",
 		Rebalance:     fmt.Sprintf("every %d trading days; hold in between", s.RebalanceEvery),
 		Execution:     "decide at the close, fill at the next open",
 		Costs:         fmt.Sprintf("%.0f bps round trip charged on turnover", s.CostBpsRoundTrip),
 		MinTurnoverCr: s.MinTurnover / 1e7,
-		Doc:           "docs/strategies/2026-09-08_trend_quintile.md",
+		Doc:           s.Doc,
 	}
 }
 
@@ -129,10 +129,13 @@ func List(ctx context.Context, st *store.Store) ([]Strategy, error) {
 
 // Detail assembles one strategy's payload.
 func Detail(ctx context.Context, st *store.Store, name string) (Strategy, error) {
-	spec := paper.FrozenSpec()
+	// A reference track describes itself with its strategy's spec. A name no
+	// spec claims (an old experiment left in the tables) gets an empty spec
+	// rather than borrowing another strategy's description.
+	spec, known := paper.SpecFor(strings.TrimSuffix(name, ReferenceSuffix))
 	s := Strategy{
 		Name:      name,
-		IsForward: name == spec.Name,
+		IsForward: known && name == spec.Name,
 		Start:     spec.Start.Format("2006-01-02"),
 		Spec:      specView(spec),
 	}

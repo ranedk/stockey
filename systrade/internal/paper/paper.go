@@ -26,8 +26,16 @@ import (
 // docs/strategies/2026-09-08_trend_quintile.md; changing any field here means
 // a different strategy, a new spec document and a new clock.
 type Spec struct {
-	Name           string
-	Start          time.Time
+	Name  string
+	Start time.Time
+	// Signal names the selection signal cmd/paper builds. It is part of the
+	// spec because a frozen strategy run with a different signal is a
+	// different strategy wearing its name.
+	Signal string
+	// SignalLabel says the same in words, for the screener.
+	SignalLabel string
+	// Doc is the spec document this configuration mirrors.
+	Doc            string
 	MinTurnover    float64 // 60-bar median traded value, INR
 	TurnoverWindow int
 	Quantile       int // 5 = hold the top fifth by forecast
@@ -279,6 +287,9 @@ func FrozenSpec() Spec {
 	return Spec{
 		Name:             "trend-quintile",
 		Start:            time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC),
+		Signal:           "ewmac32",
+		SignalLabel:      "EWMAC 32/128 — exponential moving-average crossover, volatility-normalised, long-only",
+		Doc:              "docs/strategies/2026-09-08_trend_quintile.md",
 		MinTurnover:      1e8,
 		TurnoverWindow:   60,
 		Quantile:         5,
@@ -299,6 +310,34 @@ func FrozenSpec() Spec {
 		ExposureDaily:    false,
 		ConstantExposure: 1,
 	}
+}
+
+// SpeedBlendSpec is the configuration frozen on 2026-09-10: trend-quintile
+// in every respect but the signal, which blends the three slow EWMAC speeds
+// instead of picking one (Law 5). Same universe, same clock, same costs, and
+// the same random-ranking seed, so the two tracks share identical control
+// books and differ ONLY in what they select.
+func SpeedBlendSpec() Spec {
+	s := FrozenSpec()
+	s.Name = "trend-speed-blend"
+	s.Start = time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	s.Signal = "trend-speed-blend"
+	s.SignalLabel = "EWMAC 16/64, 32/128 and 64/256 blended 40/16/44 (handcrafted), FDM 1.10 — volatility-normalised, long-only"
+	s.Doc = "docs/strategies/2026-09-10_trend_speed_blend.md"
+	return s
+}
+
+// Specs lists every strategy with a forward record, in the order they began.
+func Specs() []Spec { return []Spec{FrozenSpec(), SpeedBlendSpec()} }
+
+// SpecFor finds a registered strategy by name.
+func SpecFor(name string) (Spec, bool) {
+	for _, s := range Specs() {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Spec{}, false
 }
 
 // Book names. The strategy is tracked against both benchmarks from day one,

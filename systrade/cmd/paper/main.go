@@ -1,6 +1,7 @@
-// Command paper keeps the forward record for the frozen trend-quintile
-// strategy: what it would hold, what it would trade, and what it earned
-// against an equal-weight book and a random-ranking book of the same size.
+// Command paper keeps the forward record for each frozen strategy in
+// paper.Specs (trend-quintile, trend-speed-blend): what it would hold, what it
+// would trade, and what it earned against an equal-weight book and a
+// random-ranking book of the same size.
 //
 //	paper run          recompute the whole track and store it
 //	paper run -dry     compute and print, write nothing
@@ -42,6 +43,7 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "run" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
+	strategy := flag.String("strategy", "trend-quintile", "registered strategy to run: trend-quintile | trend-speed-blend")
 	dry := flag.Bool("dry", false, "compute and print, write nothing")
 	start := flag.String("start", "", "override the spec's start date")
 	name := flag.String("name", "", "override the strategy name (use with -start for the in-sample reference track)")
@@ -54,13 +56,19 @@ func main() {
 	exitRate := flag.Float64("random-exit-rate", 0, "for -stop=random: exits per position per day")
 	rebalance := flag.Int("rebalance", 0, "trading days between rebalances (0 = spec default)")
 	holdCount := flag.Int("hold-count", 0, "hold a fixed number of names instead of a quantile")
-	signal := flag.String("signal", "ewmac32", "selection signal: ewmac32 | ewmac16 | ret5 | reversal20 | reversal60")
+	signal := flag.String("signal", "", "override the spec's selection signal: ewmac32 | ewmac16 | trend-speed-blend | ret5 | reversal20 | reversal60")
 	signal2 := flag.String("signal2", "reversal20", "the second signal, used by -mode=switch and -mode=blend")
 	mode := flag.String("mode", "single", "selection mode: single | switch | blend")
 	switchBreadth := flag.Float64("switch-breadth", 0.40, "for -mode=switch: use the second signal below this share of the universe in an uptrend")
 	flag.Parse()
 
-	spec := paper.FrozenSpec()
+	spec, ok := paper.SpecFor(*strategy)
+	if !ok {
+		fatal(fmt.Errorf("no registered strategy %q", *strategy))
+	}
+	if *signal == "" {
+		*signal = spec.Signal
+	}
 	if *start != "" {
 		t, err := time.Parse("2006-01-02", *start)
 		fatalIf(err)
@@ -245,9 +253,11 @@ type signalFn func(ser bars.Series, closes core.Series, vol core.Series) []float
 func parseSignal(name string) (signalFn, error) {
 	switch name {
 	case "ewmac32":
-		return ewmacSignal(32), nil
+		return ruleSignal(rules.EWMAC{Fast: 32}), nil
 	case "ewmac16":
-		return ewmacSignal(16), nil
+		return ruleSignal(rules.EWMAC{Fast: 16}), nil
+	case "trend-speed-blend":
+		return ruleSignal(rules.SpeedBlend()), nil
 	case "reversal20", "reversal60", "reversal120":
 		w := map[string]int{"reversal20": 20, "reversal60": 60, "reversal120": 120}[name]
 		return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
@@ -288,16 +298,16 @@ func parseSignal(name string) (signalFn, error) {
 			return out
 		}, nil
 	}
-	return nil, fmt.Errorf("unknown signal %q (ewmac32 | ewmac16 | ret5)", name)
+	return nil, fmt.Errorf("unknown signal %q (ewmac32 | ewmac16 | trend-speed-blend | ret5 | ret5inv | reversal20 | reversal60 | reversal120)", name)
 }
 
-func ewmacSignal(fast int) signalFn {
+func ruleSignal(r rules.Rule) signalFn {
 	return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
 		inst := &data.Instrument{
 			Meta:   data.Meta{Symbol: ser.Symbol, PointValue: 1, Block: 1, LongOnly: true},
 			Prices: closes,
 		}
-		return rules.Forecast(rules.EWMAC{Fast: fast}, inst, vol).Values
+		return rules.Forecast(r, inst, vol).Values
 	}
 }
 

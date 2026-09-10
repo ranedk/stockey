@@ -1,0 +1,33 @@
+# Speed-blend kill screen (LEDGER row 26, trials=1) — generated 2026-09-10T11:07Z by `slice blend` (defaults).
+# Pre-registered: research/preregistrations/2026-09-10_speed_blend_screen.md
+
+SPEED-BLEND KILL SCREEN — 2013-07-01..2026-06-30, Rs 10 cr floor, top quintile, rebalance 20
+signal: trend-speed-blend = EWMAC16/32/64 at 40/16/44%, FDM 1.10 | trials=1 | pre-registered 2026-09-10
+Mined sample: this can kill the blend, never confirm it.
+
+  book                        ann ret  ann vol     SR    maxDD  turnover/d
+  speed blend                  21.02%   22.18%   0.97   -40.0%       4.06%
+  trend-quintile (ewmac32)     20.11%   22.47%   0.93   -40.2%       4.01%
+  equal-weight (beta)          12.28%   21.79%   0.64   -58.3%       1.25%
+  stable-shuffle (selection)   13.22%   21.43%   0.69   -56.7%       1.28%
+  speed blend at 100 bps       17.96%   22.20%   0.86   -42.5%       4.06%
+
+edge, monthly paired, 147 months, 90% bootstrap intervals (mean block 5 months, 10000 resamples)
+  vs equal-weight    +0.60 [+0.27,+0.92] p0.002
+  vs stable-shuffle  +0.55 [+0.22,+0.86] p0.002
+  at 100 bps: vs equal-weight +0.45%/mo, vs stable-shuffle +0.40%/mo
+
+pre-registered criteria
+  K1  p < 0.10 against both controls at 50 bps        PASS (p 0.0017, 0.0025)
+  K2  positive mean against both controls at 100 bps  PASS
+  VERDICT: SURVIVES — the forward track may start
+
+reported, deciding nothing
+  excess over the tougher control: 0.236 SR/month, P(true SR > 0) = 0.998 (one trial; row 18's family context is LEDGER row 25)
+  matched risk (leverage 1.013 on the blend, hindsight-fixed — a reading device):
+    blend at matched risk      21.28%   22.47%   0.97   -40.5%       4.06%
+    trend-quintile             20.11%   22.47%   0.93   -40.2%       4.01%
+  blend − trend-quintile at matched risk: +0.08 [-0.01,+0.16] p0.073
+  Choosing between these two on this sample would be pick-the-winner (Law 5); it informs nothing here.
+
+Workspace-wide Bonferroni bar, context only (amended Law 2): t = 4.09 at M = 1160.

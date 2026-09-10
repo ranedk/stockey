@@ -1,0 +1,43 @@
+# Speed-blend construction — generated 2026-09-10T11:07Z by `slice speeds` (defaults).
+# Weights, costs and correlations only (Law 6). The bootstrap cross-check at the end is Carver's appendix-C
+# method; an earlier run with an equal-means version (now retired, see internal/evidence/weights.go) gave 50/0/50
+# with zero-width intervals, a corner artefact. With 301-day samples each optimisation is itself a corner, so the
+# 10-90% ranges span 0-100 and only the MEAN is informative. Read after the weights were frozen; cannot move them.
+
+SPEED-BLEND CONSTRUCTION — 2013-07-01..2026-06-30, Rs 10 cr floor, top quintile, rebalance 20, 50 bps
+Inputs Law 6 admits: correlations (estimable) and costs (facts). No return, SR or edge is printed;
+only the bootstrap cross-check at the end sees sample means, as Carver's method requires.
+3016 common trading days.
+
+cost of trading each speed's book
+  ewmac16_64   turnover  5.20%/day one-way   cost 0.145 SR/yr
+  ewmac32_128  turnover  4.01%/day one-way   cost 0.112 SR/yr
+  ewmac64_256  turnover  3.36%/day one-way   cost 0.098 SR/yr
+
+correlation of daily returns in excess of the equal-weight book (the weighting input)
+               ewmac16_64  ewmac32_128  ewmac64_256
+  ewmac16_64         1.00        0.84        0.61 
+  ewmac32_128        0.84        1.00        0.82 
+  ewmac64_256        0.61        0.82        1.00 
+
+forecast correlation, pooled (row 14 — the FDM input)
+               ewmac16_64  ewmac32_128  ewmac64_256
+  ewmac16_64         1.00        0.87        0.59 
+  ewmac32_128        0.87        1.00        0.87 
+  ewmac64_256        0.59        0.87        1.00 
+
+handcrafted (Table 8)
+  trend          row 11 (0.84/0.61/0.82)      ewmac16_64 42%, ewmac32_128 16%, ewmac64_256 42%
+
+Table 12 column A on cost differences (SR vs group average -> factor)
+  ewmac16_64   -0.027 -> x0.968   42.0% -> 40.3%
+  ewmac32_128  +0.006 -> x1.013   16.0% -> 16.1%
+  ewmac64_256  +0.021 -> x1.046   42.0% -> 43.6%
+
+FDM over forecast correlations with these weights: 1.104
+
+cross-check: Carver's bootstrap, max-Sharpe on 301-day samples (500 resamples, mean block 14 days; 51 samples uninformative)
+  read only after the weights above were frozen in rules.SpeedBlend; it cannot move them
+  ewmac16_64   handcrafted  40.3%   bootstrap  30.5% [  0.0, 100.0]   single fit   2.6%
+  ewmac32_128  handcrafted  16.1%   bootstrap  24.1% [  0.0, 100.0]   single fit  47.7%
+  ewmac64_256  handcrafted  43.6%   bootstrap  45.4% [  0.0, 100.0]   single fit  49.7%
