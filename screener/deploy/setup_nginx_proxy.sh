@@ -3,6 +3,9 @@
 # setup_nginx_proxy.sh -- put the screener behind nginx with HTTP basic auth.
 #
 #   sudo ./deploy/setup_nginx_proxy.sh <username>                    # Cloudflare in front (default)
+#   sudo ./deploy/setup_nginx_proxy.sh <username> --static-root /var/www/screener
+#                                                                    # production build: nginx
+#                                                                    # serves the hashed assets
 #   sudo ./deploy/setup_nginx_proxy.sh <username> --direct           # no CDN, open :80 to the world
 #   sudo ./deploy/setup_nginx_proxy.sh <username> \
 #        --origin-cert /path/cert.pem --origin-key /path/key.pem     # + serve :443 (Full (strict))
@@ -31,10 +34,11 @@
 
 set -euo pipefail
 
-USERNAME=""; MODE="cloudflare"; ORIGIN_CERT=""; ORIGIN_KEY=""
+USERNAME=""; MODE="cloudflare"; ORIGIN_CERT=""; ORIGIN_KEY=""; STATIC_ROOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --direct) MODE="direct" ;;
+    --static-root) STATIC_ROOT="${2:-}"; shift ;;
     --origin-cert) ORIGIN_CERT="${2:-}"; shift ;;
     --origin-key)  ORIGIN_KEY="${2:-}"; shift ;;
     -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
@@ -43,11 +47,18 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -n "$USERNAME" ] || { echo "Usage: sudo $0 <username> [--direct] [--origin-cert C --origin-key K]" >&2; exit 2; }
+[ -n "$USERNAME" ] || { echo "Usage: sudo $0 <username> [--static-root DIR] [--direct] [--origin-cert C --origin-key K]" >&2; exit 2; }
 # Checked after parsing so --help is usable without sudo.
 [ "$(id -u)" -eq 0 ] || { echo "This needs root: sudo $0 $USERNAME" >&2; exit 1; }
 if [ -n "$ORIGIN_CERT" ] || [ -n "$ORIGIN_KEY" ]; then
   [ -r "$ORIGIN_CERT" ] && [ -r "$ORIGIN_KEY" ] || { echo "origin cert/key not readable" >&2; exit 2; }
+fi
+if [ -n "$STATIC_ROOT" ]; then
+  [ -d "$STATIC_ROOT/_nuxt" ] || {
+    echo "!! ${STATIC_ROOT}/_nuxt does not exist. Run ./deploy/build_and_deploy.sh first," >&2
+    echo "   or leave --static-root off to proxy everything to the dev server." >&2
+    exit 2
+  }
 fi
 
 SITE_NAME="screener"
@@ -90,7 +101,38 @@ if [ -f "$SITE_FILE" ]; then
 fi
 
 # ---------------------------------------------------------------- the site
+STATIC_BLOCK=""
+if [ -n "$STATIC_ROOT" ]; then
+STATIC_BLOCK=$(cat <<'SBLOCK'
+    # The build's hashed assets, straight off disk. These never reach node, which is
+    # most of the request volume on any page load.
+    #
+    # =404 rather than a fallback to the app ON PURPOSE. In production every one of
+    # these files exists, so the fallback would never fire; but if someone switches
+    # back to `nuxt dev` without re-running this script, a fallback would quietly serve
+    # them year-cached production assets. A loud 404 is the better failure.
+    root __STATIC_ROOT__;
+
+    location /_nuxt/ {
+        try_files $uri =404;
+        # Safe only because every filename here contains a content hash: a changed file
+        # is a different URL, so nothing stale can be pinned.
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # favicon, robots.txt and anything else the build drops in public/ — served from
+    # disk when it exists, handed to the app when it does not.
+    location = /favicon.ico { try_files $uri @app; access_log off; }
+    location = /robots.txt  { try_files $uri @app; access_log off; }
+SBLOCK
+)
+STATIC_BLOCK="${STATIC_BLOCK//__STATIC_ROOT__/$STATIC_ROOT}"
+fi
+
 PROXY_BLOCK=$(cat <<'BLOCK'
+__STATIC_BLOCK__
     # ONE auth gate for the whole origin. Both backends are reached through this app's
     # own /_stockey/ and /_systrader/ route rules, so they inherit this gate instead of
     # needing separate location blocks somebody could forget. That matters:
@@ -118,11 +160,21 @@ PROXY_BLOCK=$(cat <<'BLOCK'
         proxy_read_timeout    120s;
     }
 
+    location @app {
+        proxy_pass http://__UPSTREAM__;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     client_max_body_size 10m;
     access_log /var/log/nginx/screener.access.log;
     error_log  /var/log/nginx/screener.error.log;
 BLOCK
 )
+PROXY_BLOCK="${PROXY_BLOCK//__STATIC_BLOCK__/$STATIC_BLOCK}"
 PROXY_BLOCK="${PROXY_BLOCK//__HTPASSWD__/$HTPASSWD}"
 PROXY_BLOCK="${PROXY_BLOCK//__UPSTREAM__/$APP_UPSTREAM}"
 
@@ -216,6 +268,7 @@ cat <<DONE
       curl -sI -u ${USERNAME}:<pass> https://stockey.japlin.com/ | head -1   # expect 200
 
   Nuxt must stay listening on ${APP_UPSTREAM}:
+      cd ~/code/trading/screener && ./deploy/build_and_deploy.sh      # production
       cd ~/code/trading/screener && setsid --fork npx nuxt dev --host 127.0.0.1 --port 3000
   Never start it with --host 0.0.0.0 -- that publishes :3000 directly and lets anyone
   reach the app without passing the auth gate.

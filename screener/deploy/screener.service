@@ -1,0 +1,42 @@
+# Nitro production server for the screener frontend.
+#
+#   sudo cp deploy/screener.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now screener
+#
+# Serves SSR and the /_stockey/ and /_systrader/ API proxies on 127.0.0.1:3000.
+# It does NOT serve the hashed JS/CSS — nginx does that straight off disk, so those
+# requests never reach node at all.
+#
+# Bound to 127.0.0.1 on purpose. The only way in is through nginx, which holds the
+# basic-auth gate; a 0.0.0.0 bind would publish the app on :3000 and let anyone walk
+# around that gate.
+[Unit]
+Description=Screener frontend (Nuxt/Nitro)
+After=network.target
+Documentation=file:///home/dev/code/trading/screener/deploy/setup_nginx_proxy.sh
+
+[Service]
+Type=simple
+User=dev
+Group=dev
+WorkingDirectory=/home/dev/code/trading/screener
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+# The API origins are baked in at BUILD time by nuxt.config.ts's routeRules, not read
+# here — nuxt.config reads process.env when it is evaluated. The defaults
+# (127.0.0.1:8000 and :8090) are what this host runs, so nothing needs setting; if that
+# ever changes, it is a rebuild, not a restart.
+ExecStart=/home/dev/.local/tools/node/bin/node /home/dev/code/trading/screener/.output/server/index.mjs
+Restart=always
+RestartSec=3
+# The build output is the only thing it needs to read, and it writes nothing.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
