@@ -42,9 +42,6 @@ const (
 	tradeMin     = 40
 	deliveryWin  = 20
 	deliveryMin  = 15
-	// A daily move beyond ±50% is a data error or a mis-adjusted corporate
-	// action, not a price: NSE's circuit limits cap real daily moves at 20%.
-	maxDailyMove = 0.5
 )
 
 // The library, current traits first. Sector, market breadth and year are not
@@ -86,51 +83,15 @@ func main() {
 	circuits, err := st.CircuitHits(ctx, loadFrom, toT)
 	fatalIf(err)
 
-	// Pass 1: the market — the equal-weight mean return of the eligible
-	// universe, eligibility decided the day before — and each name's last day.
-	type acc struct {
-		sum float64
-		n   int
-	}
-	mkt := map[time.Time]*acc{}
-	last := map[string]time.Time{}
-	var mu sync.Mutex
-	fatalIf(bars.ScanParallel(*cache, 0, func(ser bars.Series) {
-		b := ser.Bars
-		if len(b) < 2 {
-			return
-		}
-		turn := bars.MedianTurnover(b, turnoverWin)
-		local := map[time.Time]float64{}
-		for i := 1; i < len(b); i++ {
-			r := dailyReturn(b, i)
-			if math.IsNaN(r) || math.IsNaN(turn[i-1]) || turn[i-1] < *floor {
-				continue
-			}
-			local[day(b[i].Date)] = r
-		}
-		mu.Lock()
-		for d, r := range local {
-			a := mkt[d]
-			if a == nil {
-				a = &acc{}
-				mkt[d] = a
-			}
-			a.sum += r
-			a.n++
-		}
-		last[ser.Symbol] = day(b[len(b)-1].Date)
-		mu.Unlock()
-	}))
-	mktRet := map[time.Time]float64{}
+	// Pass 1: the market beta is measured against, and each name's last day.
+	mktRet, last, err := traits.MarketReturns(*cache, *floor)
+	fatalIf(err)
 	var dates []time.Time
-	for d, a := range mkt {
-		if a.n >= 100 {
-			mktRet[d] = a.sum / float64(a.n)
-			dates = append(dates, d)
-		}
+	for d := range mktRet {
+		dates = append(dates, d)
 	}
 	sort.Slice(dates, func(i, j int) bool { return dates[i].Before(dates[j]) })
+	var mu sync.Mutex
 	var end time.Time
 	for _, t := range last {
 		if t.After(end) {
@@ -166,9 +127,9 @@ func main() {
 		value := make([]float64, n)
 		mk := make([]float64, n)
 		for i, x := range b {
-			times[i], closes[i], highs[i] = day(x.Date), x.Close, x.High
+			times[i], closes[i], highs[i] = traits.Day(x.Date), x.Close, x.High
 			value[i] = x.Close * x.Vol
-			ret[i] = dailyReturn(b, i)
+			ret[i] = traits.DailyReturn(b, i)
 			mk[i] = math.NaN()
 			if v, ok := mktRet[times[i]]; ok {
 				mk[i] = v
@@ -178,9 +139,9 @@ func main() {
 		prices := core.New(times, closes)
 		pvol := core.PriceUnitVol(prices, 36, 10).Values
 		sma := core.SMA(prices, 200).Values
-		ts := align(times, sizes[ser.Symbol])
-		dl := align(times, deliv[ser.Symbol])
-		ch := align(times, circuits[ser.Symbol])
+		ts := traits.Align(times, sizes[ser.Symbol])
+		dl := traits.Align(times, deliv[ser.Symbol])
+		ch := traits.Align(times, circuits[ser.Symbol])
 		for i := range ch {
 			if math.IsNaN(ch[i]) {
 				ch[i] = 0 // the band-hit file lists hits only: no row is no hit
@@ -314,37 +275,6 @@ func abbrev(s string) string {
 		"upper circuits 60d": "upC", "lower circuits 60d": "loC",
 	}
 	return m[s]
-}
-
-func dailyReturn(b []bars.Bar, i int) float64 {
-	if i == 0 || b[i-1].Close <= 0 || b[i].Close <= 0 {
-		return math.NaN()
-	}
-	r := b[i].Close/b[i-1].Close - 1
-	if math.Abs(r) > maxDailyMove {
-		return math.NaN()
-	}
-	return r
-}
-
-func align(times []time.Time, pts []store.DatedValue) []float64 {
-	byDate := make(map[time.Time]float64, len(pts))
-	for _, p := range pts {
-		byDate[p.Date] = p.Value
-	}
-	out := make([]float64, len(times))
-	for i, t := range times {
-		out[i] = math.NaN()
-		if v, ok := byDate[t]; ok {
-			out[i] = v
-		}
-	}
-	return out
-}
-
-func day(t time.Time) time.Time {
-	u := t.UTC()
-	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 func mustDate(s string) time.Time {

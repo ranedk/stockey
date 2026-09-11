@@ -32,9 +32,11 @@ import (
 	"github.com/ranedk/systrader/internal/bars"
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/data"
+	"github.com/ranedk/systrader/internal/evidence"
 	"github.com/ranedk/systrader/internal/explore"
 	"github.com/ranedk/systrader/internal/rules"
 	"github.com/ranedk/systrader/internal/store"
+	"github.com/ranedk/systrader/internal/traits"
 )
 
 const (
@@ -78,9 +80,12 @@ func main() {
 	list := flag.Bool("list", false, "list available rules and exit")
 	horizon := flag.Int("horizon", 20, "forward holding period in trading days")
 	from := flag.String("from", "2013-07-01", "first decision date")
-	to := flag.String("to", "2026-06-30", "last decision date")
+	to := flag.String("to", "2021-12-31", "last decision date — exploration stops before the confirmation years (see -include-confirmation-years)")
 	minTurnover := flag.Float64("min-turnover", 1e7, "minimum 60-bar median traded value in INR")
 	quantiles := flag.Int("quantiles", 5, "buckets per continuous dimension")
+	costBps := flag.Float64("cost-bps", 50, "round-trip cost charged on each bucket's churn")
+	reps := flag.Int("reps", 1000, "block-bootstrap resamples for each bucket's 'vs ctl' score (0 = skip)")
+	readConfirm := flag.Bool("include-confirmation-years", false, "let -to reach 2022 onward, the years kept unread for confirmation")
 	flag.Parse()
 
 	if *list {
@@ -94,35 +99,29 @@ func main() {
 		fatal(fmt.Errorf("unknown rule %q (try -list)", *ruleName))
 	}
 
+	guardConfirmationYears(mustDate(*to), *readConfirm)
+
 	ctx := context.Background()
 	st, err := store.Open(ctx)
 	fatalIf(err)
 	defer st.Close()
 	sectors, err := st.SectorCodes(ctx)
 	fatalIf(err)
-	mcaps, err := st.MarketCaps(ctx)
+	mcaps, err := st.MarketCaps(ctx) // names sector buckets only; not a slicing trait
+	fatalIf(err)
+	tc, err := traits.LoadContext(ctx, st, *cache, *minTurnover, mustDate(*from), mustDate(*to))
 	fatalIf(err)
 
-	days := build(*cache, rule, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors)
+	days := build(*cache, rule, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors, tc)
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 
-	dims := []explore.Dimension{
-		// Liquidity is the size axis. Market cap was removed 2026-09-11: our data has
-		// no full-history source for it (LEDGER row 27 — large caps only before 2024).
-		explore.QuantileDimension("liquidity", *quantiles, func(o explore.Obs) float64 { return o.Turnover }),
-		explore.QuantileDimension("own volatility", *quantiles, func(o explore.Obs) float64 { return o.Vol }),
-		explore.QuantileDimension("price level", *quantiles, func(o explore.Obs) float64 { return o.Price }),
-		explore.CategoryDimension("sector", func(o explore.Obs) string { return o.Sector }),
-		explore.BooleanDimension("own trend", "above 200DMA", "below 200DMA", func(o explore.Obs) bool { return o.AboveSMA }),
-		explore.DayDimension("market breadth", explore.BreadthLabel, explore.BreadthOrder),
-		explore.DayDimension("year", func(d explore.Day) string { return fmt.Sprintf("%d", d.Date.Year()) }, nil),
-	}
+	dims := universalDims(*quantiles)
 
 	res := explore.Run(days, dims, rule.Name(), *horizon)
-	printResult(res, mcaps, sectors, false)
+	printResult(res, deviations(res, *horizon, *reps), *costBps, mcaps, sectors, false)
 }
 
-func printResult(res explore.Result, mcaps map[string][]store.MCapPoint, sectors map[string]string, event bool) {
+func printResult(res explore.Result, dev explore.Deviation, costBps float64, mcaps map[string][]store.MCapPoint, sectors map[string]string, event bool) {
 	fmt.Printf("EXPLORATION — %s, %d-day forward return, entries at the open after the decision close\n",
 		res.Rule, res.Horizon)
 	fmt.Printf("%d decision days, %d symbol-days, %d dimensions, %d buckets examined\n",
@@ -139,39 +138,62 @@ func printResult(res explore.Result, mcaps map[string][]store.MCapPoint, sectors
 	}
 	fmt.Println("'vol x' is how volatile the selected names are relative to their bucket — well")
 	fmt.Println("above 1.0 means the edge may be risk premium, not selection (LEDGER row 4).")
+	fmt.Println("'churn' is the share of the selected names replaced each holding period — what")
+	fmt.Printf("actually trades; 'net' is the edge after %.0f bps round trip on that churn.\n", costBps)
 	fmt.Println()
-	fmt.Println("NO BUCKET BELOW IS A RESULT. With this many buckets the best one is what noise")
-	fmt.Println("looks like. Read the halves and the years: an edge that lives in one of them is")
-	fmt.Println("the shape of LEDGER row 13's dead effect. Take a MECHANISM from here, then test")
-	fmt.Println("it where this command has not looked.")
+	if dev.Reps > 0 {
+		fmt.Println("'vs ctl' asks whether the rule does better or worse in a bucket than it would anyway.")
+		fmt.Println("A bucket of stocks is compared, day by day, with random groups of the SAME size drawn")
+		fmt.Println("from the names its dimension covered that day (a small bucket's top fifth is less")
+		fmt.Println("extreme, so comparing it with the whole universe would invent differences). A bucket")
+		fmt.Println("of days — year, breadth — is compared with the rule on all other days. The score is")
+		fmt.Println("that difference over its own standard error, from a block bootstrap")
+		fmt.Printf("(%d resamples, mean block %.0f trading days,\n", dev.Reps, dev.MeanBlock)
+		fmt.Println("so overlapping forward returns and slow-changing selections are not mistaken for")
+		fmt.Println("independent evidence). The same blocks are drawn for every bucket, so the threshold is")
+		fmt.Printf("family-wise: with no real differences, the largest score of all %d buckets exceeds %.1f\n", len(res.Buckets), dev.Threshold)
+		fmt.Println("in only 5% of resamples. ◆ marks a real bucket beyond it — worth writing a mechanism")
+		fmt.Println("down for; still not a result.")
+	} else {
+		fmt.Println("NO RESAMPLES (-reps 0): no bucket below can be told apart from luck.")
+	}
+	fmt.Println()
+	fmt.Println("Read the halves and the years too: an edge that lives in one of them is the shape")
+	fmt.Println("of LEDGER row 13's dead effect.")
 	fmt.Println()
 
-	o := res.Overall
-	pos, tot := o.YearsPositive()
 	second := "bottom"
 	if event {
 		second = "held"
 	}
+	cost := costBps / 1e4
 	header := func(first string) {
-		fmt.Printf("%-28s %6s %7s %8s %8s %8s %8s %6s %6s\n",
-			first, "names", "days", "edge", second, "1st half", "2nd half", "vol x", "yrs +")
+		fmt.Printf("  %-28s %6s %7s %8s %7s %8s %6s %8s %8s %8s %6s %6s\n",
+			first, "names", "days", "edge", "vs ctl", second, "churn", "net", "1st half", "2nd half", "vol x", "yrs +")
 	}
-	row := func(label string, b explore.Bucket) {
+	row := func(label string, b explore.Bucket, markable bool) {
 		p, t := b.YearsPositive()
-		secondVal := 100 * b.BottomEdge
-		format := "%-28s %6.0f %7d %7.3f%% %7.3f%% %7.3f%% %7.3f%% %6.2f %4d/%d\n"
-		if event {
-			secondVal = b.Held
-			format = "%-28s %6.0f %7d %7.3f%% %8.1f %7.3f%% %7.3f%% %6.2f %4d/%d\n"
+		mark, vsAll := "  ", "      ·"
+		if markable {
+			if z, ok := dev.Z[explore.BucketKey(b)]; ok {
+				vsAll = fmt.Sprintf("%+6.1f", z)
+				if math.Abs(z) > dev.Threshold {
+					mark = "◆ "
+				}
+			}
 		}
-		fmt.Printf(format, truncate(label, 28), b.Names, b.Days, 100*b.Edge, secondVal,
+		secondVal := fmt.Sprintf("%7.3f%%", 100*b.BottomEdge)
+		if event {
+			secondVal = fmt.Sprintf("%8.1f", b.Held)
+		}
+		net := b.Edge - b.Churn*cost
+		fmt.Printf("%s%-28s %6.0f %7d %7.3f%% %s %s %5.0f%% %7.3f%% %7.3f%% %7.3f%% %6.2f %4d/%d\n",
+			mark, truncate(label, 28), b.Names, b.Days, 100*b.Edge, vsAll, secondVal, 100*b.Churn, 100*net,
 			100*b.FirstHalf, 100*b.SecondHal, b.VolRatio, p, t)
 	}
 	header("unsliced yardstick")
-	row("whole universe", o)
+	row("whole universe", res.Overall, false)
 	fmt.Println()
-	_ = pos
-	_ = tot
 
 	byDim := map[string][]explore.Bucket{}
 	var order []string
@@ -191,12 +213,61 @@ func printResult(res explore.Result, mcaps map[string][]store.MCapPoint, sectors
 			if dim == "sector" {
 				label = fmt.Sprintf("%s %s", b.Label, sectorHint(b.Label, sectors, mcaps))
 			}
-			row(label, b)
+			row(label, b, true)
 		}
 		// Dispersion across a dimension says more than any single bucket: a
 		// rule whose edge is identical everywhere has no conditioning to find.
-		fmt.Printf("%-28s spread %.3f%% between the widest and narrowest bucket\n\n", "", 100*spread(bs))
+		fmt.Printf("  %-28s spread %.3f%% between the widest and narrowest bucket\n\n", "", 100*spread(bs))
 	}
+}
+
+// universalDims are the traits every slicing command cuts by — chosen by the
+// operator 2026-09-11 from LEDGER rows 27-28: one member of each duplicate
+// group (liquidity, own volatility), price, beta, delivery %, distance below
+// the 52-week high (in place of the binary 200-day trend flag), upper and
+// lower price-band hits, sector, and the two whole-day labels.
+func universalDims(q int) []explore.Dimension {
+	circuitEdges := []float64{0, 1, 3, 6}
+	circuitLabels := []string{"0", "1-2", "3-5", "6+"}
+	return []explore.Dimension{
+		explore.QuantileDimension("liquidity", q, func(o explore.Obs) float64 { return o.Turnover }),
+		explore.QuantileDimension("own volatility", q, func(o explore.Obs) float64 { return o.Vol }),
+		explore.QuantileDimension("price level", q, func(o explore.Obs) float64 { return o.Price }),
+		explore.RankDimension("beta", q, func(o explore.Obs) float64 { return o.Beta }),
+		explore.RankDimension("delivery %", q, func(o explore.Obs) float64 { return o.Delivery }),
+		explore.RankDimension("below 52w high", q, func(o explore.Obs) float64 { return o.Dist52 }),
+		explore.BinDimension("upper circuits (60d)", func(o explore.Obs) float64 { return o.UpCircuits }, circuitEdges, circuitLabels),
+		explore.BinDimension("lower circuits (60d)", func(o explore.Obs) float64 { return o.LoCircuits }, circuitEdges, circuitLabels),
+		explore.CategoryDimension("sector", func(o explore.Obs) string { return o.Sector }),
+		explore.DayDimension("market breadth", explore.BreadthLabel, explore.BreadthOrder),
+		explore.DayDimension("year", func(d explore.Day) string { return fmt.Sprintf("%d", d.Date.Year()) }, nil),
+	}
+}
+
+// confirmationStart is where exploration stops by default. Explore freely,
+// confirm elsewhere (docs/RESEARCH_PROTOCOL.md): everything from here on stays
+// unread so a mechanism found in the earlier years can be tested on years it
+// has never seen. Reading them here has to be asked for on the command line.
+var confirmationStart = time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func guardConfirmationYears(to time.Time, allowed bool) {
+	if !to.Before(confirmationStart) && !allowed {
+		fatal(fmt.Errorf("-to %s reaches into the confirmation years (%s onward), which exploration leaves unread; "+
+			"pass -include-confirmation-years to read them anyway, and say so in the ledger row",
+			to.Format("2006-01-02"), confirmationStart.Format("2006-01-02")))
+	}
+}
+
+// deviations scores every bucket against the whole universe. The mean block
+// is three holding periods: consecutive forward returns overlap for a whole
+// horizon, and a slow rule's selections persist for several.
+func deviations(res explore.Result, horizon, reps int) explore.Deviation {
+	if reps <= 0 {
+		return explore.Deviation{}
+	}
+	dev, err := explore.Deviations(res, evidence.Bootstrap{MeanBlock: float64(3 * horizon), Reps: reps, Seed: 1})
+	fatalIf(err)
+	return dev
 }
 
 func spread(bs []explore.Bucket) float64 {
@@ -251,7 +322,7 @@ func truncate(s string, n int) string {
 
 // build streams the bar cache and produces the daily cross-sections.
 func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
-	minTurnover float64, sectors map[string]string) []explore.Day {
+	minTurnover float64, sectors map[string]string, tc traits.Context) []explore.Day {
 
 	byDate := map[time.Time][]explore.Obs{}
 	var mu sync.Mutex
@@ -275,6 +346,7 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 		sma := core.SMA(prices, trendWin).Values
 		turnover := bars.MedianTurnover(ser.Bars, turnoverWin)
 		sector := sectors[ser.Symbol]
+		ta := tc.For(ser)
 
 		var local []struct {
 			d time.Time
@@ -297,13 +369,18 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 				d time.Time
 				o explore.Obs
 			}{d, explore.Obs{
-				Forecast: f,
-				FwdRet:   exit/entry - 1,
-				Turnover: turnover[i],
-				Vol:      vol.Values[i] / closes[i],
-				Price:    closes[i],
-				Sector:   sector,
-				AboveSMA: closes[i] > sma[i],
+				Forecast:   f,
+				FwdRet:     exit/entry - 1,
+				Turnover:   turnover[i],
+				Vol:        vol.Values[i] / closes[i],
+				Price:      closes[i],
+				Sector:     sector,
+				AboveSMA:   closes[i] > sma[i],
+				Beta:       ta.Beta[i],
+				Delivery:   ta.Delivery[i],
+				Dist52:     ta.Dist52[i],
+				UpCircuits: ta.UpCircuits[i],
+				LoCircuits: ta.LoCircuits[i],
 			}})
 		}
 		if len(local) == 0 {

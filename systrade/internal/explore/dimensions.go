@@ -13,6 +13,17 @@ import (
 // 2015 than it does now". Observations whose value is missing are left out of
 // this dimension rather than lumped into a bucket.
 func QuantileDimension(name string, k int, value func(Obs) float64) Dimension {
+	return quantileDimension(name, k, value, func(v float64) bool { return v > 0 })
+}
+
+// RankDimension is QuantileDimension for a signed attribute — beta, distance
+// below a high — where zero and negative values are real values, not missing
+// ones. Only NaN is left out.
+func RankDimension(name string, k int, value func(Obs) float64) Dimension {
+	return quantileDimension(name, k, value, func(v float64) bool { return !math.IsNaN(v) })
+}
+
+func quantileDimension(name string, k int, value func(Obs) float64, keep func(float64) bool) Dimension {
 	labels := make([]string, k)
 	for i := range labels {
 		labels[i] = quantileLabel(i, k)
@@ -24,8 +35,7 @@ func QuantileDimension(name string, k int, value func(Obs) float64) Dimension {
 			out := make([]string, len(d.Obs))
 			idx := make([]int, 0, len(d.Obs))
 			for i, o := range d.Obs {
-				v := value(o)
-				if math.IsNaN(v) || v <= 0 {
+				if v := value(o); math.IsNaN(v) || !keep(v) {
 					continue
 				}
 				idx = append(idx, i)
@@ -96,7 +106,7 @@ func BooleanDimension(name, yes, no string, pred func(Obs) bool) Dimension {
 // bucket to itself.
 func DayDimension(name string, label func(d Day) string, order []string) Dimension {
 	return Dimension{
-		Name: name, Order: order,
+		Name: name, Order: order, Daily: true,
 		Assign: func(d Day) []string {
 			l := label(d)
 			out := make([]string, len(d.Obs))
@@ -139,4 +149,31 @@ func BreadthLabel(d Day) string {
 var BreadthOrder = []string{
 	"breadth <20% (washout)", "breadth 20-40%", "breadth 40-60%",
 	"breadth 60-80%", "breadth >80% (broad rally)",
+}
+
+// BinDimension buckets a count by fixed edges rather than by rank — for an
+// attribute most names share one value of (most stocks hit no price band in a
+// quarter), where rank buckets would split identical names by tie order.
+// edges[i] is bucket i's lower bound, ascending; values below edges[0] and
+// NaN are left out.
+func BinDimension(name string, value func(Obs) float64, edges []float64, labels []string) Dimension {
+	return Dimension{
+		Name: name, Order: labels,
+		Assign: func(d Day) []string {
+			out := make([]string, len(d.Obs))
+			for i, o := range d.Obs {
+				v := value(o)
+				if math.IsNaN(v) {
+					continue
+				}
+				for j := len(edges) - 1; j >= 0; j-- {
+					if v >= edges[j] {
+						out[i] = labels[j]
+						break
+					}
+				}
+			}
+			return out
+		},
+	}
 }

@@ -116,3 +116,48 @@ func TestCountOverATrailingWindow(t *testing.T) {
 		t.Error("a window reaching before the series start must not count as zero hits")
 	}
 }
+
+func TestRollingFormsMatchTheirPointForms(t *testing.T) {
+	rng := rand.New(rand.NewSource(8))
+	n := 700
+	mkt, ret, high, close, x, hits := make([]float64, n), make([]float64, n), make([]float64, n), make([]float64, n), make([]float64, n), make([]float64, n)
+	p := 100.0
+	for i := 0; i < n; i++ {
+		mkt[i] = rng.NormFloat64() * 0.01
+		ret[i] = 0.8*mkt[i] + rng.NormFloat64()*0.015
+		if i%37 == 0 {
+			ret[i], mkt[i] = math.NaN(), math.NaN() // gaps must be skipped identically
+		}
+		p *= 1 + rng.NormFloat64()*0.02
+		close[i], high[i] = p, p*(1+rng.Float64()*0.02)
+		x[i] = rng.Float64() * 100
+		if i%11 == 0 {
+			x[i] = math.NaN()
+		}
+		hits[i] = float64(rng.Intn(3) - 1)
+	}
+	rb, ri := RollingBetaIdio(ret, mkt, 252, 200)
+	dh := RollingDistFromHigh(high, close, 252)
+	md := RollingMedian(x, 20, 15)
+	up := RollingCount(hits, 1, 60)
+	for i := 0; i < n; i++ {
+		b, idio, ok := BetaIdio(ret, mkt, i, 252, 200)
+		if !ok {
+			if !math.IsNaN(rb[i]) {
+				t.Fatalf("i=%d: rolling beta %v where the point form has none", i, rb[i])
+			}
+		} else {
+			near(t, "beta", rb[i], b, 1e-9)
+			near(t, "idio", ri[i], idio, 1e-9)
+		}
+		if want := DistFromHigh(high, close, i, 252); !(math.IsNaN(want) && math.IsNaN(dh[i])) {
+			near(t, "dist from high", dh[i], want, 1e-12)
+		}
+		if want := Median(x, i, 20, 15); !(math.IsNaN(want) && math.IsNaN(md[i])) {
+			near(t, "median", md[i], want, 0)
+		}
+		if want := Count(hits, 1, i, 60); !(math.IsNaN(want) && math.IsNaN(up[i])) {
+			near(t, "count", up[i], want, 0)
+		}
+	}
+}

@@ -313,11 +313,18 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
 - [x] Price-band hits revived in stockey (`nseindia_circuit_hit`, 2013+,
       756k rows) the same way as delivery % — `scripts/restore_retired_table.py`
       now restores either table
-- [ ] Slicer upgrade, step 2: the chosen trait set, a noise floor (the same
-      slicing on a random score, so the best fake bucket is printed beside
-      the real ones), a cost column per bucket, exploration on early years
-      only with the later years held for confirmation, and two-trait grids
-      only for pairs named in advance
+- [x] Slicer upgrade, step 2 (LEDGER row 29): the operator's trait set in
+      `slice explore` and `slice coi` (`internal/traits` shared with
+      `cmd/traits`, rolling forms tested against point forms); churn and
+      net-of-cost edge per bucket; exploration stops at 2021-12-31 unless
+      `-include-confirmation-years`; and a family-wise 'vs ctl' score —
+      each bucket of stocks against random same-size groups from the same
+      day, each bucket of days against all other days, block-bootstrapped.
+      Two earlier designs (a random-score noise floor; a whole-universe
+      comparison) were each caught by a synthetic calibration test and
+      replaced; the shipped one flags 3 of 30 uniform-effect datasets
+- [ ] Two-trait grids, only for pairs named in advance (the last piece of
+      step 2, not yet built)
 - [ ] **Next research: the low-volatility anomaly.** A published, price-only
       premium (low-volatility / betting-against-beta, documented in Indian
       equities) that should correlate little with momentum — a second

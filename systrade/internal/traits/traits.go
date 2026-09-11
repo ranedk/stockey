@@ -27,6 +27,8 @@ package traits
 import (
 	"math"
 	"sort"
+
+	"github.com/ranedk/systrader/internal/evidence"
 )
 
 // BetaIdio regresses a stock's returns on the market's over the window
@@ -139,59 +141,7 @@ func Median(x []float64, end, window, minValid int) float64 {
 
 // Spearman is the rank correlation of paired values, pairs with a NaN on
 // either side dropped, ties given their average rank.
-func Spearman(a, b []float64) float64 {
-	var x, y []float64
-	for i := range a {
-		if math.IsNaN(a[i]) || math.IsNaN(b[i]) {
-			continue
-		}
-		x = append(x, a[i])
-		y = append(y, b[i])
-	}
-	if len(x) < 3 {
-		return math.NaN()
-	}
-	rx, ry := ranks(x), ranks(y)
-	var mx, my float64
-	for i := range rx {
-		mx += rx[i]
-		my += ry[i]
-	}
-	mx /= float64(len(rx))
-	my /= float64(len(ry))
-	var sxy, sxx, syy float64
-	for i := range rx {
-		dx, dy := rx[i]-mx, ry[i]-my
-		sxy += dx * dy
-		sxx += dx * dx
-		syy += dy * dy
-	}
-	if sxx == 0 || syy == 0 {
-		return math.NaN()
-	}
-	return sxy / math.Sqrt(sxx*syy)
-}
-
-func ranks(x []float64) []float64 {
-	idx := make([]int, len(x))
-	for i := range idx {
-		idx[i] = i
-	}
-	sort.Slice(idx, func(a, b int) bool { return x[idx[a]] < x[idx[b]] })
-	r := make([]float64, len(x))
-	for i := 0; i < len(idx); {
-		j := i
-		for j+1 < len(idx) && x[idx[j+1]] == x[idx[i]] {
-			j++
-		}
-		avg := float64(i+j)/2 + 1
-		for k := i; k <= j; k++ {
-			r[idx[k]] = avg
-		}
-		i = j + 1
-	}
-	return r
-}
+func Spearman(a, b []float64) float64 { return evidence.RankCorrelation(a, b) }
 
 // Row is one stock on one sample date: its trait values (NaN = missing) and
 // whether it stops trading within the following year.

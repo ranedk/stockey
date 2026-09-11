@@ -14,6 +14,7 @@ import (
 	"github.com/ranedk/systrader/internal/explore"
 	"github.com/ranedk/systrader/internal/patterns/coi"
 	"github.com/ranedk/systrader/internal/store"
+	"github.com/ranedk/systrader/internal/traits"
 )
 
 // The COI pattern, re-examined with the slicing method.
@@ -54,10 +55,14 @@ func runCOI(args []string) {
 	cache := fs.String("cache", defaultCache, "bar cache file")
 	horizon := fs.Int("horizon", 20, "forward holding period in trading days")
 	from := fs.String("from", "2013-07-01", "first decision date")
-	to := fs.String("to", "2026-06-30", "last decision date")
+	to := fs.String("to", "2021-12-31", "last decision date — exploration stops before the confirmation years (see -include-confirmation-years)")
 	minTurnover := fs.Float64("min-turnover", 1e7, "minimum 60-bar median traded value in INR")
 	quantiles := fs.Int("quantiles", 5, "buckets per continuous dimension")
+	costBps := fs.Float64("cost-bps", 50, "round-trip cost charged on each bucket's churn")
+	reps := fs.Int("reps", 1000, "block-bootstrap resamples for each bucket's 'vs ctl' score (0 = skip)")
+	readConfirm := fs.Bool("include-confirmation-years", false, "let -to reach 2022 onward, the years kept unread for confirmation")
 	fatalIf(fs.Parse(args))
+	guardConfirmationYears(mustDate(*to), *readConfirm)
 
 	ctx := context.Background()
 	st, err := store.Open(ctx)
@@ -65,10 +70,12 @@ func runCOI(args []string) {
 	defer st.Close()
 	sectors, err := st.SectorCodes(ctx)
 	fatalIf(err)
-	mcaps, err := st.MarketCaps(ctx)
+	mcaps, err := st.MarketCaps(ctx) // names sector buckets only; not a slicing trait
+	fatalIf(err)
+	tc, err := traits.LoadContext(ctx, st, *cache, *minTurnover, mustDate(*from), mustDate(*to))
 	fatalIf(err)
 
-	days := buildCOI(*cache, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors)
+	days := buildCOI(*cache, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors, tc)
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 
 	dims := []explore.Dimension{
@@ -90,16 +97,9 @@ func runCOI(args []string) {
 			func(o explore.Obs) float64 { return o.Extra[xBandWidth] }),
 		explore.QuantileDimension("drop from 120-bar high", *quantiles,
 			func(o explore.Obs) float64 { return o.Extra[xDropFromHigh] }),
-		// The universal dimensions, identical to `slice explore`.
-		explore.QuantileDimension("liquidity", *quantiles, func(o explore.Obs) float64 { return o.Turnover }),
-		explore.QuantileDimension("own volatility", *quantiles, func(o explore.Obs) float64 { return o.Vol }),
-		explore.QuantileDimension("price level", *quantiles, func(o explore.Obs) float64 { return o.Price }),
-		explore.CategoryDimension("sector", func(o explore.Obs) string { return o.Sector }),
-		explore.BooleanDimension("own trend", "above 200DMA", "below 200DMA",
-			func(o explore.Obs) bool { return o.AboveSMA }),
-		explore.DayDimension("market breadth", explore.BreadthLabel, explore.BreadthOrder),
-		explore.DayDimension("year", func(d explore.Day) string { return fmt.Sprintf("%d", d.Date.Year()) }, nil),
 	}
+	// The universal dimensions, identical to `slice explore`.
+	dims = append(dims, universalDims(*quantiles)...)
 
 	res := explore.RunEvent(days, dims, "COI (full variant)", *horizon)
 	fmt.Println("EXPLORATION — the COI pattern, sliced. LEDGER rows 11-13 already rejected it;")
@@ -109,7 +109,7 @@ func runCOI(args []string) {
 	fmt.Println("the ones that fired, so each bucket holds the pattern's setups AND every other")
 	fmt.Println("name in the same indicator state that day. 'edge' is what the pattern added")
 	fmt.Println("over them; 'held' is how many setups fired per bucket-day.")
-	printResult(res, mcaps, sectors, true)
+	printResult(res, deviations(res, *horizon, *reps), *costBps, mcaps, sectors, true)
 }
 
 // shift moves a signed quantity away from zero so QuantileDimension, which
@@ -123,7 +123,7 @@ func shift(v float64) float64 {
 }
 
 func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64,
-	sectors map[string]string) []explore.Day {
+	sectors map[string]string, tc traits.Context) []explore.Day {
 
 	byDate := map[time.Time][]explore.Obs{}
 	var mu sync.Mutex
@@ -154,6 +154,7 @@ func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64
 		sma := core.SMA(prices, trendWin).Values
 		turnover := bars.MedianTurnover(ser.Bars, turnoverWin)
 		sector := sectors[ser.Symbol]
+		ta := tc.For(ser)
 
 		var local []struct {
 			d time.Time
@@ -191,14 +192,19 @@ func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64
 				d time.Time
 				o explore.Obs
 			}{d, explore.Obs{
-				FwdRet:   exit/entry - 1,
-				Selected: confirmDay[i],
-				Turnover: turnover[i],
-				Vol:      vol.Values[i] / closes[i],
-				Price:    closes[i],
-				Sector:   sector,
-				AboveSMA: closes[i] > sma[i],
-				Extra:    extra,
+				FwdRet:     exit/entry - 1,
+				Selected:   confirmDay[i],
+				Turnover:   turnover[i],
+				Vol:        vol.Values[i] / closes[i],
+				Price:      closes[i],
+				Sector:     sector,
+				AboveSMA:   closes[i] > sma[i],
+				Beta:       ta.Beta[i],
+				Delivery:   ta.Delivery[i],
+				Dist52:     ta.Dist52[i],
+				UpCircuits: ta.UpCircuits[i],
+				LoCircuits: ta.LoCircuits[i],
+				Extra:      extra,
 			}})
 		}
 		if len(local) == 0 {
