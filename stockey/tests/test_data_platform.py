@@ -22215,3 +22215,107 @@ def test_run_watchlist_exit_evaluation_falls_back_to_stored_price_when_live_look
     result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
 
     assert result["price_flagged"] == 1  # 100 -> 200 is +100%, still flagged using the stored fallback
+
+
+def test_bhavcopy_parser_mto_dat_delivery(monkeypatch, tmp_path):
+    # NSE ships delivery as MTO_<ddmmyyyy>.DAT with 4 preamble lines, "20,..." security rows, and a
+    # "90,..." grand-total trailer. The parser must read the .DAT layout and drop the trailer.
+    captured: dict[str, object] = {}
+    path = tmp_path / "MTO_02012018.DAT"
+    path.write_text(
+        "Security Wise Delivery Position - Compulsory Rolling Settlement\n"
+        "10,MTO,02012018,723652832,0002021\n"
+        "Trade Date <02-JAN-2018>,Settlement Type <N>\n"
+        "Record Type,Sr No,Name of Security,Series,Quantity Traded,Deliverable Quantity,Percentage\n"
+        "20,1,RELIANCE,EQ,1000,600,60.00\n"
+        "20,2,TCS,EQ,500,250,50.00\n"
+        "90,MTO,02012018,1500,850\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
+
+    frame = bhavcopy_parser.parse_mto(str(path))
+
+    assert captured["table"] == "nseindia_mto"
+    assert set(frame["symbol"]) == {"RELIANCE", "TCS"}          # the "90" trailer row is dropped
+    reliance = frame[frame["symbol"] == "RELIANCE"].iloc[0]
+    assert int(reliance["deliverable_volume"]) == 600
+    assert abs(float(reliance["deliverable_percent"]) - 60.0) < 1e-9
+    assert reliance["date"] == pd.Timestamp("2018-01-02")
+
+def test_restored_mto_archive_rows_match_the_live_parser(monkeypatch, tmp_path):
+    # Rows restored from the 2026-08-15 retirement archive must be indistinguishable from rows parse_mto
+    # writes today -- same columns, same dtypes, same values -- or the revived table has two populations.
+    import gzip
+    from scripts import restore_retired_table as restore
+
+    path = tmp_path / "MTO_03082026.DAT"
+    path.write_text(
+        "Security Wise Delivery Position - Compulsory Rolling Settlement\n"
+        "10,MTO,03082026,1,1\n"
+        "Trade Date <03-AUG-2026>,Settlement Type <N>\n"
+        "Record Type,Sr No,Name of Security,Series,Quantity Traded,Deliverable Quantity,Percentage\n"
+        "20,1,RELIANCE,EQ,1000,600,60.00\n"
+        "20,2,TCS,EQ,500,250,50.00\n"
+        "90,MTO,03082026,1500,850\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: None)
+    live = bhavcopy_parser.parse_mto(str(path)).reset_index(drop=True)
+
+    archived = (
+        "record_type,sr_no,symbol,series,volume,deliverable_volume,deliverable_percent,date,company_master_id\n"
+        "20,1,RELIANCE,EQ,1000,600,60.0,2026-08-03 00:00:00+00,\n"
+        "20,2,TCS,EQ,500,250,50.0,2026-08-03 00:00:00+00,\n"
+    )
+    restored = restore.frame_from_archive("nseindia_mto", gzip.compress(archived.encode())).reset_index(drop=True)
+
+    assert list(restored.columns) == list(live.columns)
+    assert dict(restored.dtypes.astype(str)) == dict(live.dtypes.astype(str))
+    pd.testing.assert_frame_equal(restored, live)
+
+
+def test_bhavcopy_parser_records_circuit_hit_date_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    path = tmp_path / "bh01012026.csv"
+    path.write_text("SYMBOL,SERIES,IGNORED,CIRCUIT\nABC,EQ,x,UPPER\n", encoding="utf-8")
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda *_args, **_kwargs: None)
+
+    frame = bhavcopy_parser.parse_circuit_hit(str(path))
+
+    assert frame["date"].iloc[0] == pd.Timestamp("2026-01-01")
+    assert events[0]["fallback_type"] == "nse_bhavcopy_circuit_hit_date_fallback"
+    assert events[0]["metadata"]["fallback_format"] == "bh%d%m%Y.csv"
+
+
+def test_restored_circuit_hit_archive_rows_match_the_live_parser(monkeypatch, tmp_path):
+    # Same guarantee as for delivery: restored band-hit rows must be indistinguishable from the rows
+    # parse_circuit_hit writes today.
+    import gzip
+    from scripts import restore_retired_table as restore
+
+    path = tmp_path / "bh030826.csv"
+    path.write_text(
+        "SYMBOL,SERIES,SECURITY,HIGH/LOW,INDEX FLAG\n"
+        "ABC,EQ,Abc Limited,H,N\n"
+        "XYZ,BE,Xyz Limited,L,N\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda *_args, **_kwargs: None)
+    live = bhavcopy_parser.parse_circuit_hit(str(path)).reset_index(drop=True)
+
+    archived = (
+        "symbol,series,circuit_hit,date,company_master_id\n"
+        "ABC,EQ,H,2026-08-03 00:00:00+00,nse:ABC\n"
+        "XYZ,BE,L,2026-08-03 00:00:00+00,\n"
+    )
+    restored = restore.frame_from_archive("nseindia_circuit_hit", gzip.compress(archived.encode())).reset_index(drop=True)
+
+    assert list(restored.columns) == list(live.columns)
+    assert dict(restored.dtypes.astype(str)) == dict(live.dtypes.astype(str))
+    pd.testing.assert_frame_equal(restored, live)

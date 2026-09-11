@@ -389,6 +389,80 @@ def parse_mcap(path):
     return df
 
 
+def parse_mto(path):
+    # Delivery position (MTO_<ddmmyyyy>.DAT): retired 2026-08-15 as write-only, revived 2026-09-11 --
+    # systrader reads delivery % as a slicing trait (speculative vs investor volume).
+    emit("Processing MTO")
+    parts = path.split("_")[-1].split(".")[0]
+    for_date = pd.to_datetime(parts, format="%d%m%Y")
+    # header=None: the 4 skipped lines are preamble (title / "10,MTO" / trade-date / column-name row); the
+    # first "20,..." security row must be read as DATA, not consumed as the header (that silently dropped
+    # the first stock's delivery every day). Columns are assigned explicitly below.
+    df = pd.read_csv(path, skiprows=4, header=None)
+    df = df.reset_index(drop=True)
+    df.columns = [
+        "record_type",
+        "sr_no",
+        "symbol",
+        "series",
+        "volume",
+        "deliverable_volume",
+        "deliverable_percent",
+    ][: df.shape[1]]
+    df["date"] = for_date
+    # keep only security rows (record_type == 20); drop the "90,..." grand-total trailer if present.
+    df = df[df["record_type"].astype(str).str.strip() == "20"]
+    for c in ["volume", "deliverable_volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    df["deliverable_percent"] = pd.to_numeric(
+        df["deliverable_percent"], errors="coerce"
+    )
+    df["symbol"] = df["symbol"].astype(str).str.strip()
+    df["series"] = df["series"].astype(str).str.strip()
+    # sr_no is text: the "90,MTO,..." trailer puts a word in this column, so pandas reads it as text on a
+    # day with a trailer and as integers on a day without one -- pin it so the column type never flips.
+    df["sr_no"] = df["sr_no"].astype(str).str.strip()
+    unique_keys = ["date", "symbol"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
+    upsert_to_db(df, "nseindia_mto", unique_keys=unique_keys)
+    return df
+
+
+def parse_circuit_hit(path):
+    # Price-band hits (bh<ddmmyy>.csv in the PR zip): which stocks hit their upper (H) or lower (L) band.
+    # Retired 2026-08-15 as write-only, revived 2026-09-11 -- systrader reads it as a slicing trait.
+    emit("Processing Circuit Hit")
+    parts = os.path.basename(path)
+    try:
+        for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
+    except ValueError as exc: # Format issue
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=str(path),
+            fallback_type="nse_bhavcopy_circuit_hit_date_fallback",
+            severity="info",
+            reason="Circuit-hit file date did not match short-year format; trying long-year fallback parser.",
+            deterministic_fallback=True,
+            error=exc,
+            metadata={"path": str(path), "filename": parts, "fallback_format": "bh%d%m%Y.csv"},
+        )
+        for_date = pd.to_datetime(parts, format="bh%d%m%Y.csv")
+
+    df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
+    df.columns = ["symbol", "series", "circuit_hit"]
+    df["date"] = for_date
+    unique_keys = ["date", "symbol", "series", "circuit_hit"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
+    upsert_to_db(
+        df,
+        "nseindia_circuit_hit",
+        unique_keys=unique_keys,
+    )
+    return df
+
+
 def parse_corporate_actions_bc(path):
     emit("Processing Corporate Actions BC")
     cols = [
@@ -686,9 +760,21 @@ def unzip_and_process(zip_path):
                 for file_path in bc_files:
                     _run("corporate_actions_bc", file_path, parse_corporate_actions_bc)
 
+                # Price-band hits (bh<ddmmyy>.csv) -- revived 2026-09-11 with parse_circuit_hit.
+                bh_files = _ci_glob(nested_tmpdir, "bh")
+                for file_path in bh_files:
+                    _run("circuit_hit", file_path, parse_circuit_hit)
+
                 mcap_files = _ci_glob(nested_tmpdir, "mcap")
                 for file_path in mcap_files:
                     _run("mcap", file_path, parse_mcap)
+
+        # NSE ships the security-wise delivery report as MTO_<ddmmyyyy>.DAT (not .CSV) at the top level of
+        # the day's archive; the .CSV glob is kept for any older layout.
+        mto_files = glob.glob(os.path.join(tmpdir, "**", "MTO_*.DAT"), recursive=True)
+        mto_files += glob.glob(os.path.join(tmpdir, "**", "MTO_*.CSV"), recursive=True)
+        for file_path in mto_files:
+            _run("mto", file_path, parse_mto)
 
         if failures:
             emit(f"⚠️ Completed bhavcopy zip with {len(failures)} file-level failure(s): {zip_path}")

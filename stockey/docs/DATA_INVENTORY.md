@@ -12,7 +12,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 
 | Source | Modules (`data/…`) | Tables |
 |---|---|---|
-| NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap` |
+| NSE bhavcopy | `nseindia/bhavcopy_{downloader,history,parser}` | `nseindia_ohlcv`, `nseindia_mcap`, `nseindia_mto` (security-wise delivery position) and `nseindia_circuit_hit` (price-band hits), both from the same daily zip, both revived 2026-09-11 and read by systrader as slicing traits |
 | NSE corporate actions | `nseindia/corporate_action_events`, `nseindia/adjusted_prices` | `nseindia_corporate_actions_bc_raw`, `nseindia_corporate_actions_normalized`, `events_dividend`, `events_capital_change` |
 | Price adjustment | `data/nseindia/price_adjustment.py` | `nseindia_adjustment_factors` (written); `advisory_adjusted_ohlcv_daily` is a VIEW over it × `nseindia_ohlcv` (systrader's PRIMARY series, not a written table) |
 | BSE bhavcopy (BSE-only companies) | `data/bseindia/bhavcopy.py` | `bseindia_ohlcv` — one market-wide file/day, closes a fundamentals-screener gap (43 active L1-universe companies with no NSE listing had zero price/technicals coverage, confirmed live 2026-08-15); not systrader's PRIMARY series (that stays NSE-only) |
@@ -63,6 +63,18 @@ retired:
   parser.py` parsers for all seven deleted along with the dispatch that fed
   them; `nseindia_var1`'s only-ever consumer was `advisory/event_evidence_
   store.py`, deleted in the pure-TA cut, orphaning it.
+  **`nseindia_mto` REVIVED 2026-09-11**: systrader reads delivery % as a
+  slicing trait (speculative vs investor volume). `parse_mto` and its dispatch
+  restored from git as they stood at retirement (the `.DAT` layout and the
+  first-row/trailer fixes intact, plus `sr_no` pinned to text so the column
+  type never flips on a day without a trailer); history reloaded from this
+  archive by `scripts/restore_retired_table.py`, days after it by the parser's
+  `--force` backfill. No new cron job: it rides the existing bhavcopy parse.
+  **`nseindia_circuit_hit` REVIVED 2026-09-11** the same way and for the same
+  reason (which stocks hit their upper or lower price band — retail frenzy and
+  forced selling): `parse_circuit_hit` and its PR-zip dispatch restored from
+  git, history from this archive by `scripts/restore_retired_table.py`, days
+  after it by `--force`.
 - `nseindia_short_selling`, `nseindia_block_deals`, `nseindia_bulk_deals` —
   the whole `data/nseindia/offmarket.py`/`offmarket_parser.py` collector
   deleted (it was also independently broken: NSE download-trigger timeouts
