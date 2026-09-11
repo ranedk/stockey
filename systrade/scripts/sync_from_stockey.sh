@@ -56,6 +56,8 @@ FULL_TABLES=(
 INCR_TABLES=(               # incremental on the "date" column + reconciliation
   dhan_ohlcv_daily          # 2015+, ~2400 stocks (unadjusted)
   nseindia_ohlcv            # raw NSE bhavcopy feed
+  nseindia_mto              # delivery position (delivery %), 2013+ — trait library, revived 2026-09-11
+  nseindia_circuit_hit      # price-band hits, 2013+ — trait library, revived 2026-09-11
   nseindia_indices          # index OHLCV + PE/PB/divyield (carry inputs)
   advisory_adjusted_ohlcv_daily  # ADJUSTED closes 2013+, incl. delisted — primary backtest series.
                                   # A view on the source side since 2026-08-14 (was a written table);
