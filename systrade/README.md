@@ -299,5 +299,31 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       costs); record from 2026-09-10 beside trend-quintile, which it does not
       replace. `cmd/paper -strategy`, specs registered in `paper.Specs`, the
       screener lists it on its own
+- [x] Delivery % revived in stockey (`nseindia_mto`, 2013+, 6.0M rows):
+      the retired parser restored from git, history reloaded from its S3
+      archive, days since by the parser's own backfill; no new cron job
+- [x] Trait library, step 1 (LEDGER rows 27-28, `cmd/traits`): traits
+      judged WITHOUT forward returns — random gaps, 20-day persistence,
+      overlap. Two duplicate groups; beta, 52-week-high distance, delivery %
+      and upper/lower price-band hits are new and distinct. Market cap
+      REMOVED from the slicer: it covered 8.8% of stock-dates, and no
+      full-history source exists in our data (NSE's market-cap file starts
+      2024-02-01). Liquidity is the size axis. Rest of the trait set pending
+      the operator
+- [x] Price-band hits revived in stockey (`nseindia_circuit_hit`, 2013+,
+      756k rows) the same way as delivery % — `scripts/restore_retired_table.py`
+      now restores either table
+- [ ] Slicer upgrade, step 2: the chosen trait set, a noise floor (the same
+      slicing on a random score, so the best fake bucket is printed beside
+      the real ones), a cost column per bucket, exploration on early years
+      only with the later years held for confirmation, and two-trait grids
+      only for pairs named in advance
+- [ ] **Next research: the low-volatility anomaly.** A published, price-only
+      premium (low-volatility / betting-against-beta, documented in Indian
+      equities) that should correlate little with momentum — a second
+      strategy, not another version of the first. Take the published
+      definition as-is, pre-register it, slice only for tradability (costs,
+      liquidity, capacity), never for score, and expect roughly half the
+      published return
 - [ ] Instrument universe finalization (blocked on capital, A1)
 - [ ] Live execution via Dhan orders API (after, and only after, paper data)

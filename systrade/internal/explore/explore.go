@@ -53,9 +53,8 @@ type Obs struct {
 	Turnover float64 // 60-bar median traded value
 	Vol      float64 // trailing realized volatility
 	Price    float64
-	Mcap     float64 // latest reported market cap on or before this date, 0 if unknown
-	Sector   string  // static attribute, "" if unknown
-	AboveSMA bool    // the symbol's own 200-day trend state
+	Sector   string // static attribute, "" if unknown
+	AboveSMA bool   // the symbol's own 200-day trend state
 	// Extra carries caller-defined attributes — the indicator state a
 	// specific screener cares about, computed for EVERY name rather than only
 	// the ones that fired, so a slice on "names touching the lower band" holds

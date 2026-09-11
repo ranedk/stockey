@@ -68,7 +68,7 @@ func runCOI(args []string) {
 	mcaps, err := st.MarketCaps(ctx)
 	fatalIf(err)
 
-	days := buildCOI(*cache, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors, mcaps)
+	days := buildCOI(*cache, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors)
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 
 	dims := []explore.Dimension{
@@ -92,7 +92,6 @@ func runCOI(args []string) {
 			func(o explore.Obs) float64 { return o.Extra[xDropFromHigh] }),
 		// The universal dimensions, identical to `slice explore`.
 		explore.QuantileDimension("liquidity", *quantiles, func(o explore.Obs) float64 { return o.Turnover }),
-		explore.QuantileDimension("size (mcap)", *quantiles, func(o explore.Obs) float64 { return o.Mcap }),
 		explore.QuantileDimension("own volatility", *quantiles, func(o explore.Obs) float64 { return o.Vol }),
 		explore.QuantileDimension("price level", *quantiles, func(o explore.Obs) float64 { return o.Price }),
 		explore.CategoryDimension("sector", func(o explore.Obs) string { return o.Sector }),
@@ -124,7 +123,7 @@ func shift(v float64) float64 {
 }
 
 func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64,
-	sectors map[string]string, mcaps map[string][]store.MCapPoint) []explore.Day {
+	sectors map[string]string) []explore.Day {
 
 	byDate := map[time.Time][]explore.Obs{}
 	var mu sync.Mutex
@@ -154,7 +153,6 @@ func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64
 		vol := core.PriceUnitVol(prices, volSpan, volMin)
 		sma := core.SMA(prices, trendWin).Values
 		turnover := bars.MedianTurnover(ser.Bars, turnoverWin)
-		mc := mcaps[ser.Symbol]
 		sector := sectors[ser.Symbol]
 
 		var local []struct {
@@ -198,7 +196,6 @@ func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64
 				Turnover: turnover[i],
 				Vol:      vol.Values[i] / closes[i],
 				Price:    closes[i],
-				Mcap:     mcapAt(mc, d),
 				Sector:   sector,
 				AboveSMA: closes[i] > sma[i],
 				Extra:    extra,

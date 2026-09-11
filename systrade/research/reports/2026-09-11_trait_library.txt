@@ -1,0 +1,47 @@
+# Trait library, returns-free characterisation (LEDGER row 27, trials=0) — generated 2026-09-11T09:08Z by `traits` (defaults).
+# No forward returns read. Delivery % from nseindia_mto, revived in stockey 2026-09-11.
+
+TRAIT LIBRARY — returns-free characterisation (LEDGER row 27, trials=0)
+NSE adjusted EQ, Rs 1 cr floor, 149 sample dates every 20 trading days, 2014-07-01..2026-06-19
+131283 stock-dates, 881 names per date; 3250 stock-dates (2.5%) are names that stop trading within a year
+
+  + = new candidate
+  trait               coverage missing: stop trading / rest  persists 20d
+  liquidity             100.0%           0.0% /   0.0%         0.98
+  market cap              8.8%          98.4% /  91.0%         0.99
+  own volatility        100.0%           0.0% /   0.0%         0.80
+  price                 100.0%           0.0% /   0.0%         1.00
+  own trend (0/1)        95.4%           3.7% /   4.6%         0.65
++ beta                   93.4%           5.4% /   6.6%         0.98
++ idio volatility        93.4%           5.4% /   6.6%         0.98
++ dist 52w high          93.4%           5.4% /   6.6%         0.82
++ illiquidity           100.0%           0.0% /   0.0%         0.99
++ trade size            100.0%           0.0% /   0.0%         0.98
++ delivery %             98.4%           2.2% /   1.6%         0.84
+
+overlap: mean cross-sectional rank correlation
+                        liq   mcap    vol  price  trend   beta   ivol   52wh   amih   trsz  deliv
+  liquidity               ·   0.64  -0.17   0.26   0.07  -0.08  -0.27   0.20  -0.95   0.79  -0.41
+  market cap           0.64      ·  -0.41   0.39   0.05  -0.33  -0.50   0.25  -0.70   0.60  -0.13
+  own volatility      -0.17  -0.41      ·  -0.37   0.00   0.60   0.76  -0.35   0.35  -0.28  -0.31
+  price                0.26   0.39  -0.37      ·   0.14  -0.46  -0.36   0.34  -0.33   0.41   0.07
+  own trend (0/1)      0.07   0.05   0.00   0.14      ·  -0.06   0.03   0.62  -0.04   0.14  -0.03
+  beta                -0.08  -0.33   0.60  -0.46  -0.06      ·   0.58  -0.34   0.20  -0.20  -0.41
+  idio volatility     -0.27  -0.50   0.76  -0.36   0.03   0.58      ·  -0.33   0.43  -0.34  -0.21
+  dist 52w high        0.20   0.25  -0.35   0.34   0.62  -0.34  -0.33      ·  -0.24   0.30   0.07
+  illiquidity         -0.95  -0.70   0.35  -0.33  -0.04   0.20   0.43  -0.24      ·  -0.80   0.33
+  trade size           0.79   0.60  -0.28   0.41   0.14  -0.20  -0.34   0.30  -0.80      ·  -0.25
+  delivery %          -0.41  -0.13  -0.31   0.07  -0.03  -0.41  -0.21   0.07   0.33  -0.25      ·
+
+duplicate groups at |rho| >= 0.70 (complete linkage — every pair in a group clears it):
+  liquidity, illiquidity, trade size   <- duplicates: keep one
+  market cap
+  own volatility, idio volatility   <- duplicates: keep one
+  price
+  own trend (0/1)
+  beta
+  dist 52w high
+  delivery %
+
+Not yet in the library: intraday (minute-data) volatility. Its history starts 2021 and holds only
+names still listed in 2026, so it needs its own survivorship-aware design before it can be judged.

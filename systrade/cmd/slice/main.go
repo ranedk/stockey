@@ -103,12 +103,13 @@ func main() {
 	mcaps, err := st.MarketCaps(ctx)
 	fatalIf(err)
 
-	days := build(*cache, rule, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors, mcaps)
+	days := build(*cache, rule, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors)
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 
 	dims := []explore.Dimension{
+		// Liquidity is the size axis. Market cap was removed 2026-09-11: our data has
+		// no full-history source for it (LEDGER row 27 — large caps only before 2024).
 		explore.QuantileDimension("liquidity", *quantiles, func(o explore.Obs) float64 { return o.Turnover }),
-		explore.QuantileDimension("size (mcap)", *quantiles, func(o explore.Obs) float64 { return o.Mcap }),
 		explore.QuantileDimension("own volatility", *quantiles, func(o explore.Obs) float64 { return o.Vol }),
 		explore.QuantileDimension("price level", *quantiles, func(o explore.Obs) float64 { return o.Price }),
 		explore.CategoryDimension("sector", func(o explore.Obs) string { return o.Sector }),
@@ -250,7 +251,7 @@ func truncate(s string, n int) string {
 
 // build streams the bar cache and produces the daily cross-sections.
 func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
-	minTurnover float64, sectors map[string]string, mcaps map[string][]store.MCapPoint) []explore.Day {
+	minTurnover float64, sectors map[string]string) []explore.Day {
 
 	byDate := map[time.Time][]explore.Obs{}
 	var mu sync.Mutex
@@ -273,7 +274,6 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 		fc := rules.Forecast(rule, inst, vol).Values
 		sma := core.SMA(prices, trendWin).Values
 		turnover := bars.MedianTurnover(ser.Bars, turnoverWin)
-		mc := mcaps[ser.Symbol]
 		sector := sectors[ser.Symbol]
 
 		var local []struct {
@@ -302,7 +302,6 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 				Turnover: turnover[i],
 				Vol:      vol.Values[i] / closes[i],
 				Price:    closes[i],
-				Mcap:     mcapAt(mc, d),
 				Sector:   sector,
 				AboveSMA: closes[i] > sma[i],
 			}})
@@ -332,16 +331,6 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 		fatal(fmt.Errorf("no observations in %s..%s", from.Format("2006-01-02"), to.Format("2006-01-02")))
 	}
 	return days
-}
-
-// mcapAt returns the latest market cap reported on or before d — point in
-// time, never the value that was only published later.
-func mcapAt(pts []store.MCapPoint, d time.Time) float64 {
-	i := sort.Search(len(pts), func(i int) bool { return pts[i].Date.After(d) })
-	if i == 0 {
-		return 0
-	}
-	return pts[i-1].MCap
 }
 
 func findRule(name string) rules.Rule {
