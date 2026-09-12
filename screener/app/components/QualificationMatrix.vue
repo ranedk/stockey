@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import type { QualColumn, QualMatrix } from '~/types/systrader'
 
-// Every stock that qualifies for any tracked momentum strategy — or any
-// variant inside a blend — and which ones. The operator's view across all the
-// versions of the same idea at once: the more columns a stock fills, the more
-// of these momentum definitions agree on it.
+// Every stock that qualifies for any tracked strategy — or any variant inside a
+// blend — and which ones. The operator's view across every tracked idea at
+// once: the more columns a stock fills, the more of them agree on it. A
+// combination track is left out by the API: its columns would repeat its
+// parents'.
 const props = defineProps<{ matrix: QualMatrix }>()
 
 const filter = ref('')
@@ -36,12 +37,13 @@ const hasVariants = computed(() => columns.value.some(c => c.label.includes(' ·
 
 <template>
   <section class="mt-10">
-    <h2 class="text-base font-semibold text-slate-900">Which momentum strategies each stock qualifies for</h2>
+    <h2 class="text-base font-semibold text-slate-900">Which strategies each stock qualifies for</h2>
     <p class="mt-1 max-w-3xl text-sm text-slate-600">
       Every stock in the top fifth of any tracked strategy — or of any variant inside a blend — on the latest
       decision day<template v-if="matrix.as_of"> ({{ formatDate(matrix.as_of) }})</template>. Qualifying is
       not holding: each book only trades on its own rebalance clock. The more columns a stock fills, the more
-      of these versions of momentum agree on it.
+      of these strategies agree on it. A combination track is not shown separately — its columns are its
+      parents'.
     </p>
 
     <div class="mt-3 flex flex-wrap items-center gap-3 text-sm">
