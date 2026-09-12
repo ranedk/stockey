@@ -1,0 +1,45 @@
+# Low-volatility blend — construction, generated 2026-09-12 by `slice lookbacks -family lowvol`.
+# Law 6 inputs only; exploration years. The bootstrap cross-check at the end was read after the weights were fixed.
+
+LOW-VOLATILITY BLEND — CONSTRUCTION. 2013-07-01..2021-12-31, Rs 10 cr floor, top quintile, monthly rebalance, 50 bps
+Law 6 inputs only: costs (facts) and correlations (estimable). No return, SR or edge printed;
+only the bootstrap cross-check at the end sees sample means, as Carver's method requires.
+1844 common trading days from 2014-07-16.
+
+cost of trading each member's book
+  vol3     turnover  2.60%/day one-way   cost 0.111 SR/yr
+  vol6     turnover  1.69%/day one-way   cost 0.073 SR/yr
+  vol12    turnover  1.19%/day one-way   cost 0.052 SR/yr
+  beta12   turnover  1.60%/day one-way   cost 0.069 SR/yr
+  idio12   turnover  1.36%/day one-way   cost 0.053 SR/yr
+
+correlation of daily returns in excess of the equal-weight book
+               vol3  vol6  vol12  beta12  idio12
+  vol3               1.00        0.96        0.94        0.88        0.88 
+  vol6               0.96        1.00        0.97        0.89        0.91 
+  vol12              0.94        0.97        1.00        0.90        0.93 
+  beta12             0.88        0.89        0.90        1.00        0.80 
+  idio12             0.88        0.91        0.93        0.80        1.00 
+
+handcrafted (Table 8), near-duplicates grouped at rho >= 0.9
+  low risk       row 3 (0.89/0.91/0.80)       vol3+vol6+vol12 33%, beta12 33%, idio12 33%
+  vol3+vol6+vol12 row 3 (0.96/0.94/0.97)       vol3 33%, vol6 33%, vol12 33%
+
+Table 12 column A on cost differences (SR vs group average -> factor), then whole percent
+  vol3     -0.039 -> x0.953   11.1% -> 10.4% -> 11%
+  vol6     -0.002 -> x0.998   11.1% -> 10.9% -> 11%
+  vol12    +0.020 -> x1.044   11.1% -> 11.4% -> 11%
+  beta12   +0.002 -> x1.005   33.3% -> 33.0% -> 33%
+  idio12   +0.019 -> x1.041   33.3% -> 34.2% -> 34%
+
+No FDM: this is a blend of BOOKS (each variant's own top quintile), not an average of
+forecasts, so there is no combined forecast to rescale.
+
+cross-check: Carver's bootstrap, max-Sharpe on 184-day samples (500 resamples; 144 uninformative)
+  read only after the weights above are fixed; it cannot move them
+  vol3     handcrafted  11%   bootstrap  13.8%   single fit   0.0%
+  vol6     handcrafted  11%   bootstrap  12.8%   single fit  20.3%
+  vol12    handcrafted  11%   bootstrap   2.9%   single fit   0.0%
+  beta12   handcrafted  33%   bootstrap  40.3%   single fit  79.7%
+  idio12   handcrafted  34%   bootstrap  30.2%   single fit   0.0%
+

@@ -33,4 +33,12 @@ go run ./cmd/paper run -strategy trend-speed-blend -name trend-speed-blend-refer
 # No reference track: drawing one would read 2022+, which this family has left unread.
 go run ./cmd/paper run -strategy momentum-lookback-blend
 
+# Strategy 4: the low-volatility anomaly as a blend of five low-risk books
+# (docs/strategies/2026-09-12_low_volatility_blend.md). No reference track.
+go run ./cmd/paper run -strategy low-volatility-blend
+
+# Strategy 5: momentum and low volatility as one book of their nine variants
+# (docs/strategies/2026-09-12_momentum_lowvol_combination.md). No reference track.
+go run ./cmd/paper run -strategy momentum-lowvol-combination
+
 echo "=== paper_daily done ==="

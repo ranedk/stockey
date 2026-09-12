@@ -564,7 +564,15 @@ func TestQualifyListsEveryVariantAStockMeets(t *testing.T) {
 }
 
 func TestTheLookbackBlendSpecIsWhole(t *testing.T) {
-	s := MomentumLookbackBlendSpec()
+	for _, s := range Specs() {
+		if s.Mode == ModeBookBlend {
+			checkBookBlendSpec(t, s)
+		}
+	}
+}
+
+func checkBookBlendSpec(t *testing.T, s Spec) {
+	t.Helper()
 	if len(s.Variants) != len(s.VariantWeights) {
 		t.Fatalf("%d variants, %d weights", len(s.Variants), len(s.VariantWeights))
 	}

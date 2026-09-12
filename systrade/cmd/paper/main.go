@@ -30,6 +30,7 @@ import (
 	"github.com/ranedk/systrader/internal/paper"
 	"github.com/ranedk/systrader/internal/rules"
 	"github.com/ranedk/systrader/internal/store"
+	"github.com/ranedk/systrader/internal/traits"
 )
 
 // warmupDays is history loaded before the start date so the 32/128 crossover
@@ -107,6 +108,17 @@ func main() {
 	fatalIf(err)
 	sig2, err := parseSignal(*signal2)
 	fatalIf(err)
+	ctx := context.Background()
+	st, err := store.Open(ctx)
+	fatalIf(err)
+	defer st.Close()
+
+	from := spec.Start.AddDate(0, 0, -warmupDays)
+	to := time.Now().UTC()
+	if traits.NeedsMarket(spec.Variants) {
+		marketForBeta, err = marketReturns(ctx, st, from, to, spec.MinTurnover)
+		fatalIf(err)
+	}
 	var variants []signalFn
 	for _, v := range spec.Variants {
 		fn, err := parseSignal(v)
@@ -125,13 +137,6 @@ func main() {
 		spec.ConstantExposure = *constant
 	}
 
-	ctx := context.Background()
-	st, err := store.Open(ctx)
-	fatalIf(err)
-	defer st.Close()
-
-	from := spec.Start.AddDate(0, 0, -warmupDays)
-	to := time.Now().UTC()
 	fmt.Printf("%s: loading adjusted bars %s..%s\n", spec.Name,
 		from.Format("2006-01-02"), to.Format("2006-01-02"))
 
@@ -284,6 +289,15 @@ func parseSignal(name string) (signalFn, error) {
 		return windowReturn(12*month, 0), nil
 	case "mom12_1":
 		return windowReturn(12*month, month), nil
+	case "vol1", "vol3", "vol6", "vol12", "beta12", "idio12":
+		return func(ser bars.Series, _ core.Series, _ core.Series) []float64 {
+			s, err := traits.LowRiskScore(name, ser.Bars, marketForBeta)
+			fatalIf(err)
+			return s
+		}, nil
+	case "low-volatility-blend", "momentum-lowvol-combination":
+		// Book-blends rank by their variants; eligibility comes from them.
+		return windowReturn(6*month, 0), nil
 	case "momentum-lookback-blend":
 		// A book-blend ranks by its variants (spec.Variants); the primary
 		// signal only decides eligibility, which buildDays sets from them.
@@ -329,6 +343,53 @@ func parseSignal(name string) (signalFn, error) {
 		}, nil
 	}
 	return nil, fmt.Errorf("unknown signal %q (ewmac32 | ewmac16 | trend-speed-blend | ret5 | ret5inv | reversal20 | reversal60 | reversal120)", name)
+}
+
+// marketForBeta is the market the beta-based low-risk scores measure against,
+// loaded once in main when a spec's variants need it.
+var marketForBeta map[time.Time]float64
+
+// marketReturns builds that market from the same stream the tracker reads:
+// the equal-weight mean daily return of the names eligible the day before —
+// the construction traits.MarketReturns uses on the research bar cache.
+func marketReturns(ctx context.Context, st *store.Store, from, to time.Time, floor float64) (map[time.Time]float64, error) {
+	type acc struct {
+		sum float64
+		n   int
+	}
+	sums := map[time.Time]*acc{}
+	err := st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
+		b := ser.Bars
+		if len(b) < 2 {
+			return nil
+		}
+		turn := bars.MedianTurnover(b, traits.TurnoverWindow)
+		for i := 1; i < len(b); i++ {
+			r := traits.DailyReturn(b, i)
+			if math.IsNaN(r) || math.IsNaN(turn[i-1]) || turn[i-1] < floor {
+				continue
+			}
+			d := traits.Day(b[i].Date)
+			a := sums[d]
+			if a == nil {
+				a = &acc{}
+				sums[d] = a
+			}
+			a.sum += r
+			a.n++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := map[time.Time]float64{}
+	for d, a := range sums {
+		if a.n >= 100 {
+			out[d] = a.sum / float64(a.n)
+		}
+	}
+	return out, nil
 }
 
 // month is 21 trading days, as in `slice windows`.

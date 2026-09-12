@@ -291,6 +291,9 @@ func Qualifications(ctx context.Context, st *store.Store) (QualMatrix, error) {
 	var m QualMatrix
 	col := map[string]int{}
 	for _, sp := range paper.Specs() {
+		if sp.Composite {
+			continue // its variants are other tracks' columns already
+		}
 		vs := sp.Variants
 		if len(vs) == 0 {
 			vs = []string{sp.Signal}

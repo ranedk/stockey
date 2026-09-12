@@ -240,9 +240,9 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       months and 12 rebalances from 2026-09-08, trend-speed-blend likewise from
       2026-09-10, and the one comparison between them at 2027-09-10, per the
       specs' binding terms
-- [ ] Combination policies (handcrafted | Hedge | ML) judged vs the same
-      matched-control baseline — on hold: every rule tested so far has failed
-      its controls, so there is nothing yet worth combining
+- [ ] Combination policies beyond the handcrafted one (Hedge | ML), judged
+      vs the same matched-control baseline — the handcrafted policy is live as
+      momentum-lowvol-combination (LEDGER row 34)
 - [x] Futures stitching (`internal/futures`, `cmd/futures report`): curve
       cleaning that rejects recycled security ids (six of NIFTY's nine slots
       are option series) and collapses duplicate streams, roll detection by
@@ -350,6 +350,18 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       from a parallel scan's order and the control keys its per-symbol draw on
       the id, so identical runs drew different random books (8.35%, 10.64%,
       11.10%/yr). Ids are now assigned by name (`stableIDs`)
+- [x] **Fourth paper track: low-volatility-blend** (LEDGER row 33): the
+      lowest-risk quintiles by 3/6/12-month volatility, beta and residual
+      volatility, held 11/11/11/33/34 as a blend of books, monthly. Survived
+      its kill screen at matched risk (13.2%/yr at 14.8% volatility, maxDD
+      −30.5%); its raw edge is not significant — the defensive profile the
+      claim predicts
+- [x] **Fifth paper track: momentum-lowvol-combination** (LEDGER row 34) —
+      the combination item's handcrafted policy, now that two strategies have
+      survived: one book of both blends' nine variants, 48% momentum / 52%
+      low risk; the branches' excess returns correlate −0.12. Survived its
+      kill screen (16.7%/yr at 19.1% volatility, maxDD −38.6%); its Sharpe
+      ratio sits near the better parent's, not above both
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,

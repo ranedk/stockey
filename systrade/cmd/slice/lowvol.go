@@ -34,44 +34,16 @@ var lowVolHolds = []int{1, 3, 6}
 // fifth. A measure needs 80% of its window's daily returns; beta and residual
 // volatility need 200 of 252, as internal/traits does.
 func lowVolScorers(mkt map[time.Time]float64) []scorer {
-	returns := func(b []bars.Bar) []float64 {
-		r := make([]float64, len(b))
-		for i := range r {
-			r[i] = traits.DailyReturn(b, i)
-		}
-		return r
+	var out []scorer
+	for _, n := range []string{"vol1", "vol3", "vol6", "vol12", "beta12", "idio12"} {
+		n := n
+		out = append(out, scorer{Name: n, Score: func(b []bars.Bar) []float64 {
+			s, err := traits.LowRiskScore(n, b, mkt)
+			fatalIf(err)
+			return s
+		}})
 	}
-	negate := func(x []float64) []float64 {
-		for i := range x {
-			x[i] = -x[i]
-		}
-		return x
-	}
-	vol := func(name string, window int) scorer {
-		return scorer{Name: name, Score: func(b []bars.Bar) []float64 {
-			return negate(traits.RollingSD(returns(b), window, int(math.Ceil(0.8*float64(window)))))
-		}}
-	}
-	fromBeta := func(name string, pickIdio bool) scorer {
-		return scorer{Name: name, Score: func(b []bars.Bar) []float64 {
-			mk := make([]float64, len(b))
-			for i, x := range b {
-				mk[i] = math.NaN()
-				if v, ok := mkt[traits.Day(x.Date)]; ok {
-					mk[i] = v
-				}
-			}
-			beta, idio := traits.RollingBetaIdio(returns(b), mk, traits.BetaWindow, traits.BetaMinValid)
-			if pickIdio {
-				return negate(idio)
-			}
-			return negate(beta)
-		}}
-	}
-	return []scorer{
-		vol("vol1", 1*month), vol("vol3", 3*month), vol("vol6", 6*month), vol("vol12", 12*month),
-		fromBeta("beta12", false), fromBeta("idio12", true),
-	}
+	return out
 }
 
 // atRisk levers a book's daily returns to a reference book's realised

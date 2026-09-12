@@ -1,0 +1,23 @@
+# Kill screen (LEDGER row 33, trials=1) — generated 2026-09-12 by `slice lookbacks -family lowvol -screen`.
+# Pre-registered: research/preregistrations/2026-09-12_lowvol_and_combination_screens.md
+
+LOW-VOLATILITY BLEND — KILL SCREEN (trials=1, pre-registered 2026-09-12). 2013-07-01..2021-12-31, Rs 10 cr, 50 bps
+weights [0.11 0.11 0.11 0.33 0.34] over [vol3 vol6 vol12 beta12 idio12], from 2014-07-16 (every member live). Exploration years: this can kill, never confirm.
+
+  low-volatility blend   13.20%/yr  vol  14.76%  SR  0.91  maxDD  -30.5%  turnover  1.59%/day
+  equal-weight          8.90%/yr  vol  22.10%  SR  0.50  maxDD  -58.3%  turnover  1.17%/day
+  stable-shuffle        8.93%/yr  vol  22.49%  SR  0.49  maxDD  -59.1%  turnover  1.29%/day
+
+edge, monthly paired, 90 months, 90% bootstrap intervals
+  vs equal-weight    +0.20 [-0.34,+0.74] p0.281
+  vs stable-shuffle  +0.19 [-0.38,+0.78] p0.301
+  at 100 bps: vs equal-weight +0.18%/mo, vs stable-shuffle +0.18%/mo
+
+edge at MATCHED risk (the book scaled, with hindsight, to each control's volatility) — the deciding statistic
+  vs equal-weight    +0.75 [+0.34,+1.19] p0.002
+  vs stable-shuffle  +0.77 [+0.32,+1.25] p0.003
+  at 100 bps: vs equal-weight +0.69%/mo, vs stable-shuffle +0.71%/mo
+
+  K1  p < 0.10 against both controls at 50 bps        PASS (p 0.0020, 0.0028)
+  K2  positive mean against both controls at 100 bps  PASS
+  VERDICT: SURVIVES — the forward track may start

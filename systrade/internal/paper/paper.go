@@ -52,8 +52,11 @@ type Spec struct {
 	// Variants names the scores a book-blend holds books of (ModeBookBlend),
 	// in the order Obs.Signals carries them; VariantWeights are their fixed
 	// shares of the book, from the handcrafting tree.
-	Variants         []string
-	VariantWeights   []float64
+	Variants       []string
+	VariantWeights []float64
+	// Composite marks a track built from other registered tracks' variants:
+	// its qualifications duplicate theirs, so the cross-strategy view leaves it out.
+	Composite        bool
 	RebalanceEvery   int     // trading days between rebalances
 	CostBpsRoundTrip float64 // charged as half per side on turnover
 	RandomSeed       int64   // for the random-ranking benchmark
@@ -365,8 +368,55 @@ func MomentumLookbackBlendSpec() Spec {
 	return s
 }
 
+// LowVolBlendSpec is the configuration frozen on 2026-09-12: the low-risk
+// measures whose one-month-hold cells survived LEDGER row 32 — 3/6/12-month
+// volatility, 1-year beta and 1-year residual volatility — each variant's
+// LOWEST-risk quintile, held as a blend of books at handcrafted weights: Table
+// 8 row 3 over the groups {the three volatility windows, correlating
+// 0.94-0.97}, {beta}, {residual volatility}, thirds again inside the
+// volatility group; Table 12 column A on costs; whole percent
+// (research/reports/2026-09-12_lowvol_blend_construction.txt). Monthly.
+func LowVolBlendSpec() Spec {
+	s := FrozenSpec()
+	s.Name = "low-volatility-blend"
+	s.Start = time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	s.Signal = "low-volatility-blend"
+	s.SignalLabel = "Lowest-risk fifth by 3/6/12-month volatility, 1-year beta and 1-year residual volatility — held 11/11/11/33/34 (handcrafted), long-only, monthly"
+	s.Doc = "docs/strategies/2026-09-12_low_volatility_blend.md"
+	s.Mode = ModeBookBlend
+	s.Variants = []string{"vol3", "vol6", "vol12", "beta12", "idio12"}
+	s.VariantWeights = []float64{0.11, 0.11, 0.11, 0.33, 0.34}
+	s.RebalanceEvery = 21
+	return s
+}
+
+// MomentumLowVolCombinationSpec is the configuration frozen on 2026-09-12:
+// the momentum and low-volatility tracks' books together as one book of their
+// nine variants. A two-branch handcrafting tree — each branch at its own
+// track's frozen weights — split by Table 8 row 2 (halves) and tilted by Table
+// 12 column A on the branches' costs (0.088 vs 0.067 SR/yr: 49/51), whole
+// percent over the members (research/reports/2026-09-12_combination_construction.txt).
+// The branches' excess returns correlate -0.12. Monthly. Composite: the
+// cross-strategy view shows its members under their own tracks.
+func MomentumLowVolCombinationSpec() Spec {
+	s := FrozenSpec()
+	s.Name = "momentum-lowvol-combination"
+	s.Start = time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	s.Signal = "momentum-lowvol-combination"
+	s.SignalLabel = "Momentum lookback blend 48% + low-volatility blend 52%, one book of their nine variants (handcrafted), long-only, monthly"
+	s.Doc = "docs/strategies/2026-09-12_momentum_lowvol_combination.md"
+	s.Mode = ModeBookBlend
+	s.Variants = []string{"mom6", "mom9", "mom12", "mom12_1", "vol3", "vol6", "vol12", "beta12", "idio12"}
+	s.VariantWeights = []float64{0.16, 0.16, 0.08, 0.08, 0.06, 0.06, 0.06, 0.17, 0.17}
+	s.RebalanceEvery = 21
+	s.Composite = true
+	return s
+}
+
 // Specs lists every strategy with a forward record, in the order they began.
-func Specs() []Spec { return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec()} }
+func Specs() []Spec {
+	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(), MomentumLowVolCombinationSpec()}
+}
 
 // SpecFor finds a registered strategy by name.
 func SpecFor(name string) (Spec, bool) {

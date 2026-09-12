@@ -2,6 +2,7 @@ package traits
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -180,4 +181,57 @@ func (c Context) For(ser bars.Series) Arrays {
 		UpCircuits: RollingCount(ch, 1, CircuitWindow),
 		LoCircuits: RollingCount(ch, -1, CircuitWindow),
 	}
+}
+
+// LowRiskScore scores a symbol's bars for the low-volatility books (LEDGER
+// row 32), LOWER risk scoring HIGHER, NaN where undefined. vol1/vol3/vol6/vol12
+// are the standard deviation of daily returns over 1/3/6/12 months of 21
+// trading days, with at least 80% of the window present; beta12 and idio12
+// are the 252-day beta to mkt and the residual volatility after it (at least
+// 200 days). One definition, so paper trading holds exactly what research
+// measured.
+func LowRiskScore(name string, b []bars.Bar, mkt map[time.Time]float64) ([]float64, error) {
+	ret := make([]float64, len(b))
+	for i := range ret {
+		ret[i] = DailyReturn(b, i)
+	}
+	negate := func(x []float64) []float64 {
+		for i := range x {
+			x[i] = -x[i]
+		}
+		return x
+	}
+	vol := map[string]int{"vol1": 21, "vol3": 63, "vol6": 126, "vol12": 252}
+	if w, ok := vol[name]; ok {
+		return negate(RollingSD(ret, w, int(math.Ceil(0.8*float64(w))))), nil
+	}
+	if name != "beta12" && name != "idio12" {
+		return nil, fmt.Errorf("traits: no low-risk score %q", name)
+	}
+	if mkt == nil {
+		return nil, fmt.Errorf("traits: %s needs the market series", name)
+	}
+	mk := make([]float64, len(b))
+	for i, x := range b {
+		mk[i] = math.NaN()
+		if v, ok := mkt[Day(x.Date)]; ok {
+			mk[i] = v
+		}
+	}
+	beta, idio := RollingBetaIdio(ret, mk, BetaWindow, BetaMinValid)
+	if name == "idio12" {
+		return negate(idio), nil
+	}
+	return negate(beta), nil
+}
+
+// NeedsMarket reports whether any of the named low-risk scores needs the
+// market series.
+func NeedsMarket(names []string) bool {
+	for _, n := range names {
+		if n == "beta12" || n == "idio12" {
+			return true
+		}
+	}
+	return false
 }

@@ -1,9 +1,11 @@
 package traits
 
 import (
+	"github.com/ranedk/systrader/internal/bars"
 	"math"
 	"math/rand"
 	"testing"
+	"time"
 )
 
 func near(t *testing.T, what string, got, want, tol float64) {
@@ -196,5 +198,41 @@ func TestRollingSDMatchesADirectCalculation(t *testing.T) {
 			q += (a - m) * (a - m)
 		}
 		near(t, "rolling sd", sd[i], math.Sqrt(q/float64(len(v)-1)), 1e-12)
+	}
+}
+
+func TestLowRiskScoreIsNegatedRiskAndRefusesUnknownNames(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	var b []bars.Bar
+	p := 100.0
+	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	mkt := map[time.Time]float64{}
+	for i := 0; i < 400; i++ {
+		m := rng.NormFloat64() * 0.01
+		p *= 1 + 1.2*m + rng.NormFloat64()*0.01
+		d := start.AddDate(0, 0, i)
+		b = append(b, bars.Bar{Date: d, Open: p, High: p, Low: p, Close: p, Vol: 1})
+		mkt[d] = m
+	}
+	ret := make([]float64, len(b))
+	for i := range ret {
+		ret[i] = DailyReturn(b, i)
+	}
+	v3, err := LowRiskScore("vol3", b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd := RollingSD(ret, 63, 51)
+	near(t, "vol3 is minus the 63-day sd", v3[300], -sd[300], 1e-15)
+	beta, err := LowRiskScore("beta12", b, mkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	near(t, "beta12 is minus a beta near 1.2", beta[399], -1.2, 0.15)
+	if _, err := LowRiskScore("beta12", b, nil); err == nil {
+		t.Error("beta without a market series was computed")
+	}
+	if _, err := LowRiskScore("vol2", b, nil); err == nil {
+		t.Error("an unknown score was accepted")
 	}
 }
