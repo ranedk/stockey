@@ -335,8 +335,12 @@ func buildWindows(cache string, sigs []windowSignal, from, to time.Time, floor f
 		mu.Unlock()
 	}))
 
+	remap := stableIDs(ids)
 	days := make([]sleeve.Day, 0, len(byDate))
 	for d, os := range byDate {
+		for i := range os {
+			os[i].sym = remap[os[i].sym]
+		}
 		day := sleeve.Day{Date: d, Obs: make([]sleeve.Obs, len(os))}
 		for i, o := range os {
 			day.Obs[i] = sleeve.Obs{Sym: o.sym, U: make([]float64, len(sigs)), Ret: o.ret}
@@ -428,4 +432,23 @@ func doubleCost(b sleeve.Book) sleeve.Book {
 		out.Net[i] = b.Gross[i] - 2*(b.Gross[i]-b.Net[i])
 	}
 	return out
+}
+
+// stableIDs renumbers symbols by name. The bar cache is scanned in parallel,
+// so ids handed out in scan order change from run to run — and the
+// stable-shuffle control keys each symbol's draw on its id, so the control
+// itself changed between identical runs (the lookback screen's stable-shuffle
+// book read 8.35%/yr, then 10.64%, on the same data). Every builder feeding
+// internal/sleeve renumbers through here.
+func stableIDs(ids map[string]int32) map[int32]int32 {
+	names := make([]string, 0, len(ids))
+	for n := range ids {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	remap := make(map[int32]int32, len(ids))
+	for i, n := range names {
+		remap[ids[n]] = int32(i + 1)
+	}
+	return remap
 }

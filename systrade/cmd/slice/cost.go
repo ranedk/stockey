@@ -180,8 +180,12 @@ func buildCost(cache string, rule rules.Rule, from, to time.Time, minTurnover fl
 		mu.Unlock()
 	}))
 
+	remap := stableIDs(ids) // reproducible stable-shuffle draws, see stableIDs
 	days := make([]sleeve.Day, 0, len(byDate))
 	for d, obs := range byDate {
+		for i := range obs {
+			obs[i].sym = remap[obs[i].sym]
+		}
 		if len(obs) < 25 { // fewer than five names a quintile
 			continue
 		}
