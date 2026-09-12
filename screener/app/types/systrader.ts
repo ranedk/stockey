@@ -106,6 +106,29 @@ export interface PaperStrategy {
   reference?: PaperStrategy | null
 }
 
+// One strategy variant a stock can qualify for. A single-signal strategy has
+// one variant (its signal); a book-blend has one per variant.
+export interface QualColumn {
+  strategy: string
+  variant: string
+  label: string
+}
+
+// A stock and which columns it qualifies for, in columns order.
+export interface QualRow {
+  symbol: string
+  marks: boolean[]
+  count: number
+}
+
+// Every stock in the top fifth of any tracked strategy's variant on its
+// latest decision day (GET /api/paper/qualifiers).
+export interface QualMatrix {
+  as_of: string
+  columns: QualColumn[] | null
+  rows: QualRow[] | null
+}
+
 export interface PaperListResponse {
   strategies: PaperStrategy[]
 }

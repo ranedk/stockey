@@ -1,10 +1,15 @@
 <script setup lang="ts">
-import type { PaperListResponse } from '~/types/systrader'
+import type { PaperListResponse, QualMatrix } from '~/types/systrader'
 
 const api = useSystraderApi()
 const { data, status, error } = await useAsyncData('paper-list', () => api.get<PaperListResponse>('/api/paper'))
 
 const strategies = computed(() => data.value?.strategies ?? [])
+
+// The cross-strategy view. Optional: an API older than the endpoint, or a day
+// before any strategy has recorded qualifications, simply shows nothing.
+const { data: quals } = await useAsyncData('paper-qualifiers',
+  () => api.get<QualMatrix>('/api/paper/qualifiers').catch(() => null))
 </script>
 
 <template>
@@ -61,5 +66,7 @@ const strategies = computed(() => data.value?.strategies ?? [])
         </div>
       </NuxtLink>
     </div>
+
+    <QualificationMatrix v-if="quals?.rows?.length" :matrix="quals" />
   </div>
 </template>
