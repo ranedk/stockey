@@ -323,6 +323,15 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       Two earlier designs (a random-score noise floor; a whole-universe
       comparison) were each caught by a synthetic calibration test and
       replaced; the shipped one flags 3 of 30 uniform-effect datasets
+- [x] Momentum across time windows (LEDGER row 30, `slice windows`,
+      pre-registered): 6 formation windows from the literature (3/6/9/12
+      months, 12-minus-1, 12-to-7) x 5 holding periods (1/2/3/6/12 months,
+      staggered books), Rs 10cr, exploration years only. Verdict IN BETWEEN:
+      17 of 30 cells beat both controls and survive FDR (20 needed for a
+      plateau), spread over 5 of 6 windows and all 5 holds; every cell's edge
+      is positive, strongest at 6-12 month lookbacks held 1-3 months; no cell
+      reaches deflated Sharpe 0.95. The reversal "known-sign controls" came
+      out negative, the opposite of the pre-registered expectation
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [ ] **Next research: the low-volatility anomaly.** A published, price-only
