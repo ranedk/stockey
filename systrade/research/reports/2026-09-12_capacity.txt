@@ -1,0 +1,160 @@
+CAPACITY — trend-quintile in rupees, research/preregistrations/2026-09-12_capacity.md (LEDGER trials=0)
+2102 trading days 2013-07-02..2021-12-31, rebalance every 20; whole shares at the raw open, Law 12 inertia 10%,
+Dhan statutory + Rs 14.75 DP per sale + square-root impact, auction fills. Capital constant, nominal rupees.
+
+policy                  names    median       p10 deployed    stat      DP  impact    cost   model turnover  <2 sh   zero   TE/yr  diff/yr F1 F2 F3
+                         held  position  position              /yr     /yr     /yr     /yr 50bp/yr      /yr   days                        
+Rs 30 lakh                 45     60088     35245      98%   1.04%   0.17%   0.32%   1.53%   2.26%     466%   0.4%   0.0%   0.18%   -0.13%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k     45     60088     35245      98%   1.04%   0.17%   0.32%   1.53%   2.26%     466%   0.4%   0.0%   0.18%   -0.13%  ✓  ✓  ✓
+Rs 1 cr                    45    200123    117000      98%   1.04%   0.05%   0.58%   1.67%   2.26%     465%   0.0%   0.0%   0.16%   -0.09%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k        45    200123    117000      98%   1.04%   0.05%   0.58%   1.67%   2.26%     465%   0.0%   0.0%   0.16%   -0.09%  ✓  ✓  ✓
+-- today-sized: capital scaled at each rebalance by names held / 160 (today's book)
+Rs 30 lakh, today-sized     45     18770     17982     101%   1.03%   0.52%   0.17%   1.72%   2.26%     463%   2.2%   0.4%   0.33%   +0.01%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k, today-sized     45     18770     17982     101%   1.03%   0.52%   0.17%   1.72%   2.26%     463%   2.2%   0.4%   0.33%   +0.01%  ✓  ✓  ✓
+Rs 1 cr, today-sized       45     62523     60532     101%   1.03%   0.16%   0.31%   1.50%   2.26%     462%   0.4%   0.0%   0.18%   +0.01%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k, today-sized     45     62523     60532     101%   1.03%   0.16%   0.31%   1.50%   2.26%     462%   0.4%   0.0%   0.18%   +0.01%  ✓  ✓  ✓
+
+F1 tracking error of gross daily returns vs the weight book <= 2%/yr; F2 realised cost <= the 50 bps
+model's; F3 under 5% of position-days below 2 shares (Law 14). Costs are fractions of deployed rupees.
+'diff/yr' is the mean gross difference against the weight book, reported, not a decision input.
+
+plain book by year: median names held / median position, nominal and today-sized
+  year               Rs 30 lakh             Rs 1 crore    30 lakh today-sized    1 crore today-sized
+  2013           24 / Rs  124000         24 / Rs  416010         24 / Rs   18765         24 / Rs   62503
+  2014           36 / Rs   82271         36 / Rs  274215         36 / Rs   18753         36 / Rs   62540
+  2015           39 / Rs   76032         39 / Rs  253034         39 / Rs   18760         39 / Rs   62498
+  2016           40 / Rs   73703         40 / Rs  244995         40 / Rs   18766         40 / Rs   62505
+  2017           50 / Rs   58888         50 / Rs  196199         49 / Rs   18777         50 / Rs   62550
+  2018           54 / Rs   52558         54 / Rs  175206         54 / Rs   18800         54 / Rs   62540
+  2019           47 / Rs   64672         47 / Rs  215215         47 / Rs   18789         47 / Rs   62557
+  2020           50 / Rs   55800         50 / Rs  185320         50 / Rs   18788         50 / Rs   62519
+  2021           80 / Rs   35605         80 / Rs  119195         80 / Rs   18761         80 / Rs   62515
+
+CAPACITY — trend-speed-blend in rupees, research/preregistrations/2026-09-12_capacity.md (LEDGER trials=0)
+2102 trading days 2013-07-02..2021-12-31, rebalance every 20; whole shares at the raw open, Law 12 inertia 10%,
+Dhan statutory + Rs 14.75 DP per sale + square-root impact, auction fills. Capital constant, nominal rupees.
+
+policy                  names    median       p10 deployed    stat      DP  impact    cost   model turnover  <2 sh   zero   TE/yr  diff/yr F1 F2 F3
+                         held  position  position              /yr     /yr     /yr     /yr 50bp/yr      /yr   days                        
+Rs 30 lakh                 45     60060     35200      98%   1.04%   0.17%   0.32%   1.53%   2.26%     466%   0.4%   0.0%   0.18%   -0.14%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k     45     60060     35200      98%   1.04%   0.17%   0.32%   1.53%   2.26%     466%   0.4%   0.0%   0.18%   -0.14%  ✓  ✓  ✓
+Rs 1 cr                    45    200071    116554      98%   1.04%   0.05%   0.58%   1.67%   2.26%     465%   0.0%   0.0%   0.16%   -0.10%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k        45    200071    116554      98%   1.04%   0.05%   0.58%   1.67%   2.26%     465%   0.0%   0.0%   0.16%   -0.10%  ✓  ✓  ✓
+-- today-sized: capital scaled at each rebalance by names held / 160 (today's book)
+Rs 30 lakh, today-sized     45     18776     17986     101%   1.03%   0.53%   0.17%   1.73%   2.26%     464%   2.3%   0.4%   0.32%   +0.02%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k, today-sized     45     18776     17986     101%   1.03%   0.53%   0.17%   1.73%   2.26%     464%   2.3%   0.4%   0.32%   +0.02%  ✓  ✓  ✓
+Rs 1 cr, today-sized       45     62535     60760     101%   1.03%   0.16%   0.31%   1.50%   2.26%     462%   0.4%   0.0%   0.18%   -0.04%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k, today-sized     45     62535     60760     101%   1.03%   0.16%   0.31%   1.50%   2.26%     462%   0.4%   0.0%   0.18%   -0.04%  ✓  ✓  ✓
+
+F1 tracking error of gross daily returns vs the weight book <= 2%/yr; F2 realised cost <= the 50 bps
+model's; F3 under 5% of position-days below 2 shares (Law 14). Costs are fractions of deployed rupees.
+'diff/yr' is the mean gross difference against the weight book, reported, not a decision input.
+
+plain book by year: median names held / median position, nominal and today-sized
+  year               Rs 30 lakh             Rs 1 crore    30 lakh today-sized    1 crore today-sized
+  2013           24 / Rs  123984         24 / Rs  416000         24 / Rs   18778         24 / Rs   62506
+  2014           36 / Rs   82390         36 / Rs  275076         36 / Rs   18762         36 / Rs   62555
+  2015           39 / Rs   76540         39 / Rs  254085         39 / Rs   18762         39 / Rs   62510
+  2016           40 / Rs   74241         40 / Rs  247802         40 / Rs   18759         40 / Rs   62514
+  2017           50 / Rs   58904         50 / Rs  196200         49 / Rs   18768         50 / Rs   62550
+  2018           54 / Rs   52620         54 / Rs  175318         54 / Rs   18804         54 / Rs   62553
+  2019           47 / Rs   64452         47 / Rs  214698         47 / Rs   18792         47 / Rs   62599
+  2020           50 / Rs   55825         50 / Rs  185324         50 / Rs   18794         50 / Rs   62532
+  2021           80 / Rs   35688         80 / Rs  117862         80 / Rs   18768         80 / Rs   62528
+
+CAPACITY — momentum-lookback-blend in rupees, research/preregistrations/2026-09-12_capacity.md (LEDGER trials=0)
+2102 trading days 2013-07-02..2021-12-31, rebalance every 21; whole shares at the raw open, Law 12 inertia 10%,
+Dhan statutory + Rs 14.75 DP per sale + square-root impact, auction fills. Capital constant, nominal rupees.
+
+policy                  names    median       p10 deployed    stat      DP  impact    cost   model turnover  <2 sh   zero   TE/yr  diff/yr F1 F2 F3
+                         held  position  position              /yr     /yr     /yr     /yr 50bp/yr      /yr   days                        
+Rs 30 lakh                 68     35881     13184      95%   0.76%   0.25%   0.32%   1.32%   1.60%     340%   0.7%   0.2%   0.18%   +0.03%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k     68     35881     13184      95%   0.75%   0.25%   0.32%   1.32%   1.60%     339%   0.6%   0.2%   0.19%   +0.01%  ✓  ✓  ✓
+Rs 1 cr                    69    119100     43540      95%   0.76%   0.07%   0.58%   1.42%   1.60%     340%   0.2%   0.0%   0.15%   +0.07%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k        69    119100     43540      95%   0.76%   0.07%   0.58%   1.42%   1.60%     340%   0.2%   0.0%   0.15%   +0.07%  ✓  ✓  ✓
+-- today-sized: capital scaled at each rebalance by names held / 241 (today's book)
+Rs 30 lakh, today-sized     68     12758      5898     101%   0.74%   0.77%   0.20%   1.71%   1.60%     334%   2.5%   0.7%   0.31%   +0.06%  ✓  ✗  ✓
+Rs 30 lakh, min Rs 10k, today-sized     68     12748      9852     113%   0.72%   0.64%   0.20%   1.56%   1.60%     323%   1.9%   0.5%   1.00%   -1.47%  ✓  ✓  ✓
+Rs 1 cr, today-sized       68     42504     19838     101%   0.74%   0.23%   0.37%   1.35%   1.60%     334%   0.6%   0.2%   0.18%   -0.15%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k, today-sized     68     42504     19838     101%   0.74%   0.23%   0.37%   1.35%   1.60%     334%   0.6%   0.2%   0.18%   -0.15%  ✓  ✓  ✓
+
+F1 tracking error of gross daily returns vs the weight book <= 2%/yr; F2 realised cost <= the 50 bps
+model's; F3 under 5% of position-days below 2 shares (Law 14). Costs are fractions of deployed rupees.
+'diff/yr' is the mean gross difference against the weight book, reported, not a decision input.
+
+plain book by year: median names held / median position, nominal and today-sized
+  year               Rs 30 lakh             Rs 1 crore    30 lakh today-sized    1 crore today-sized
+  2013            0 / Rs     NaN          0 / Rs     NaN          0 / Rs     NaN          0 / Rs     NaN
+  2014           43 / Rs   63891         43 / Rs  212736         43 / Rs   12495         43 / Rs   41580
+  2015           60 / Rs   50400         60 / Rs  167768         59 / Rs   12672         60 / Rs   42264
+  2016           65 / Rs   46210         65 / Rs  154054         64 / Rs   12796         65 / Rs   42394
+  2017           77 / Rs   40429         77 / Rs  134644         76 / Rs   12850         77 / Rs   43056
+  2018           84 / Rs   37383         84 / Rs  123786         83 / Rs   12597         84 / Rs   42347
+  2019           72 / Rs   41600         72 / Rs  138476         72 / Rs   13024         72 / Rs   43884
+  2020           75 / Rs   36630         75 / Rs  122024         74 / Rs   12740         75 / Rs   42394
+  2021          120 / Rs   23250        120 / Rs   77824        120 / Rs   12901        120 / Rs   42950
+
+CAPACITY — low-volatility-blend in rupees, research/preregistrations/2026-09-12_capacity.md (LEDGER trials=0)
+2102 trading days 2013-07-02..2021-12-31, rebalance every 21; whole shares at the raw open, Law 12 inertia 10%,
+Dhan statutory + Rs 14.75 DP per sale + square-root impact, auction fills. Capital constant, nominal rupees.
+
+policy                  names    median       p10 deployed    stat      DP  impact    cost   model turnover  <2 sh   zero   TE/yr  diff/yr F1 F2 F3
+                         held  position  position              /yr     /yr     /yr     /yr 50bp/yr      /yr   days                        
+Rs 30 lakh                 79     29440     10818      98%   0.39%   0.18%   0.07%   0.64%   0.86%     174%   2.0%   0.6%   0.20%   -0.00%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k     79     29412     10933      99%   0.39%   0.18%   0.07%   0.64%   0.86%     175%   1.9%   0.5%   0.24%   +0.04%  ✓  ✓  ✓
+Rs 1 cr                    79     97636     35417      98%   0.39%   0.06%   0.12%   0.56%   0.86%     174%   0.7%   0.0%   0.13%   +0.02%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k        79     97636     35417      98%   0.39%   0.06%   0.12%   0.56%   0.86%     174%   0.7%   0.0%   0.13%   +0.02%  ✓  ✓  ✓
+-- today-sized: capital scaled at each rebalance by names held / 279 (today's book)
+Rs 30 lakh, today-sized     77     10276      4085     100%   0.37%   0.54%   0.03%   0.95%   0.86%     167%   5.1%   2.3%   0.42%   -0.00%  ✓  ✗  ✗
+Rs 30 lakh, min Rs 10k, today-sized     78     10800      9639     118%   0.39%   0.41%   0.06%   0.86%   0.86%     173%   3.6%   1.5%   0.97%   +0.23%  ✓  ✓  ✓
+Rs 1 cr, today-sized       79     34200     13662     101%   0.36%   0.16%   0.06%   0.58%   0.86%     161%   2.0%   0.4%   0.18%   -0.01%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k, today-sized     79     34184     13662     102%   0.36%   0.16%   0.06%   0.59%   0.86%     162%   2.0%   0.3%   0.20%   -0.01%  ✓  ✓  ✓
+
+F1 tracking error of gross daily returns vs the weight book <= 2%/yr; F2 realised cost <= the 50 bps
+model's; F3 under 5% of position-days below 2 shares (Law 14). Costs are fractions of deployed rupees.
+'diff/yr' is the mean gross difference against the weight book, reported, not a decision input.
+
+plain book by year: median names held / median position, nominal and today-sized
+  year               Rs 30 lakh             Rs 1 crore    30 lakh today-sized    1 crore today-sized
+  2013            0 / Rs  125042          0 / Rs  416646          0 / Rs   10800          0 / Rs   35931
+  2014           40 / Rs   53600         40 / Rs  178510         40 / Rs   11660         40 / Rs   39053
+  2015           72 / Rs   36060         72 / Rs  118482         72 / Rs   10056         72 / Rs   31414
+  2016           68 / Rs   40367         69 / Rs  133529         66 / Rs   10315         68 / Rs   33800
+  2017           82 / Rs   34500         82 / Rs  115290         82 / Rs   10450         82 / Rs   34661
+  2018           94 / Rs   28178         94 / Rs   93664         92 / Rs   10133         94 / Rs   33828
+  2019           80 / Rs   32078         80 / Rs  107319         79 / Rs    9396         80 / Rs   31772
+  2020           88 / Rs   27550         89 / Rs   92685         86 / Rs    9948         88 / Rs   32582
+  2021          142 / Rs   19454        144 / Rs   64380        140 / Rs   10120        142 / Rs   34050
+
+CAPACITY — momentum-lowvol-combination in rupees, research/preregistrations/2026-09-12_capacity.md (LEDGER trials=0)
+2102 trading days 2013-07-02..2021-12-31, rebalance every 21; whole shares at the raw open, Law 12 inertia 10%,
+Dhan statutory + Rs 14.75 DP per sale + square-root impact, auction fills. Capital constant, nominal rupees.
+
+policy                  names    median       p10 deployed    stat      DP  impact    cost   model turnover  <2 sh   zero   TE/yr  diff/yr F1 F2 F3
+                         held  position  position              /yr     /yr     /yr     /yr 50bp/yr      /yr   days                        
+Rs 30 lakh                127     18090      6305      98%   0.55%   0.37%   0.15%   1.07%   1.21%     249%   2.2%   1.0%   0.19%   +0.06%  ✓  ✓  ✓
+Rs 30 lakh, min Rs 10k    127     18088      9982     101%   0.55%   0.34%   0.15%   1.04%   1.21%     246%   1.9%   0.9%   0.34%   -0.17%  ✓  ✓  ✓
+Rs 1 cr                   128     59915     20568      98%   0.55%   0.11%   0.27%   0.93%   1.21%     248%   0.9%   0.1%   0.12%   +0.04%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k       128     59915     20568      98%   0.55%   0.11%   0.27%   0.93%   1.21%     248%   0.9%   0.1%   0.12%   +0.04%  ✓  ✓  ✓
+-- today-sized: capital scaled at each rebalance by names held / 493 (today's book)
+Rs 30 lakh, today-sized    124      5945      2530     100%   0.53%   1.18%   0.08%   1.79%   1.21%     236%   8.2%   2.6%   0.40%   +0.05%  ✓  ✗  ✗
+Rs 30 lakh, min Rs 10k, today-sized    126     10020      9384     168%   0.48%   0.58%   0.09%   1.15%   1.21%     217%   3.5%   1.4%   2.02%   -2.02%  ✗  ✓  ✓
+Rs 1 cr, today-sized      127     19824      8544     101%   0.52%   0.36%   0.15%   1.03%   1.21%     233%   1.8%   0.9%   0.19%   -0.02%  ✓  ✓  ✓
+Rs 1 cr, min Rs 10k, today-sized    127     19809      9998     103%   0.51%   0.35%   0.15%   1.01%   1.21%     231%   1.7%   0.8%   0.32%   -0.30%  ✓  ✓  ✓
+
+F1 tracking error of gross daily returns vs the weight book <= 2%/yr; F2 realised cost <= the 50 bps
+model's; F3 under 5% of position-days below 2 shares (Law 14). Costs are fractions of deployed rupees.
+'diff/yr' is the mean gross difference against the weight book, reported, not a decision input.
+
+plain book by year: median names held / median position, nominal and today-sized
+  year               Rs 30 lakh             Rs 1 crore    30 lakh today-sized    1 crore today-sized
+  2013            0 / Rs  125042          0 / Rs  416646          0 / Rs    6070          0 / Rs   20220
+  2014           83 / Rs   28441         83 / Rs   94853         82 / Rs    5709         83 / Rs   19175
+  2015          120 / Rs   24578        120 / Rs   81686        116 / Rs    6072        120 / Rs   20233
+  2016          118 / Rs   23811        118 / Rs   78672        115 / Rs    5880        118 / Rs   19943
+  2017          150 / Rs   20000        151 / Rs   66400        149 / Rs    6110        150 / Rs   20346
+  2018          144 / Rs   18130        145 / Rs   60336        141 / Rs    5800        144 / Rs   19430
+  2019          123 / Rs   21994        124 / Rs   72838        122 / Rs    5644        123 / Rs   18802
+  2020          136 / Rs   18074        137 / Rs   59597        134 / Rs    5741        136 / Rs   19123
+  2021          250 / Rs   11520        251 / Rs   38433        249 / Rs    6238        251 / Rs   20680
+

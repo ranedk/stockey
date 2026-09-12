@@ -1259,3 +1259,9 @@ func Qualify(spec Spec, d Day) []Qualification {
 	})
 	return out
 }
+
+// TargetWeights is the strategy book's target on a decision day — what a
+// capital-aware simulation sizes in rupees.
+func TargetWeights(spec Spec, d Day) map[string]float64 {
+	return targetWeights(BookStrategy, spec, d)
+}

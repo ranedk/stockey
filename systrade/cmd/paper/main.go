@@ -41,6 +41,10 @@ func main() {
 	// "paper run" reads better than "paper", and flag.Parse stops at the first
 	// positional argument, so the verb has to come off before the flags are
 	// read — otherwise every flag after it is silently ignored.
+	if len(os.Args) > 1 && os.Args[1] == "capacity" {
+		runCapacity(os.Args[2:])
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "run" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}

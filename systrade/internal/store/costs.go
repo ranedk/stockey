@@ -58,3 +58,29 @@ func (s *Store) RawCloses(ctx context.Context, from, to time.Time) (map[string][
 		WHERE series = 'EQ' AND date >= $1 AND date <= $2 AND close > 0
 		ORDER BY symbol, date`, from, to)
 }
+
+// RawRatios returns, for every EQ symbol trading on date, the factor that
+// turns an adjusted price back into the price actually quoted that day:
+// close / adj_close. Share counts are whole numbers of RAW shares, so a
+// capital-aware book needs it on every day it trades.
+func (s *Store) RawRatios(ctx context.Context, date time.Time) (map[string]float64, error) {
+	d := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
+	rows, err := s.pool.Query(ctx, `
+		SELECT symbol, close / adj_close FROM advisory_adjusted_ohlcv_daily
+		WHERE series = 'EQ' AND date >= $1 AND date < $2 AND adj_close > 0 AND close > 0`,
+		d, d.AddDate(0, 0, 1))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]float64{}
+	for rows.Next() {
+		var sym string
+		var r float64
+		if err := rows.Scan(&sym, &r); err != nil {
+			return nil, err
+		}
+		out[sym] = r
+	}
+	return out, rows.Err()
+}

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/ranedk/systrader/internal/bars"
+	"github.com/ranedk/systrader/internal/costs"
 	"github.com/ranedk/systrader/internal/store"
 )
 
@@ -36,7 +37,6 @@ const (
 	minBars     = 20
 	vwapBars    = 15 // 09:15-09:29
 	lookbackDay = 60
-	impactY     = 1.0
 )
 
 func tierOf(v float64) int {
@@ -148,12 +148,12 @@ func main() {
 }
 
 func report(acc []*tierAcc, sample []time.Time) {
-	stat := statutoryRoundTrip()
+	stat := costs.StatutoryRoundTrip()
 	fmt.Println("WHAT FILLS ACTUALLY COST — research/preregistrations/2026-09-12_fill_costs.md (LEDGER trials=0)")
 	fmt.Printf("%d sampled days, %s..%s, first half-hour (09:15-09:44 IST) of 1-minute bars\n\n",
 		len(sample), sample[0].Format("2006-01-02"), sample[len(sample)-1].Format("2006-01-02"))
 	fmt.Printf("statutory charges, equity delivery round trip: %.2f bps (STT 20.00, stamp 1.50, exchange 0.61, SEBI+IPFT 0.04, GST %.2f)\n",
-		1e4*stat, 1e4*gstOnCharges())
+		1e4*stat, 1e4*costs.GSTOnCharges())
 	fmt.Println("plus the DP charge on every sale: Rs 14.75 per stock, fixed in rupees")
 	fmt.Println()
 	fmt.Printf("  %-14s %9s %7s %11s %13s %10s %10s %10s %10s %8s\n", "tier (60d med)", "name-days", "thin", "day value", "1st-min value",
@@ -186,7 +186,7 @@ func report(acc []*tierAcc, sample []time.Time) {
 		for _, mode := range []string{"auction", "after open"} {
 			fmt.Printf("  %-14s", map[bool]string{true: tierNames[i], false: ""}[mode == "auction"])
 			for _, q := range positions {
-				c := stat + dpCost(q) + 2*impactY*meds[i].sigma*math.Sqrt(q/meds[i].value)
+				c := stat + costs.DPFraction(q) + 2*costs.ImpactY*meds[i].sigma*math.Sqrt(q/meds[i].value)
 				if mode == "after open" {
 					c += meds[i].spread
 				}
@@ -212,29 +212,6 @@ func rupees(q float64) string {
 	}
 	return fmt.Sprintf("%.1fk", q/1e3)
 }
-
-// statutoryRoundTrip is the equity-delivery round trip as a fraction of trade
-// value, from Dhan's schedule (docs/open_questions.md B.5).
-func statutoryRoundTrip() float64 {
-	const (
-		stt      = 0.001 * 2
-		stamp    = 0.00015
-		exchange = 0.000030699 * 2
-		sebi     = 0.000001 * 2
-		ipft     = 0.000001 * 2
-	)
-	return stt + stamp + exchange + sebi + ipft + gstOnCharges()
-}
-
-// gstOnCharges is 18% GST on brokerage (nil for delivery at Dhan) plus the
-// exchange, SEBI and IPFT charges, both legs.
-func gstOnCharges() float64 {
-	return 0.18 * (0.000030699*2 + 0.000001*2 + 0.000001*2)
-}
-
-// dpCost is the depository charge on the sale — Rs 12.50 + 18% GST per stock
-// — as a fraction of a position of q rupees.
-func dpCost(q float64) float64 { return 12.5 * 1.18 / q }
 
 // arProducts returns the sum and count of the Abdi-Ranaldo products
 // (c_t − η_t)(c_t − η_{t+1}) over consecutive bars, in logs.

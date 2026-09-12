@@ -370,6 +370,14 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       was conservative except for the smallest positions. Also: the OS
       crontab now syncs at 15:00 UTC and runs the paper tracks at 15:30 UTC,
       after stockey's price adjustment, so order sheets use the day's prices
+- [x] What the paper books become at real capital (LEDGER row 36,
+      `paper capacity`, `internal/capacity`): each track's own targets in
+      whole shares, Law 12 inertia, Dhan's real per-trade costs. Sized to
+      today's books, **Rs 1 crore carries all five tracks faithfully** (cost
+      0.6-1.5%/yr, under the 50-bps model; tracking error ≤ 0.3%/yr); Rs 30
+      lakh carries only the 160-name trend books — the blends' small slices
+      pay the Rs 14.75 DP charge out of Rs 6,000-12,500 positions, and a Rs
+      10,000 floor fixes cost only by changing the book
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,

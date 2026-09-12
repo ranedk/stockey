@@ -9,16 +9,6 @@ import (
 	"github.com/ranedk/systrader/internal/bars"
 )
 
-func TestStatutoryRoundTripMatchesTheSchedule(t *testing.T) {
-	// 20 STT + 1.5 stamp + 0.614 exchange + 0.04 SEBI/IPFT + GST 0.1177 = 22.27 bps
-	if got := 1e4 * statutoryRoundTrip(); math.Abs(got-22.27) > 0.01 {
-		t.Errorf("statutory round trip = %.3f bps, want 22.27", got)
-	}
-	if got := 1e4 * dpCost(6000); math.Abs(got-24.58) > 0.01 {
-		t.Errorf("DP on a Rs 6,000 position = %.2f bps, want 24.58", got)
-	}
-}
-
 // synthBars builds one-minute bars from trades that bounce between a bid and
 // an ask `spread` apart around a slowly wandering mid.
 func synthBars(rng *rand.Rand, minutes, tradesPerMin int, spread, midVol float64) []bars.Bar {
