@@ -1,6 +1,7 @@
 package paper
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -496,5 +497,85 @@ func TestNoStopMeansNoExits(t *testing.T) {
 	}
 	if tr.Books[BookStrategy].Stopped != 0 {
 		t.Error("positions were stopped out with no stop rule configured")
+	}
+}
+
+func blendDay(scoreA, scoreB func(i int) float64) Day {
+	d := Day{Date: time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)}
+	for i := 0; i < 10; i++ {
+		d.Obs = append(d.Obs, Obs{
+			Symbol: fmt.Sprintf("S%d", i), Eligible: true, Forecast: float64(10 - i),
+			Signals: []float64{scoreA(i), scoreB(i)},
+		})
+	}
+	return d
+}
+
+func blendSpec() Spec {
+	s := FrozenSpec()
+	s.Mode = ModeBookBlend
+	s.Variants = []string{"a", "b"}
+	s.VariantWeights = []float64{0.75, 0.25}
+	return s
+}
+
+func TestBookBlendHoldsEachVariantsBookAtItsWeight(t *testing.T) {
+	// Top fifth of ten is two names. Variant a picks S0, S1; b picks S1, S2.
+	d := blendDay(func(i int) float64 { return float64(-i) }, func(i int) float64 { return -math.Abs(float64(i) - 1.5) })
+	w := targetWeights(BookStrategy, blendSpec(), d)
+	want := map[string]float64{"S0": 0.375, "S1": 0.375 + 0.125, "S2": 0.125}
+	var sum float64
+	for sym, v := range w {
+		sum += v
+		if math.Abs(v-want[sym]) > 1e-12 {
+			t.Errorf("%s weight %v, want %v", sym, v, want[sym])
+		}
+	}
+	if len(w) != 3 || math.Abs(sum-1) > 1e-12 {
+		t.Errorf("book %v sums to %v over %d names", w, sum, len(w))
+	}
+}
+
+func TestBookBlendHandsAMissingVariantsShareToTheOthers(t *testing.T) {
+	d := blendDay(func(i int) float64 { return float64(-i) }, func(int) float64 { return math.NaN() })
+	w := targetWeights(BookStrategy, blendSpec(), d)
+	if math.Abs(w["S0"]-0.5) > 1e-12 || math.Abs(w["S1"]-0.5) > 1e-12 || len(w) != 2 {
+		t.Errorf("with variant b still warming up, the book should be all of a's: %v", w)
+	}
+}
+
+func TestQualifyListsEveryVariantAStockMeets(t *testing.T) {
+	d := blendDay(func(i int) float64 { return float64(-i) }, func(i int) float64 { return -math.Abs(float64(i) - 1.5) })
+	got := Qualify(blendSpec(), d)
+	want := []Qualification{{"S0", "a"}, {"S1", "a"}, {"S1", "b"}, {"S2", "b"}}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("qualification %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+	// A single-signal strategy qualifies its top quintile under its signal's name.
+	single := Qualify(FrozenSpec(), d)
+	if len(single) != 2 || single[0] != (Qualification{"S0", "ewmac32"}) || single[1] != (Qualification{"S1", "ewmac32"}) {
+		t.Errorf("single-signal qualifications = %v", single)
+	}
+}
+
+func TestTheLookbackBlendSpecIsWhole(t *testing.T) {
+	s := MomentumLookbackBlendSpec()
+	if len(s.Variants) != len(s.VariantWeights) {
+		t.Fatalf("%d variants, %d weights", len(s.Variants), len(s.VariantWeights))
+	}
+	var sum float64
+	for _, w := range s.VariantWeights {
+		sum += w
+	}
+	if math.Abs(sum-1) > 1e-9 {
+		t.Errorf("weights sum to %v", sum)
+	}
+	if _, ok := SpecFor(s.Name); !ok {
+		t.Error("not registered")
 	}
 }

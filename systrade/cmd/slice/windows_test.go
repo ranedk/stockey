@@ -52,3 +52,19 @@ func TestDoubleCostChargesTheCostTwice(t *testing.T) {
 		t.Errorf("net at 2x cost = %v, want 0.005 (cost 25bps -> 50bps)", got)
 	}
 }
+
+func TestWholePercentAlwaysSumsToAHundred(t *testing.T) {
+	for _, w := range [][]float64{{0.3333, 0.3333, 0.3334}, {0.403, 0.161, 0.436}, {0.25, 0.25, 0.25, 0.25}, {0.1049, 0.2951, 0.6}} {
+		p := wholePercent(w)
+		sum := 0
+		for i, v := range p {
+			sum += v
+			if math.Abs(float64(v)-100*w[i]) >= 1 {
+				t.Errorf("%v -> %v: %d is more than a point from %.2f", w, p, v, 100*w[i])
+			}
+		}
+		if sum != 100 {
+			t.Errorf("%v -> %v sums to %d", w, p, sum)
+		}
+	}
+}

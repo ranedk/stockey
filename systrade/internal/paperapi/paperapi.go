@@ -12,6 +12,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ranedk/systrader/internal/paper"
 	"github.com/ranedk/systrader/internal/store"
@@ -254,4 +255,86 @@ func summarize(book string, rows []store.PaperNavRow) Summary {
 		s.TotalReturn = 0
 	}
 	return s
+}
+
+// QualColumn is one strategy variant a stock can qualify for.
+type QualColumn struct {
+	Strategy string `json:"strategy"`
+	Variant  string `json:"variant"`
+	Label    string `json:"label"`
+}
+
+// QualRow is one stock and the columns it qualifies for, in Columns order.
+type QualRow struct {
+	Symbol string `json:"symbol"`
+	Marks  []bool `json:"marks"`
+	Count  int    `json:"count"`
+}
+
+// QualMatrix is every stock that qualifies for any variant of any tracked
+// strategy on its latest decision day, and which ones.
+type QualMatrix struct {
+	AsOf    string       `json:"as_of"`
+	Columns []QualColumn `json:"columns"`
+	Rows    []QualRow    `json:"rows"`
+}
+
+// Qualifications assembles the cross-strategy matrix. Columns follow the
+// registry (paper.Specs), one per variant — a single-signal strategy has one —
+// so a strategy that has not recorded anything yet still shows, empty. Rows
+// sort by how many columns a stock meets, most first.
+func Qualifications(ctx context.Context, st *store.Store) (QualMatrix, error) {
+	rows, err := st.PaperQualifications(ctx)
+	if err != nil {
+		return QualMatrix{}, err
+	}
+	var m QualMatrix
+	col := map[string]int{}
+	for _, sp := range paper.Specs() {
+		vs := sp.Variants
+		if len(vs) == 0 {
+			vs = []string{sp.Signal}
+		}
+		for _, v := range vs {
+			label := sp.Name
+			if len(sp.Variants) > 0 {
+				label = sp.Name + " · " + v
+			}
+			col[sp.Name+"\x00"+v] = len(m.Columns)
+			m.Columns = append(m.Columns, QualColumn{Strategy: sp.Name, Variant: v, Label: label})
+		}
+	}
+	bySym := map[string]*QualRow{}
+	var asOf time.Time
+	for _, r := range rows {
+		c, ok := col[r.Strategy+"\x00"+r.Variant]
+		if !ok {
+			continue // a strategy no longer registered
+		}
+		q := bySym[r.Symbol]
+		if q == nil {
+			q = &QualRow{Symbol: r.Symbol, Marks: make([]bool, len(m.Columns))}
+			bySym[r.Symbol] = q
+		}
+		if !q.Marks[c] {
+			q.Marks[c] = true
+			q.Count++
+		}
+		if r.Date.After(asOf) {
+			asOf = r.Date
+		}
+	}
+	for _, q := range bySym {
+		m.Rows = append(m.Rows, *q)
+	}
+	sort.Slice(m.Rows, func(i, j int) bool {
+		if m.Rows[i].Count != m.Rows[j].Count {
+			return m.Rows[i].Count > m.Rows[j].Count
+		}
+		return m.Rows[i].Symbol < m.Rows[j].Symbol
+	})
+	if !asOf.IsZero() {
+		m.AsOf = asOf.Format("2006-01-02")
+	}
+	return m, nil
 }

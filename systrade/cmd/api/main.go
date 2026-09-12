@@ -11,6 +11,7 @@
 //	                       full adjusted-price universe (reporting only)
 //	GET /api/paper         every tracked paper strategy, forward record first
 //	GET /api/paper/{name}  one strategy: order sheet, book, NAV vs benchmarks
+//	GET /api/paper/qualifiers  every stock qualifying for any strategy variant, and which
 //
 // NOT hardened for public exposure -- no auth, permissive CORS. Personal
 // single-user tool meant to run on localhost/trusted network next to the
@@ -53,6 +54,7 @@ func main() {
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/stage", handleStage(st))
 	mux.HandleFunc("GET /api/paper", handlePaperList(st))
+	mux.HandleFunc("GET /api/paper/qualifiers", handlePaperQualifiers(st))
 	mux.HandleFunc("GET /api/paper/{name}", handlePaperDetail(st))
 
 	addr := ":" + port
@@ -74,6 +76,19 @@ func handlePaperList(st *store.Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"strategies": out})
+	}
+}
+
+// handlePaperQualifiers serves, for every stock that qualifies for any variant
+// of any tracked strategy, which ones — the screener's cross-strategy view.
+func handlePaperQualifiers(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out, err := paperapi.Qualifications(r.Context(), st)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	}
 }
 

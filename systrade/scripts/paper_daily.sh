@@ -28,4 +28,9 @@ go run ./cmd/paper run -name trend-quintile-reference -start 2022-01-01
 go run ./cmd/paper run -strategy trend-speed-blend
 go run ./cmd/paper run -strategy trend-speed-blend -name trend-speed-blend-reference -start 2022-01-01
 
+# Strategy 3: the literature's momentum at 6/9/12/12-minus-1 month lookbacks, a
+# blend of their books (docs/strategies/2026-09-12_momentum_lookback_blend.md).
+# No reference track: drawing one would read 2022+, which this family has left unread.
+go run ./cmd/paper run -strategy momentum-lookback-blend
+
 echo "=== paper_daily done ==="

@@ -68,6 +68,13 @@ func (s *Store) EnsurePaperTables(ctx context.Context) error {
 			ref_price   double precision,
 			PRIMARY KEY (strategy, symbol)
 		);
+		CREATE TABLE IF NOT EXISTS systrader_paper_qualify (
+			strategy text NOT NULL,
+			date     date NOT NULL,
+			symbol   text NOT NULL,
+			variant  text NOT NULL,
+			PRIMARY KEY (strategy, variant, symbol)
+		);
 		CREATE INDEX IF NOT EXISTS idx_paper_nav_strategy_date
 			ON systrader_paper_nav (strategy, date);
 		CREATE INDEX IF NOT EXISTS idx_paper_order_strategy_date
@@ -344,6 +351,57 @@ func (s *Store) PaperStrategies(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// SaveQualifications replaces one strategy's qualification list with the one
+// for its latest decision day (paper.Qualify). Only the latest day is kept:
+// it answers "what qualifies now", and the orders already carry the history.
+func (s *Store) SaveQualifications(ctx context.Context, strategy string, date time.Time, qs []paper.Qualification) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM systrader_paper_qualify WHERE strategy = $1`, strategy); err != nil {
+		return err
+	}
+	rows := make([][]any, len(qs))
+	for i, q := range qs {
+		rows[i] = []any{strategy, date, q.Symbol, q.Variant}
+	}
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"systrader_paper_qualify"},
+		[]string{"strategy", "date", "symbol", "variant"}, pgx.CopyFromRows(rows)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// PaperQualRow is one stock qualifying for one strategy variant.
+type PaperQualRow struct {
+	Strategy string
+	Date     time.Time
+	Symbol   string
+	Variant  string
+}
+
+// PaperQualifications returns every strategy's latest qualifications.
+func (s *Store) PaperQualifications(ctx context.Context) ([]PaperQualRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT strategy, date, symbol, variant FROM systrader_paper_qualify
+		ORDER BY symbol, strategy, variant`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PaperQualRow
+	for rows.Next() {
+		var r PaperQualRow
+		if err := rows.Scan(&r.Strategy, &r.Date, &r.Symbol, &r.Variant); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

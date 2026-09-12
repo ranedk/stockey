@@ -332,6 +332,24 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       is positive, strongest at 6-12 month lookbacks held 1-3 months; no cell
       reaches deflated Sharpe 0.95. The reversal "known-sign controls" came
       out negative, the opposite of the pre-registered expectation
+- [x] **Third paper track: momentum-lookback-blend** (LEDGER row 31). The
+      literature's momentum — trailing 6, 9, 12 and 12-minus-1 month returns,
+      the lookbacks whose one-month-hold cells survived row 30 — held as a
+      blend of their BOOKS (`paper.ModeBookBlend`: each variant's top quintile
+      at handcrafted weights 33/33/17/17, from correlations and costs only),
+      rebalanced monthly. Survived its pre-registered kill screen; record from
+      2026-09-12 beside the other two, replacing neither; no in-sample
+      reference curve, so 2022+ stays unread for this family
+- [x] Cross-strategy qualification view: every paper run records which stocks
+      are in the top fifth of each strategy and of each variant inside a
+      blend (`paper.Qualify`, `systrader_paper_qualify`), served as a stock ×
+      strategy/variant matrix at `GET /api/paper/qualifiers` and shown on
+      screener/'s Paper page — for any stock, every version of momentum it
+      currently qualifies for
+- [x] Fixed: the stable-shuffle control was not reproducible. Symbol ids came
+      from a parallel scan's order and the control keys its per-symbol draw on
+      the id, so identical runs drew different random books (8.35%, 10.64%,
+      11.10%/yr). Ids are now assigned by name (`stableIDs`)
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [ ] **Next research: the low-volatility anomaly.** A published, price-only

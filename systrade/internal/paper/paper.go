@@ -48,7 +48,12 @@ type Spec struct {
 	Mode SelectionMode
 	// SwitchBreadth is the share of the universe in an uptrend below which a
 	// switching book uses its SECOND signal instead of its first.
-	SwitchBreadth    float64
+	SwitchBreadth float64
+	// Variants names the scores a book-blend holds books of (ModeBookBlend),
+	// in the order Obs.Signals carries them; VariantWeights are their fixed
+	// shares of the book, from the handcrafting tree.
+	Variants         []string
+	VariantWeights   []float64
 	RebalanceEvery   int     // trading days between rebalances
 	CostBpsRoundTrip float64 // charged as half per side on turnover
 	RandomSeed       int64   // for the random-ranking benchmark
@@ -174,6 +179,13 @@ const (
 	// alone will improve a book whether or not the switching does anything.
 	// Without this, "the switch works" cannot be told from "owning both works".
 	ModeBlend
+	// ModeBookBlend holds several variants' own books at fixed weights — each
+	// variant's top quantile by its own score — and adds them up. A blend of
+	// BOOKS, not of signals: variants whose raw scores have different spreads
+	// (a 6-month and a 12-month return) cannot be averaged without the widest
+	// one dominating, and each variant's book is exactly what research
+	// measured (LEDGER row 30).
+	ModeBookBlend
 )
 
 func (m SelectionMode) String() string {
@@ -182,6 +194,8 @@ func (m SelectionMode) String() string {
 		return "switch on breadth"
 	case ModeBlend:
 		return "constant blend (control)"
+	case ModeBookBlend:
+		return "blend of variant books"
 	default:
 		return "single signal"
 	}
@@ -196,8 +210,10 @@ func ParseMode(s string) (SelectionMode, error) {
 		return ModeSwitch, nil
 	case "blend":
 		return ModeBlend, nil
+	case "bookblend":
+		return ModeBookBlend, nil
 	}
-	return ModeSingle, fmt.Errorf("paper: unknown mode %q (single|switch|blend)", s)
+	return ModeSingle, fmt.Errorf("paper: unknown mode %q (single|switch|blend|bookblend)", s)
 }
 
 // breadthOf is the share of the eligible universe in an uptrend — the regime
@@ -327,8 +343,30 @@ func SpeedBlendSpec() Spec {
 	return s
 }
 
+// MomentumLookbackBlendSpec is the configuration frozen on 2026-09-12: the
+// literature's momentum — trailing total return, not EWMAC — at the four
+// lookbacks whose one-month-hold cells survived LEDGER row 30, held as a blend
+// of their books (ModeBookBlend) at handcrafted weights: Table 8 row 3 over
+// the groups {6m}, {9m}, {12m, 12-minus-1} (the last two correlate 0.94),
+// Table 12 column A on costs, whole percent
+// (research/reports/2026-09-12_lookback_blend_construction.txt). Rebalanced
+// monthly. Same universe, costs and random-ranking seed as the other tracks.
+func MomentumLookbackBlendSpec() Spec {
+	s := FrozenSpec()
+	s.Name = "momentum-lookback-blend"
+	s.Start = time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	s.Signal = "momentum-lookback-blend"
+	s.SignalLabel = "Trailing 6, 9, 12 and 12-minus-1 month returns — each variant's top quintile, held 33/33/17/17 (handcrafted), long-only, monthly"
+	s.Doc = "docs/strategies/2026-09-12_momentum_lookback_blend.md"
+	s.Mode = ModeBookBlend
+	s.Variants = []string{"mom6", "mom9", "mom12", "mom12_1"}
+	s.VariantWeights = []float64{0.33, 0.33, 0.17, 0.17}
+	s.RebalanceEvery = 21
+	return s
+}
+
 // Specs lists every strategy with a forward record, in the order they began.
-func Specs() []Spec { return []Spec{FrozenSpec(), SpeedBlendSpec()} }
+func Specs() []Spec { return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec()} }
 
 // SpecFor finds a registered strategy by name.
 func SpecFor(name string) (Spec, bool) {
@@ -363,6 +401,9 @@ type Obs struct {
 	AnnVol float64
 	// Forecast2 is the alternate signal, for a book that switches or blends.
 	Forecast2 float64
+	// Signals are a book-blend's variant scores, in Spec.Variants order, NaN
+	// where a variant is undefined (not enough history yet).
+	Signals []float64
 	// AboveSMA is the name's own 200-day trend state, from which the day's
 	// breadth — the share of the universe in an uptrend — is counted.
 	AboveSMA bool
@@ -855,6 +896,8 @@ func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 			}
 		case ModeBlend:
 			return blendWeights(eligible, n)
+		case ModeBookBlend:
+			return bookBlendWeights(eligible, spec)
 		default:
 			sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
 		}
@@ -1066,4 +1109,103 @@ func Pending(spec Spec, latest Day, current map[string]float64, daysToDue int) P
 		Orders:    ordersBetween(latest.Date, BookStrategy, current, target, prices),
 		Target:    target,
 	}
+}
+
+// variantTops returns, for each variant, the symbols in its own top quantile
+// of the eligible names that variant can score. A variant with too few such
+// names that day has no book (nil).
+func variantTops(eligible []Obs, spec Spec) [][]string {
+	out := make([][]string, len(spec.Variants))
+	for v := range spec.Variants {
+		var have []Obs
+		for _, o := range eligible {
+			if v < len(o.Signals) && !math.IsNaN(o.Signals[v]) {
+				have = append(have, o)
+			}
+		}
+		if len(have) < spec.Quantile {
+			continue
+		}
+		sort.Slice(have, func(i, j int) bool {
+			if have[i].Signals[v] != have[j].Signals[v] {
+				return have[i].Signals[v] > have[j].Signals[v]
+			}
+			return have[i].Symbol < have[j].Symbol
+		})
+		n := len(have) / spec.Quantile
+		if n < 1 {
+			n = 1
+		}
+		for _, o := range have[:n] {
+			out[v] = append(out[v], o.Symbol)
+		}
+	}
+	return out
+}
+
+// bookBlendWeights holds each variant's own top quantile at that variant's
+// weight. A name topping several variants is held once at the summed weight;
+// a variant with no book yet (warm-up) hands its share to the others rather
+// than to cash.
+func bookBlendWeights(eligible []Obs, spec Spec) map[string]float64 {
+	tops := variantTops(eligible, spec)
+	var wsum float64
+	for v, t := range tops {
+		if len(t) > 0 {
+			wsum += spec.VariantWeights[v]
+		}
+	}
+	out := map[string]float64{}
+	if wsum <= 0 {
+		return out
+	}
+	for v, t := range tops {
+		for _, s := range t {
+			out[s] += spec.VariantWeights[v] / wsum / float64(len(t))
+		}
+	}
+	return out
+}
+
+// Qualification is one stock qualifying for one variant of a strategy on a
+// decision day: in that variant's top quantile of the eligible universe.
+// Recorded for every strategy, so the screener can show, for any stock, every
+// strategy and variant it currently qualifies for.
+type Qualification struct {
+	Symbol  string
+	Variant string
+}
+
+// Qualify lists a day's qualifications. A single-signal strategy has one
+// variant, its signal; a book-blend has one per variant.
+func Qualify(spec Spec, d Day) []Qualification {
+	var out []Qualification
+	if spec.Mode == ModeBookBlend {
+		var eligible []Obs
+		for _, o := range d.Obs {
+			if o.Eligible {
+				eligible = append(eligible, o)
+			}
+		}
+		for v, t := range variantTops(eligible, spec) {
+			for _, s := range t {
+				out = append(out, Qualification{Symbol: s, Variant: spec.Variants[v]})
+			}
+		}
+	} else {
+		name := spec.Signal
+		if name == "" {
+			name = spec.Name
+		}
+		for s := range targetWeights(BookStrategy, spec, d) {
+			out = append(out, Qualification{Symbol: s, Variant: name})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Symbol != out[j].Symbol {
+			return out[i].Symbol < out[j].Symbol
+		}
+		return out[i].Variant < out[j].Variant
+	})
+	return out
 }

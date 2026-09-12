@@ -1,0 +1,40 @@
+# Momentum lookback blend — construction, generated 2026-09-12 by `slice lookbacks` (defaults).
+# Law 6 inputs only; exploration years. The bootstrap cross-check at the end was read after the weights were fixed.
+
+MOMENTUM LOOKBACK BLEND — CONSTRUCTION. 2013-07-01..2021-12-31, Rs 10 cr floor, top quintile, monthly rebalance, 50 bps
+Law 6 inputs only: costs (facts) and correlations (estimable). No return, SR or edge printed;
+only the bootstrap cross-check at the end sees sample means, as Carver's method requires.
+1851 common trading days from 2014-07-07.
+
+cost of trading each lookback's book
+  mom6     turnover  4.01%/day one-way   cost 0.099 SR/yr
+  mom9     turnover  3.46%/day one-way   cost 0.086 SR/yr
+  mom12    turnover  3.16%/day one-way   cost 0.078 SR/yr
+  mom12_1  turnover  3.32%/day one-way   cost 0.082 SR/yr
+
+correlation of daily returns in excess of the equal-weight book
+               mom6  mom9  mom12  mom12_1
+  mom6               1.00        0.87        0.82        0.76 
+  mom9               0.87        1.00        0.89        0.84 
+  mom12              0.82        0.89        1.00        0.94 
+  mom12_1            0.76        0.84        0.94        1.00 
+
+handcrafted (Table 8), near-duplicates grouped at rho >= 0.9
+  lookbacks      row 3 (0.87/0.79/0.87)       mom6 33%, mom9 33%, mom12+mom12_1 33%
+  mom12+mom12_1  row 2                        mom12 50%, mom12_1 50%
+
+Table 12 column A on cost differences (SR vs group average -> factor), then whole percent
+  mom6     -0.013 -> x0.984   33.3% -> 32.8% -> 33%
+  mom9     +0.000 -> x1.001   33.3% -> 33.4% -> 33%
+  mom12    +0.008 -> x1.018   16.7% -> 17.0% -> 17%
+  mom12_1  +0.005 -> x1.010   16.7% -> 16.8% -> 17%
+
+No FDM: this is a blend of BOOKS (each variant's own top quintile), not an average of
+forecasts, so there is no combined forecast to rescale.
+
+cross-check: Carver's bootstrap, max-Sharpe on 185-day samples (500 resamples; 45 uninformative)
+  read only after the weights above are fixed; it cannot move them
+  mom6     handcrafted  33%   bootstrap  19.8%   single fit   0.0%
+  mom9     handcrafted  33%   bootstrap  29.8%   single fit  34.6%
+  mom12    handcrafted  17%   bootstrap  31.5%   single fit  65.4%
+  mom12_1  handcrafted  17%   bootstrap  18.9%   single fit   0.0%

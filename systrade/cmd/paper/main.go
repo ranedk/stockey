@@ -58,7 +58,7 @@ func main() {
 	holdCount := flag.Int("hold-count", 0, "hold a fixed number of names instead of a quantile")
 	signal := flag.String("signal", "", "override the spec's selection signal: ewmac32 | ewmac16 | trend-speed-blend | ret5 | reversal20 | reversal60")
 	signal2 := flag.String("signal2", "reversal20", "the second signal, used by -mode=switch and -mode=blend")
-	mode := flag.String("mode", "single", "selection mode: single | switch | blend")
+	mode := flag.String("mode", "", "override the spec's selection mode: single | switch | blend | bookblend")
 	switchBreadth := flag.Float64("switch-breadth", 0.40, "for -mode=switch: use the second signal below this share of the universe in an uptrend")
 	flag.Parse()
 
@@ -107,9 +107,19 @@ func main() {
 	fatalIf(err)
 	sig2, err := parseSignal(*signal2)
 	fatalIf(err)
-	m, err := paper.ParseMode(*mode)
-	fatalIf(err)
-	spec.Mode = m
+	var variants []signalFn
+	for _, v := range spec.Variants {
+		fn, err := parseSignal(v)
+		fatalIf(err)
+		variants = append(variants, fn)
+	}
+	// Only an explicit -mode overrides the spec. A default of "single" here once
+	// silently turned the lookback book-blend into a plain 6-month book.
+	if *mode != "" {
+		m, err := paper.ParseMode(*mode)
+		fatalIf(err)
+		spec.Mode = m
+	}
 	spec.SwitchBreadth = *switchBreadth
 	if *constant > 0 {
 		spec.ConstantExposure = *constant
@@ -125,7 +135,7 @@ func main() {
 	fmt.Printf("%s: loading adjusted bars %s..%s\n", spec.Name,
 		from.Format("2006-01-02"), to.Format("2006-01-02"))
 
-	all, err := buildDays(ctx, st, spec, sig, sig2, from, to, true)
+	all, err := buildDays(ctx, st, spec, sig, sig2, variants, from, to, true)
 	fatalIf(err)
 	if len(all) == 0 {
 		fatal(fmt.Errorf("no price data at all in %s..%s", from.Format("2006-01-02"), to.Format("2006-01-02")))
@@ -160,6 +170,14 @@ func main() {
 	fatalIf(st.EnsurePaperTables(ctx))
 	fatalIf(st.SavePaperTrack(ctx, track))
 	fatalIf(st.SavePending(ctx, spec.Name, sheet))
+	// What qualifies today, per variant — for the screener's cross-strategy
+	// view. Forward records only: a reference track's latest day is the same
+	// day and would only duplicate it.
+	if *name == "" && *start == "" {
+		quals := paper.Qualify(spec, all[len(all)-1])
+		fatalIf(st.SaveQualifications(ctx, spec.Name, all[len(all)-1].Date, quals))
+		fmt.Printf("qualifying: %d stock-variant pairs on %s\n", len(quals), all[len(all)-1].Date.Format("2006-01-02"))
+	}
 	fmt.Printf("\nstored: %d tracked days x %d books, %d pending orders\n",
 		len(track.Dates), len(track.Books), len(sheet.Orders))
 }
@@ -258,6 +276,18 @@ func parseSignal(name string) (signalFn, error) {
 		return ruleSignal(rules.EWMAC{Fast: 16}), nil
 	case "trend-speed-blend":
 		return ruleSignal(rules.SpeedBlend()), nil
+	case "mom6":
+		return windowReturn(6*month, 0), nil
+	case "mom9":
+		return windowReturn(9*month, 0), nil
+	case "mom12":
+		return windowReturn(12*month, 0), nil
+	case "mom12_1":
+		return windowReturn(12*month, month), nil
+	case "momentum-lookback-blend":
+		// A book-blend ranks by its variants (spec.Variants); the primary
+		// signal only decides eligibility, which buildDays sets from them.
+		return windowReturn(6*month, 0), nil
 	case "reversal20", "reversal60", "reversal120":
 		w := map[string]int{"reversal20": 20, "reversal60": 60, "reversal120": 120}[name]
 		return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
@@ -301,6 +331,25 @@ func parseSignal(name string) (signalFn, error) {
 	return nil, fmt.Errorf("unknown signal %q (ewmac32 | ewmac16 | trend-speed-blend | ret5 | ret5inv | reversal20 | reversal60 | reversal120)", name)
 }
 
+// month is 21 trading days, as in `slice windows`.
+const month = 21
+
+// windowReturn is the trailing total return over t−from → t−to trading days,
+// the formation windows of LEDGER row 30.
+func windowReturn(from, to int) signalFn {
+	return func(_ bars.Series, closes core.Series, _ core.Series) []float64 {
+		v := closes.Values
+		out := make([]float64, len(v))
+		for i := range out {
+			out[i] = math.NaN()
+			if i-from >= 0 && v[i-from] > 0 && v[i-to] > 0 {
+				out[i] = v[i-to]/v[i-from] - 1
+			}
+		}
+		return out
+	}
+}
+
 func ruleSignal(r rules.Rule) signalFn {
 	return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
 		inst := &data.Instrument{
@@ -311,7 +360,7 @@ func ruleSignal(r rules.Rule) signalFn {
 	}
 }
 
-func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
+func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, variants []signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
 	byDate := map[time.Time][]paper.Obs{}
 	err := st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
 		n := len(ser.Bars)
@@ -327,6 +376,10 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 		vol := core.PriceUnitVol(prices, 36, 10)
 		fc := signal(ser, prices, vol)
 		fc2 := signal2(ser, prices, vol)
+		vs := make([][]float64, len(variants))
+		for k, fn := range variants {
+			vs[k] = fn(ser, prices, vol)
+		}
 		sma := core.SMA(prices, 200).Values
 		turnover := bars.MedianTurnover(ser.Bars, spec.TurnoverWindow)
 
@@ -347,6 +400,24 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				continue
 			}
 			f, t60 := fc[i-1], turnover[i-1] // decided at yesterday's close
+			var sigs []float64
+			if len(vs) > 0 {
+				sigs = make([]float64, len(vs))
+				defined := false
+				for k := range vs {
+					sigs[k] = vs[k][i-1]
+					if !math.IsNaN(sigs[k]) {
+						defined = true
+					}
+				}
+				if spec.Mode == paper.ModeBookBlend {
+					// Eligible if any variant can score the name yet.
+					f = math.NaN()
+					if defined {
+						f = 0
+					}
+				}
+			}
 			eligible := !math.IsNaN(f) && !math.IsNaN(t60) && t60 >= spec.MinTurnover
 			annVol := math.NaN()
 			if v := vol.Values[i-1]; !math.IsNaN(v) && closes[i-1] > 0 {
@@ -356,6 +427,7 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				Symbol: ser.Symbol, Open: b.Open, Close: b.Close, PrevClose: closes[i-1],
 				Forecast: f, Turnover: t60, Eligible: eligible, AnnVol: annVol,
 				Forecast2: fc2[i-1],
+				Signals:   sigs,
 				AboveSMA:  !math.IsNaN(sma[i-1]) && closes[i-1] > sma[i-1],
 			})
 		}
