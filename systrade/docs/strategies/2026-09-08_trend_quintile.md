@@ -96,7 +96,7 @@ like in-sample, and it is not fragile to the arbitrary choices".
   rewrites `systrader_paper_nav`, `systrader_paper_holding`,
   `systrader_paper_order` and `systrader_paper_pending`. Idempotent by
   construction: running twice changes nothing and a missed day fills itself in.
-- `scripts/paper_daily.sh` runs it every weekday at 20:15 IST, half an hour
+- `scripts/paper_daily.sh` runs it every weekday at 21:00 IST (20:15 until 2026-09-12), half an hour
   after the day's adjusted prices land.
 - screener/'s **Paper** page shows the order sheet for the next session, the
   current book, and the strategy against both benchmarks — with the in-sample

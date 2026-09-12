@@ -219,7 +219,7 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       Law 4 both point at. Spec frozen in
       `docs/strategies/2026-09-08_trend_quintile.md`; `cmd/paper` recomputes the
       order sheet, book and NAV against an equal-weight and a random-ranking
-      book every weekday (`scripts/paper_daily.sh`, 20:15 IST), and screener/'s
+      book every weekday (`scripts/paper_daily.sh`, 21:00 IST), and screener/'s
       Paper page shows it. Record starts 2026-09-08; judgement is pre-committed
       to wait 12 months and 12 rebalances
 - [x] Attacked the strategy's known failure mode before the record began
@@ -362,6 +362,14 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       low risk; the branches' excess returns correlate −0.12. Survived its
       kill screen (16.7%/yr at 19.1% volatility, maxDD −38.6%); its Sharpe
       ratio sits near the better parent's, not above both
+- [x] What fills actually cost (LEDGER row 35, `cmd/costs`): statutory 22.3
+      bps a round trip plus Rs 14.75 DP per sale; spreads 4-17 bps by
+      liquidity, none paid in the opening auction; no drift after the open.
+      In the Rs 10 cr+ universe a round trip runs 30-39 bps at Rs 12,500-20,000
+      a position and ~48-50 at Rs 6,000 — so the 50 bps every backtest assumed
+      was conservative except for the smallest positions. Also: the OS
+      crontab now syncs at 15:00 UTC and runs the paper tracks at 15:30 UTC,
+      after stockey's price adjustment, so order sheets use the day's prices
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,

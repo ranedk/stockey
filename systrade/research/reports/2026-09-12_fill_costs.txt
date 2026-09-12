@@ -1,0 +1,37 @@
+# What fills actually cost (LEDGER row 35, trials=0) — generated 2026-09-12 by `costs` (defaults).
+# Design: research/preregistrations/2026-09-12_fill_costs.md
+
+WHAT FILLS ACTUALLY COST — research/preregistrations/2026-09-12_fill_costs.md (LEDGER trials=0)
+162 sampled days, 2023-06-01..2026-08-28, first half-hour (09:15-09:44 IST) of 1-minute bars
+
+statutory charges, equity delivery round trip: 22.27 bps (STT 20.00, stamp 1.50, exchange 0.61, SEBI+IPFT 0.04, GST 0.12)
+plus the DP charge on every sale: Rs 14.75 per stock, fixed in rupees
+
+  tier (60d med) name-days    thin   day value 1st-min value     spread     spread  gap after      |gap|  daily σ
+                                        median        median     pooled     median open, mean     median   median
+  Rs 1-10 cr        109702     12%      3.9 cr        2.5 lakh     16.5 bp      9.7 bp     +0.6 bp     58.4 bp    2.44%
+  Rs 10-25 cr        41199      6%     15.6 cr       15.7 lakh      9.6 bp      7.4 bp     -2.0 bp     55.7 bp    2.46%
+  Rs 25-100 cr       40682      5%     48.4 cr       53.9 lakh      5.6 bp      5.4 bp     -0.4 bp     50.1 bp    2.34%
+  Rs 100-500 cr      24612      2%    194.3 cr      226.3 lakh      3.7 bp      3.2 bp     -0.7 bp     41.6 bp    1.98%
+  Rs 500 cr+          3804      5%    781.4 cr     1100.9 lakh      4.2 bp      2.1 bp     -1.1 bp     34.4 bp    1.74%
+
+'thin' = no 09:15 bar or fewer than 20 of the first 30 minutes traded. 'gap after open' = where the
+09:15-09:29 volume-weighted price sat against the auction price: an order placed after the open lands
+there instead, and pays the spread; an auction order pays neither.
+
+ROUND TRIP, basis points, for a median name in each tier — against the 50 bps every backtest assumed
+  position                 Rs 6.0k          Rs 12.5k          Rs 20.0k             Rs 1L             Rs 3L
+  Rs 1-10 cr            52.9 auct         42.8 auct         40.7 auct         48.5 auct         65.6 auct 
+                        69.4 open         59.3 open         57.2 open         64.9 open         82.0 open 
+  Rs 10-25 cr           49.9 auct         38.5 auct         35.2 auct         36.2 auct         44.3 auct 
+                        59.5 open         48.1 open         44.8 open         45.8 open         53.9 open 
+  Rs 25-100 cr          48.5 auct         36.5 auct         32.7 auct         30.5 auct         34.4 auct 
+                        54.1 open         42.1 open         38.3 open         36.1 open         40.0 open 
+  Rs 100-500 cr         47.5 auct         35.1 auct         30.9 auct         26.6 auct         27.7 auct 
+                        51.3 open         38.8 open         34.6 open         30.3 open         31.4 open 
+  Rs 500 cr+            47.2 auct         34.5 auct         30.2 auct         25.0 auct         24.9 auct 
+                        51.4 open         38.7 open         34.4 open         29.2 open         29.2 open 
+
+auction = statutory + DP + modelled impact (square-root law, Y=1, both legs); after open = the same plus
+the pooled spread. Impact is a MODEL; statutory and DP are facts; the spread is estimated from bars.
+
