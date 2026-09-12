@@ -352,12 +352,13 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       11.10%/yr). Ids are now assigned by name (`stableIDs`)
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
-- [ ] **Next research: the low-volatility anomaly.** A published, price-only
-      premium (low-volatility / betting-against-beta, documented in Indian
-      equities) that should correlate little with momentum — a second
-      strategy, not another version of the first. Take the published
-      definition as-is, pre-register it, slice only for tradability (costs,
-      liquidity, capacity), never for score, and expect roughly half the
-      published return
+- [x] **The low-volatility anomaly across time windows** (LEDGER row 32,
+      `slice lowvol`, pre-registered): the lowest-risk fifth by 1/3/6/12-month
+      volatility, 1-year beta and 1-year residual volatility, held 1/3/6
+      months, judged at matched risk. Verdict PLATEAU: 17 of 18 cells beat
+      both controls and survive FDR, across every measure and hold. Every
+      book ran 14-16% volatility and −28% to −40% drawdowns against the
+      universe's 22% and −58%, while keeping up on raw return. A candidate
+      second strategy and momentum partner — confirmation is forward only
 - [ ] Instrument universe finalization (blocked on capital, A1)
 - [ ] Live execution via Dhan orders API (after, and only after, paper data)

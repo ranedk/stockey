@@ -7,6 +7,7 @@
 //	slice blend    (the speed blend's pre-registered kill screen)
 //	slice windows  (momentum across formation x holding windows, pre-registered)
 //	slice lookbacks (the momentum lookback blend's construction: costs and correlations)
+//	slice lowvol   (the low-volatility anomaly across time windows, pre-registered)
 //	slice drawdown -rule ewmac32_128
 //
 // This is EXPLORATION. It prints no verdict and no p-value on a winning
@@ -52,6 +53,10 @@ const (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "cost" {
 		runCost(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "lowvol" {
+		runLowVol(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "lookbacks" {

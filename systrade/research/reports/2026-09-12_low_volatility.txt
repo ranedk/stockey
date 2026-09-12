@@ -1,0 +1,60 @@
+# Low volatility across time windows (LEDGER row 32) — generated 2026-09-12 by `slice lowvol` (defaults).
+# Pre-registered: research/preregistrations/2026-09-12_low_volatility.md. Exploration years 2013-07..2021-12 only.
+
+LOW-VOLATILITY ACROSS TIME WINDOWS — pre-registered, research/preregistrations/2026-09-12_low_volatility.md
+NSE adjusted EQ, Rs 10 cr floor, the LOWEST-risk quintile, equal weight, fills at the next open, 2013-07-01..2021-12-31
+50 bps round trip (100 bps shown separately); a K-month hold = K staggered books a month apart, averaged
+Deciding statistic: the edge at MATCHED risk — each book scaled (hindsight, a reading device) to the
+realised volatility of the control it is compared with. Exploration years: can kill, never confirm.
+
+the book: annual return / volatility / max drawdown
+                          hold 1m                hold 3m                hold 6m
+  vol1       14.2% / 15.6% / -40%   15.4% / 15.4% / -34%   15.2% / 15.6% / -34%
+  vol3       14.3% / 14.5% / -32%   14.1% / 14.7% / -33%   14.5% / 14.9% / -33%
+  vol6       15.1% / 14.4% / -30%   14.4% / 14.6% / -31%   15.1% / 14.7% / -29%
+  vol12      11.9% / 14.5% / -30%   12.6% / 14.8% / -30%   12.9% / 15.0% / -30%
+  beta12     14.4% / 14.5% / -28%   13.7% / 14.7% / -28%   12.8% / 14.8% / -30%
+  idio12     12.3% / 16.1% / -35%   12.0% / 16.2% / -33%   12.7% / 16.5% / -36%
+
+reference: equal-weight 8.1% / 22.3% / -58%, stable-shuffle 8.7% / 22.5% / -57% (held 1m, 90 months)
+
+RAW edge over equal-weight, %/month (the 'similar return' half of the claim)
+                          hold 1m                hold 3m                hold 6m
+  vol1                      -0.09                  +0.03                  -0.02
+  vol3                      -0.13                  -0.07                  -0.08
+  vol6                      +0.06                  +0.04                  -0.00
+  vol12                     +0.17                  +0.22                  +0.26
+  beta12                    +0.28                  +0.25                  +0.18
+  idio12                    +0.15                  +0.16                  +0.21
+
+edge at MATCHED risk over the TOUGHER control, %/month at 50 bps  (✓ = beats both at matched risk and survives FDR)
+                          hold 1m                hold 3m                hold 6m
+  vol1                     +0.36                  +0.54✓                 +0.47✓
+  vol3                     +0.46✓                 +0.47✓                 +0.47✓
+  vol6                     +0.71✓                 +0.63✓                 +0.57✓
+  vol12                    +0.67✓                 +0.72✓                 +0.70✓
+  beta12                   +0.84✓                 +0.76✓                 +0.62✓
+  idio12                   +0.49✓                 +0.48✓                 +0.51✓
+
+same at 100 bps (worse of the two controls)
+                          hold 1m                hold 3m                hold 6m
+  vol1                      -0.00                  +0.43                  +0.42
+  vol3                      +0.31                  +0.39                  +0.43
+  vol6                      +0.63                  +0.59                  +0.54
+  vol12                     +0.64                  +0.70                  +0.69
+  beta12                    +0.77                  +0.72                  +0.59
+  idio12                    +0.46                  +0.46                  +0.50
+
+deflated Sharpe on the matched-risk excess, 18 trials
+                          hold 1m                hold 3m                hold 6m
+  vol1                      0.717                  0.913                  0.875
+  vol3                      0.779                  0.801                  0.802
+  vol6                      0.917                  0.895                  0.844
+  vol12                     0.929                  0.949                  0.955
+  beta12                    0.924                  0.894                  0.825
+  idio12                    0.871                  0.862                  0.923
+
+PRE-REGISTERED VERDICT: 17 of 18 cells beat both controls at matched risk and survive FDR, spanning 6 of 6 measures and 3 of 3 holding periods -> PLATEAU
+(plateau: >= 12 survivors not confined to one row or column; spike: < 6, or all in one row or column)
+Surviving cells: beta12/1m, beta12/3m, beta12/6m, idio12/1m, idio12/3m, idio12/6m, vol1/3m, vol1/6m, vol12/1m, vol12/3m, vol12/6m, vol3/1m, vol3/3m, vol3/6m, vol6/1m, vol6/3m, vol6/6m
+Workspace-wide Bonferroni bar, context only (amended Law 2): t = 4.10 at M = 1202.

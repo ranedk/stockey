@@ -86,29 +86,13 @@ func runWindows(args []string) {
 		fatal(fmt.Errorf("no eligible days"))
 	}
 
+	books := staggeredBooks(days, names, holdMonths, *costBps)
 	var cells []windowCell
 	for _, k := range holdMonths {
-		var phases [][]sleeve.RuleResult
-		for p := 0; p < k && p*month < len(days); p++ {
-			res, err := sleeve.Run(days[p*month:], names, sleeve.Config{
-				CostBpsRoundTrip: *costBps,
-				Seeds:            []int64{1, 2, 3, 4, 5},
-				RebalanceEvery:   k * month,
-			})
-			fatalIf(err)
-			phases = append(phases, res)
+		for _, sg := range sigs {
+			b := books[sg.Name][k]
+			cells = append(cells, windowCell{sig: sg, k: k, signal: b.Signal, eq: b.Equal, sh: b.Shuffle, phases: b.Phases})
 		}
-		for j, s := range sigs {
-			var sb, eb, hb []sleeve.Book
-			for _, ph := range phases {
-				start := firstTraded(ph[j].Signal)
-				sb = append(sb, trimFrom(ph[j].Signal, start))
-				eb = append(eb, trimFrom(ph[j].EqualWeight, start))
-				hb = append(hb, trimFrom(ph[j].StableShuffled, start))
-			}
-			cells = append(cells, windowCell{sig: s, k: k, signal: stagger(sb), eq: stagger(eb), sh: stagger(hb), phases: len(phases)})
-		}
-		fmt.Fprintf(os.Stderr, "held %2d months: %d staggered books run\n", k, len(phases))
 	}
 
 	boot := evidence.Bootstrap{MeanBlock: 5, Reps: *reps, Seed: *seed}
@@ -267,12 +251,43 @@ func runWindows(args []string) {
 	fmt.Printf("Surviving cells: %s\n", strings.Join(list, ", "))
 }
 
-// buildWindows computes every signal for every eligible name on every
-// decision day and marks, per signal, the day's top quintile (U = 1) against
-// the rest of the eligible names that signal can see (U = 0); a signal whose
-// formation window reaches before the name's history is NaN, so each window
-// starts when its data does.
+// scorer turns one symbol's bars into a score on every bar, NaN where it is
+// undefined; a book holds each day's top quintile by it.
+type scorer struct {
+	Name  string
+	Score func(b []bars.Bar) []float64
+}
+
+// windowScorer is a trailing-return signal as a scorer.
+func windowScorer(s windowSignal) scorer {
+	return scorer{Name: s.Name, Score: func(b []bars.Bar) []float64 {
+		out := make([]float64, len(b))
+		for i := range out {
+			out[i] = math.NaN()
+			a, z := i-s.From, i-s.To
+			if a < 0 || b[a].Close <= 0 || b[z].Close <= 0 {
+				continue
+			}
+			out[i] = s.Sign * (b[z].Close/b[a].Close - 1)
+		}
+		return out
+	}}
+}
+
+// buildWindows builds the trailing-return grid's days (LEDGER row 30).
 func buildWindows(cache string, sigs []windowSignal, from, to time.Time, floor float64) []sleeve.Day {
+	scs := make([]scorer, len(sigs))
+	for i, s := range sigs {
+		scs[i] = windowScorer(s)
+	}
+	return buildScores(cache, scs, from, to, floor, month+3)
+}
+
+// buildScores computes every scorer for every eligible name on every decision
+// day and marks, per scorer, the day's top quintile (U = 1) against the rest
+// of the eligible names it can score (U = 0). A scorer that cannot score a
+// name yet leaves it NaN, so each book starts when its data does.
+func buildScores(cache string, scs []scorer, from, to time.Time, floor float64, minBars int) []sleeve.Day {
 	type obs struct {
 		sym int32
 		sig []float64
@@ -284,10 +299,14 @@ func buildWindows(cache string, sigs []windowSignal, from, to time.Time, floor f
 	fatalIf(bars.ScanParallel(cache, 0, func(ser bars.Series) {
 		b := ser.Bars
 		n := len(b)
-		if n < month+3 {
+		if n < minBars {
 			return
 		}
 		turn := bars.MedianTurnover(b, turnoverWin)
+		arrays := make([][]float64, len(scs))
+		for j, sc := range scs {
+			arrays[j] = sc.Score(b)
+		}
 		type row struct {
 			d time.Time
 			o obs
@@ -302,16 +321,13 @@ func buildWindows(cache string, sigs []windowSignal, from, to time.Time, floor f
 			if entry <= 0 || exit <= 0 || b[i].Close <= 0 {
 				continue
 			}
-			vals := make([]float64, len(sigs))
+			vals := make([]float64, len(scs))
 			any := false
-			for j, s := range sigs {
-				vals[j] = math.NaN()
-				a, z := i-s.From, i-s.To
-				if a < 0 || b[a].Close <= 0 || b[z].Close <= 0 {
-					continue
+			for j := range scs {
+				vals[j] = arrays[j][i]
+				if !math.IsNaN(vals[j]) {
+					any = true
 				}
-				vals[j] = s.Sign * (b[z].Close/b[a].Close - 1)
-				any = true
 			}
 			if !any {
 				continue
@@ -343,9 +359,9 @@ func buildWindows(cache string, sigs []windowSignal, from, to time.Time, floor f
 		}
 		day := sleeve.Day{Date: d, Obs: make([]sleeve.Obs, len(os))}
 		for i, o := range os {
-			day.Obs[i] = sleeve.Obs{Sym: o.sym, U: make([]float64, len(sigs)), Ret: o.ret}
+			day.Obs[i] = sleeve.Obs{Sym: o.sym, U: make([]float64, len(scs)), Ret: o.ret}
 		}
-		for j := range sigs {
+		for j := range scs {
 			var have []int
 			for i, o := range os {
 				if math.IsNaN(o.sig[j]) {
@@ -370,6 +386,46 @@ func buildWindows(cache string, sigs []windowSignal, from, to time.Time, floor f
 	}
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 	return days
+}
+
+// cellBooks is one cell's three staggered books.
+type cellBooks struct {
+	Signal, Equal, Shuffle sleeve.Book
+	Phases                 int
+}
+
+// staggeredBooks runs every named book at every holding period as K staggered
+// books a month apart (Jegadeesh-Titman), each trimmed to the first day it held
+// anything, and averages them on their common dates.
+func staggeredBooks(days []sleeve.Day, names []string, holds []int, costBps float64) map[string]map[int]cellBooks {
+	out := map[string]map[int]cellBooks{}
+	for _, n := range names {
+		out[n] = map[int]cellBooks{}
+	}
+	for _, k := range holds {
+		var phases [][]sleeve.RuleResult
+		for p := 0; p < k && p*month < len(days); p++ {
+			res, err := sleeve.Run(days[p*month:], names, sleeve.Config{
+				CostBpsRoundTrip: costBps,
+				Seeds:            []int64{1, 2, 3, 4, 5},
+				RebalanceEvery:   k * month,
+			})
+			fatalIf(err)
+			phases = append(phases, res)
+		}
+		for j, n := range names {
+			var sb, eb, hb []sleeve.Book
+			for _, ph := range phases {
+				start := firstTraded(ph[j].Signal)
+				sb = append(sb, trimFrom(ph[j].Signal, start))
+				eb = append(eb, trimFrom(ph[j].EqualWeight, start))
+				hb = append(hb, trimFrom(ph[j].StableShuffled, start))
+			}
+			out[n][k] = cellBooks{Signal: stagger(sb), Equal: stagger(eb), Shuffle: stagger(hb), Phases: len(phases)}
+		}
+		fmt.Fprintf(os.Stderr, "held %2d months: %d staggered books run\n", k, len(phases))
+	}
+	return out
 }
 
 // firstTraded is the first date a book held anything; before it the signal

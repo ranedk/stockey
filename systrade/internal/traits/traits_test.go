@@ -161,3 +161,40 @@ func TestRollingFormsMatchTheirPointForms(t *testing.T) {
 		}
 	}
 }
+
+func TestRollingSDMatchesADirectCalculation(t *testing.T) {
+	rng := rand.New(rand.NewSource(12))
+	x := make([]float64, 400)
+	for i := range x {
+		x[i] = rng.NormFloat64() * 0.02
+		if i%13 == 0 {
+			x[i] = math.NaN()
+		}
+	}
+	sd := RollingSD(x, 21, 17)
+	for i := range x {
+		var v []float64
+		if i >= 20 {
+			for j := i - 20; j <= i; j++ {
+				if !math.IsNaN(x[j]) {
+					v = append(v, x[j])
+				}
+			}
+		}
+		if len(v) < 17 {
+			if !math.IsNaN(sd[i]) {
+				t.Fatalf("i=%d: %v where too few values exist", i, sd[i])
+			}
+			continue
+		}
+		var m, q float64
+		for _, a := range v {
+			m += a
+		}
+		m /= float64(len(v))
+		for _, a := range v {
+			q += (a - m) * (a - m)
+		}
+		near(t, "rolling sd", sd[i], math.Sqrt(q/float64(len(v)-1)), 1e-12)
+	}
+}

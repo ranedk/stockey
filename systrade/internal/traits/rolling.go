@@ -103,3 +103,29 @@ func RollingCount(x []float64, v float64, window int) []float64 {
 	}
 	return out
 }
+
+// RollingSD is the sample standard deviation of the non-NaN values in the
+// trailing window ending at each index, NaN until at least minValid exist —
+// in O(n) by running sums.
+func RollingSD(x []float64, window, minValid int) []float64 {
+	out := nanSlice(len(x))
+	var c, s, ss float64
+	for i := range x {
+		if v := x[i]; !math.IsNaN(v) {
+			c++
+			s += v
+			ss += v * v
+		}
+		if i >= window {
+			if v := x[i-window]; !math.IsNaN(v) {
+				c--
+				s -= v
+				ss -= v * v
+			}
+		}
+		if i >= window-1 && int(c+0.5) >= minValid && c > 1 {
+			out[i] = math.Sqrt(math.Max(0, (ss-s*s/c)/(c-1)))
+		}
+	}
+	return out
+}

@@ -68,3 +68,14 @@ func TestWholePercentAlwaysSumsToAHundred(t *testing.T) {
 		}
 	}
 }
+
+func TestAtRiskMatchesTheReferenceVolatility(t *testing.T) {
+	b := book(0, 0.01, -0.02, 0.03, -0.01, 0.02)
+	ref := book(0, 0.02, -0.04, 0.06, -0.02, 0.04) // exactly twice as volatile
+	s := atRisk(b, ref)
+	for i := range b.Net {
+		if math.Abs(s.Net[i]-2*b.Net[i]) > 1e-12 || math.Abs(s.Gross[i]-2*b.Gross[i]) > 1e-12 || math.Abs(s.Turnover[i]-2*b.Turnover[i]) > 1e-12 {
+			t.Fatalf("day %d: scaled %v/%v/%v, want twice %v/%v/%v", i, s.Net[i], s.Gross[i], s.Turnover[i], b.Net[i], b.Gross[i], b.Turnover[i])
+		}
+	}
+}
