@@ -2026,15 +2026,20 @@ def test_dhan_auth_cli_refresh_with_explicit_token_id_skips_the_login_lock(monke
     assert lock_calls == []
 
 
+# Dhan writes a token's expiryTime as a bare IST wall clock ("2026-09-11T07:35:19"), so the
+# fixtures below do too -- a bare datetime.now() is the HOST's clock, which is not what Dhan sends.
+_DHAN_IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def test_dhan_auth_cli_ensure_uses_fresh_cached_token(monkeypatch):
-    expires_at = datetime.now() + timedelta(hours=2)
+    expires_at = datetime.now(_DHAN_IST) + timedelta(hours=2)
 
     monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
     monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
     monkeypatch.setattr(
         dhan_auth_cli,
         "load_cached_access_token_payload",
-        lambda: {"accessToken": "cached-token", "expiryTime": expires_at.isoformat()},
+        lambda: {"accessToken": "cached-token", "expiryTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S")},
     )
     monkeypatch.setattr(dhan_auth_cli, "validate_token", lambda access_token: {"status": "ok", "access_token": access_token})
     monkeypatch.setattr(dhan_auth_cli, "refresh_token", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("refresh not expected")))
@@ -2048,7 +2053,7 @@ def test_dhan_auth_cli_ensure_uses_fresh_cached_token(monkeypatch):
 
 
 def test_dhan_auth_cli_ensure_fails_without_noninteractive_refresh_path(monkeypatch, tmp_path):
-    expired_at = datetime.now() - timedelta(hours=1)
+    expired_at = datetime.now(_DHAN_IST) - timedelta(hours=1)
 
     monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
     monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
@@ -2056,7 +2061,7 @@ def test_dhan_auth_cli_ensure_fails_without_noninteractive_refresh_path(monkeypa
     monkeypatch.setattr(
         dhan_auth_cli,
         "load_cached_access_token_payload",
-        lambda: {"accessToken": "expired-token", "expiryTime": expired_at.isoformat()},
+        lambda: {"accessToken": "expired-token", "expiryTime": expired_at.strftime("%Y-%m-%dT%H:%M:%S")},
     )
     monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
     monkeypatch.setattr(dhan_auth_cli, "refresh_token", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("manual refresh not expected")))
@@ -2069,7 +2074,7 @@ def test_dhan_auth_cli_ensure_fails_without_noninteractive_refresh_path(monkeypa
 
 
 def test_dhan_auth_cli_ensure_refresh_failure_returns_structured_error(monkeypatch, tmp_path):
-    expired_at = datetime.now() - timedelta(hours=1)
+    expired_at = datetime.now(_DHAN_IST) - timedelta(hours=1)
     events = []
 
     monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
@@ -2078,7 +2083,7 @@ def test_dhan_auth_cli_ensure_refresh_failure_returns_structured_error(monkeypat
     monkeypatch.setattr(
         dhan_auth_cli,
         "load_cached_access_token_payload",
-        lambda: {"accessToken": "expired-token", "expiryTime": expired_at.isoformat()},
+        lambda: {"accessToken": "expired-token", "expiryTime": expired_at.strftime("%Y-%m-%dT%H:%M:%S")},
     )
     monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
     monkeypatch.setattr(dhan_auth_cli, "refresh_token", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cdp refused")))
@@ -2202,6 +2207,24 @@ def test_dhan_auth_cached_token_past_real_utc_expiry_is_rejected(tmp_path):
     cache_path.write_text(json.dumps({"accessToken": "TOKEN", "expiryTime": past_expiry}), encoding="utf-8")
 
     assert dhan_auth.load_cached_access_token(cache_path) is None
+
+
+def test_dhan_auth_bare_expiry_is_ist_wall_clock(tmp_path):
+    # Regression (2026-09-13): the cache holds Dhan's expiryTime as a bare IST wall clock.
+    # Refreshed 2026-09-10 02:05:24 UTC (07:35:24 IST), it said "2026-09-11T07:35:19" -- 24h
+    # later in IST. Read as UTC it looked 5.5h fresher than it was, and the 07:35 IST ensure
+    # job skipped refreshing a token that died 18 seconds later.
+    assert dhan_auth.parse_iso_expiry_to_utc("2026-09-11T07:35:19") == datetime(2026, 9, 11, 2, 5, 19, tzinfo=timezone.utc)
+    assert dhan_auth.parse_iso_expiry_to_utc("2026-09-11T07:35:19Z") == datetime(2026, 9, 11, 7, 35, 19, tzinfo=timezone.utc)
+    assert dhan_auth.parse_iso_expiry_to_utc("2026-09-11T07:35:19+05:30") == datetime(2026, 9, 11, 2, 5, 19, tzinfo=timezone.utc)
+
+    cache_path = tmp_path / "dhan.json"
+    a_minute_ago = (datetime.now(_DHAN_IST) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    cache_path.write_text(json.dumps({"accessToken": "TOKEN", "expiryTime": a_minute_ago}), encoding="utf-8")
+    assert dhan_auth.load_cached_access_token(cache_path) is None
+    in_two_hours = (datetime.now(_DHAN_IST) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    cache_path.write_text(json.dumps({"accessToken": "TOKEN", "expiryTime": in_two_hours}), encoding="utf-8")
+    assert dhan_auth.load_cached_access_token(cache_path) == "TOKEN"
 
 
 def test_dhan_auth_force_refresh_relogins_when_no_concurrent_refresher(monkeypatch, tmp_path):

@@ -442,6 +442,10 @@ def _parse_json_response(response: requests.Response) -> dict:
         raise DhanAuthError(f"Expected JSON from Dhan auth endpoint, got: {response.text[:500]}") from exc
 
 
+# Dhan writes expiryTime as a bare IST wall clock; see parse_iso_expiry_to_utc.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def parse_iso_expiry_to_utc(raw_expiry: str) -> datetime | None:
     """Pure parse, no telemetry -- shared by _parse_expiry below and auth_cli.py's own
     parse_expiry(), which used to carry a second, independent implementation of exactly this
@@ -455,14 +459,17 @@ def parse_iso_expiry_to_utc(raw_expiry: str) -> datetime | None:
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     parsed = datetime.fromisoformat(text)
-    # Dhan's expiryTime is UTC in practice ('...Z'); treat a bare timestamp as UTC too
-    # rather than guessing the local zone. Always return timezone-aware UTC so callers
-    # compare like-for-like against datetime.now(timezone.utc) -- a prior version
-    # returned a naive LOCAL-wall-clock value that got compared against naive
-    # datetime.utcnow() in load_cached_access_token(), silently treating already-expired
-    # tokens as valid for ~5.5h (the IST offset) past their real expiry.
+    # A bare timestamp is IST wall clock: that is what Dhan's consent endpoint returns and
+    # what the cache holds. BUG FOUND LIVE 2026-09-13: refreshed 2026-09-10 02:05:24 UTC
+    # (07:35:24 IST), the cache said expiryTime "2026-09-11T07:35:19" -- 24h later in IST,
+    # 29.5h if read as UTC. This used to read it as UTC, so every token looked 5.5h fresher
+    # than it was: the 07:35 IST ensure job skipped the refresh on alternate weekdays and
+    # the morning Dhan jobs ran on a dead token. An explicit offset or 'Z' is honoured as
+    # given. Always return timezone-aware UTC so callers compare like-for-like against
+    # datetime.now(timezone.utc) -- an older version returned a naive LOCAL-wall-clock value
+    # compared against naive datetime.utcnow(), the same 5.5h error by another route.
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=_IST)
     return parsed.astimezone(timezone.utc)
 
 
