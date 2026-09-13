@@ -434,7 +434,17 @@ const (
 	BookStrategy = "strategy"
 	BookEqual    = "equal-weight"
 	BookRandom   = "random-ranking"
+	// BookAccount is the strategy book in rupees: AccountCapital in whole
+	// shares, Law 12 inertia and Dhan's real charges (internal/capacity,
+	// LEDGER row 36). The same targets; what a real account would hold.
+	BookAccount = "account"
 )
+
+// AccountCapital is the paper account each forward track keeps: Rs 1 crore,
+// the capital at which every track's book survived whole shares and real
+// costs (LEDGER row 36). Paper money, per track, set by the operator
+// 2026-09-13.
+const AccountCapital = 1e7
 
 // Obs is one symbol on one date: what it was worth and what the rule thought.
 type Obs struct {
@@ -490,6 +500,14 @@ type Order struct {
 	FromWeight float64
 	ToWeight   float64
 	FillPrice  float64
+	// InShares marks an order of the rupee account (BookAccount): counted in
+	// whole shares at the raw price, with the rupees traded and what Dhan
+	// charges for it.
+	InShares   bool
+	FromShares float64
+	ToShares   float64
+	ValueRs    float64
+	CostRs     float64
 }
 
 // Entry is what a position cost and what it is worth now — the two numbers a
@@ -517,7 +535,10 @@ func (e Entry) Return() float64 {
 
 // Book is one tracked portfolio.
 type Book struct {
-	Name     string
+	Name string
+	// Shares is the rupee account's share count per name; nil for the
+	// weight books, which hold fractions of NAV.
+	Shares   map[string]float64
 	NAV      []NavPoint
 	Holdings map[string]float64 // weights as of the last computed day
 	Entries  map[string]Entry   // cost basis and last mark, same keys as Holdings

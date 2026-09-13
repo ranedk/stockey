@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/ranedk/systrader/internal/bars"
+	"github.com/ranedk/systrader/internal/capacity"
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/data"
 	"github.com/ranedk/systrader/internal/paper"
@@ -159,6 +160,18 @@ func main() {
 	track, err := paper.Compute(spec, tracked)
 	fatalIf(err)
 
+	// The Rs 1 crore account: the same targets in whole shares, Law 12 inertia
+	// and Dhan's charges per trade (internal/capacity, LEDGER row 36). Forward
+	// records only — a reference track's nominal rupees in 2022 would size
+	// positions today's book never holds.
+	var account *capacity.Result
+	if *name == "" && *start == "" && capacity.Supports(spec) {
+		raw := func(d time.Time) (map[string]float64, error) { return st.RawRatios(ctx, d) }
+		account, err = capacity.Simulate(spec, tracked, raw, capacity.AccountPolicy())
+		fatalIf(err)
+		track.Books[paper.BookAccount] = account.Book(paper.BookAccount)
+	}
+
 	// The order sheet is computed from the most recent close available, even
 	// when the forward record itself has not started yet: on day one the sheet
 	// IS the product, and the history is empty by definition.
@@ -169,6 +182,14 @@ func main() {
 		daysToDue = track.DaysToNextRebalance()
 	}
 	sheet := paper.Pending(spec, all[len(all)-1], current, daysToDue)
+	if account != nil {
+		latest := all[len(all)-1]
+		ratios, err := st.RawRatios(ctx, latest.Date)
+		fatalIf(err)
+		trades, held, err := account.PlanOrders(spec, latest, ratios)
+		fatalIf(err)
+		sheet.Orders = withShares(sheet, current, trades, held)
+	}
 
 	report(spec, track, sheet)
 
@@ -223,6 +244,9 @@ func report(spec paper.Spec, t *paper.Track, sheet paper.PendingSheet) {
 	fmt.Printf("%-16s %9s %9s %8s %8s %9s %8s %9s\n",
 		"book", "NAV", "return", "ann vol", "maxDD", "holdings", "cost/yr", "exposure")
 	names := []string{paper.BookStrategy, paper.BookEqual, paper.BookRandom}
+	if b, ok := t.Books[paper.BookAccount]; ok && len(b.NAV) > 0 {
+		names = append(names, paper.BookAccount)
+	}
 	for _, n := range names {
 		b := t.Books[n]
 		p := b.NAV[len(b.NAV)-1]
@@ -260,13 +284,31 @@ func printSheet(sheet paper.PendingSheet) {
 	}
 	fmt.Printf("\norder sheet %s — %d orders, priced off %s (rebalance in %d trading days)\n",
 		verb, len(sheet.Orders), sheet.BasedOn.Format("2006-01-02"), sheet.DaysToDue)
+	var trades int
+	var traded, charges float64
+	for _, o := range sheet.Orders {
+		if o.InShares && o.ValueRs > 0 {
+			trades++
+			traded += o.ValueRs
+			charges += o.CostRs
+		}
+	}
+	if trades > 0 {
+		fmt.Printf("Rs %.0f crore account: %d orders, Rs %.0f traded, charges Rs %.0f (%.1f bps)\n",
+			paper.AccountCapital/1e7, trades, traded, charges, 1e4*charges/traded)
+	}
 	for i, o := range sheet.Orders {
 		if i >= 10 {
 			fmt.Printf("  ... and %d more\n", len(sheet.Orders)-10)
 			break
 		}
-		fmt.Printf("  %-5s %-14s %6.2f%% -> %6.2f%%  ref %.2f\n",
+		line := fmt.Sprintf("  %-5s %-14s %6.2f%% -> %6.2f%%  ref %.2f",
 			o.Side, o.Symbol, 100*o.FromWeight, 100*o.ToWeight, o.FillPrice)
+		if o.InShares {
+			line += fmt.Sprintf("   %5.0f -> %5.0f shares  Rs %9.0f  charges Rs %5.0f",
+				o.FromShares, o.ToShares, o.ValueRs, o.CostRs)
+		}
+		fmt.Println(line)
 	}
 }
 
@@ -519,4 +561,44 @@ func fatalIf(err error) {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "paper:", err)
 	os.Exit(1)
+}
+
+// withShares puts the Rs 1 crore account's orders beside the weight book's.
+// Each weight order gets the account's share count, rupees and charges; a
+// name inside Law 12's band shows its holding unchanged and no rupees; a name
+// the account trades that the weight sheet does not list (a rounding
+// difference) gets a row of its own.
+func withShares(sheet paper.PendingSheet, current map[string]float64, trades []capacity.Trade, held map[string]float64) []paper.Order {
+	bySym := make(map[string]capacity.Trade, len(trades))
+	for _, t := range trades {
+		bySym[t.Symbol] = t
+	}
+	out := make([]paper.Order, 0, len(sheet.Orders)+len(trades))
+	seen := map[string]bool{}
+	for _, o := range sheet.Orders {
+		seen[o.Symbol] = true
+		o.InShares = true
+		if t, ok := bySym[o.Symbol]; ok {
+			o.FromShares, o.ToShares, o.ValueRs, o.CostRs = t.FromShares, t.ToShares, t.Value, t.Cost
+		} else {
+			o.FromShares, o.ToShares = held[o.Symbol], held[o.Symbol]
+		}
+		out = append(out, o)
+	}
+	for _, t := range trades {
+		if seen[t.Symbol] {
+			continue
+		}
+		o := capacity.ToOrder(t, paper.BookStrategy, 0)
+		o.Date = sheet.BasedOn
+		o.FromWeight, o.ToWeight = current[t.Symbol], sheet.Target[t.Symbol]
+		out = append(out, o)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Side != out[j].Side {
+			return out[i].Side < out[j].Side
+		}
+		return out[i].Symbol < out[j].Symbol
+	})
+	return out
 }

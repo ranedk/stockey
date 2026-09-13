@@ -378,6 +378,23 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       lakh carries only the 160-name trend books — the blends' small slices
       pay the Rs 14.75 DP charge out of Rs 6,000-12,500 positions, and a Rs
       10,000 floor fixes cost only by changing the book
+- [x] A Rs 1 crore paper account on every forward track (book `account`,
+      operator 2026-09-13): the same targets in whole shares, Law 12 inertia
+      and Dhan's charges per trade (`capacity.AccountPolicy`). The order
+      sheet shows shares, rupees and charges beside the weights; the forward
+      record shows the account's NAV and realised cost beside the weight books
+- [ ] **Stability gate** (`docs/RESEARCH_PROTOCOL.md`, amendment 2026-09-13):
+      20 consecutive clean trading days of the scheduled runs, fresh and
+      complete order sheets, one rebalance reconciled end to end, charges
+      under the kill level, and the Dhan execution dry run — then capital may
+      move. Replaces waiting for the 12-month reading; kill rules stay
+- [ ] Multi-strategy live portfolio (operator 2026-09-13): one account holding
+      several tracks, weighted by risk with Law 6's handcrafting (correlations
+      and costs — not backtested returns), a stock held by several tracks
+      netted into one position (one order, one DP charge). A corpus topped up
+      over time, new money added on rebalance days; every track's slice at or
+      above its row-36 capacity floor (Rs 1 crore for the blends, Rs 30 lakh
+      for the trend books)
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,
@@ -389,4 +406,5 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       universe's 22% and −58%, while keeping up on raw return. A candidate
       second strategy and momentum partner — confirmation is forward only
 - [ ] Instrument universe finalization (blocked on capital, A1)
-- [ ] Live execution via Dhan orders API (after, and only after, paper data)
+- [ ] Live execution via Dhan orders API (its `LIVE_ORDERS=false` dry run is
+      stability-gate item S5)

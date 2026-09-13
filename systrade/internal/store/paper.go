@@ -44,6 +44,7 @@ func (s *Store) EnsurePaperTables(ctx context.Context) error {
 		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS entry_date date;
 		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS entry_price double precision;
 		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS last_price double precision;
+		ALTER TABLE systrader_paper_holding ADD COLUMN IF NOT EXISTS shares double precision;
 		CREATE TABLE IF NOT EXISTS systrader_paper_order (
 			strategy    text NOT NULL,
 			book        text NOT NULL,
@@ -68,6 +69,14 @@ func (s *Store) EnsurePaperTables(ctx context.Context) error {
 			ref_price   double precision,
 			PRIMARY KEY (strategy, symbol)
 		);
+		ALTER TABLE systrader_paper_order ADD COLUMN IF NOT EXISTS from_shares double precision;
+		ALTER TABLE systrader_paper_order ADD COLUMN IF NOT EXISTS to_shares double precision;
+		ALTER TABLE systrader_paper_order ADD COLUMN IF NOT EXISTS value_rs double precision;
+		ALTER TABLE systrader_paper_order ADD COLUMN IF NOT EXISTS cost_rs double precision;
+		ALTER TABLE systrader_paper_pending ADD COLUMN IF NOT EXISTS from_shares double precision;
+		ALTER TABLE systrader_paper_pending ADD COLUMN IF NOT EXISTS to_shares double precision;
+		ALTER TABLE systrader_paper_pending ADD COLUMN IF NOT EXISTS value_rs double precision;
+		ALTER TABLE systrader_paper_pending ADD COLUMN IF NOT EXISTS cost_rs double precision;
 		CREATE TABLE IF NOT EXISTS systrader_paper_qualify (
 			strategy text NOT NULL,
 			date     date NOT NULL,
@@ -111,12 +120,17 @@ func (s *Store) SavePaperTrack(ctx context.Context, tr *paper.Track) error {
 			last := b.NAV[len(b.NAV)-1].Date
 			for sym, w := range b.Holdings {
 				e := b.Entries[sym]
+				var shares any
+				if n, ok := b.Shares[sym]; ok {
+					shares = n
+				}
 				holdRows = append(holdRows, []any{name, book, last, sym, w,
-					nilIfZeroTime(e.Date), nilIfZero(e.Price), nilIfZero(e.LastPrice)})
+					nilIfZeroTime(e.Date), nilIfZero(e.Price), nilIfZero(e.LastPrice), shares})
 			}
 		}
 		for _, o := range b.Orders {
-			orderRows = append(orderRows, []any{name, book, o.Date, o.Symbol, o.Side, o.FromWeight, o.ToWeight, nilIfZero(o.FillPrice)})
+			row := []any{name, book, o.Date, o.Symbol, o.Side, o.FromWeight, o.ToWeight, nilIfZero(o.FillPrice)}
+			orderRows = append(orderRows, append(row, orderShares(o)...))
 		}
 	}
 
@@ -126,12 +140,13 @@ func (s *Store) SavePaperTrack(ctx context.Context, tr *paper.Track) error {
 		return err
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"systrader_paper_holding"},
-		[]string{"strategy", "book", "date", "symbol", "weight", "entry_date", "entry_price", "last_price"},
+		[]string{"strategy", "book", "date", "symbol", "weight", "entry_date", "entry_price", "last_price", "shares"},
 		pgx.CopyFromRows(holdRows)); err != nil {
 		return err
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"systrader_paper_order"},
-		[]string{"strategy", "book", "date", "symbol", "side", "from_weight", "to_weight", "fill_price"},
+		[]string{"strategy", "book", "date", "symbol", "side", "from_weight", "to_weight", "fill_price",
+			"from_shares", "to_shares", "value_rs", "cost_rs"},
 		pgx.CopyFromRows(orderRows)); err != nil {
 		return err
 	}
@@ -151,12 +166,14 @@ func (s *Store) SavePending(ctx context.Context, strategy string, sheet paper.Pe
 	now := time.Now().UTC()
 	var rows [][]any
 	for _, o := range sheet.Orders {
-		rows = append(rows, []any{strategy, now, sheet.BasedOn, sheet.Due, sheet.DaysToDue,
-			o.Symbol, o.Side, o.FromWeight, o.ToWeight, nilIfZero(o.FillPrice)})
+		row := []any{strategy, now, sheet.BasedOn, sheet.Due, sheet.DaysToDue,
+			o.Symbol, o.Side, o.FromWeight, o.ToWeight, nilIfZero(o.FillPrice)}
+		rows = append(rows, append(row, orderShares(o)...))
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"systrader_paper_pending"},
 		[]string{"strategy", "computed_at", "based_on", "due", "days_to_due",
-			"symbol", "side", "from_weight", "to_weight", "ref_price"},
+			"symbol", "side", "from_weight", "to_weight", "ref_price",
+			"from_shares", "to_shares", "value_rs", "cost_rs"},
 		pgx.CopyFromRows(rows)); err != nil {
 		return err
 	}
@@ -175,7 +192,8 @@ type PaperPending struct {
 // PendingSheet returns the strategy's next-session order sheet.
 func (s *Store) PendingSheet(ctx context.Context, strategy string) (PaperPending, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT computed_at, based_on, due, days_to_due, symbol, side, from_weight, to_weight, ref_price
+		SELECT computed_at, based_on, due, days_to_due, symbol, side, from_weight, to_weight, ref_price,
+		       from_shares, to_shares, value_rs, cost_rs
 		FROM systrader_paper_pending WHERE strategy = $1
 		ORDER BY side ASC, symbol ASC`, strategy)
 	if err != nil {
@@ -186,13 +204,23 @@ func (s *Store) PendingSheet(ctx context.Context, strategy string) (PaperPending
 	for rows.Next() {
 		var o PaperOrderRow
 		if err := rows.Scan(&out.ComputedAt, &out.BasedOn, &out.Due, &out.DaysToDue,
-			&o.Symbol, &o.Side, &o.FromWeight, &o.ToWeight, &o.FillPrice); err != nil {
+			&o.Symbol, &o.Side, &o.FromWeight, &o.ToWeight, &o.FillPrice,
+			&o.FromShares, &o.ToShares, &o.ValueRs, &o.CostRs); err != nil {
 			return out, err
 		}
 		o.Date = out.BasedOn
 		out.Orders = append(out.Orders, o)
 	}
 	return out, rows.Err()
+}
+
+// orderShares is an order's share columns: filled for the rupee account's
+// orders, NULL for the weight books', which trade fractions of NAV.
+func orderShares(o paper.Order) []any {
+	if !o.InShares {
+		return []any{nil, nil, nil, nil}
+	}
+	return []any{o.FromShares, o.ToShares, o.ValueRs, o.CostRs}
 }
 
 func nilIfZeroTime(t time.Time) any {
@@ -251,6 +279,9 @@ type PaperHoldingRow struct {
 	EntryPrice *float64   `json:"entry_price"`
 	LastPrice  *float64   `json:"last_price"`
 	Return     *float64   `json:"return"`
+	// Shares is what the Rs 1 crore account holds of the name (filled in by
+	// paperapi from the account book; NULL on the weight books themselves).
+	Shares *float64 `json:"shares"`
 }
 
 // PaperHoldings returns one book's latest positions, heaviest first.
@@ -268,7 +299,7 @@ func (s *Store) PaperHoldings(ctx context.Context, strategy, book string) ([]Pap
 	}
 	asOf := *latest
 	rows, err := s.pool.Query(ctx, `
-		SELECT symbol, weight, entry_date, entry_price, last_price
+		SELECT symbol, weight, entry_date, entry_price, last_price, shares
 		FROM systrader_paper_holding
 		WHERE strategy = $1 AND book = $2 AND date = $3
 		ORDER BY symbol ASC`, strategy, book, asOf)
@@ -279,7 +310,7 @@ func (s *Store) PaperHoldings(ctx context.Context, strategy, book string) ([]Pap
 	var out []PaperHoldingRow
 	for rows.Next() {
 		var r PaperHoldingRow
-		if err := rows.Scan(&r.Symbol, &r.Weight, &r.EntryDate, &r.EntryPrice, &r.LastPrice); err != nil {
+		if err := rows.Scan(&r.Symbol, &r.Weight, &r.EntryDate, &r.EntryPrice, &r.LastPrice, &r.Shares); err != nil {
 			return nil, asOf, err
 		}
 		if r.EntryPrice != nil && r.LastPrice != nil && *r.EntryPrice > 0 {
@@ -299,6 +330,12 @@ type PaperOrderRow struct {
 	FromWeight float64   `json:"from_weight"`
 	ToWeight   float64   `json:"to_weight"`
 	FillPrice  *float64  `json:"fill_price"`
+	// The rupee account's share count, rupees and Dhan charges; NULL for
+	// weight-book orders.
+	FromShares *float64 `json:"from_shares"`
+	ToShares   *float64 `json:"to_shares"`
+	ValueRs    *float64 `json:"value_rs"`
+	CostRs     *float64 `json:"cost_rs"`
 }
 
 // PaperOrders returns the most recent rebalance's orders for one book.
@@ -314,7 +351,8 @@ func (s *Store) PaperOrders(ctx context.Context, strategy, book string) ([]Paper
 	}
 	asOf := *latest
 	rows, err := s.pool.Query(ctx, `
-		SELECT date, symbol, side, from_weight, to_weight, fill_price
+		SELECT date, symbol, side, from_weight, to_weight, fill_price,
+		       from_shares, to_shares, value_rs, cost_rs
 		FROM systrader_paper_order
 		WHERE strategy = $1 AND book = $2 AND date = $3
 		ORDER BY side ASC, symbol ASC`, strategy, book, asOf)
@@ -325,7 +363,8 @@ func (s *Store) PaperOrders(ctx context.Context, strategy, book string) ([]Paper
 	var out []PaperOrderRow
 	for rows.Next() {
 		var r PaperOrderRow
-		if err := rows.Scan(&r.Date, &r.Symbol, &r.Side, &r.FromWeight, &r.ToWeight, &r.FillPrice); err != nil {
+		if err := rows.Scan(&r.Date, &r.Symbol, &r.Side, &r.FromWeight, &r.ToWeight, &r.FillPrice,
+			&r.FromShares, &r.ToShares, &r.ValueRs, &r.CostRs); err != nil {
 			return nil, asOf, err
 		}
 		out = append(out, r)

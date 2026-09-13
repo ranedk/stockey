@@ -85,13 +85,14 @@ type SpecView struct {
 
 func specView(s paper.Spec) SpecView {
 	return SpecView{
-		Universe:      fmt.Sprintf("NSE cash equity, 60-bar median turnover at or above Rs %.0f crore", s.MinTurnover/1e7),
-		Signal:        s.SignalLabel,
-		Selection:     fmt.Sprintf("top %dth of the eligible universe by forecast", s.Quantile),
-		Weighting:     "equal weight across the held names, fully invested, no leverage or shorting",
-		Rebalance:     fmt.Sprintf("every %d trading days; hold in between", s.RebalanceEvery),
-		Execution:     "decide at the close, fill at the next open",
-		Costs:         fmt.Sprintf("%.0f bps round trip charged on turnover", s.CostBpsRoundTrip),
+		Universe:  fmt.Sprintf("NSE cash equity, 60-bar median turnover at or above Rs %.0f crore", s.MinTurnover/1e7),
+		Signal:    s.SignalLabel,
+		Selection: fmt.Sprintf("top %dth of the eligible universe by forecast", s.Quantile),
+		Weighting: "equal weight across the held names, fully invested, no leverage or shorting",
+		Rebalance: fmt.Sprintf("every %d trading days; hold in between", s.RebalanceEvery),
+		Execution: "decide at the close, fill at the next open",
+		Costs: fmt.Sprintf("%.0f bps round trip charged on turnover; the Rs %.0f crore account pays Dhan's charges per trade in whole shares",
+			s.CostBpsRoundTrip, paper.AccountCapital/1e7),
 		MinTurnoverCr: s.MinTurnover / 1e7,
 		Doc:           s.Doc,
 	}
@@ -170,7 +171,7 @@ func Detail(ctx context.Context, st *store.Store, name string) (Strategy, error)
 		s.AsOf = order[len(order)-1]
 		s.Start = order[0]
 	}
-	for _, book := range []string{paper.BookStrategy, paper.BookEqual, paper.BookRandom} {
+	for _, book := range []string{paper.BookStrategy, paper.BookEqual, paper.BookRandom, paper.BookAccount} {
 		rows := perBook[book]
 		if len(rows) == 0 {
 			continue
@@ -220,6 +221,18 @@ func holdings(ctx context.Context, st *store.Store, name string) ([]store.PaperH
 	rows, asOf, err := st.PaperHoldings(ctx, name, paper.BookStrategy)
 	if err != nil {
 		return nil, "", err
+	}
+	// Beside each weight, what the Rs 1 crore account actually holds.
+	acct, _, err := st.PaperHoldings(ctx, name, paper.BookAccount)
+	if err != nil {
+		return nil, "", err
+	}
+	shares := make(map[string]*float64, len(acct))
+	for _, a := range acct {
+		shares[a.Symbol] = a.Shares
+	}
+	for i := range rows {
+		rows[i].Shares = shares[rows[i].Symbol]
 	}
 	if asOf.IsZero() {
 		return rows, "", nil

@@ -76,3 +76,34 @@ Law 1 (story first), Law 3 (edge is always versus a matched control), Law 5
 (blend, never select the best variation), Law 7 (discount every backtest),
 Law 19 (no discretionary override of a live decision). Slicing is allowed;
 believing an unconfirmed slice is not.
+
+## Amendment 2026-09-13 (operator): the go-live gate is operational stability
+
+The operator has decided that capital may move to a paper-tracked strategy
+once the SYSTEM has run cleanly, without waiting for the specs' 12-month
+judgement. The backtests' drawdowns and their limits are accepted as known;
+performance is no longer a go-live criterion. "Forward paper trading is the
+real gate" above now means this gate, not a performance reading.
+
+**Stability gate** — all of these, recorded with dates in the README before
+any order is sent:
+
+- **S1:** 20 consecutive trading days of unattended scheduled runs — the
+  stockey sync, `paper run` for every forward track, the API — each exiting
+  cleanly, with no manual re-run or hand fix.
+- **S2:** every order sheet in that window priced off the previous trading
+  day's close, with no missing price and no zero or non-numeric share count
+  on the Rs 1 crore account.
+- **S3:** at least one scheduled rebalance inside the window processed end to
+  end: the account book's trades on the day match the order sheet produced
+  the evening before.
+- **S4:** the account's realised charges below every spec's 100-bps kill level.
+- **S5 (before the first real order):** the Dhan execution path, run with
+  `LIVE_ORDERS=false`, produces exactly the order sheet for one rebalance.
+
+**What does not change.** Every spec's kill criteria still apply and are
+applied mechanically (Law 19) — from go-live they stop real capital, not
+just a paper record. The 12-month evaluations still run, and now inform
+scaling and the weights of the multi-strategy portfolio instead of the
+go-live decision. Frozen parameters stay frozen; a change is still a new
+spec and a new clock.

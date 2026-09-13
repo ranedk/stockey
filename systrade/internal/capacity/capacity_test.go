@@ -179,3 +179,62 @@ func TestTodaySizedScalesCapitalByBookSize(t *testing.T) {
 		t.Fatalf("deployed share %v, want 1", got)
 	}
 }
+
+func TestPlanOrdersIsTheNextRebalance(t *testing.T) {
+	days := []paper.Day{book(0, flat(100), nil, rank)}
+	r, err := Simulate(spec(), days, ones, Policy{Capital: 1000, Inertia: 0.10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	swap := map[string]float64{"A": 1, "B": 2, "C": 3, "D": 4}
+	next := book(1, flat(100), nil, swap)
+	ratios, _ := ones(next.Date)
+	trades, held, err := r.PlanOrders(spec(), next, ratios)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held["A"] != 5 || held["B"] != 5 || len(held) != 2 {
+		t.Fatalf("held going in: %v, want A and B at 5 shares", held)
+	}
+	want := []struct {
+		sym, side string
+		to        float64
+	}{{"A", "EXIT", 0}, {"B", "EXIT", 0}, {"C", "BUY", 5}, {"D", "BUY", 5}}
+	if len(trades) != len(want) {
+		t.Fatalf("%d trades, want %d: %+v", len(trades), len(want), trades)
+	}
+	for i, w := range want {
+		tr := trades[i]
+		if tr.Symbol != w.sym || tr.Side != w.side || tr.ToShares != w.to || tr.Value != 500 {
+			t.Fatalf("trade %d = %+v, want %s %s to %v worth 500", i, tr, w.side, w.sym, w.to)
+		}
+	}
+	if trades[0].Cost < costs.DPCharge || trades[2].Cost >= costs.DPCharge {
+		t.Fatal("a sale pays the DP charge and a purchase does not")
+	}
+}
+
+func TestBookRendersTheAccount(t *testing.T) {
+	days := []paper.Day{book(0, flat(100), nil, rank), book(1, flat(110), flat(100), rank)}
+	r, err := Simulate(spec(), days, ones, Policy{Capital: 1000, Inertia: 0.10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := r.Book("account")
+	if want := 100 * (1 + r.Net[0]) * (1 + r.Net[1]); math.Abs(b.NAV[1].NAV-want) > 1e-9 {
+		t.Fatalf("NAV %v, want %v", b.NAV[1].NAV, want)
+	}
+	if !b.NAV[0].Rebalanced || b.NAV[1].Rebalanced || b.NAV[0].Cost <= 0 || b.NAV[1].Cost != 0 {
+		t.Fatalf("rebalance and cost marks wrong: %+v", b.NAV)
+	}
+	if b.Shares["A"] != 5 || b.Shares["B"] != 5 || math.Abs(b.Holdings["A"]+b.Holdings["B"]-1) > 1e-12 {
+		t.Fatalf("shares %v weights %v", b.Shares, b.Holdings)
+	}
+	if e := b.Entries["A"]; e.Price != 100 || e.LastPrice != 110 {
+		t.Fatalf("entry %+v, want bought at 100, last 110", e)
+	}
+	if len(b.Orders) != 2 || !b.Orders[0].InShares || b.Orders[0].ToShares != 5 || b.Orders[0].CostRs <= 0 ||
+		math.Abs(b.Orders[0].ToWeight-0.5) > 1e-12 {
+		t.Fatalf("orders %+v", b.Orders)
+	}
+}
