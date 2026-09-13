@@ -49,6 +49,8 @@ export interface PaperNavPoint {
 export interface PaperHolding {
   symbol: string
   weight: number
+  // Shares the Rs 1 crore paper account holds of the name.
+  shares: number | null
   entry_date: string | null
   entry_price: number | null
   last_price: number | null
@@ -63,6 +65,12 @@ export interface PaperOrder {
   from_weight: number
   to_weight: number
   fill_price: number | null
+  // The Rs 1 crore account's side of the order: whole shares, rupees, Dhan charges.
+  // null on weight-book orders.
+  from_shares: number | null
+  to_shares: number | null
+  value_rs: number | null
+  cost_rs: number | null
 }
 
 export interface PaperPending {

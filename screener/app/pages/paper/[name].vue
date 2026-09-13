@@ -31,6 +31,33 @@ const showAllOrders = ref(false)
 const orders = computed<PaperOrder[]>(() => forward.value?.pending?.orders ?? [])
 const shownOrders = computed(() => showAllOrders.value ? orders.value : orders.value.slice(0, 15))
 
+// The Rs 1 crore account's side of the sheet: how many real orders, how many
+// rupees, and what Dhan would charge. Rows inside Law 12's 10% band trade nothing.
+const account = computed(() => {
+  let trades = 0, traded = 0, cost = 0
+  for (const o of orders.value) {
+    if (o.value_rs && o.value_rs > 0) {
+      trades++
+      traded += o.value_rs
+      cost += o.cost_rs ?? 0
+    }
+  }
+  return { trades, traded, cost, any: orders.value.some(o => o.to_shares !== null) }
+})
+
+function rupees(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—'
+  return `₹${Math.round(v).toLocaleString('en-IN')}`
+}
+
+function sharesMove(o: PaperOrder): string {
+  if (o.to_shares === null || o.from_shares === null) return '—'
+  const a = Math.round(o.from_shares)
+  const b = Math.round(o.to_shares)
+  if (!o.value_rs) return a === 0 && b === 0 ? 'none (under one share)' : `${b} — hold, within 10%`
+  return `${a} → ${b}`
+}
+
 function pct(v: number | null | undefined, digits = 2): string {
   if (v === null || v === undefined) return '—'
   return `${(v * 100).toFixed(digits)}%`
@@ -142,6 +169,12 @@ const sideTone: Record<string, 'good' | 'bad' | 'warn'> = { BUY: 'good', SELL: '
           What the frozen rules would place at the next open. On a hold day the list is shown anyway,
           so the book can be watched without being touched.
         </p>
+        <p v-if="account.any" class="mt-1 text-xs text-slate-600">
+          <span class="font-medium">Rs 1 crore account:</span>
+          {{ account.trades }} orders, {{ rupees(account.traded) }} traded, Dhan charges about {{ rupees(account.cost) }}
+          <span v-if="account.traded > 0">({{ (account.cost / account.traded * 1e4).toFixed(1) }} bps of the value traded)</span>.
+          Whole shares at the auction; a position within 10% of its target is left alone.
+        </p>
 
         <div v-if="orders.length === 0" class="mt-3 rounded-lg border border-slate-200 bg-white p-4 text-sm text-slate-500">
           No orders — the book already matches its target.
@@ -155,6 +188,9 @@ const sideTone: Record<string, 'good' | 'bad' | 'warn'> = { BUY: 'good', SELL: '
                 <th class="px-3 py-2 text-right">Weight now</th>
                 <th class="px-3 py-2 text-right">Target</th>
                 <th class="px-3 py-2 text-right">Reference price</th>
+                <th class="px-3 py-2 text-right">Shares (Rs 1 cr)</th>
+                <th class="px-3 py-2 text-right">Rupees</th>
+                <th class="px-3 py-2 text-right">Charges</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
@@ -164,6 +200,9 @@ const sideTone: Record<string, 'good' | 'bad' | 'warn'> = { BUY: 'good', SELL: '
                 <td class="px-3 py-1.5 text-right tabular-nums text-slate-500">{{ pct(o.from_weight) }}</td>
                 <td class="px-3 py-1.5 text-right tabular-nums">{{ pct(o.to_weight) }}</td>
                 <td class="px-3 py-1.5 text-right tabular-nums">{{ formatPrice(o.fill_price) }}</td>
+                <td class="px-3 py-1.5 text-right tabular-nums text-slate-600">{{ sharesMove(o) }}</td>
+                <td class="px-3 py-1.5 text-right tabular-nums">{{ o.value_rs ? rupees(o.value_rs) : '—' }}</td>
+                <td class="px-3 py-1.5 text-right tabular-nums text-slate-500">{{ o.value_rs ? rupees(o.cost_rs) : '—' }}</td>
               </tr>
             </tbody>
           </table>
@@ -233,6 +272,7 @@ const sideTone: Record<string, 'good' | 'bad' | 'warn'> = { BUY: 'good', SELL: '
                 <th class="px-3 py-2 text-left">Symbol</th>
                 <th class="px-3 py-2 text-right">Since entry</th>
                 <th class="px-3 py-2 text-right">Weight</th>
+                <th class="px-3 py-2 text-right">Shares (Rs 1 cr)</th>
                 <th class="px-3 py-2 text-left">Entered</th>
                 <th class="px-3 py-2 text-right">Entry</th>
                 <th class="px-3 py-2 text-right">Last</th>
@@ -243,6 +283,7 @@ const sideTone: Record<string, 'good' | 'bad' | 'warn'> = { BUY: 'good', SELL: '
                 <td class="px-3 py-1.5 font-medium">{{ h.symbol }}</td>
                 <td class="px-3 py-1.5 text-right"><ReturnValue :value="h.return" /></td>
                 <td class="px-3 py-1.5 text-right tabular-nums text-slate-500">{{ pct(h.weight, 2) }}</td>
+                <td class="px-3 py-1.5 text-right tabular-nums text-slate-500">{{ h.shares != null ? Math.round(h.shares) : '—' }}</td>
                 <td class="px-3 py-1.5 text-slate-500">{{ formatDate(h.entry_date) }}</td>
                 <td class="px-3 py-1.5 text-right tabular-nums text-slate-500">{{ formatPrice(h.entry_price) }}</td>
                 <td class="px-3 py-1.5 text-right tabular-nums">{{ formatPrice(h.last_price) }}</td>

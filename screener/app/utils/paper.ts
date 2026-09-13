@@ -4,6 +4,7 @@ export const PAPER_BOOKS = [
   { key: 'strategy', label: 'Strategy', colour: '#0f766e' },
   { key: 'equal-weight', label: 'Equal-weight universe (beta control)', colour: '#94a3b8' },
   { key: 'random-ranking', label: 'Random ranking, same size (selection control)', colour: '#f59e0b' },
+  { key: 'account', label: 'Rs 1 crore account (whole shares, Dhan charges)', colour: '#6366f1' },
 ]
 
 export const PAPER_BOOK_LABEL: Record<string, string> = Object.fromEntries(
