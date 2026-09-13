@@ -202,6 +202,13 @@ func (c *Client) LTP(ctx context.Context, req map[string][]int) (map[string]any,
 	return out, err
 }
 
+// Orders returns the day's order book (after-market orders included).
+func (c *Client) Orders(ctx context.Context) ([]map[string]any, error) {
+	var out []map[string]any
+	err := c.do(ctx, http.MethodGet, "/orders", nil, &out)
+	return out, err
+}
+
 // --- Trading (guarded) -------------------------------------------------------
 
 type Order struct {
@@ -213,6 +220,13 @@ type Order struct {
 	SecurityID      string  `json:"securityId"`
 	Quantity        int     `json:"quantity"`
 	Price           float64 `json:"price,omitempty"`
+	// CorrelationID is ours, echoed back by Dhan: it is how a re-run finds
+	// an order it already placed and does not place it twice.
+	CorrelationID string `json:"correlationId,omitempty"`
+	// AfterMarketOrder with AmoTime PRE_OPEN pumps the order into the next
+	// session's pre-open call auction — the fill every backtest assumes.
+	AfterMarketOrder bool   `json:"afterMarketOrder,omitempty"`
+	AmoTime          string `json:"amoTime,omitempty"`
 }
 
 // PlaceOrder submits an order — ONLY when LIVE_ORDERS=yes. Otherwise it
@@ -234,6 +248,13 @@ func (c *Client) PlaceOrder(ctx context.Context, o Order) (map[string]any, error
 	}
 	if o.OrderType == "LIMIT" {
 		payload["price"] = o.Price
+	}
+	if o.CorrelationID != "" {
+		payload["correlationId"] = o.CorrelationID
+	}
+	if o.AfterMarketOrder {
+		payload["afterMarketOrder"] = true
+		payload["amoTime"] = o.AmoTime
 	}
 	var out map[string]any
 	err := c.do(ctx, http.MethodPost, "/orders", payload, &out)

@@ -406,5 +406,20 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       universe's 22% and −58%, while keeping up on raw return. A candidate
       second strategy and momentum partner — confirmation is forward only
 - [ ] Instrument universe finalization (blocked on capital, A1)
-- [ ] Live execution via Dhan orders API (its `LIVE_ORDERS=false` dry run is
-      stability-gate item S5)
+- [x] Dhan order builder (`dhan orders`, `internal/execution`): a track's
+      sheet as delivery market orders for the next pre-open auction (AMO
+      PRE_OPEN), sells first, deterministic correlation ids so a re-run never
+      places twice. Security ids matched on the EQ series by ticker OR
+      bhavcopy ISIN (renames keep the ISIN; stockey's master never closes a
+      vanished row). A sheet it cannot reproduce exactly — unmapped or
+      ambiguous id, freeze quantity, a quantity × price far from the sheet's
+      rupees, a stale sheet — is refused whole. Runs nightly as a DRY RUN
+      after the paper job and logs to `systrader_exec_batch/_order`
+      (stability-gate S2/S5 evidence); needs no token
+- [ ] Live execution: `dhan orders -strategy <one> -live` with
+      `LIVE_ORDERS=yes` is built but has never sent an order. Before it can:
+      whitelist this server's static IP with Dhan (order APIs require it), a
+      valid token at run time, and the gate. It refuses unless the batch is
+      clean and due, Dhan's last price agrees with the sheet for every
+      security id (±15%), and the buys fit the available balance (sale
+      proceeds are not counted)

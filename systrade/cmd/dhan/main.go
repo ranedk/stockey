@@ -7,6 +7,10 @@
 //	                                fetch daily history (one-off inspection)
 //	dhan backfill [-group etf|index|futures|all] [-from 2015-01-01]
 //	                                fetch gap series into systrader_ohlcv_daily
+//	dhan orders [-strategy all|<name>] [-live]
+//	                                a track's order sheet as Dhan pre-open orders:
+//	                                built, checked, logged; sent only with -live
+//	                                and LIVE_ORDERS=yes
 //
 // Auth: reuses stockey's cached access token (see internal/broker/dhan).
 package main
@@ -26,8 +30,13 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: dhan funds|holdings|positions|hist [flags]")
+		fmt.Println("usage: dhan funds|holdings|positions|hist|backfill|orders [flags]")
 		os.Exit(1)
+	}
+	// orders builds and checks without a token; it asks for one only to send.
+	if os.Args[1] == "orders" {
+		runOrders(os.Args[2:])
+		return
 	}
 	c, err := dhan.New()
 	if err != nil {
