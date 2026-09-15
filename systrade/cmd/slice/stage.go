@@ -7,6 +7,8 @@ package main
 //	                             same-size random group (kill screen)
 //	slice stage -part strategy   step 2: three trading versions, and their
 //	                             overlap with the momentum lookback blend
+//	slice stage -part followups  the two follow-ups from row 39's map: early
+//	                             Stage 2 and a faithful breakout (row 40)
 //	slice stage -part explore -event stage2|breakout
 //	                             EXPLORATION: where did it work? The signal cut
 //	                             by every slicing trait plus four of Weinstein's
@@ -289,7 +291,7 @@ func runStage(args []string) {
 	cfg := sleeve.Config{CostBpsRoundTrip: *costBps, Seeds: []int64{1, 2, 3, 4, 5}, RebalanceEvery: weinsteinWeek}
 
 	header := func(title string) {
-		fmt.Println(title + " — pre-registered, research/preregistrations/2026-09-15_weinstein.md")
+		fmt.Println(title)
 		fmt.Printf("NSE adjusted EQ, Rs %.0f cr floor, %s..%s, weekly stages (a day uses its last COMPLETED week),\n", *floor/1e7, *from, *to)
 		fmt.Printf("equal weight, decide at a close, fill at the next open, rebalanced every %d trading days, %.0f bps round trip.\n", weinsteinWeek, *costBps)
 		fmt.Println("Controls: the equal-weight universe, and the same number of names at random from the same eligible set, held")
@@ -304,7 +306,7 @@ func runStage(args []string) {
 		days := buildScores(*cache, scs, mustDate(*from), mustDate(*to), *floor, minBars)
 		res, err := sleeve.Run(days, names, cfg)
 		fatalIf(err)
-		header("WEINSTEIN STAGES — STEP 1: do the stages sort future returns?")
+		header("WEINSTEIN STAGES — STEP 1: do the stages sort future returns? — pre-registered, research/preregistrations/2026-09-15_weinstein.md")
 		fmt.Printf("  %-8s %26s %26s %13s %13s %11s\n", "", "the book: ret / vol / maxDD", "same-size random group", "edge vs it", "edge vs EW", "at 100 bps")
 		fmt.Printf("  %-8s %26s %26s %13s %13s %11s\n", "", "", "", "%/mo (p)", "%/mo (p)", "vs random")
 		var s2 evidence.Edge
@@ -343,121 +345,85 @@ func runStage(args []string) {
 		fatalIf(err)
 		m := newMarket(mret)
 		ws := weinsteinScorers(m)
-		momNames := []string{"mom6", "mom9", "mom12", "mom12_1"}
-		momWeights := []float64{0.33, 0.33, 0.17, 0.17} // the frozen lookback blend
 		scs := append(append([]scorer(nil), ws...), memberScorers(momNames, nil)...)
 		names := scorerNames(scs)
 		days := buildScores(*cache, scs, mustDate(*from), mustDate(*to), *floor, minBars)
 		res, err := sleeve.Run(days, names, cfg)
 		fatalIf(err)
+		idx := make([]int, len(ws))
+		for k := range idx {
+			idx[k] = k
+		}
+		vs := judgeVersions(res, idx, momentumExcess(res, len(ws)), boot, *q)
 
-		// The momentum blend's daily gross excess over its equal-weight book.
-		momExcess := map[time.Time]float64{}
-		for j := range momNames {
-			r := res[len(ws)+j]
-			for i, d := range r.Signal.Dates {
-				momExcess[d] += momWeights[j] * (r.Signal.Gross[i] - r.EqualWeight.Gross[i])
-			}
-		}
-
-		type cell struct {
-			name          string
-			sum, eqS, shS sleeve.Summary
-			raw, mEq, mSh evidence.Edge
-			m2, corr      float64
-			excess        []float64
-			p, qv, dsr    float64
-			deciding      string
-			survivor      bool
-		}
-		var cells []*cell
-		for k := range ws {
-			r := res[k]
-			start := firstTraded(r.Signal)
-			sb, eb, hb := trimFrom(r.Signal, start), trimFrom(r.EqualWeight, start), trimFrom(r.StableShuffled, start)
-			_, ms := sleeve.Monthly(sb)
-			_, me := sleeve.Monthly(eb)
-			_, mse := sleeve.Monthly(atRisk(sb, eb))
-			_, msh := sleeve.Monthly(atRisk(sb, hb))
-			_, mh := sleeve.Monthly(hb)
-			if len(ms) < 12 || len(ms) != len(me) || len(ms) != len(mh) {
-				fatal(fmt.Errorf("%s: books misaligned or too short", names[k]))
-			}
-			c := &cell{name: names[k], sum: sleeve.Summarize(sb), eqS: sleeve.Summarize(eb), shS: sleeve.Summarize(hb)}
-			c.raw, err = evidence.PairedEdge(ms, me, boot, 0.90)
-			fatalIf(err)
-			c.mEq, err = evidence.PairedEdge(mse, me, boot, 0.90)
-			fatalIf(err)
-			c.mSh, err = evidence.PairedEdge(msh, mh, boot, 0.90)
-			fatalIf(err)
-			scaled, ctl, e := mse, me, c.mEq
-			c.deciding = "equal-wt"
-			if c.mSh.P > c.mEq.P {
-				scaled, ctl, e, c.deciding = msh, mh, c.mSh, "random"
-			}
-			c.excess = make([]float64, len(scaled))
-			for i := range scaled {
-				c.excess[i] = scaled[i] - ctl[i]
-			}
-			c.p = e.P
-			c.m2 = math.Inf(1)
-			for _, ref := range []sleeve.Book{eb, hb} {
-				c.m2 = math.Min(c.m2, sleeve.PairedMonthly(atRisk(doubleCost(sb), doubleCost(ref)), doubleCost(ref)).MeanDiff)
-			}
-			var a, bb []float64
-			for i, d := range sb.Dates {
-				if x, ok := momExcess[d]; ok {
-					a = append(a, sb.Gross[i]-eb.Gross[i])
-					bb = append(bb, x)
-				}
-			}
-			c.corr = pearson(a, bb)
-			cells = append(cells, c)
-		}
-		members := make([]evidence.Member, len(cells))
-		for i, c := range cells {
-			members[i] = evidence.Member{Name: c.name, Returns: c.excess, P: c.p}
-		}
-		verdicts, err := evidence.Judge(members, len(members), *q)
-		fatalIf(err)
-		for i, v := range verdicts {
-			c := cells[i]
-			c.qv, c.dsr = v.Q, v.Deflated.DSR
-			c.survivor = v.Discovery && c.mEq.MeanDiff > 0 && c.mSh.MeanDiff > 0 && c.m2 >= 0
-		}
-
-		header("WEINSTEIN STAGES — STEP 2: three trading versions")
+		header("WEINSTEIN STAGES — STEP 2: three trading versions — pre-registered, research/preregistrations/2026-09-15_weinstein.md")
 		fmt.Println("(a) hold Stage 2 | (b) Stage 1->2 breakouts on >= 2x volume with Mansfield RS > 0 | (c) (b) only while the")
 		fmt.Println("market index is in Stage 2. All exit on a weekly close below the 30-week average.")
 		fmt.Println()
-		fmt.Printf("  %-15s %26s %9s %26s %26s\n", "", "the book: ret / vol / maxDD", "turnover", "equal-weight", "same-size random")
-		for _, c := range cells {
-			fmt.Printf("  %-15s %26s %8.0f%% %26s %26s\n", c.name,
-				fmt.Sprintf("%.1f%% / %.1f%% / %.0f%%", 100*c.sum.AnnReturn, 100*c.sum.AnnVol, 100*c.sum.MaxDD),
-				100*252*c.sum.MeanTurnover,
-				fmt.Sprintf("%.1f%% / %.1f%% / %.0f%%", 100*c.eqS.AnnReturn, 100*c.eqS.AnnVol, 100*c.eqS.MaxDD),
-				fmt.Sprintf("%.1f%% / %.1f%% / %.0f%%", 100*c.shS.AnnReturn, 100*c.shS.AnnVol, 100*c.shS.MaxDD))
+		printVersions(vs)
+
+	case "followups":
+		mret, _, err := traits.MarketReturns(*cache, *floor)
+		fatalIf(err)
+		m := newMarket(mret)
+		scs := append(followupScorers(m), memberScorers(momNames, nil)...)
+		days := buildScores(*cache, scs, mustDate(*from), mustDate(*to), *floor, minBars)
+		fdays, entries, meanHeld := followupDays(days)
+		names := append([]string{"stage2", "d-early-stage2", "e-faithful-breakout"}, momNames...)
+		res, err := sleeve.Run(fdays, names, cfg)
+		fatalIf(err)
+		vs := judgeVersions(res, []int{1, 2}, momentumExcess(res, 3), boot, *q)
+
+		// (d)'s own question: did dropping the extended names improve on
+		// plain Stage 2, on the same universe and clock?
+		start := firstTraded(res[1].Signal)
+		_, md := sleeve.Monthly(trimFrom(res[1].Signal, start))
+		_, mp := sleeve.Monthly(trimFrom(res[0].Signal, start))
+		if len(md) != len(mp) {
+			fatal(fmt.Errorf("early and plain Stage 2 books misaligned"))
 		}
+		better, err := evidence.PairedEdge(md, mp, boot, 0.90)
+		fatalIf(err)
+		plain := sleeve.Summarize(trimFrom(res[0].Signal, start))
+
+		header("WEINSTEIN FOLLOW-UPS — pre-registered, research/preregistrations/2026-09-15_weinstein_followups.md")
+		fmt.Println("(d) early Stage 2: every Stage 2 name except, each day, the top fifth of them by 30-week MA slope or by")
+		fmt.Println("    distance above the MA. (e) faithful breakout: a weekly close above the prior 30 weeks' highest close,")
+		fmt.Println("    out of a flat-MA base, MA not falling, above the MA, >= 2x volume, Mansfield RS > 0; exit on a weekly")
+		fmt.Println("    close below the 30-week MA.")
 		fmt.Println()
-		fmt.Printf("  %-15s %10s %18s %18s %9s %7s %6s %11s  %s\n", "%/month", "raw vs EW", "matched vs EW (p)", "matched vs rnd (p)",
-			"100 bps", "FDR q", "DSR", "corr w/ mom", "verdict")
-		for _, c := range cells {
-			v := "does not survive"
-			switch {
-			case c.survivor && c.corr >= 0.8:
-				v = "SURVIVES — same bet as momentum (a variant, not a track)"
-			case c.survivor:
-				v = "SURVIVES — distinct from momentum: candidate paper track"
-			}
-			fmt.Printf("  %-15s %+10.2f %+9.2f (%.3f) %+9.2f (%.3f) %+9.2f %7.3f %6.3f %11.2f  %s\n", c.name,
-				100*c.raw.MeanDiff, 100*c.mEq.MeanDiff, c.mEq.P, 100*c.mSh.MeanDiff, c.mSh.P, 100*c.m2, c.qv, c.dsr, c.corr, v)
+		printVersions(vs)
+		fmt.Printf("\nplain Stage 2, same universe and clock: %.1f%% / %.1f%% / %.0f%%\n",
+			100*plain.AnnReturn, 100*plain.AnnVol, 100*plain.MaxDD)
+		fmt.Printf("(d) vs plain Stage 2, net: %+.2f%%/month, p = %.3f (pre-registered: must be positive with p < 0.10)\n",
+			100*better.MeanDiff, better.P)
+		var years []int
+		for y := range entries {
+			years = append(years, y)
 		}
-		fmt.Println()
-		fmt.Println("Deciding: matched-risk edge over the tougher control; survive = beats both, FDR discovery within these three,")
-		fmt.Println("100-bps edge not negative. 'corr w/ mom' = daily gross excess (book - equal-weight) vs the momentum lookback")
-		fmt.Println("blend's, run here on the same days (weekly rebalanced); >= 0.8 means the same bet.")
+		sort.Ints(years)
+		fmt.Printf("(e) entries a year:")
+		for _, y := range years {
+			fmt.Printf(" %d: %d", y, entries[y])
+		}
+		fmt.Printf(" | mean names held %.1f\n\n", meanHeld)
+
+		d, e := vs[0], vs[1]
+		dVerdict := "does not survive"
+		switch {
+		case d.survivor && better.MeanDiff > 0 && better.P < 0.10:
+			dVerdict = "SURVIVES and improves on plain Stage 2"
+		case d.survivor:
+			dVerdict = "survives, but does not improve on plain Stage 2 — the exclusion is not what works"
+		}
+		eVerdict := "does not survive"
+		if e.survivor {
+			eVerdict = "SURVIVES"
+		}
+		fmt.Printf("PRE-REGISTERED VERDICT: (d) %s; (e) %s.\n", dVerdict, eVerdict)
+
 	default:
-		fatal(fmt.Errorf("unknown -part %q (buckets | strategy)", *part))
+		fatal(fmt.Errorf("unknown -part %q (buckets | strategy | followups | explore)", *part))
 	}
 }
 
@@ -579,4 +545,244 @@ func runStageExplore(cache, kind string, from, to time.Time, floor float64, hori
 	title := map[string]string{"stage2": "Weinstein Stage 2 (every name in it)", "breakout": "Weinstein breakout (Stage 1->2, >= 2x volume, Mansfield RS > 0)"}[kind]
 	res := explore.RunEvent(days, dims, title, horizon)
 	printResult(res, deviations(res, horizon, reps), costBps, mcaps, sectors, true)
+}
+
+// momNames and momWeights are the frozen momentum lookback blend, run beside
+// the Weinstein books to measure how much they overlap.
+var (
+	momNames   = []string{"mom6", "mom9", "mom12", "mom12_1"}
+	momWeights = []float64{0.33, 0.33, 0.17, 0.17}
+)
+
+// momentumExcess is the momentum blend's daily gross excess over its
+// equal-weight book, its members sitting at res[first:first+4].
+func momentumExcess(res []sleeve.RuleResult, first int) map[time.Time]float64 {
+	out := map[time.Time]float64{}
+	for j := range momNames {
+		r := res[first+j]
+		for i, d := range r.Signal.Dates {
+			out[d] += momWeights[j] * (r.Signal.Gross[i] - r.EqualWeight.Gross[i])
+		}
+	}
+	return out
+}
+
+// version is one trading version's judgement.
+type version struct {
+	name          string
+	sum, eqS, shS sleeve.Summary
+	raw, mEq, mSh evidence.Edge
+	m2, corr      float64
+	excess        []float64
+	p, qv, dsr    float64
+	deciding      string
+	survivor      bool
+}
+
+// judgeVersions applies the pre-registered rule to the books at idx, as one
+// family: matched-risk edge over the tougher control, FDR within the family,
+// the 100-bps edge not negative against either control; plus the overlap with
+// the momentum blend.
+func judgeVersions(res []sleeve.RuleResult, idx []int, momExcess map[time.Time]float64, boot evidence.Bootstrap, q float64) []*version {
+	var vs []*version
+	for _, k := range idx {
+		r := res[k]
+		start := firstTraded(r.Signal)
+		sb, eb, hb := trimFrom(r.Signal, start), trimFrom(r.EqualWeight, start), trimFrom(r.StableShuffled, start)
+		_, ms := sleeve.Monthly(sb)
+		_, me := sleeve.Monthly(eb)
+		_, mse := sleeve.Monthly(atRisk(sb, eb))
+		_, msh := sleeve.Monthly(atRisk(sb, hb))
+		_, mh := sleeve.Monthly(hb)
+		if len(ms) < 12 || len(ms) != len(me) || len(ms) != len(mh) {
+			fatal(fmt.Errorf("%s: books misaligned or too short", r.Rule))
+		}
+		v := &version{name: r.Rule, sum: sleeve.Summarize(sb), eqS: sleeve.Summarize(eb), shS: sleeve.Summarize(hb)}
+		var err error
+		v.raw, err = evidence.PairedEdge(ms, me, boot, 0.90)
+		fatalIf(err)
+		v.mEq, err = evidence.PairedEdge(mse, me, boot, 0.90)
+		fatalIf(err)
+		v.mSh, err = evidence.PairedEdge(msh, mh, boot, 0.90)
+		fatalIf(err)
+		scaled, ctl, e := mse, me, v.mEq
+		v.deciding = "equal-wt"
+		if v.mSh.P > v.mEq.P {
+			scaled, ctl, e, v.deciding = msh, mh, v.mSh, "random"
+		}
+		v.excess = make([]float64, len(scaled))
+		for i := range scaled {
+			v.excess[i] = scaled[i] - ctl[i]
+		}
+		v.p = e.P
+		v.m2 = math.Inf(1)
+		for _, ref := range []sleeve.Book{eb, hb} {
+			v.m2 = math.Min(v.m2, sleeve.PairedMonthly(atRisk(doubleCost(sb), doubleCost(ref)), doubleCost(ref)).MeanDiff)
+		}
+		var a, b []float64
+		for i, d := range sb.Dates {
+			if x, ok := momExcess[d]; ok {
+				a = append(a, sb.Gross[i]-eb.Gross[i])
+				b = append(b, x)
+			}
+		}
+		v.corr = pearson(a, b)
+		vs = append(vs, v)
+	}
+	members := make([]evidence.Member, len(vs))
+	for i, v := range vs {
+		members[i] = evidence.Member{Name: v.name, Returns: v.excess, P: v.p}
+	}
+	verdicts, err := evidence.Judge(members, len(members), q)
+	fatalIf(err)
+	for i, vd := range verdicts {
+		v := vs[i]
+		v.qv, v.dsr = vd.Q, vd.Deflated.DSR
+		v.survivor = vd.Discovery && v.mEq.MeanDiff > 0 && v.mSh.MeanDiff > 0 && v.m2 >= 0
+	}
+	return vs
+}
+
+func printVersions(vs []*version) {
+	fmt.Printf("  %-19s %26s %9s %26s %26s\n", "", "the book: ret / vol / maxDD", "turnover", "equal-weight", "same-size random")
+	for _, v := range vs {
+		fmt.Printf("  %-19s %26s %8.0f%% %26s %26s\n", v.name,
+			fmt.Sprintf("%.1f%% / %.1f%% / %.0f%%", 100*v.sum.AnnReturn, 100*v.sum.AnnVol, 100*v.sum.MaxDD),
+			100*252*v.sum.MeanTurnover,
+			fmt.Sprintf("%.1f%% / %.1f%% / %.0f%%", 100*v.eqS.AnnReturn, 100*v.eqS.AnnVol, 100*v.eqS.MaxDD),
+			fmt.Sprintf("%.1f%% / %.1f%% / %.0f%%", 100*v.shS.AnnReturn, 100*v.shS.AnnVol, 100*v.shS.MaxDD))
+	}
+	fmt.Println()
+	fmt.Printf("  %-19s %10s %18s %18s %9s %7s %6s %11s  %s\n", "%/month", "raw vs EW", "matched vs EW (p)", "matched vs rnd (p)",
+		"100 bps", "FDR q", "DSR", "corr w/ mom", "verdict")
+	for _, v := range vs {
+		verdict := "does not survive"
+		switch {
+		case v.survivor && v.corr >= 0.8:
+			verdict = "SURVIVES — same bet as momentum (a variant, not a track)"
+		case v.survivor:
+			verdict = "SURVIVES — distinct from momentum: candidate paper track"
+		}
+		fmt.Printf("  %-19s %+10.2f %+9.2f (%.3f) %+9.2f (%.3f) %+9.2f %7.3f %6.3f %11.2f  %s\n", v.name,
+			100*v.raw.MeanDiff, 100*v.mEq.MeanDiff, v.mEq.P, 100*v.mSh.MeanDiff, v.mSh.P, 100*v.m2, v.qv, v.dsr, v.corr, verdict)
+	}
+	fmt.Println()
+	fmt.Println("Deciding: matched-risk edge over the tougher control; survive = beats both, FDR discovery within the family,")
+	fmt.Println("100-bps edge not negative. 'corr w/ mom' = daily gross excess (book - equal-weight) vs the momentum lookback")
+	fmt.Println("blend's, run here on the same days (weekly rebalanced); >= 0.8 means the same bet.")
+}
+
+// enterFaithful is version (e)'s entry, Weinstein's own buy point: the week
+// a name closes above the highest weekly close of the prior 30 weeks (the top
+// of its base — the MA's own window), out of a base (last week's MA slope
+// inside the flat band), with the MA not falling, the close above the MA,
+// at least twice the average volume and positive Mansfield relative strength.
+func enterFaithful(cls []stage.Classification, rs []float64) func(int) bool {
+	return func(k int) bool {
+		if k < stage.MAWindowWeeks {
+			return false
+		}
+		c, prev := cls[k], cls[k-1]
+		hi := math.Inf(-1)
+		for j := k - stage.MAWindowWeeks; j < k; j++ {
+			hi = math.Max(hi, cls[j].Close)
+		}
+		return c.Close > hi && c.Close > c.MA30 &&
+			math.Abs(prev.MASlopePct) <= stage.FlatThresholdPct &&
+			c.MASlopePct >= -stage.FlatThresholdPct &&
+			c.VolumeRatio >= breakoutVolume && rs[k] > 0
+	}
+}
+
+// followupScorers carry what the two follow-ups need per name, as sizing
+// units straight through (Direct): Stage 2 membership, the 30-week MA slope,
+// the distance above it, and the faithful breakout's held position.
+// followupDays turns the first three into (d)'s book.
+func followupScorers(m *market) []scorer {
+	weekly := func(name string, val func(w weeks) []float64) scorer {
+		return scorer{Name: name, Direct: true, Score: func(b []bars.Bar) []float64 {
+			w := weeklyView(b)
+			return w.daily(len(b), val(w))
+		}}
+	}
+	known := func(w weeks, f func(c stage.Classification) float64) []float64 {
+		out := make([]float64, len(w.cls))
+		for k, c := range w.cls {
+			out[k] = math.NaN()
+			if c.Stage != stage.StageUnknown && c.MA30 > 0 {
+				out[k] = f(c)
+			}
+		}
+		return out
+	}
+	return []scorer{
+		weekly("member", func(w weeks) []float64 { return stageMembership(w.cls, stage.Stage2Advancing) }),
+		weekly("slope", func(w weeks) []float64 {
+			return known(w, func(c stage.Classification) float64 { return c.MASlopePct })
+		}),
+		weekly("dist", func(w weeks) []float64 {
+			return known(w, func(c stage.Classification) float64 { return c.Close/c.MA30 - 1 })
+		}),
+		weekly("e-faithful-breakout", func(w weeks) []float64 {
+			return holdPositions(w.cls, enterFaithful(w.cls, mansfield(w.cls, m.levelAt)))
+		}),
+	}
+}
+
+// followupDays rebuilds each day's sizing units as [plain Stage 2, (d) early
+// Stage 2, (e) faithful breakout, the four momentum members] from the columns
+// followupScorers and memberScorers produced, and counts (e)'s entries by
+// year and its mean names held.
+func followupDays(days []sleeve.Day) ([]sleeve.Day, map[int]int, float64) {
+	out := make([]sleeve.Day, len(days))
+	entries := map[int]int{}
+	prev := map[int32]bool{}
+	var heldSum float64
+	for di, d := range days {
+		var slopes, dists []float64
+		for _, o := range d.Obs {
+			if o.U[0] == 1 && !math.IsNaN(o.U[1]) && !math.IsNaN(o.U[2]) {
+				slopes = append(slopes, o.U[1])
+				dists = append(dists, o.U[2])
+			}
+		}
+		cutS, cutD := topFifthCut(slopes), topFifthCut(dists)
+		nd := sleeve.Day{Date: d.Date, Obs: make([]sleeve.Obs, len(d.Obs))}
+		held := 0
+		for i, o := range d.Obs {
+			member, early := o.U[0], o.U[0]
+			if member == 1 && (o.U[1] >= cutS || o.U[2] >= cutD) {
+				early = 0
+			}
+			e := o.U[3]
+			if e == 1 {
+				held++
+				if !prev[o.Sym] {
+					entries[d.Date.Year()]++
+				}
+			}
+			prev[o.Sym] = e == 1
+			nd.Obs[i] = sleeve.Obs{Sym: o.Sym, Ret: o.Ret, U: []float64{member, early, e, o.U[4], o.U[5], o.U[6], o.U[7]}}
+		}
+		heldSum += float64(held)
+		out[di] = nd
+	}
+	mean := 0.0
+	if len(days) > 0 {
+		mean = heldSum / float64(len(days))
+	}
+	return out, entries, mean
+}
+
+// topFifthCut is the value at which the top fifth of x begins (the n/5
+// largest are at or above it); +Inf when there are fewer than five values, so
+// nothing is cut from a day too thin to have a top fifth.
+func topFifthCut(x []float64) float64 {
+	n := len(x)
+	if n < 5 {
+		return math.Inf(1)
+	}
+	c := append([]float64(nil), x...)
+	sort.Float64s(c)
+	return c[n-n/5]
 }

@@ -142,3 +142,51 @@ func TestBreakoutEventFiresOnlyOnTheBreakoutWeeksLastDay(t *testing.T) {
 		t.Fatalf("stage2 membership %d on the breakout Friday, %d the day before", stg[60*5+4], stg[60*5+3])
 	}
 }
+
+func TestFaithfulBreakoutIsWeinsteinsBuyPoint(t *testing.T) {
+	// 30 weeks of a base (closes at most 100, the MA flat), then the week under test.
+	mk := func(close, ma, slope, prevSlope, vol, rs float64) ([]stage.Classification, []float64) {
+		cls := make([]stage.Classification, 31)
+		r := make([]float64, 31)
+		for k := 0; k < 30; k++ {
+			cls[k] = stage.Classification{Stage: stage.Stage1Basing, Close: 95 + float64(k%6), MA30: 98, MASlopePct: 0.2}
+		}
+		cls[29].MASlopePct = prevSlope
+		cls[30] = stage.Classification{Stage: stage.Stage3Topping, Close: close, MA30: ma, MASlopePct: slope, VolumeRatio: vol}
+		r[30] = rs
+		return cls, r
+	}
+	cases := []struct {
+		name                                 string
+		close, ma, slope, prevSlope, vol, rs float64
+		want                                 bool
+	}{
+		{"a clean breakout from a flat base", 110, 99, 0.8, 0.3, 2.5, 0.05, true},
+		{"the MA already rising: fires even though our Stage 2 would not", 110, 99, 0.8, 0.9, 2.5, 0.05, true},
+		{"not above the base's highest close", 100, 99, 0.8, 0.3, 2.5, 0.05, false},
+		{"out of a rising MA, not a base", 110, 99, 2.0, 1.5, 2.5, 0.05, false},
+		{"into a falling MA", 110, 99, -1.5, 0.3, 2.5, 0.05, false},
+		{"on thin volume", 110, 99, 0.8, 0.3, 1.5, 0.05, false},
+		{"lagging the market", 110, 99, 0.8, 0.3, 2.5, -0.01, false},
+		{"still below the MA", 110, 115, 0.8, 0.3, 2.5, 0.05, false},
+	}
+	for _, c := range cases {
+		cls, rs := mk(c.close, c.ma, c.slope, c.prevSlope, c.vol, c.rs)
+		if got := enterFaithful(cls, rs)(30); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+	cls, rs := mk(110, 99, 0.8, 0.3, 2.5, 0.05)
+	if enterFaithful(cls, rs)(29) {
+		t.Error("fewer than 30 prior weeks: no base to break out of")
+	}
+}
+
+func TestTopFifthCut(t *testing.T) {
+	if c := topFifthCut([]float64{5, 1, 4, 2, 3, 10, 9, 8, 7, 6}); c != 9 {
+		t.Fatalf("cut %v, want 9 (the two largest of ten are cut)", c)
+	}
+	if !math.IsInf(topFifthCut([]float64{1, 2, 3, 4}), 1) {
+		t.Fatal("four values have no top fifth: cut nothing")
+	}
+}

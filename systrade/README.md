@@ -417,10 +417,14 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       (129 days in eight years) — our Stage 2 needs a rising MA a fresh
       breakout has not built yet. Fixed on the way: unscored thin buckets
       (they had scored ±1e14) and unstable ids in `slice explore`'s builder
-- [ ] Candidates from row 39, each needing its own pre-registration: Stage 2
-      minus the most extended names in the Rs 10 cr universe; a faithful
-      Weinstein breakout (weekly close above the base's high on volume, MA
-      flat or turning up)
+- [x] The two follow-ups from row 39 (LEDGER row 40, `slice stage -part
+      followups`, pre-registered): early Stage 2 (dropping the most extended
+      names) did WORSE than plain Stage 2 (14.5% vs 17.1%/yr, −0.20%/month,
+      p = 0.99); a faithful Weinstein breakout (close above the 30-week high
+      out of a flat base, ≥ 2× volume, RS > 0) fires ~45 times a year but its
+      +0.37%/month is its extra volatility — +0.02 to +0.10 at matched risk.
+      Neither survives. Weinstein closed on the exploration years: Stage 2 is
+      the momentum premium, held more cheaply by the momentum tracks
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,
