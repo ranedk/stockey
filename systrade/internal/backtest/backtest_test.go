@@ -251,7 +251,7 @@ func TestComputeMetrics_NormalRunLeavesBustedFalse(t *testing.T) {
 
 func TestReport_PrintsBustedWarning(t *testing.T) {
 	m := Metrics{Days: 10, Busted: true, BustedDay: 3}
-	report := m.Report(1)
+	report := m.Report()
 	if !strings.Contains(report, "BUSTED at day 3") {
 		t.Fatalf("Report() should surface the bust prominently, got:\n%s", report)
 	}

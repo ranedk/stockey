@@ -10,10 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/bars"
 	"github.com/ranedk/systrader/internal/evidence"
-	"github.com/ranedk/systrader/internal/research"
 	"github.com/ranedk/systrader/internal/sleeve"
 )
 
@@ -72,7 +70,6 @@ func runWindows(args []string) {
 	seed := fs.Int64("seed", 1, "bootstrap seed — declared, never drawn")
 	q := fs.Float64("fdr", 0.10, "false-discovery rate within each family")
 	readConfirm := fs.Bool("include-confirmation-years", false, "let -to reach 2022 onward")
-	ledger := fs.String("ledger", "research/LEDGER.md", "ledger, for the workspace-wide bar printed as context")
 	fatalIf(fs.Parse(args))
 	guardConfirmationYears(mustDate(*to), *readConfirm)
 
@@ -238,9 +235,6 @@ func runWindows(args []string) {
 	eqRef := lookup["mom12_1/1"]
 	es := sleeve.Summarize(eqRef.eq)
 	fmt.Printf("\nReference: the equal-weight universe (held 1m) %.1f%%/yr at %.1f%% vol over %d months.\n", 100*es.AnnReturn, 100*es.AnnVol, eqRef.monthsUsed)
-	if m, err := research.CountM(*ledger); err == nil {
-		fmt.Printf("Workspace-wide Bonferroni bar, context only (amended Law 2): t = %.2f at M = %d.\n", backtest.BonferroniBar(m), m)
-	}
 	var list []string
 	for _, s := range all {
 		if s.family == "momentum" && s.survivor {
@@ -252,10 +246,13 @@ func runWindows(args []string) {
 }
 
 // scorer turns one symbol's bars into a score on every bar, NaN where it is
-// undefined; a book holds each day's top quintile by it.
+// undefined; a book holds each day's top quintile by it — or, when Direct,
+// the score itself is the sizing unit (1 held, 0 not), for books defined by
+// membership rather than rank (a Weinstein stage, a held breakout).
 type scorer struct {
-	Name  string
-	Score func(b []bars.Bar) []float64
+	Name   string
+	Score  func(b []bars.Bar) []float64
+	Direct bool
 }
 
 // windowScorer is a trailing-return signal as a scorer.
@@ -373,6 +370,12 @@ func buildScores(cache string, scs []scorer, from, to time.Time, floor float64, 
 			if len(have) < 25 { // fewer than five names a quintile: no book today
 				for _, i := range have {
 					day.Obs[i].U[j] = math.NaN()
+				}
+				continue
+			}
+			if scs[j].Direct {
+				for _, i := range have {
+					day.Obs[i].U[j] = os[i].sig[j]
 				}
 				continue
 			}

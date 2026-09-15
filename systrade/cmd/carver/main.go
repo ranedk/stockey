@@ -96,13 +96,10 @@ func main() {
 	fatalIf(err)
 	defer st.Close()
 
-	m, err := research.CountM("research/LEDGER.md")
-	fatalIf(err)
 	fmt.Printf("%s window %s..%s | capital Rs %.2f cr | vol target %.0f%% | costs x%.0f\n",
 		*period, from.Format("2006-01-02"), to.Format("2006-01-02"), *capital/1e7, 100*volTargetPct, *costMult)
 	fmt.Printf("rules: ewmac16/32/64 + carry, equal forecast weights, FDM %.2f, IDM derived point-in-time\n", fdm)
-	fmt.Printf("decision bar (pre-registered): monthly paired t > 2.0 vs BOTH controls on the holdout;\n")
-	fmt.Printf("workspace Bonferroni bar for context: t = %.2f at M = %d\n\n", backtest.BonferroniBar(m), m)
+	fmt.Printf("decision bar (pre-registered): monthly paired t > 2.0 vs BOTH controls on the holdout\n\n")
 
 	runSleeve(ctx, st, "FUTURES", futuresSleeve, from, to, *capital, *costMult, 0)
 	runSleeve(ctx, st, "ETF / CASH", etfSleeve, from, to, *capital, *costMult, 1.0)

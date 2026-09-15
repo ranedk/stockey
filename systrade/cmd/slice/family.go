@@ -6,9 +6,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/evidence"
-	"github.com/ranedk/systrader/internal/research"
 	"github.com/ranedk/systrader/internal/sleeve"
 )
 
@@ -45,7 +43,6 @@ func runFamily(args []string) {
 	q := fs.Float64("fdr", 0.10, "false-discovery rate within the family (amended Law 2)")
 	reps := fs.Int("reps", 10000, "bootstrap resamples")
 	seed := fs.Int64("seed", 1, "bootstrap seed — declared, never drawn")
-	ledger := fs.String("ledger", "research/LEDGER.md", "ledger, for the workspace-wide bar printed as context")
 	fatalIf(fs.Parse(args))
 
 	names := make([]string, len(variants))
@@ -162,9 +159,6 @@ func runFamily(args []string) {
 		fmt.Printf("\nDeflation benchmark: the best of %d no-skill configurations with this family's spread of Sharpe\n", b.Trials)
 		fmt.Printf("ratios would show %.3f per month (%.2f annualised) on excess returns. DSR = P(true excess SR > that).\n",
 			b.Benchmark, b.Benchmark*math.Sqrt(12))
-	}
-	if m, err := research.CountM(*ledger); err == nil {
-		fmt.Printf("Workspace-wide Bonferroni bar, context only (amended Law 2): t = %.2f at M = %d.\n", backtest.BonferroniBar(m), m)
 	}
 	fmt.Println("* = the frozen paper-trading configuration (docs/strategies/2026-09-08_trend_quintile.md).")
 }

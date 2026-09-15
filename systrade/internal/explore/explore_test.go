@@ -375,3 +375,29 @@ func TestDayLevelBucketsAreComparedWithOtherDays(t *testing.T) {
 		}
 	}
 }
+
+func TestSparseBucketsGetNoScoreAndLeaveTheThresholdAlone(t *testing.T) {
+	// Sector B's names fire every day; sector A's on only five days — the
+	// Weinstein breakout shape that once scored -1.6e14 and marked six sectors.
+	days := synthDaysSeed(7, 300, 30, "", 0)
+	for di := range days {
+		for i := range days[di].Obs {
+			o := &days[di].Obs[i]
+			o.Selected = o.Forecast > 1 && (o.Sector == "B" || (o.Sector == "A" && di < 5))
+		}
+	}
+	res := RunEvent(days, []Dimension{CategoryDimension("sector", func(o Obs) string { return o.Sector })}, "sparse", 20)
+	dev, err := Deviations(res, boot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if z, ok := dev.Z[BucketKey(Bucket{Dimension: "sector", Label: "A"})]; ok {
+		t.Fatalf("a bucket seen on 5 days was scored %v; it cannot carry a block bootstrap", z)
+	}
+	if _, ok := dev.Z[BucketKey(Bucket{Dimension: "sector", Label: "B"})]; !ok {
+		t.Fatal("the bucket that fired every day lost its score")
+	}
+	if math.IsInf(dev.Threshold, 0) || dev.Threshold > 10 {
+		t.Fatalf("threshold %v: a sparse bucket leaked into the family", dev.Threshold)
+	}
+}

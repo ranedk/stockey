@@ -53,6 +53,21 @@ now on:
   kind. They are logged precisely so a mined dataset can never later be
   mistaken for a fresh one.
 
+**AMENDED AGAIN 2026-09-15 (operator).** The running count no longer sets any
+bar. A threshold that rises with every idea ever tried was judged the wrong tool
+for an exploration phase — it taxes the next idea for the last one — and the gate
+before capital is now the forward paper record's stability gate
+(RESEARCH_PROTOCOL, 2026-09-13), not a backtest threshold. What remains:
+
+- **The ledger still logs every experiment** — an audit trail, so mined data is
+  never mistaken for virgin data. M is still counted, as a record of how much
+  searching has happened, and sets no bar.
+- **A claim about a family of variants is still corrected within that family**
+  (FDR 10% + deflated Sharpe over the family's own trial count): it asks whether
+  the best of the variants tried together is more than their luck, and it does
+  not grow with later research.
+- Reports no longer print a workspace-wide Bonferroni bar.
+
 ### Law 3: Edge = performance − matched baseline
 Never quote raw win rates or raw Sharpe. A pattern that wins 80% while random
 entries in the same stocks/period win 90% has NEGATIVE edge. Baselines must match

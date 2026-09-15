@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/evidence"
-	"github.com/ranedk/systrader/internal/research"
 	"github.com/ranedk/systrader/internal/rules"
 	"github.com/ranedk/systrader/internal/sleeve"
 )
@@ -37,7 +35,6 @@ func runBlend(args []string) {
 	rebalance := fs.Int("rebalance", 20, "trade every N decision days (the spec's 20)")
 	reps := fs.Int("reps", 10000, "bootstrap resamples")
 	seed := fs.Int64("seed", 1, "bootstrap seed — declared, never drawn")
-	ledger := fs.String("ledger", "research/LEDGER.md", "ledger, for the workspace-wide bar printed as context")
 	fatalIf(fs.Parse(args))
 
 	names := make([]string, len(variants))
@@ -134,9 +131,6 @@ func runBlend(args []string) {
 	fatalIf(err)
 	fmt.Printf("  blend − trend-quintile at matched risk: %s\n", edgeCell(mr))
 	fmt.Println("  Choosing between these two on this sample would be pick-the-winner (Law 5); it informs nothing here.")
-	if m, err := research.CountM(*ledger); err == nil {
-		fmt.Printf("\nWorkspace-wide Bonferroni bar, context only (amended Law 2): t = %.2f at M = %d.\n", backtest.BonferroniBar(m), m)
-	}
 }
 
 func passFail(ok bool) string {

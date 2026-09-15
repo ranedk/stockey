@@ -24,7 +24,6 @@ import (
 	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/data"
-	"github.com/ranedk/systrader/internal/research"
 	"github.com/ranedk/systrader/internal/rules"
 	"github.com/ranedk/systrader/internal/store"
 )
@@ -133,14 +132,9 @@ func runReal(tickers []string, capital, volTarget float64, weekly bool) {
 	if err != nil {
 		panic(err)
 	}
-	ledgerM, lerr := research.CountM("research/LEDGER.md")
-	if lerr != nil {
-		ledgerM = 2 // inherited rows; never report a bar easier than reality
-		fmt.Printf("WARN: cannot read research/LEDGER.md (%v), assuming M=%d\n", lerr, ledgerM)
-	}
 	fmt.Println("\n=== REAL DATA (cash-equity economics, long-only) ===")
 	fmt.Printf("IDM (correlation-derived, point-in-time): %.2f\n", res.IDMUsed)
-	fmt.Println(res.Metrics.Report(ledgerM))
+	fmt.Println(res.Metrics.Report())
 	fmt.Println()
 	for _, in := range instruments {
 		ir := res.Instruments[in.Meta.Symbol]
@@ -192,7 +186,7 @@ func runSynthetic() {
 	}
 
 	fmt.Println("=== SYNTHETIC DEMO — numbers are meaningless by construction ===")
-	fmt.Println(res.Metrics.Report(2)) // ledger M=2 (the two inherited rules)
+	fmt.Println(res.Metrics.Report())
 	fmt.Println()
 	for _, sym := range []string{"SYNTH-TREND", "SYNTH-CARRY"} {
 		ir := res.Instruments[sym]

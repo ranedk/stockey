@@ -106,7 +106,7 @@ func ComputeMetrics(res *Result, capital float64) Metrics {
 	return m
 }
 
-func (m Metrics) Report(ledgerM int) string {
+func (m Metrics) Report() string {
 	var b strings.Builder
 	if m.Busted {
 		fmt.Fprintf(&b, "⚠⚠ BUSTED at day %d of %d — capital hit zero. Every statistic below is computed ONLY over the %d days before the bust and does NOT represent the full run.\n",
@@ -117,14 +117,6 @@ func (m Metrics) Report(ledgerM int) string {
 	fmt.Fprintf(&b, "tStat=%.2f  skew=%.2f  maxDD=%.1f%%  costDrag=%.3f SR/yr", m.TStat, m.Skew, m.MaxDDPct, m.CostDragSR)
 	if m.CostDragSR > 0.13 {
 		b.WriteString("  ⚠ SPEED LIMIT BREACHED (Law 13: max 0.13)")
-	}
-	bar := BonferroniBar(ledgerM)
-	fmt.Fprintf(&b, "\nledger M=%d → required t=%.2f → ", ledgerM, bar)
-	switch {
-	case m.TStat >= bar:
-		b.WriteString("PASSES the multiple-testing bar")
-	default:
-		b.WriteString("NOT significant (Law 2: luck explains this)")
 	}
 	if m.Sharpe > 1.0 {
 		b.WriteString("\n⚠ SR > 1.0: assume bug → look-ahead → hidden skew → over-fitting (Law 7)")

@@ -8,10 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/bars"
 	"github.com/ranedk/systrader/internal/evidence"
-	"github.com/ranedk/systrader/internal/research"
 	"github.com/ranedk/systrader/internal/sleeve"
 	"github.com/ranedk/systrader/internal/traits"
 )
@@ -70,7 +68,6 @@ func runLowVol(args []string) {
 	seed := fs.Int64("seed", 1, "bootstrap seed — declared, never drawn")
 	q := fs.Float64("fdr", 0.10, "false-discovery rate within the family")
 	readConfirm := fs.Bool("include-confirmation-years", false, "let -to reach 2022 onward")
-	ledger := fs.String("ledger", "research/LEDGER.md", "ledger, for the workspace-wide bar printed as context")
 	fatalIf(fs.Parse(args))
 	guardConfirmationYears(mustDate(*to), *readConfirm)
 
@@ -227,7 +224,4 @@ func runLowVol(args []string) {
 		survivors, len(rows), len(cols), verdict)
 	fmt.Println("(plateau: >= 12 survivors not confined to one row or column; spike: < 6, or all in one row or column)")
 	fmt.Printf("Surviving cells: %s\n", strings.Join(list, ", "))
-	if m, err := research.CountM(*ledger); err == nil {
-		fmt.Printf("Workspace-wide Bonferroni bar, context only (amended Law 2): t = %.2f at M = %d.\n", backtest.BonferroniBar(m), m)
-	}
 }

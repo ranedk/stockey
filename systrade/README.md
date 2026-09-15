@@ -395,6 +395,32 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       over time, new money added on rebalance days; every track's slice at or
       above its row-36 capacity floor (Rs 1 crore for the blends, Rs 30 lakh
       for the trend books)
+- [x] No cumulative testing bar (operator, 2026-09-15; TRADING_BIBLE Law 2
+      second amendment, RESEARCH_PROTOCOL): the workspace-wide Bonferroni
+      no longer prints or gates anything (slice, carver, backtest's report).
+      Ledger rows stay (audit log); families are still judged with FDR +
+      deflated Sharpe over their own trials
+- [x] **Weinstein's stage analysis backtested** (LEDGER rows 37-38,
+      `slice stage`, pre-registered). The stages do sort returns — Stage 2
+      beat a same-size random group by +0.41%/month (p = 0.048) — but in the
+      order 2 > 3 > 4 > 1, with basing (Stage 1) names the WORST. Of the
+      three trading versions none survived: holding Stage 2 (17.5%/yr, maxDD
+      −46% vs the universe's −58%) was suggestive alone (p ≈ 0.09) but not a
+      discovery within its family, correlates 0.71 with momentum and turns
+      over 1,259%/yr; the book's signature breakouts lost 6.4%/yr (−83% max
+      drawdown), with or without the market-stage filter. No new track
+- [x] Weinstein sliced (LEDGER row 39, `slice stage -part explore`,
+      EXPLORATION): Stage 2 beats the rest of its slice by +0.61% per 20
+      days, 8/8 years — strongest in smaller, more volatile, cheaper and
+      price-band-hitting names, weakest (the only ◆) in the most extended ones
+      (steepest 30-week MA, furthest above it). Breakouts too rare to slice
+      (129 days in eight years) — our Stage 2 needs a rising MA a fresh
+      breakout has not built yet. Fixed on the way: unscored thin buckets
+      (they had scored ±1e14) and unstable ids in `slice explore`'s builder
+- [ ] Candidates from row 39, each needing its own pre-registration: Stage 2
+      minus the most extended names in the Rs 10 cr universe; a faithful
+      Weinstein breakout (weekly close above the base's high on volume, MA
+      flat or turning up)
 - [ ] Two-trait grids, only for pairs named in advance (the last piece of
       step 2, not yet built)
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,

@@ -1,0 +1,22 @@
+WEINSTEIN STAGES — STEP 2: three trading versions — pre-registered, research/preregistrations/2026-09-15_weinstein.md
+NSE adjusted EQ, Rs 10 cr floor, 2013-07-01..2021-12-31, weekly stages (a day uses its last COMPLETED week),
+equal weight, decide at a close, fill at the next open, rebalanced every 5 trading days, 50 bps round trip.
+Controls: the equal-weight universe, and the same number of names at random from the same eligible set, held
+(stable shuffle). Exploration years: can kill, never confirm.
+
+(a) hold Stage 2 | (b) Stage 1->2 breakouts on >= 2x volume with Mansfield RS > 0 | (c) (b) only while the
+market index is in Stage 2. All exit on a weekly close below the 30-week average.
+
+                  the book: ret / vol / maxDD  turnover               equal-weight           same-size random
+  a-hold-stage2         17.5% / 21.7% / -46%     1259%       13.6% / 22.3% / -58%       13.1% / 22.1% / -58%
+  b-breakout            -6.4% / 38.4% / -83%     1285%        9.7% / 22.3% / -58%        7.8% / 21.2% / -58%
+  c-breakout-mkt         1.0% / 25.6% / -59%      671%        9.7% / 22.3% / -58%       12.0% / 14.2% / -24%
+
+  %/month          raw vs EW  matched vs EW (p) matched vs rnd (p)   100 bps   FDR q    DSR corr w/ mom  verdict
+  a-hold-stage2        +0.24     +0.28 (0.095)     +0.31 (0.084)     +0.10   0.286  0.338        0.71  does not survive
+  b-breakout           -1.00     -0.96 (0.983)     -0.82 (0.948)     -1.03   0.994  0.000        0.21  does not survive
+  c-breakout-mkt       -0.64     -0.68 (0.886)     -0.80 (0.994)     -0.73   0.994  0.000        0.21  does not survive
+
+Deciding: matched-risk edge over the tougher control; survive = beats both, FDR discovery within these three,
+100-bps edge not negative. 'corr w/ mom' = daily gross excess (book - equal-weight) vs the momentum lookback
+blend's, run here on the same days (weekly rebalanced); >= 0.8 means the same bet.

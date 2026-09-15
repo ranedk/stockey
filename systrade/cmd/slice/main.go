@@ -8,6 +8,7 @@
 //	slice windows  (momentum across formation x holding windows, pre-registered)
 //	slice lookbacks (the momentum lookback blend's construction: costs and correlations)
 //	slice lowvol   (the low-volatility anomaly across time windows, pre-registered)
+//	slice stage    (Weinstein's stage analysis: -part buckets | strategy, pre-registered)
 //	slice drawdown -rule ewmac32_128
 //
 // This is EXPLORATION. It prints no verdict and no p-value on a winning
@@ -57,6 +58,10 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "lowvol" {
 		runLowVol(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "stage" {
+		runStage(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "lookbacks" {
@@ -127,7 +132,7 @@ func main() {
 	tc, err := traits.LoadContext(ctx, st, *cache, *minTurnover, mustDate(*from), mustDate(*to))
 	fatalIf(err)
 
-	days := build(*cache, rule, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors, tc)
+	days := build(*cache, rule, nil, *horizon, mustDate(*from), mustDate(*to), *minTurnover, sectors, tc)
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 
 	dims := universalDims(*quantiles)
@@ -317,7 +322,12 @@ func sectorHint(code string, sectors map[string]string, mcaps map[string][]store
 			members = append(members, sm{sym, pts[len(pts)-1].MCap})
 		}
 	}
-	sort.Slice(members, func(i, j int) bool { return members[i].mcap > members[j].mcap })
+	sort.Slice(members, func(i, j int) bool {
+		if members[i].mcap != members[j].mcap {
+			return members[i].mcap > members[j].mcap
+		}
+		return members[i].sym < members[j].sym // ties by name: the same label every run
+	})
 	var names []string
 	for i := 0; i < len(members) && i < 3; i++ {
 		names = append(names, members[i].sym)
@@ -335,8 +345,15 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-// build streams the bar cache and produces the daily cross-sections.
-func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
+// eventFn replaces a rule with a discrete screener: for every bar, whether it
+// fired (1), did not (0), or the name should be left out that day (-1, e.g. a
+// classifier still warming up), plus caller-defined Extra attributes computed
+// for EVERY bar so a slice holds the pattern's names and the control together.
+type eventFn func(b []bars.Bar) (fired []int8, extra [][8]float64)
+
+// build streams the bar cache and produces the daily cross-sections — ranked
+// by rule's forecast, or, when ev is set (and rule nil), marked by the event.
+func build(cache string, rule rules.Rule, ev eventFn, horizon int, from, to time.Time,
 	minTurnover float64, sectors map[string]string, tc traits.Context) []explore.Day {
 
 	byDate := map[time.Time][]explore.Obs{}
@@ -357,7 +374,15 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 		prices := core.New(times, closes)
 		inst := &data.Instrument{Meta: data.Meta{Symbol: ser.Symbol, PointValue: 1, Block: 1}, Prices: prices}
 		vol := core.PriceUnitVol(prices, volSpan, volMin)
-		fc := rules.Forecast(rule, inst, vol).Values
+		var fc []float64
+		if rule != nil {
+			fc = rules.Forecast(rule, inst, vol).Values
+		}
+		var fired []int8
+		var extra [][8]float64
+		if ev != nil {
+			fired, extra = ev(ser.Bars)
+		}
 		sma := core.SMA(prices, trendWin).Values
 		turnover := bars.MedianTurnover(ser.Bars, turnoverWin)
 		sector := sectors[ser.Symbol]
@@ -376,9 +401,20 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 				continue
 			}
 			entry, exit := opens[i+1], opens[i+1+horizon]
-			f := fc[i]
+			f := 0.0
+			if fc != nil {
+				f = fc[i]
+			}
 			if entry <= 0 || exit <= 0 || math.IsNaN(f) || math.IsNaN(sma[i]) || math.IsNaN(vol.Values[i]) {
 				continue
+			}
+			var sel bool
+			var ext [8]float64
+			if ev != nil {
+				if fired[i] < 0 {
+					continue
+				}
+				sel, ext = fired[i] == 1, extra[i]
 			}
 			local = append(local, struct {
 				d time.Time
@@ -396,6 +432,8 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 				Dist52:     ta.Dist52[i],
 				UpCircuits: ta.UpCircuits[i],
 				LoCircuits: ta.LoCircuits[i],
+				Selected:   sel,
+				Extra:      ext,
 			}})
 		}
 		if len(local) == 0 {
@@ -415,8 +453,17 @@ func build(cache string, rule rules.Rule, horizon int, from, to time.Time,
 		mu.Unlock()
 	}))
 
+	// Symbol ids arrive in whatever order the scan's workers finish, and the
+	// explorer's matched controls draw from each day's names by position: left
+	// as is, 'vs ctl' scores moved by up to 0.4 between identical runs and a ◆
+	// came and went (found 2026-09-15; the fix buildScores got in LEDGER row 31).
+	remap := stableIDs(ids)
 	days := make([]explore.Day, 0, len(byDate))
 	for d, obs := range byDate {
+		for i := range obs {
+			obs[i].Sym = remap[obs[i].Sym]
+		}
+		sort.Slice(obs, func(a, b int) bool { return obs[a].Sym < obs[b].Sym })
 		days = append(days, explore.Day{Date: d, Obs: obs})
 	}
 	if len(days) == 0 {

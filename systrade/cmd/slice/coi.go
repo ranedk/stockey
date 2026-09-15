@@ -226,8 +226,15 @@ func buildCOI(cache string, horizon int, from, to time.Time, minTurnover float64
 	}))
 
 	fmt.Printf("%d COI confirmations across %d symbols\n\n", fired, len(ids))
+	// Stable ids and a fixed order within each day: the matched controls draw
+	// by position (see build in main.go, fixed the same day, 2026-09-15).
+	remap := stableIDs(ids)
 	days := make([]explore.Day, 0, len(byDate))
 	for d, obs := range byDate {
+		for i := range obs {
+			obs[i].Sym = remap[obs[i].Sym]
+		}
+		sort.Slice(obs, func(a, b int) bool { return obs[a].Sym < obs[b].Sym })
 		days = append(days, explore.Day{Date: d, Obs: obs})
 	}
 	return days

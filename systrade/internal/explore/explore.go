@@ -418,6 +418,14 @@ func BucketKey(b Bucket) string { return b.Dimension + "\x00" + b.Label }
 // control, to keep the control's own noise well below the bucket's.
 const controlsPerBucketDay = 3
 
+// minScoredDays: a bucket observed on fewer days than this gets no 'vs ctl'
+// score and stays out of the family-wise threshold. BUG FOUND 2026-09-15 on
+// the Weinstein breakout screener, which fired on 129 days in eight years: a
+// sector bucket seen on four of them resampled to a standard error of ~1e-17
+// and scored -1.6e14, marking six sectors ◆ on nothing. A block bootstrap
+// with blocks of about a month cannot say anything from a few weeks of days.
+const minScoredDays = 60
+
 // Deviations computes Z for every bucket of res and the family-wise threshold.
 func Deviations(res Result, bs evidence.Bootstrap) (Deviation, error) {
 	dev := Deviation{Z: map[string]float64{}, Reps: bs.Reps, MeanBlock: bs.MeanBlock, Threshold: math.Inf(1)}
@@ -435,6 +443,15 @@ func Deviations(res Result, bs evidence.Bootstrap) (Deviation, error) {
 		b := b
 		var stat func(idx []int) float64
 		if b.dayLevel {
+			seen := 0
+			for _, v := range b.daily {
+				if !math.IsNaN(v) {
+					seen++
+				}
+			}
+			if seen < minScoredDays {
+				continue
+			}
 			// This bucket's days against every day, on the universe's edge.
 			stat = func(idx []int) float64 {
 				var in, tot float64
@@ -458,11 +475,16 @@ func Deviations(res Result, bs evidence.Bootstrap) (Deviation, error) {
 			}
 		} else {
 			d := make([]float64, n)
+			paired := 0
 			for t := range d {
 				d[t] = math.NaN()
 				if t < len(b.daily) && t < len(b.ctrlDaily) && !math.IsNaN(b.daily[t]) && !math.IsNaN(b.ctrlDaily[t]) {
 					d[t] = b.daily[t] - b.ctrlDaily[t]
+					paired++
 				}
+			}
+			if paired < minScoredDays {
+				continue
 			}
 			stat = func(idx []int) float64 {
 				var sum float64

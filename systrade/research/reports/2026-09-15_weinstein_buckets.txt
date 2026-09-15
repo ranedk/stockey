@@ -1,0 +1,17 @@
+WEINSTEIN STAGES — STEP 1: do the stages sort future returns? — pre-registered, research/preregistrations/2026-09-15_weinstein.md
+NSE adjusted EQ, Rs 10 cr floor, 2013-07-01..2021-12-31, weekly stages (a day uses its last COMPLETED week),
+equal weight, decide at a close, fill at the next open, rebalanced every 5 trading days, 50 bps round trip.
+Controls: the equal-weight universe, and the same number of names at random from the same eligible set, held
+(stable shuffle). Exploration years: can kill, never confirm.
+
+           the book: ret / vol / maxDD     same-size random group    edge vs it    edge vs EW  at 100 bps
+                                                                      %/mo (p)      %/mo (p)   vs random
+  stage1         -4.9% / 21.6% / -76%       11.1% / 23.4% / -64%   -1.26 (1.000)   -1.44 (1.000)      -1.40
+  stage2         17.1% / 21.8% / -47%       10.9% / 22.5% / -62%   +0.41 (0.048)   +0.21 (0.169)      +0.34
+  stage3          4.4% / 21.3% / -59%       10.1% / 22.9% / -62%   -0.46 (0.951)   -0.70 (0.997)      -0.63
+  stage4         -0.3% / 26.3% / -74%       10.3% / 23.2% / -62%   -0.73 (0.999)   -0.98 (1.000)      -0.83
+
+  equal-weight universe: 13.6% / 22.3% / -58%
+
+PRE-REGISTERED VERDICT: Stage 2 vs its same-size random group +0.41%/month, p = 0.048 -> PROCEED to step 2
+(proceed only if positive with p < 0.10 at 50 bps)

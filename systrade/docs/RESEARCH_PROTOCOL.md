@@ -107,3 +107,15 @@ just a paper record. The 12-month evaluations still run, and now inform
 scaling and the weights of the multi-strategy portfolio instead of the
 go-live decision. Frozen parameters stay frozen; a change is still a new
 spec and a new clock.
+
+## Amendment 2026-09-15 (operator): no cumulative bar
+
+The workspace-wide Bonferroni bar is dropped, even as "context": a threshold that
+rises with every idea ever tried taxes exploration for its own history, and the
+gate before capital is the stability gate above, not a backtest threshold.
+Ledger rows are still written for every experiment (the audit trail) and M is
+still counted, as a record only. A family of variants tested together is still
+judged with FDR and a deflated Sharpe over that family's own trials — the
+correction that stops the luckiest of three looking like a discovery, and one
+that does not grow with later research. Kill screens and pre-registrations
+are unchanged.
