@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pyotp
@@ -26,6 +28,13 @@ MOBILE_INPUT_SELECTOR = "input[type='tel'][maxlength='10'], input[placeholder*='
 PROCEED_BUTTON_SELECTOR = "button[type='submit']:has-text('Proceed'), button.btn.btn-primary:has-text('Proceed')"
 CODE_INPUT_SELECTOR = "code-input input[autocomplete='one-time-code'], code-input input[type='tel']"
 PIN_INPUT_SELECTOR = "code-input span.code-hidden input[autocomplete='one-time-code'], code-input span.code-hidden input[type='tel']"
+# The TOTP boxes are the code-input boxes that are NOT masked. CODE_INPUT_SELECTOR matches the
+# masked PIN boxes too, which is how a skipped TOTP screen got the TOTP typed in as the PIN
+# (2026-09-14/15): Dhan stopped asking for the TOTP on a device it already trusts -- the CDP
+# Chrome profile keeps its cookies -- and went straight to the PIN.
+TOTP_INPUT_SELECTOR = "code-input span:not(.code-hidden) input[autocomplete='one-time-code'], code-input span:not(.code-hidden) input[type='tel']"
+SCREEN_POLL_MS = 250
+FAILURE_EVIDENCE_DIR = Path(env.str("DHAN_LOGIN_EVIDENCE_DIR", "logs/dhan_login"))
 TOKEN_URL_MARKER = "tokenId="
 DEFAULT_STEP_TIMEOUT_MS = max(int(env.int("DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS", default=30000)), 1000)
 
@@ -146,6 +155,84 @@ def _wait_for_pin_inputs_or_submit_totp(page, *, timeout_ms: int = 30000) -> Non
     pin_inputs.first.wait_for(state="visible", timeout=timeout_ms)
 
 
+def _visible(page, selector: str) -> bool:
+    try:
+        locator = page.locator(selector)
+        return locator.count() > 0 and bool(locator.first.is_visible())
+    except Exception:
+        return False
+
+
+def _detect_code_screen(page, *, timeout_ms: int) -> str:
+    """After the mobile number Dhan shows either the TOTP boxes or -- for a device it trusts --
+    goes straight to the masked PIN boxes. Returns "totp" or "pin". Types NOTHING and raises if
+    neither appears, or both do: a TOTP typed into the PIN boxes is a wrong PIN, and wrong PINs
+    lock the account."""
+    polls = max(int(timeout_ms) // SCREEN_POLL_MS, 0)
+    for attempt in range(polls + 1):
+        pin, totp = _visible(page, PIN_INPUT_SELECTOR), _visible(page, TOTP_INPUT_SELECTOR)
+        if pin and totp:
+            evidence = _save_failure_evidence(page, "ambiguous_code_screen")
+            _record_dhan_web_login_fallback(
+                fallback_type="dhan_web_login_code_screen_ambiguous",
+                reason="Dhan showed TOTP and PIN boxes at once; typed nothing rather than guess.",
+                error="ambiguous_code_screen",
+                severity="error",
+                metadata={"current_url_host": _url_host(getattr(page, "url", None)), **evidence},
+            )
+            raise DhanAuthError("Dhan login showed both TOTP and PIN inputs; refusing to guess which to fill")
+        if pin:
+            return "pin"
+        if totp:
+            return "totp"
+        if attempt < polls:
+            page.wait_for_timeout(SCREEN_POLL_MS)
+    evidence = _save_failure_evidence(page, "no_code_screen")
+    _record_dhan_web_login_fallback(
+        fallback_type="dhan_web_login_code_screen_missing",
+        reason="Dhan showed neither TOTP nor PIN inputs after the mobile number.",
+        error="no_code_screen",
+        severity="error",
+        metadata={"timeout_ms": int(timeout_ms), "current_url_host": _url_host(getattr(page, "url", None)), **evidence},
+    )
+    raise DhanAuthError("Dhan login showed neither TOTP nor PIN inputs after the mobile number")
+
+
+def _save_failure_evidence(page, label: str) -> dict[str, str]:
+    """A screenshot and the page's visible text, so the next failure says what Dhan asked for.
+    Best effort: never raises. Written under logs/ (gitignored)."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = FAILURE_EVIDENCE_DIR / f"{stamp}_{label}"
+    out: dict[str, str] = {}
+    try:
+        base.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        out["screenshot"] = str(base.with_suffix(".png"))
+    except Exception as exc:
+        out["screenshot_error"] = str(exc)[:200]
+    try:
+        text = page.inner_text("body", timeout=5000)
+        base.with_suffix(".txt").write_text(str(text)[:20000], encoding="utf-8")
+        out["page_text"] = str(base.with_suffix(".txt"))
+    except Exception as exc:
+        out["page_text_error"] = str(exc)[:200]
+    return out
+
+
+def _main_frame_navigation(page, request) -> bool:
+    """A navigation of the page itself -- not an ad tracker's iframe, which is how a
+    doubleclick.net frame was once recorded as where the login 'redirected'."""
+    try:
+        if not request.is_navigation_request():
+            return False
+    except Exception:
+        return False
+    try:
+        return request.frame == page.main_frame
+    except Exception:
+        return True
+
+
 def fill_digit_code(page, code: str, *, selector: str = CODE_INPUT_SELECTOR, timeout_ms: int = 30000) -> None:
     digits = "".join(ch for ch in str(code) if ch.isdigit())
     if len(digits) != 6:
@@ -189,10 +276,20 @@ def run_dhan_consent_login(
     page.locator(MOBILE_INPUT_SELECTOR).first.dispatch_event("change")
     _click_enabled_proceed(page, timeout_ms=effective_timeout_ms)
 
-    page.wait_for_timeout(1000)
-    fill_digit_code(page, generate_totp(totp_secret), selector=CODE_INPUT_SELECTOR, timeout_ms=effective_timeout_ms)
-    page.wait_for_timeout(1000)
-    _wait_for_pin_inputs_or_submit_totp(page, timeout_ms=effective_timeout_ms)
+    # The TOTP screen may or may not come: Dhan skips it for a device it trusts. Keep the TOTP
+    # path -- it may come back -- but only ever type into the screen actually showing.
+    if _detect_code_screen(page, timeout_ms=effective_timeout_ms) == "totp":
+        page.wait_for_timeout(1000)
+        fill_digit_code(page, generate_totp(totp_secret), selector=TOTP_INPUT_SELECTOR, timeout_ms=effective_timeout_ms)
+        page.wait_for_timeout(1000)
+        _wait_for_pin_inputs_or_submit_totp(page, timeout_ms=effective_timeout_ms)
+    else:
+        _record_dhan_web_login_fallback(
+            fallback_type="dhan_web_login_totp_skipped",
+            reason="Dhan went straight to the PIN after the mobile number (trusted device); no TOTP entered.",
+            error="totp_screen_absent",
+            metadata={"current_url_host": _url_host(getattr(page, "url", None))},
+        )
 
     # To capture redirection to a non-existent url is tricky
     nav_capture = {
@@ -204,16 +301,16 @@ def run_dhan_consent_login(
     }
 
     def on_request(request):
-        if request.is_navigation_request():
+        if _main_frame_navigation(page, request):
             nav_capture["requested_url"] = request.url
 
     def on_response(response):
-        if response.request.is_navigation_request():
+        if _main_frame_navigation(page, response.request):
             nav_capture["response_url"] = response.url
             nav_capture["response_status"] = response.status
 
     def on_request_failed(request):
-        if request.is_navigation_request():
+        if _main_frame_navigation(page, request):
             nav_capture["failed_url"] = request.url
             nav_capture["failure"] = request.failure
 
@@ -253,12 +350,14 @@ def run_dhan_consent_login(
             token_id = None
 
     if not token_id:
+        evidence = _save_failure_evidence(page, "token_missing")
         _record_dhan_web_login_fallback(
             fallback_type="dhan_web_login_token_missing",
             reason="Dhan automated login redirected without tokenId.",
             error="missing_token_id",
             severity="error",
             metadata={
+                **evidence,
                 "current_url_host": _url_host(getattr(page, "url", None)),
                 "failed_url_host": _url_host(nav_capture.get("failed_url")),
                 "response_url_host": _url_host(nav_capture.get("response_url")),

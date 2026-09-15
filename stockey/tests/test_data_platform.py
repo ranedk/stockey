@@ -1645,10 +1645,14 @@ def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
         def dispatch_event(self, event):
             self.page.actions.append(("dispatch", self.name, event))
 
+        def is_visible(self, **kwargs):
+            return self.page.visible.get(self.name.split("[")[0], False)
+
     class FakePage:
         def __init__(self):
             self.url = ""
             self.actions = []
+            self.visible = {"totp": True, "pin": False}  # the TOTP screen comes first
 
         def goto(self, url, **kwargs):
             self.url = url
@@ -1658,6 +1662,8 @@ def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
             self.actions.append(("wait", value))
 
         def locator(self, selector):
+            if selector == dhan_web_login.TOTP_INPUT_SELECTOR:
+                return FakeLocator(self, "totp", count=6)
             if selector == dhan_web_login.CODE_INPUT_SELECTOR:
                 return FakeLocator(self, "code", count=6)
             if selector == dhan_web_login.PIN_INPUT_SELECTOR:
@@ -1683,10 +1689,118 @@ def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
 
     assert token_id == "TOKEN123"
     assert ("fill", f"{dhan_web_login.MOBILE_INPUT_SELECTOR}[0]", "9999999999") in page.actions
-    assert ("fill", "code[0]", "6") in page.actions
-    assert ("fill", "code[5]", "1") in page.actions
+    assert ("fill", "totp[0]", "6") in page.actions
+    assert ("fill", "totp[5]", "1") in page.actions
     assert ("fill", "pin[0]", "1") in page.actions
     assert ("fill", "pin[5]", "6") in page.actions
+
+
+def _fake_dhan_code_screen_page(visible):
+    """A login page whose TOTP and PIN boxes are visible as given; records every fill."""
+
+    class FakeLocator:
+        def __init__(self, page, name, count=1):
+            self.page, self.name, self._count = page, name, count
+
+        @property
+        def first(self):
+            return self.nth(0)
+
+        @property
+        def last(self):
+            return self.nth(max(self._count - 1, 0))
+
+        def nth(self, index):
+            return FakeLocator(self.page, f"{self.name}[{index}]", count=1)
+
+        def count(self):
+            return self._count
+
+        def wait_for(self, **kwargs):
+            pass
+
+        def fill(self, value, **kwargs):
+            self.page.actions.append(("fill", self.name, value))
+
+        def click(self, **kwargs):
+            pass
+
+        def dispatch_event(self, event):
+            pass
+
+        def is_visible(self, **kwargs):
+            return self.page.visible.get(self.name.split("[")[0], False)
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.actions = []
+            self.visible = dict(visible)
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, value):
+            pass
+
+        def locator(self, selector):
+            names = {
+                dhan_web_login.TOTP_INPUT_SELECTOR: "totp",
+                dhan_web_login.PIN_INPUT_SELECTOR: "pin",
+                dhan_web_login.CODE_INPUT_SELECTOR: "code",
+                dhan_web_login.PROCEED_BUTTON_SELECTOR: "proceed",
+            }
+            if selector in names:
+                return FakeLocator(self, names[selector], count=6 if names[selector] != "proceed" else 1)
+            return FakeLocator(self, "mobile", count=1)
+
+        def wait_for_function(self, expression, **kwargs):
+            self.url = "https://trade.singularity45.ai/dhan/?tokenId=TOKEN123"
+
+    return FakePage()
+
+
+def _run_fake_dhan_login(page):
+    return dhan_web_login.run_dhan_consent_login(
+        page,
+        consent_url="https://auth.dhan.co/login/consentApp-login?consentAppId=abc",
+        mobile="9999999999",
+        pin="123456",
+        totp_secret="secret",
+        timeout_ms=1000,
+    )
+
+
+def test_dhan_web_login_skips_totp_when_dhan_goes_straight_to_pin(monkeypatch):
+    # 2026-09-14/15: Dhan trusted the CDP Chrome profile and skipped the TOTP screen; the old
+    # flow typed the TOTP into the PIN boxes -- a wrong PIN -- and never saw a tokenId.
+    events = []
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(dhan_web_login, "generate_totp", lambda _secret=None: (_ for _ in ()).throw(AssertionError("no TOTP on a PIN-first screen")))
+    page = _fake_dhan_code_screen_page({"totp": False, "pin": True})
+
+    assert _run_fake_dhan_login(page) == "TOKEN123"
+    fills = [a for a in page.actions if a[0] == "fill"]
+    assert not [a for a in fills if a[1].startswith("totp") or a[1].startswith("code")]
+    assert ("fill", "pin[0]", "1") in fills and ("fill", "pin[5]", "6") in fills
+    assert "dhan_web_login_totp_skipped" in [e["fallback_type"] for e in events]
+
+
+@pytest.mark.parametrize("visible, fallback", [
+    ({"totp": False, "pin": False}, "dhan_web_login_code_screen_missing"),
+    ({"totp": True, "pin": True}, "dhan_web_login_code_screen_ambiguous"),
+])
+def test_dhan_web_login_types_nothing_into_an_unrecognised_code_screen(monkeypatch, tmp_path, visible, fallback):
+    events = []
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(dhan_web_login, "generate_totp", lambda _secret=None: "654321")
+    monkeypatch.setattr(dhan_web_login, "FAILURE_EVIDENCE_DIR", tmp_path)
+    page = _fake_dhan_code_screen_page(visible)
+
+    with pytest.raises(dhan_web_login.DhanAuthError):
+        _run_fake_dhan_login(page)
+    assert [a for a in page.actions if a[0] == "fill"] == [("fill", "mobile[0]", "9999999999")]
+    assert events[-1]["fallback_type"] == fallback and events[-1]["severity"] == "error"
 
 
 def test_dhan_web_login_submits_totp_when_pin_inputs_do_not_auto_appear(monkeypatch):
@@ -1818,8 +1932,9 @@ def test_dhan_web_login_records_missing_token_after_timeout(monkeypatch):
     events = []
 
     class FakeLocator:
-        def __init__(self, count=1):
+        def __init__(self, count=1, visible=True):
             self._count = count
+            self._visible = visible
 
         @property
         def first(self):
@@ -1828,6 +1943,9 @@ def test_dhan_web_login_records_missing_token_after_timeout(monkeypatch):
         @property
         def last(self):
             return self
+
+        def is_visible(self, **kwargs):
+            return self._visible
 
         def nth(self, index):
             return self
@@ -1858,7 +1976,9 @@ def test_dhan_web_login_records_missing_token_after_timeout(monkeypatch):
             pass
 
         def locator(self, selector):
-            if selector in {dhan_web_login.CODE_INPUT_SELECTOR, dhan_web_login.PIN_INPUT_SELECTOR}:
+            if selector == dhan_web_login.PIN_INPUT_SELECTOR:
+                return FakeLocator(count=6, visible=False)  # the TOTP screen is showing
+            if selector in {dhan_web_login.CODE_INPUT_SELECTOR, dhan_web_login.TOTP_INPUT_SELECTOR}:
                 return FakeLocator(count=6)
             return FakeLocator(count=1)
 
