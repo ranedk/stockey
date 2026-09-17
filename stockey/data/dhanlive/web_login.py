@@ -33,6 +33,10 @@ PIN_INPUT_SELECTOR = "code-input span.code-hidden input[autocomplete='one-time-c
 # (2026-09-14/15): Dhan stopped asking for the TOTP on a device it already trusts -- the CDP
 # Chrome profile keeps its cookies -- and went straight to the PIN.
 TOTP_INPUT_SELECTOR = "code-input span:not(.code-hidden) input[autocomplete='one-time-code'], code-input span:not(.code-hidden) input[type='tel']"
+# The PIN screen's own submit button. It says "Continue", not "Proceed" (the mobile
+# screen's word), so PROCEED_BUTTON_SELECTOR does not match it.
+PIN_SUBMIT_SELECTOR = ("button[type='submit']:has-text('Continue'), button.btn.btn-primary:has-text('Continue'), "
+                       "button[type='submit']:has-text('Proceed')")
 SCREEN_POLL_MS = 250
 FAILURE_EVIDENCE_DIR = Path(env.str("DHAN_LOGIN_EVIDENCE_DIR", "logs/dhan_login"))
 TOKEN_URL_MARKER = "tokenId="
@@ -219,6 +223,25 @@ def _save_failure_evidence(page, label: str) -> dict[str, str]:
     return out
 
 
+def _submit_pin(page, *, timeout_ms: int) -> None:
+    """Click the PIN screen's own submit button if it is still showing. The screen
+    auto-submitted on the sixth digit on 2026-09-15, and did not on 2026-09-17: the login
+    sat on "Enter PIN for your Account" until it timed out
+    (logs/dhan_login/20260917T020542Z_token_missing.txt). Best effort -- when the form has
+    already submitted the button is gone, and there is nothing to click."""
+    try:
+        button = page.locator(PIN_SUBMIT_SELECTOR).last
+        button.wait_for(state="visible", timeout=min(int(timeout_ms), 5000))
+        button.click(timeout=timeout_ms)
+    except Exception as exc:
+        _record_dhan_web_login_fallback(
+            fallback_type="dhan_web_login_pin_submit_skipped",
+            reason="No PIN submit button to click; assuming the PIN screen submitted itself.",
+            error=exc,
+            metadata={"current_url_host": _url_host(getattr(page, "url", None))},
+        )
+
+
 def _main_frame_navigation(page, request) -> bool:
     """A navigation of the page itself -- not an ad tracker's iframe, which is how a
     doubleclick.net frame was once recorded as where the login 'redirected'."""
@@ -325,6 +348,7 @@ def run_dhan_consent_login(
         selector=PIN_INPUT_SELECTOR,
         timeout_ms=effective_timeout_ms,
     )
+    _submit_pin(page, timeout_ms=effective_timeout_ms)
 
     page.wait_for_timeout(5000)
 

@@ -1771,6 +1771,48 @@ def _run_fake_dhan_login(page):
     )
 
 
+def test_dhan_web_login_clicks_the_pin_screens_own_continue_button(monkeypatch):
+    # 2026-09-17: the PIN screen stopped auto-submitting on the sixth digit and waited for
+    # its "Continue" button; the login sat on "Enter PIN for your Account" and timed out.
+    clicks = []
+
+    class FakeButton:
+        def wait_for(self, **kwargs):
+            pass
+
+        def click(self, **kwargs):
+            clicks.append(kwargs)
+
+    class FakePage:
+        url = "https://partner-login.dhan.co/"
+
+        def locator(self, selector):
+            assert selector == dhan_web_login.PIN_SUBMIT_SELECTOR
+
+            class L:
+                last = FakeButton()
+
+            return L()
+
+    dhan_web_login._submit_pin(FakePage(), timeout_ms=7000)
+    assert clicks == [{"timeout": 7000}]
+
+
+def test_dhan_web_login_pin_submit_is_optional(monkeypatch):
+    # When the screen auto-submits, the button is gone: that is not a failure.
+    events = []
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    class FakePage:
+        url = "https://partner-login.dhan.co/"
+
+        def locator(self, selector):
+            raise dhan_web_login.PlaywrightTimeoutError("no continue button")
+
+    dhan_web_login._submit_pin(FakePage(), timeout_ms=7000)
+    assert events[0]["fallback_type"] == "dhan_web_login_pin_submit_skipped"
+
+
 def test_dhan_web_login_skips_totp_when_dhan_goes_straight_to_pin(monkeypatch):
     # 2026-09-14/15: Dhan trusted the CDP Chrome profile and skipped the TOTP screen; the old
     # flow typed the TOTP into the PIN boxes -- a wrong PIN -- and never saw a tokenId.
