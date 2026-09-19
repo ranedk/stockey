@@ -2,11 +2,13 @@
 import json
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.ingestion_state import get_failed_entries
 from utils import store
@@ -159,6 +161,46 @@ def download_bhavcopy_with_retries(
     return False
 
 
+# NSE publishes the day's bhavcopy from ~16:00 IST, and reliably by ~17:30 (the hour
+# the public downloaders schedule themselves). The evening chain runs 19:15 IST, so it
+# CAN have the session that just closed -- but end_date was datetime.today() - 1 day,
+# hard-coded, so it never asked for it: a session's file arrived only with the next
+# morning's 07:10 IST run, its adjusted prices only at 02:15 UTC after that, and every
+# systrader order sheet was therefore a session stale (found 2026-09-17).
+NSE_BHAVCOPY_SAME_DAY_AFTER_IST = time(17, 30)
+
+
+def _ist_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+
+def download_end_date(now: datetime | None = None) -> datetime:
+    """The newest date worth asking NSE for: today once the file is published and today
+    is a trading day, else yesterday. A non-trading 'today' is never asked for -- the
+    download would fail, and seven consecutive failures stop the run."""
+    current = now or _ist_now()
+    naive_today = datetime(current.year, current.month, current.day)
+    if current.time() < NSE_BHAVCOPY_SAME_DAY_AFTER_IST:
+        return naive_today - timedelta(days=1)
+    try:
+        from utils.advisory_date import latest_trading_day_on_or_before
+
+        latest = latest_trading_day_on_or_before(naive_today.date())
+        if latest.date() == naive_today.date():
+            return naive_today
+    except Exception as exc:  # calendar unavailable: behave as before rather than guess
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=SOURCE_PREFIX,
+            fallback_type="nse_bhavcopy_trading_day_lookup_failed",
+            severity="warn",
+            reason="Could not confirm today is a trading day; asking NSE only up to yesterday.",
+            error=exc,
+            metadata={"ist_now": current.isoformat()},
+        )
+    return naive_today - timedelta(days=1)
+
+
 def main() -> int:
     global STOCKEY_RUN_STATE
     rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
@@ -168,7 +210,7 @@ def main() -> int:
     attempted_count = 0
     existing_members = load_downloaded_dates_from_store()
     start_date = datetime.today() - timedelta(days=NSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS)
-    end_date = datetime.today() - timedelta(days=1)
+    end_date = download_end_date()
     all_dates = list(
         reverse_daterange(start_date, end_date)
     )

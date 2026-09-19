@@ -22504,3 +22504,54 @@ def test_restored_circuit_hit_archive_rows_match_the_live_parser(monkeypatch, tm
     assert list(restored.columns) == list(live.columns)
     assert dict(restored.dtypes.astype(str)) == dict(live.dtypes.astype(str))
     pd.testing.assert_frame_equal(restored, live)
+
+
+def _ist(y, m, d, hh, mm):
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    return _dt.datetime(y, m, d, hh, mm, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+
+def test_bhavcopy_download_end_date_includes_today_once_nse_has_published(monkeypatch):
+    import datetime as _dt
+
+    # 2026-09-17: end_date was hard-coded to yesterday, so the 19:15 IST evening chain never
+    # asked for the session that had just closed -- its file arrived only with the next
+    # morning's run, and every systrader order sheet was a session stale.
+    import utils.advisory_date as advisory_date
+
+    monkeypatch.setattr(advisory_date, "latest_trading_day_on_or_before",
+                        lambda value: pd.Timestamp(value).normalize().tz_localize("UTC"))
+    # Thursday 18:00 IST, a trading day, after NSE publishes: today.
+    assert bhavcopy_downloader.download_end_date(_ist(2026, 9, 17, 18, 0)).date() == _dt.date(2026, 9, 17)
+    # Same day at 16:00 IST, before the file is reliably up: yesterday.
+    assert bhavcopy_downloader.download_end_date(_ist(2026, 9, 17, 16, 0)).date() == _dt.date(2026, 9, 16)
+
+
+def test_bhavcopy_download_end_date_never_asks_for_a_non_trading_day(monkeypatch):
+    import datetime as _dt
+
+    import utils.advisory_date as advisory_date
+
+    # Saturday: the calendar's latest trading day is Friday, so today is not asked for --
+    # a download that cannot exist would burn one of the seven allowed consecutive failures.
+    monkeypatch.setattr(advisory_date, "latest_trading_day_on_or_before",
+                        lambda value: pd.Timestamp("2026-09-18").tz_localize("UTC"))
+    assert bhavcopy_downloader.download_end_date(_ist(2026, 9, 19, 20, 0)).date() == _dt.date(2026, 9, 18)
+
+
+def test_bhavcopy_download_end_date_falls_back_when_the_calendar_is_unavailable(monkeypatch):
+    import datetime as _dt
+
+    import utils.advisory_date as advisory_date
+
+    events = []
+    monkeypatch.setattr(bhavcopy_downloader, "record_local_fallback_event",
+                        lambda **kwargs: events.append(kwargs) or kwargs)
+    def boom(value):
+        raise RuntimeError("dim_trading_days unavailable")
+    monkeypatch.setattr(advisory_date, "latest_trading_day_on_or_before", boom)
+
+    assert bhavcopy_downloader.download_end_date(_ist(2026, 9, 17, 20, 0)).date() == _dt.date(2026, 9, 16)
+    assert events[0]["fallback_type"] == "nse_bhavcopy_trading_day_lookup_failed"
