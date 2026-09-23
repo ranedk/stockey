@@ -1748,6 +1748,9 @@ def _fake_dhan_code_screen_page(visible):
 
         def fill(self, value, **kwargs):
             self.page.actions.append(("fill", self.name, value))
+            hook = getattr(self.page, "on_fill", None)
+            if hook is not None:
+                hook(self.name.split("[")[0], value)
 
         def click(self, **kwargs):
             pass
@@ -22582,3 +22585,39 @@ def test_bhavcopy_download_end_date_falls_back_when_the_calendar_is_unavailable(
 
     assert bhavcopy_downloader.download_end_date(_ist(2026, 9, 17, 20, 0)).date() == _dt.date(2026, 9, 16)
     assert events[0]["fallback_type"] == "nse_bhavcopy_trading_day_lookup_failed"
+
+
+def test_dhan_web_login_retries_the_mobile_step_when_the_page_does_not_advance(monkeypatch):
+    # 2026-09-22: the Proceed click did not take, the page sat on "Login via Dhan / Mobile
+    # Number", and the day's Dhan jobs died with it. One more attempt at that step is cheap;
+    # a screen we cannot identify still fails without typing anything.
+    events = []
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(dhan_web_login, "generate_totp", lambda _secret=None: "654321")
+    page = _fake_dhan_code_screen_page({"totp": False, "pin": False, "mobile": True})
+
+    # The PIN screen appears only once the mobile number has been submitted a second time.
+    def on_fill(name, _value):
+        if name == "mobile" and sum(1 for a in page.actions if a[0] == "fill" and a[1].startswith("mobile")) >= 2:
+            page.visible["pin"] = True
+
+    page.on_fill = on_fill
+
+    assert _run_fake_dhan_login(page) == "TOKEN123"
+    mobile_fills = [a for a in page.actions if a[0] == "fill" and a[1].startswith("mobile")]
+    assert len(mobile_fills) == 2, f"mobile submitted {len(mobile_fills)} time(s), want 2"
+    assert "dhan_web_login_mobile_step_retried" in [e["fallback_type"] for e in events]
+
+
+def test_dhan_web_login_does_not_retry_when_the_mobile_field_is_gone(monkeypatch):
+    # Neither code screen AND no mobile field: an unrecognised page. Fail, type nothing.
+    events = []
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(dhan_web_login, "generate_totp", lambda _secret=None: "654321")
+    page = _fake_dhan_code_screen_page({"totp": False, "pin": False, "mobile": False})
+
+    with pytest.raises(dhan_web_login.DhanAuthError):
+        _run_fake_dhan_login(page)
+    assert "dhan_web_login_mobile_step_retried" not in [e["fallback_type"] for e in events]
+    mobile_fills = [a for a in page.actions if a[0] == "fill" and a[1].startswith("mobile")]
+    assert len(mobile_fills) == 1

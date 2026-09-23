@@ -223,6 +223,15 @@ def _save_failure_evidence(page, label: str) -> dict[str, str]:
     return out
 
 
+def _submit_mobile(page, mobile: str, *, timeout_ms: int) -> None:
+    """Type the mobile number and click Proceed."""
+    field = page.locator(MOBILE_INPUT_SELECTOR).first
+    field.fill(str(mobile), timeout=timeout_ms)
+    field.dispatch_event("input")
+    field.dispatch_event("change")
+    _click_enabled_proceed(page, timeout_ms=timeout_ms)
+
+
 def _submit_pin(page, *, timeout_ms: int) -> None:
     """Click the PIN screen's own submit button if it is still showing. The screen
     auto-submitted on the sixth digit on 2026-09-15, and did not on 2026-09-17: the login
@@ -294,14 +303,30 @@ def run_dhan_consent_login(
 
     page.goto(consent_url, wait_until="domcontentloaded", timeout=effective_timeout_ms)
     page.wait_for_timeout(3000)
-    page.locator(MOBILE_INPUT_SELECTOR).first.fill(str(effective_mobile), timeout=effective_timeout_ms)
-    page.locator(MOBILE_INPUT_SELECTOR).first.dispatch_event("input")
-    page.locator(MOBILE_INPUT_SELECTOR).first.dispatch_event("change")
-    _click_enabled_proceed(page, timeout_ms=effective_timeout_ms)
+    _submit_mobile(page, effective_mobile, timeout_ms=effective_timeout_ms)
+
+    # 2026-09-22: the Proceed click did not take and the page sat on "Login via Dhan / Mobile
+    # Number" until the code-screen wait gave up, costing that whole day's Dhan jobs. If the
+    # mobile field is still there, the step simply did not land: type it once more rather than
+    # lose a day. Anything else (a screen we cannot identify) still fails without typing.
+    try:
+        screen = _detect_code_screen(page, timeout_ms=effective_timeout_ms)
+    except DhanAuthError:
+        if not _visible(page, MOBILE_INPUT_SELECTOR):
+            raise
+        _record_dhan_web_login_fallback(
+            fallback_type="dhan_web_login_mobile_step_retried",
+            reason="Dhan stayed on the mobile-number screen; submitting it once more.",
+            error="mobile_screen_persisted",
+            metadata={"current_url_host": _url_host(getattr(page, "url", None))},
+        )
+        page.wait_for_timeout(2000)
+        _submit_mobile(page, effective_mobile, timeout_ms=effective_timeout_ms)
+        screen = _detect_code_screen(page, timeout_ms=effective_timeout_ms)
 
     # The TOTP screen may or may not come: Dhan skips it for a device it trusts. Keep the TOTP
     # path -- it may come back -- but only ever type into the screen actually showing.
-    if _detect_code_screen(page, timeout_ms=effective_timeout_ms) == "totp":
+    if screen == "totp":
         page.wait_for_timeout(1000)
         fill_digit_code(page, generate_totp(totp_secret), selector=TOTP_INPUT_SELECTOR, timeout_ms=effective_timeout_ms)
         page.wait_for_timeout(1000)
