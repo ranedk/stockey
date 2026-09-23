@@ -436,8 +436,17 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       +0.37%/month is its extra volatility — +0.02 to +0.10 at matched risk.
       Neither survives. Weinstein closed on the exploration years: Stage 2 is
       the momentum premium, held more cheaply by the momentum tracks
-- [ ] Two-trait grids, only for pairs named in advance (the last piece of
-      step 2, not yet built)
+- [x] **Two-trait grids** (`explore.CrossDimension`, `slice explore -pairs`;
+      LEDGER row 42, EXPLORATION), the last piece of step 2. A cell is a name
+      both traits placed on the same day, cut in thirds; the grid replaces the
+      single-trait slices so the family-wise threshold covers the cells
+      actually searched, and the pairs are named before the run. First three
+      pairs, operator-named: **every cell beyond the threshold came back
+      NEGATIVE** — the grids found dead zones, not pockets. The useful
+      narrowing: rows 29 and 39 both read "smaller and more volatile", and
+      separating the two says the size half was confounding — within every
+      liquidity third the edge rises with volatility, within every volatility
+      third liquidity moves little. Delivery % carved out nothing
 - [x] **The low-volatility anomaly across time windows** (LEDGER row 32,
       `slice lowvol`, pre-registered): the lowest-risk fifth by 1/3/6/12-month
       volatility, 1-year beta and 1-year residual volatility, held 1/3/6
