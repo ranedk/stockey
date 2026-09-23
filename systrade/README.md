@@ -240,9 +240,20 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       months and 12 rebalances from 2026-09-08, trend-speed-blend likewise from
       2026-09-10, and the one comparison between them at 2027-09-10, per the
       specs' binding terms
-- [ ] Combination policies beyond the handcrafted one (Hedge | ML), judged
-      vs the same matched-control baseline — the handcrafted policy is live as
-      momentum-lowvol-combination (LEDGER row 34)
+- [x] **Combination policies beyond the handcrafted one** (LEDGER row 41,
+      `slice combine`, `internal/policy`, pre-registered). Does MOVING the
+      combination's 48/52 split beat leaving it alone? Three arms as one
+      family of eight: Hedge on realised returns (four memories), risk parity
+      on realised volatility (three windows), and a purged walk-forward ridge
+      on the market regime — each paying for its own adaptation. **None
+      survives.** Every Hedge cell is negative against the handcrafted book
+      and raises drawdown to −42/−44% from −38.6%, failing in exactly the
+      direction pre-registered. Risk parity settles at 0.37 rather than 0.48
+      — a different point on the same line (less return, less risk, the same
+      Sharpe), edge +0.00 to +0.02%/mo. The ridge is the best of the eight
+      (+0.05%/mo, SR 0.94, and it beats its own time-shifted twin) and still
+      fails FDR within its family. The handcrafted split stands; the live
+      track is unchanged
 - [x] Futures stitching (`internal/futures`, `cmd/futures report`): curve
       cleaning that rejects recycled security ids (six of NIFTY's nine slots
       are option series) and collapses duplicate streams, roll detection by

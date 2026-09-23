@@ -1,0 +1,62 @@
+COMBINATION POLICIES — pre-registered 2026-09-23 (trials=8). 2013-07-01..2021-12-31, Rs 10 cr floor, 50 bps
+branches: momentum lookback blend [0.33 0.33 0.17 0.17] over [mom6 mom9 mom12 mom12_1]; low-volatility blend [0.11 0.11 0.11 0.33 0.34] over [vol3 vol6 vol12 beta12 idio12]
+1844 trading days from 2014-07-16, 88 monthly decisions; the split moves on a 21-day clock and pays for moving.
+ridge folds: 5 expanding windows, 3-year minimum fit, 1-year blocks, 31 calendar days purged.
+
+the books
+                                w_mom   moved    %/yr    vol     SR   maxDD turnover
+  handcrafted 48/52             0.48    0.0%   16.66% 19.07%   0.90  -38.6%    2.52%
+  hedge hl=6m                   0.55    6.6%   17.99% 20.74%   0.90  -43.6%    3.32%
+  hedge hl=12m                  0.54    4.7%   17.46% 20.28%   0.90  -43.4%    3.08%
+  hedge hl=24m                  0.52    3.6%   17.17% 19.90%   0.90  -42.7%    2.93%
+  hedge hl=48m                  0.51    3.1%   17.03% 19.66%   0.90  -42.2%    2.85%
+  risk parity 63d               0.37    2.1%   15.61% 17.78%   0.91  -35.8%    2.48%
+  risk parity 126d              0.37    1.2%   15.55% 17.87%   0.90  -35.8%    2.40%
+  risk parity 252d              0.37    0.7%   15.93% 17.94%   0.91  -35.5%    2.38%
+  ridge (regime)                0.46    2.6%   17.04% 18.72%   0.94  -36.0%    2.74%
+
+  for reference, the live track's own nine weights: 16.66%/yr, vol 19.06%, SR 0.90 — the whole-percent
+  rounding of 48/52 across nine members, not a different policy. The comparisons below use the
+  48/52 branch blend, so a difference is the POLICY and never the rounding.
+
+edge over the HANDCRAFTED combination — monthly paired, at matched risk, 90% bootstrap (the deciding statistic)
+                               edge %/mo [90%] p               100bps   FDR q    DSR
+  hedge hl=6m                  -0.00 [-0.12,+0.12] p0.509      -0.03   0.584  0.237
+  hedge hl=12m                 -0.01 [-0.10,+0.08] p0.584      -0.03   0.584  0.197
+  hedge hl=24m                 -0.01 [-0.08,+0.07] p0.584      -0.03   0.584  0.200
+  hedge hl=48m                 -0.01 [-0.07,+0.06] p0.552      -0.02   0.584  0.218
+  risk parity 63d              +0.01 [-0.08,+0.09] p0.458      +0.00   0.584  0.302
+  risk parity 126d             -0.00 [-0.08,+0.07] p0.542      -0.00   0.584  0.235
+  risk parity 252d             +0.02 [-0.05,+0.08] p0.309      +0.02   0.584  0.442
+  ridge (regime)               +0.05 [-0.04,+0.15] p0.185      +0.04   0.584  0.682
+
+  The deflated Sharpe here is computed on the DIFFERENCE series — the improvement over the
+  incumbent is what these eight trials searched for, so it is what the family's best draw must beat.
+
+for comparison with rows 33-34, the same books against the parents' own controls (matched risk)
+                               vs equal-weight              vs stable-shuffle           
+  handcrafted 48/52            +0.71 [+0.38,+1.04] p0.000   +0.73 [+0.37,+1.09] p0.000  
+  hedge hl=6m                  +0.73 [+0.35,+1.11] p0.001   +0.76 [+0.35,+1.16] p0.001  
+  hedge hl=12m                 +0.71 [+0.35,+1.08] p0.000   +0.74 [+0.35,+1.13] p0.001  
+  hedge hl=24m                 +0.71 [+0.36,+1.06] p0.000   +0.74 [+0.36,+1.12] p0.001  
+  hedge hl=48m                 +0.72 [+0.36,+1.06] p0.000   +0.75 [+0.37,+1.12] p0.000  
+  risk parity 63d              +0.73 [+0.41,+1.05] p0.000   +0.75 [+0.40,+1.10] p0.000  
+  risk parity 126d             +0.71 [+0.39,+1.03] p0.000   +0.74 [+0.39,+1.08] p0.000  
+  risk parity 252d             +0.74 [+0.41,+1.05] p0.000   +0.76 [+0.41,+1.11] p0.000  
+  ridge (regime)               +0.78 [+0.45,+1.10] p0.000   +0.81 [+0.45,+1.15] p0.000  
+
+arm C's time-shifted twin (ridge, features lagged 12 months): 16.63%/yr, vol 19.18%, SR 0.90, mean w_mom 0.49
+  ridge vs its twin, matched risk: +0.06 [+0.01,+0.11] p0.036
+
+pre-registered decision
+  hedge hl=6m                  P1 FAIL  P2 FAIL   no
+  hedge hl=12m                 P1 FAIL  P2 FAIL   no
+  hedge hl=24m                 P1 FAIL  P2 FAIL   no
+  hedge hl=48m                 P1 FAIL  P2 FAIL   no
+  risk parity 63d              P1 FAIL  P2 PASS   no
+  risk parity 126d             P1 FAIL  P2 FAIL   no
+  risk parity 252d             P1 FAIL  P2 PASS   no
+  ridge (regime)               P1 FAIL  P2 PASS  P3 PASS   no
+
+  VERDICT: NO POLICY SURVIVES — the handcrafted 48/52 stands. The README item closes as
+  answered and the live combination track is unchanged.

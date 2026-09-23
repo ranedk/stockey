@@ -7,6 +7,7 @@
 //	slice blend    (the speed blend's pre-registered kill screen)
 //	slice windows  (momentum across formation x holding windows, pre-registered)
 //	slice lookbacks (the momentum lookback blend's construction: costs and correlations)
+//	slice combine  (combination policies beyond the handcrafted split, pre-registered)
 //	slice lowvol   (the low-volatility anomaly across time windows, pre-registered)
 //	slice stage    (Weinstein's stage analysis: -part buckets | strategy, pre-registered)
 //	slice drawdown -rule ewmac32_128
@@ -66,6 +67,10 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "lookbacks" {
 		runLookbacks(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "combine" {
+		runCombine(os.Args[2:])
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "windows" {
