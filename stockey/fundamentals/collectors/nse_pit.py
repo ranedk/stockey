@@ -77,6 +77,7 @@ from urllib.parse import urlencode
 import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 
 from fundamentals.collectors.events_store import resolve_isin, upsert_events_with_dedup
 from fundamentals.collectors.screenerin import to_number
@@ -359,7 +360,7 @@ def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None
         return {"rows": 0, "filings_scanned": 0, "failed_filings": [], "blocked": False}
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+        browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="fundamentals.collectors.nse_pit")
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
         try:

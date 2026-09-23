@@ -133,7 +133,7 @@ def _latest_price(ticker: str) -> float | None:
     return float(df.iloc[0]["adj_close"]) if not df.empty else None
 
 
-def _size_for(candidate: dict) -> dict:
+def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET) -> dict:
     """L5 sizing for a name about to be opened.
 
     get_position_size_recommendation() gates on an ALREADY-OPEN position, which this one

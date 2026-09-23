@@ -384,7 +384,7 @@ def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[
     # full row set, cash is folded into Other Assets with no way to isolate it), so a
     # true net-of-cash figure isn't derivable from this data source at this level of
     # detail. Accepted as a documented approximation, not a silent one -- every
-    # consumer (l3_triggers.py, watch_summary.py, l4_thesis.py) reads this as a
+    # consumer (l3_triggers.py, watch_summary.py, portfolio_resolution.py) reads this as a
     # directional/trend signal (net_debt_yoy_delta_rscr, trend_direction), never as
     # an absolute net-debt figure on its own.
     net_debt_latest = _value_at(balance_sheet, "Borrowings")

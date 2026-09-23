@@ -16,6 +16,7 @@ CLAUDE.md's Current Architecture job list. Feeds systrader's own daily
 scripts/sync_intraday_from_stockey.sh, scheduled to run after this."""
 from __future__ import annotations
 
+import argparse
 import json
 
 from data.dhanlive.ohlcv import sync_many_intraday
@@ -31,8 +32,46 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 DEGRADED_FAILURE_FRACTION = 0.10
 
 
-def run_daily_intraday_sync() -> dict[str, object]:
+def _stale_symbols(symbols: list[str]) -> list[str]:
+    """Universe symbols with no intraday bar on the most recent stored session.
+
+    Bounded on purpose: the subquery is restricted to the newest session only, never
+    a whole-table scan. dhan_ohlcv_intraday is ~525M rows across 263 compressed
+    chunks, and an unbounded aggregate over it OOM'd this box on 2026-08-31."""
+    from utils.db import sql_to_df
+
+    df = sql_to_df(
+        """
+        WITH latest AS (
+          SELECT max(timestamp)::date AS d
+            FROM dhan_ohlcv_intraday
+           WHERE timestamp >= now() - interval '30 days'
+        )
+        SELECT DISTINCT ticker FROM dhan_ohlcv_intraday, latest
+         WHERE timestamp >= latest.d AND timestamp < latest.d + 1
+        """
+    )
+    current = set(df["ticker"]) if not df.empty else set()
+    return [s for s in symbols if s not in current]
+
+
+def run_daily_intraday_sync(
+    *, max_symbols: int | None = None, only_stale: bool = False
+) -> dict[str, object]:
+    """Sync the active universe forward from each symbol's own last stored bar.
+
+    max_symbols / only_stale exist for RECOVERY, not for the nightly run (whose
+    defaults are unchanged: whole universe, every symbol). After the 2026-08-26..31
+    outage the backlog was ~2,590 symbols x 3 sessions in one process; bounding it
+    lets the repair run in batches with a memory check between them. The job is
+    naturally resumable either way -- from_date=None means each symbol resumes from
+    its own last stored bar -- so an interrupted batch simply re-fetches less next
+    time, never the whole window."""
     symbols = get_equity_universe()
+    if symbols and only_stale:
+        symbols = _stale_symbols(symbols)
+    if symbols and max_symbols is not None:
+        symbols = symbols[: max(0, int(max_symbols))]
     if not symbols:
         record_local_fallback_event(
             module="data.dhanlive.intraday_daily_sync",
@@ -66,9 +105,20 @@ def run_daily_intraday_sync() -> dict[str, object]:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     global STOCKEY_RUN_STATE
-    result = run_daily_intraday_sync()
+    parser = argparse.ArgumentParser(description="Daily incremental Dhan 1-min intraday OHLCV sync.")
+    parser.add_argument("--max-symbols", type=int, default=None,
+                        help="Recovery only: cap symbols this run (default: the whole universe).")
+    parser.add_argument("--only-stale", action="store_true",
+                        help="Recovery only: sync symbols missing from the most recent STORED session. "
+                             "Note this is a keep-current measure, not a historical-gap measure: run it "
+                             "during market hours and 'the most recent session' is today's PARTIAL one, so "
+                             "every symbol that has not yet reported today counts as stale and the number "
+                             "will not converge. To close a historical gap, compare against a window "
+                             "instead (see scripts/data_completeness.py's universe_coverage check).")
+    args = parser.parse_args(argv)
+    result = run_daily_intraday_sync(max_symbols=args.max_symbols, only_stale=args.only_stale)
     degraded = result["symbols"] > 0 and result["failed"] >= result["symbols"] * DEGRADED_FAILURE_FRACTION
     STOCKEY_RUN_STATE = {
         "source": "data.dhanlive.intraday_daily_sync",

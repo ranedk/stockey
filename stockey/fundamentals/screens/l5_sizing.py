@@ -2,13 +2,18 @@
 never-built L5 layer from fundamental_basic_goal.md (§L5: "Portfolio construction").
 
 A CALCULATOR, not a decision-maker or an executor: it computes a position size for
-a company that already has an OPEN fundamentals_l4_thesis row -- i.e. a human has
-already done the one deliberate act this whole pipeline gates capital on (PRD §1/
-§3.3: "no LLM makes a capital decision... L4 is the only gate capital passes
-through"). No thesis, no size -- return None, never guess at a number for a
-company nobody has committed to yet. Nothing here writes to the database or places
-an order; a human reads the number and decides what to do with it, same as every
-other read-only screen in this package.
+a company that already has an OPEN position in fundamentals_portfolio_position --
+i.e. the mechanical ruleset passed it and the entry adjudicator did not veto it.
+No open position, no size -- return None, never guess at a number for a company
+nothing has committed to yet.
+
+CHANGED 2026-09-04: this gate used to be an OPEN fundamentals_l4_thesis row, the
+one deliberate human act the pipeline gated capital on. The operator removed the
+human forecast entirely ("only machine created portfolio and forecast"), so the
+gate moved to the machine portfolio rather than being deleted -- an ungated sizer
+would happily size any company on the watchlist, which is a much larger change
+than the one that was asked for. Nothing here writes to the database or places an
+order.
 
 Two mechanical rules, both taken directly from the source spec, neither tuned or
 LLM-judged:
@@ -17,16 +22,17 @@ LLM-judged:
   (avg_vol_1mth x cmp_rs, both already collected at L1 admission -- no new data
   source needed), so a position can always be exited without being the trade that
   moves the market. This is a LIQUIDITY ceiling, never a reason to size UP.
-- "12-20 concurrent positions... below ~10, a 20% hit rate gives a material chance
-  of holding zero winners over a cycle" -- the other half of the size is an
-  equal-capital split across a target position count, an operator-supplied
-  parameter (no default baked in here -- this module does not know the operator's
-  actual sleeve capital or how many names they intend to hold, and guessing either
-  would be exactly the kind of silent assumption this pipeline avoids everywhere
-  else).
+- A FLAT allocation per position, operator-set 2026-09-04: Rs 1,00,000 per name, up
+  to 100 names. This replaced an equal-capital split across a target position count.
+  The difference matters: under a split, every new name shrinks every existing one,
+  so position size depends on how many OTHER candidates happened to pass that day --
+  a name's allocation moving because an unrelated company qualified is not a
+  decision anyone made. A flat allocation makes each position independent, and the
+  book simply grows until it hits its ceiling.
 
-The recommended size is the SMALLER of the two -- equal-weight is the plan, ADV is
-the ceiling that can only pull it down, never up. Deliberately NOT implementing the
+The recommended size is the SMALLER of the flat allocation and the ADV cap -- the
+flat allocation is the plan, ADV is a LIQUIDITY ceiling that can only pull it down,
+never up. Deliberately NOT implementing the
 source spec's optional 200-DMA reclaim entry gate here (PRD §12 todo #8 scope is
 sizing; that gate is a timing/entry rule, a separate concern, and the source spec
 itself calls it optional)."""
@@ -34,10 +40,24 @@ from __future__ import annotations
 
 import json
 
+from environs import Env
+
 from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import sql_to_df
 
+env = Env()
+env.read_env()
+
 SYNC_SOURCE_NAME = "fundamentals.screens.l5_sizing"
+
+# Operator-set 2026-09-04: "assume we invest 1 Lacs in each ... we can go upto 100
+# stocks". 100 x Rs 1L = Rs 1 crore is therefore the maximum the book can ever deploy,
+# which makes MAX_POSITIONS a CAPITAL constraint rather than a diversification heuristic.
+# That distinction decides how it is enforced: a full book stops entering and says which
+# names it turned away (see portfolio_runner), it does not quietly truncate the candidate
+# list -- a silent truncation would make entry depend on iteration order.
+CAPITAL_PER_POSITION_RS = env.float("PORTFOLIO_CAPITAL_PER_POSITION_RS", 100000.0)
+MAX_POSITIONS = env.int("PORTFOLIO_MAX_POSITIONS", 100)
 
 # Fraction of a company's own average daily traded value a single position may
 # occupy -- a plain constant, not backtested (this whole module is a calculator
@@ -48,44 +68,50 @@ DEFAULT_MAX_PCT_OF_ADV = 0.10
 
 
 def compute_position_size(
-    *, equal_weight_capital_rs: float, adv_value_rs: float | None, max_pct_of_adv: float = DEFAULT_MAX_PCT_OF_ADV
+    *, target_capital_rs: float, adv_value_rs: float | None, max_pct_of_adv: float = DEFAULT_MAX_PCT_OF_ADV
 ) -> dict[str, object]:
     """Pure arithmetic -- no DB access, no company identity, so every rounding/
     tie-breaking decision is independently testable without mocking anything.
     adv_value_rs=None (no liquidity data at all) means the ADV cap can't be
-    computed -- falls back to equal_weight_capital_rs alone rather than silently
+    computed -- falls back to target_capital_rs alone rather than silently
     treating unknown liquidity as infinite (which a missing cap would otherwise
     imply) or zero (which would wrongly zero out the position)."""
     if adv_value_rs is None:
         return {
-            "equal_weight_capital_rs": round(equal_weight_capital_rs, 2),
+            "target_capital_rs": round(target_capital_rs, 2),
             "adv_cap_rs": None,
-            "recommended_size_rs": round(equal_weight_capital_rs, 2),
-            "binding_constraint": "equal_weight_no_adv_data",
+            "recommended_size_rs": round(target_capital_rs, 2),
+            "binding_constraint": "flat_allocation_no_adv_data",
         }
     adv_cap_rs = adv_value_rs * max_pct_of_adv
-    if adv_cap_rs < equal_weight_capital_rs:
+    if adv_cap_rs < target_capital_rs:
         return {
-            "equal_weight_capital_rs": round(equal_weight_capital_rs, 2),
+            "target_capital_rs": round(target_capital_rs, 2),
             "adv_cap_rs": round(adv_cap_rs, 2),
             "recommended_size_rs": round(adv_cap_rs, 2),
             "binding_constraint": "adv_liquidity_cap",
         }
     return {
-        "equal_weight_capital_rs": round(equal_weight_capital_rs, 2),
+        "target_capital_rs": round(target_capital_rs, 2),
         "adv_cap_rs": round(adv_cap_rs, 2),
-        "recommended_size_rs": round(equal_weight_capital_rs, 2),
-        "binding_constraint": "equal_weight",
+        "recommended_size_rs": round(target_capital_rs, 2),
+        "binding_constraint": "flat_allocation",
     }
 
 
 def load_open_thesis(company_master_id: str) -> dict | None:
-    """The single OPEN thesis for this company, if any -- the human gate this
-    whole module refuses to size around the absence of. A company can only ever
-    have one open thesis at a time in practice (create_thesis's own idempotency
-    key), but this reads defensively (LIMIT 1, most recent) rather than assuming."""
+    """The single OPEN position for this company, if any -- the gate this module
+    refuses to size around the absence of.
+
+    Only entry_decision='accept' counts. A VETOED name is still recorded as a position
+    (that is what makes the adjudicator falsifiable) but sizing one would put real
+    capital behind a name the adjudicator rejected -- the exact opposite of what the
+    veto means."""
     df = sql_to_df(
-        "SELECT thesis_id, created_date FROM fundamentals_l4_thesis WHERE company_master_id = %s AND status = 'open' ORDER BY created_date DESC LIMIT 1",
+        "SELECT position_id AS thesis_id, opened_at AS created_date "
+        "  FROM fundamentals_portfolio_position "
+        " WHERE company_master_id = %s AND status = 'open' AND entry_decision = 'accept' "
+        " ORDER BY opened_at DESC LIMIT 1",
         params=(company_master_id,),
     )
     if df.empty:
@@ -121,32 +147,34 @@ def load_adv_inputs(company_master_id: str) -> dict | None:
 
 
 def get_position_size_recommendation(
-    company_master_id: str, *, total_capital_rs: float, target_position_count: int, max_pct_of_adv: float = DEFAULT_MAX_PCT_OF_ADV
+    company_master_id: str, *, capital_per_position_rs: float | None = None,
+    max_pct_of_adv: float = DEFAULT_MAX_PCT_OF_ADV
 ) -> dict | None:
-    """None if there's no OPEN L4 thesis for this company -- the calculator refuses
-    to size a position nobody has committed to. total_capital_rs and
-    target_position_count are REQUIRED, no defaults: this module has no business
-    guessing the operator's actual sleeve capital or intended position count, and
-    a wrong guess here would be a silent, consequential assumption -- exactly what
-    this pipeline avoids everywhere else (see e.g. utils/universe.py's own "no
-    static registry" principle)."""
+    """None if there's no OPEN, ACCEPTED position for this company.
+
+    capital_per_position_rs defaults to the operator-set CAPITAL_PER_POSITION_RS. Unlike
+    the previous total_capital/position_count pair this is NOT a guess about the
+    operator's sleeve -- it is a figure they set directly, so a default here is a
+    recorded decision rather than a silent assumption."""
     thesis = load_open_thesis(company_master_id)
     if thesis is None:
         return None
-    if target_position_count <= 0:
-        raise ValueError("target_position_count must be positive")
+    target_capital_rs = (CAPITAL_PER_POSITION_RS if capital_per_position_rs is None
+                         else float(capital_per_position_rs))
+    if target_capital_rs <= 0:
+        raise ValueError("capital_per_position_rs must be positive")
 
     adv_inputs = load_adv_inputs(company_master_id)
     sizing = compute_position_size(
-        equal_weight_capital_rs=total_capital_rs / target_position_count,
+        target_capital_rs=target_capital_rs,
         adv_value_rs=adv_inputs["adv_value_rs"] if adv_inputs else None,
         max_pct_of_adv=max_pct_of_adv,
     )
     return {
         "company_master_id": company_master_id,
-        "thesis_id": thesis["thesis_id"],
-        "total_capital_rs": total_capital_rs,
-        "target_position_count": target_position_count,
+        "position_id": thesis["thesis_id"],
+        "capital_per_position_rs": target_capital_rs,
+        "max_positions": MAX_POSITIONS,
         "max_pct_of_adv": max_pct_of_adv,
         "avg_vol_1mth": adv_inputs["avg_vol_1mth"] if adv_inputs else None,
         "cmp_rs": adv_inputs["cmp_rs"] if adv_inputs else None,

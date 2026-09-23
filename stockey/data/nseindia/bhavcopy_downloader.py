@@ -76,7 +76,7 @@ def download_bhavcopy_for_date(
     Automate NSE 'Archives' tab to download the ZIP for a single day.
     Returns True on success, False on any exception.
     """
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.nseindia.bhavcopy_downloader")
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()
 

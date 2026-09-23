@@ -3,9 +3,10 @@ successor step, agreed in conversation 2026-08-11): the running, fully-automatic
 of every company that has ever had an L3 alert (fundamentals/screens/l3_triggers.py
 rule pass or llm_triage.py judgment pass -- either origin qualifies, this table
 doesn't distinguish). Auto-add on any L3 alert was the explicit, user-confirmed
-decision (no separate human "promote to watchlist" step) -- distinct from
-fundamentals_l4_thesis (l4_thesis.py), which stays the deliberate, human-only
-"portfolio" act (create_thesis/resolve_thesis) this table never touches or implies.
+decision (no separate human "promote to watchlist" step) -- and distinct from the
+machine portfolio (fundamentals_portfolio_position, portfolio_runner.py), which this
+table never touches or implies. Being watched is not being held: the ruleset decides
+which watched names become positions, and this table has no say in it.
 
 sync_watchlist_from_alerts() is idempotent: first_seen_at/first_seen_price are set
 once, the first time a company appears, and normally never overwritten on later

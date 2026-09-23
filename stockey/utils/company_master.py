@@ -123,9 +123,46 @@ def sync_company_master() -> pd.DataFrame:
         WHERE valid_to IS NULL
           AND exch_id = 'NSE'
           AND instrument = 'EQUITY'
-          AND instrument_type IN ('ES', 'ETF')
           AND underlying_symbol IS NOT NULL
-        ORDER BY underlying_symbol, load_ts DESC, valid_from DESC
+          AND (
+                instrument_type IN ('ES', 'ETF')
+                -- ...OR the symbol actually trades on NSE right now, whatever Dhan
+                -- labelled it. 2026-09-02: 13 symbols in the live equity universe were
+                -- excluded purely because Dhan files them as instrument_type='Other'
+                -- (LIQGRWBEES, a Nippon liquid ETF, among them), leaving them with no
+                -- company_master row and therefore no Dhan id and no intraday data.
+                --
+                -- Deliberately NOT broadening the filter to 'Other' outright: that
+                -- bucket holds 747 NSE rows of which only 15 trade. The other 732 are
+                -- exchange TEST instruments (011NSETEST, 021NSETEST, ...) and
+                -- zero-coupon bonds (series N0, e.g. "ABCL ... 2031 SR C2") -- note a
+                -- literal percent sign cannot appear anywhere in this string, even in a
+                -- SQL comment: psycopg2 parses it as a parameter placeholder and the
+                -- query dies with "IndexError: tuple index out of range". Admitting them
+                -- would put hundreds of non-equities into the identity spine.
+                --
+                -- The bhavcopy is the authority on what trades on NSE; Dhan's
+                -- instrument_type is only their labelling. Where the two disagree and
+                -- bhavcopy says it traded this week, trust the bhavcopy.
+                OR underlying_symbol IN (
+                     SELECT DISTINCT symbol FROM nseindia_ohlcv
+                      WHERE series IN ('EQ', 'BE')
+                        AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
+                   )
+          )
+        -- PREFER THE EQ SERIES. A symbol listed in both the rolling (EQ) and
+        -- trade-to-trade (BE) segments has TWO Dhan security_ids, and this DISTINCT ON
+        -- previously broke the tie by load_ts alone -- i.e. arbitrarily with respect to
+        -- series. Measured 2026-09-02: of 227 universe symbols missing intraday data,
+        -- 151 had resolved to their BE id and 145 of those had an EQ listing sitting
+        -- right there. Dhan serves no intraday for the BE listing, so every one of them
+        -- silently returned zero candles -- no error, no retry, just absent data.
+        -- EMPOWER is the worked example: 762670 (EQ) has bars, 762673 (BE) has none,
+        -- and we were asking for 762673 while the stock traded 107M shares in a month.
+        --
+        -- (series = 'EQ') DESC only breaks ties: a symbol that trades ONLY in BE still
+        -- resolves to its BE id, because that is then the sole row.
+        ORDER BY underlying_symbol, (series = 'EQ') DESC, load_ts DESC, valid_from DESC
         """,
         operation="sync_dhan_nse",
     )
@@ -403,7 +440,7 @@ def build_l1_ticker_by_company_master_id() -> dict[str, str]:
     literal NSE-listing claim) is NOT the same string as its L1-universe slug (e.g.
     "524634", the BSE scrip code screener.in uses as that company's own URL slug).
     Confirmed live: this exact naive-removeprefix mistake recurred independently
-    across watch_summary.py, l3_triggers.py, llm_triage.py, l4_thesis.py,
+    across watch_summary.py, l3_triggers.py, llm_triage.py, portfolio_resolution.py,
     signal_pointers.py, and l2_state.py's pull_crawl_forward (plus the reverse
     construction mistake, f"nse:{ticker}", in technicals.py) -- the SAME bug
     ae8ff4b fixed by name in 3 OTHER files earlier the same session, missed here

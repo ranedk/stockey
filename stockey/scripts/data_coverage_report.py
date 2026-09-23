@@ -91,7 +91,14 @@ TABLES: list[tuple[str, str | None, str | None, str, str]] = [
     # fbil_gsec_quote retired 2026-08-15 (zero readers, confirmed live) and dropped from the DB.
     ("company_master", None, "company_master_id", "informational", "Identity"),
     ("dim_security", "effective_from", "symbol", "informational", "Identity"),
-    ("historical_mcap", "date", "symbol", "daily", "Sharpely (mcap slice)"),
+    # "frozen", not "daily": docs/DATA_INVENTORY.md records historical_mcap as a
+    # deliberately frozen archive -- the Sharpely collector that wrote it was removed on
+    # purpose in 2abe32a ("had regressed to a 2-symbol placeholder... redundant with
+    # nseindia_mcap for 2024+"), and the table is kept only for the pre-2024 history
+    # nseindia_mcap lacks. Judging a table nobody writes against a 7-day freshness
+    # threshold made it permanently `error` -- a red row that can never go green, which
+    # is exactly what teaches an operator to stop reading the report.
+    ("historical_mcap", "date", "symbol", "frozen", "Sharpely (mcap slice, frozen archive)"),
     ("advisory_sync_state", "updated_at", "source_name", "informational", "Download run state"),
 ]
 
@@ -190,6 +197,11 @@ def check_table(table: str, date_col: str | None, symbol_col: str | None, check_
             row["detail"] = f"{staleness}d stale (>{WARN_STALENESS_DAYS}d threshold)"
         else:
             row["status"] = "ok"
+    elif check_kind == "frozen":
+        # Deliberately no longer written. Row count still matters (an empty frozen
+        # archive IS a problem, caught by the rows<=0 branch above); staleness does not.
+        row["status"] = "ok"
+        row["detail"] = "frozen archive, no longer written -- staleness not applicable"
     else:
         row["status"] = "ok"
         row["detail"] = "informational only, no staleness check"

@@ -11,6 +11,7 @@ import pyotp
 from environs import Env
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 
 from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import DhanAuthError, extract_token_id, normalize_token_id
@@ -121,7 +122,7 @@ def open_dhan_browser_session() -> DhanBrowserSession:
     if not CDP_ENDPOINT:
         raise DhanAuthError("CDP_ENDPOINT is required for automated Dhan login")
     playwright = sync_playwright().start()
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.dhanlive.web_login")
     owns_context = not bool(browser.contexts)
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()

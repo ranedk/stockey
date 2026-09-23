@@ -508,14 +508,95 @@ def _dedupe_for_upsert(df: pd.DataFrame, unique_keys: List[str]) -> tuple[pd.Dat
     return deduped, len(df) - len(deduped)
 
 
+def _build_on_conflict_clause(
+    *,
+    cols: Sequence[str],
+    unique_keys: Sequence[str],
+    table_name: str,
+    on_conflict: str = "update",
+    compare_exclude: Sequence[str] | None = None,
+) -> sql.Composable:
+    """Build the ON CONFLICT action for an upsert. See _upsert_to_db_once for the modes.
+
+    Split out of _upsert_to_db_once so the three modes can be asserted directly in
+    tests without a live database or a mocked connection.
+    """
+    if on_conflict not in ("update", "nothing", "update_if_changed"):
+        raise ValueError(
+            f"on_conflict must be 'update', 'nothing' or 'update_if_changed'; got {on_conflict!r}"
+        )
+
+    update_cols = [c for c in cols if c not in unique_keys]
+    if on_conflict == "nothing" or not update_cols:
+        return sql.SQL("DO NOTHING")
+
+    set_clause = sql.SQL(", ").join(
+        sql.Composed([sql.Identifier(c), sql.SQL(" = EXCLUDED."), sql.Identifier(c)])
+        for c in update_cols
+    )
+    if on_conflict == "update":
+        return sql.SQL("DO UPDATE SET {set}").format(set=set_clause)
+
+    excluded = ("load_ts",) if compare_exclude is None else tuple(compare_exclude)
+    compare_cols = [c for c in update_cols if c not in excluded]
+    if not compare_cols:
+        # Nothing meaningful left to compare -- a bare DO UPDATE here would rewrite
+        # every row to change only the excluded bookkeeping columns, which is exactly
+        # the write amplification this mode exists to avoid.
+        return sql.SQL("DO NOTHING")
+
+    # The existing row is addressed by the target's BASE name -- postgres aliases the
+    # ON CONFLICT range-table entry to the unqualified table name, so "public.foo" is
+    # referenced as foo.col, not public.foo.col.
+    base_name = table_name.split(".")[-1]
+
+    def _row(prefix: sql.Composable) -> sql.Composed:
+        # IS DISTINCT FROM, not <>, so a NULL on either side compares correctly instead
+        # of yielding NULL and silently skipping the row.
+        return sql.SQL(", ").join(
+            sql.SQL("{}.{}").format(prefix, sql.Identifier(c)) for c in compare_cols
+        )
+
+    return sql.SQL(
+        "DO UPDATE SET {set} WHERE ({dest}) IS DISTINCT FROM ({src})"
+    ).format(
+        set=set_clause,
+        dest=_row(sql.Identifier(base_name)),
+        src=_row(sql.SQL("EXCLUDED")),
+    )
+
+
 def _upsert_to_db_once(
     df: pd.DataFrame,
     table_name: str,
     unique_keys: List[str],
     timescaledb_column: str | None = None,
+    on_conflict: str = "update",
+    compare_exclude: Sequence[str] | None = None,
 ) -> None:
     """
     Upserts a pandas DataFrame into a PostgreSQL table using psycopg2.
+
+    on_conflict controls what happens to a row that already exists:
+
+      "update"            DO UPDATE SET <every non-key column> = EXCLUDED.<col>.
+                          The historical default, kept so existing call sites are
+                          unchanged.
+      "nothing"           DO NOTHING. For immutable historical bars, where a
+                          re-fetch of the same window carries the same values. On a
+                          COMPRESSED hypertable chunk a DO UPDATE forces
+                          decompress -> update -> recompress, all WAL-logged; DO
+                          NOTHING skips the row outright. This is the difference
+                          between a cheap re-run and the ~1.6 TB/day of WAL that
+                          filled the disk on 2026-08-23.
+      "update_if_changed" DO UPDATE ... WHERE the compared columns actually differ.
+                          For tables that are legitimately rebuilt in full but whose
+                          values almost never move -- the adjustment factors. Without
+                          the predicate, a `load_ts` stamped fresh on every row makes
+                          all 5.86M rows "differ" and rewrites the whole table nightly.
+
+    compare_exclude names columns ignored by the "update_if_changed" comparison (they
+    are still written when some other column changed). Defaults to ("load_ts",).
     """
 
     if df.empty:
@@ -540,17 +621,13 @@ def _upsert_to_db_once(
     col_identifiers = [sql.Identifier(c) for c in cols]
     conflict_identifiers = [sql.Identifier(c) for c in unique_keys]
 
-    update_cols = [c for c in cols if c not in unique_keys]
-    if update_cols:
-        set_clause = sql.SQL(", ").join(
-            sql.Composed(
-                [sql.Identifier(c), sql.SQL(" = EXCLUDED."), sql.Identifier(c)]
-            )
-            for c in update_cols
-        )
-        on_conflict = sql.SQL("DO UPDATE SET {set}").format(set=set_clause)
-    else:
-        on_conflict = sql.SQL("DO NOTHING")
+    on_conflict_sql = _build_on_conflict_clause(
+        cols=cols,
+        unique_keys=unique_keys,
+        table_name=table_name,
+        on_conflict=on_conflict,
+        compare_exclude=compare_exclude,
+    )
 
     # --- create table DDLs (yours) -----------------------------------------
     create_main_sql = generate_postgres_schema(df, table_name, unique_keys)
@@ -713,7 +790,7 @@ def _upsert_to_db_once(
                 cols=sql.SQL(", ").join(col_identifiers),
                 select_cols=sql.SQL(", ").join(select_expressions),
                 conflict_cols=sql.SQL(", ").join(conflict_identifiers),
-                on_conflict=on_conflict,
+                on_conflict=on_conflict_sql,
             )
 
             cur.execute(insert_sql)
@@ -737,13 +814,22 @@ def upsert_to_db(
     table_name: str,
     unique_keys: List[str],
     timescaledb_column: str | None = None,
+    on_conflict: str = "update",
+    compare_exclude: Sequence[str] | None = None,
 ) -> None:
+    """See _upsert_to_db_once for what on_conflict/compare_exclude do.
+
+    The default stays "update" so the ~45 existing call sites are unchanged; only the
+    writers into compressed hypertables or full-table rebuilds opt out.
+    """
     with_db_retries(
         lambda: _upsert_to_db_once(
             df,
             table_name,
             unique_keys,
             timescaledb_column=timescaledb_column,
+            on_conflict=on_conflict,
+            compare_exclude=compare_exclude,
         ),
         operation_name=f"upsert_to_db:{table_name}",
     )

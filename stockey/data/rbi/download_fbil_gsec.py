@@ -197,9 +197,39 @@ def _ist_today() -> datetime:
     return datetime.combine(pd.Timestamp.now(tz="Asia/Kolkata").date(), datetime.min.time())
 
 
+
+# FBIL publishes the G-Sec par-yield file in the evening IST. Before that hour, today's
+# file simply does not exist yet -- asking for it is not a failure, it is asking early.
+FBIL_GSEC_PUBLISH_CUTOFF_IST_HOUR = min(max(env.int("RBI_FBIL_GSEC_PUBLISH_CUTOFF_IST_HOUR", 18), 0), 23)
+
+
+def _last_publishable_date() -> datetime:
+    """The most recent date whose FBIL file should already exist.
+
+    BUG FOUND LIVE 2026-09-01: the candidate range ran through _ist_today(), so every
+    run before the evening publication asked for a file FBIL had not written yet. That
+    one date failed, failed_date_count went to 1, and main() stamped the whole run
+    "partial" -- which pinned data.rbi.download_fbil_gsec to `error` in
+    advisory_sync_state permanently, even on runs where every genuinely-available date
+    downloaded fine (2026-08-31 wrote 199 rows in the same run that reported partial).
+
+    A collector that reports failure for data the source has not published yet is a
+    collector whose status nobody can act on, so the window now ends at the last date
+    that should actually be there. Same reasoning as scripts/data_completeness.py's
+    _last_complete_trading_day.
+    """
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    last = now_ist.date()
+    if now_ist.hour < FBIL_GSEC_PUBLISH_CUTOFF_IST_HOUR:
+        last = last - pd.Timedelta(days=1)
+    return datetime.combine(last, datetime.min.time())
+
+
 def download_all_gsec_data() -> dict[str, object]:
     cookies = get_cookies()
-    today = _ist_today()
+    # NOT _ist_today(): see _last_publishable_date. Requesting a file FBIL has not
+    # published yet turned every pre-evening run into a "partial" failure.
+    today = _last_publishable_date()
     from_date = rop.get(DOWNLOADED)
     if from_date:
         from_date = datetime.strptime(from_date, "%Y-%m-%d")

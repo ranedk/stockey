@@ -27,7 +27,7 @@ classification), then reused across every filing/company that investor appears i
 avoids re-asking the same question repeatedly and means a single human correction
 (override_tier, always wins over llm_tier) fixes it everywhere that investor shows up.
 This is a suggestion the human can override, never an authority -- same pattern as
-fundamentals/screens/l4_thesis.py's check_structured_prediction(), and the override is
+portfolio_resolution.py's check_structured_prediction(), and the override is
 never auto-applied by anything else in this pipeline (nothing here gates an alert or a
 trigger on classification tier)."""
 

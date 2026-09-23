@@ -29,10 +29,11 @@ from datetime import datetime, timedelta
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 from utils.fallback_telemetry import record_local_fallback_event
 from utils import store
 from utils.date import daterange
-from utils.nse_rate_limiter import nse_goto
+from utils.nse_rate_limiter import nse_goto, nse_request_gate
 from utils.sync import get_redis_client
 
 env = Env()
@@ -121,7 +122,7 @@ def download_data(
     from_date_str = from_date.strftime("%d-%m-%Y")
     to_date_str = to_date.strftime("%d-%m-%Y")
 
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.nseindia.offmarket")
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()
     file_path: str | None = None
@@ -135,25 +136,51 @@ def download_data(
         page.wait_for_timeout(get_random(1000, 3000))
         nse_goto(page, "https://www.nseindia.com/report-detail/display-bulk-and-block-deals")
         page.wait_for_timeout(get_random(1000, 2000))
-        page.locator("#segment_dropdown").select_option(dtype)
-        page.wait_for_timeout(get_random(2000, 3000))
 
-        page.get_by_role("link", name="Custom").click()
-        page.wait_for_timeout(get_random(2000, 3000))
-
-        js_code = f'$(".startDate-block-deals.dtpicker.form-control").val("{from_date_str}");$(".endDate-block-deals.dtpicker.form-control").val("{to_date_str}");'
-        page.evaluate(js_code)
-        page.wait_for_timeout(1000)
-
-        page.get_by_role("button", name="GO").click()
-        page.wait_for_timeout(get_random(2000, 3000))
-
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
-            page.get_by_role("link", name="csv Download (.csv)").click()
-        download = download_info.value
+        # FETCH THE CSV ENDPOINT DIRECTLY -- do not drive the download button.
+        #
+        # 2026-09-01, diagnosed live (this is the failure PRD §12 #1 flagged as
+        # never-smoke-tested, and the homepage warmup added then did NOT fix it):
+        # the form dance still works -- the segment dropdown, the Custom link, the
+        # jQuery date injection and the GO click all succeed, and the results table
+        # populates with the right range. What no longer happens is a browser DOWNLOAD
+        # event: `expect_download` timed out on 12 of 12 attempts because NSE now
+        # builds that CSV client-side rather than serving it as a navigation the
+        # browser treats as a download.
+        #
+        # The page itself calls a plain endpoint to fill that table
+        # (/api/historicalOR/bulk-block-short-deals), and it honours `&csv=true`,
+        # returning text/csv with the exact same header row the parser already
+        # expects. So we ask for the file instead of miming a user who clicks for it:
+        # fewer moving parts, no dependence on NSE's front-end markup, and the date
+        # range is passed explicitly rather than injected into a datepicker and hoped
+        # for. The fetch runs INSIDE the page so it inherits the session cookies and
+        # WAF clearance the two navigations above establish -- issuing it from
+        # `requests` would be seen as an unwarmed client and blocked.
+        api_url = (
+            "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
+            f"?optionType={dtype}&from={from_date_str}&to={to_date_str}&csv=true"
+        )
+        # Through the same cross-process gate every other NSE request uses -- the WAF
+        # scores the domain's total request rate, so an in-page fetch has to queue
+        # behind nse_goto exactly like a navigation does.
+        with nse_request_gate():
+            result = page.evaluate(
+                """async (url) => {
+                    const r = await fetch(url, {headers: {Accept: 'text/csv,*/*'}, credentials: 'include'});
+                    return {status: r.status, body: r.ok ? await r.text() : ''};
+                }""",
+                api_url,
+            )
+        if int(result.get("status") or 0) != 200:
+            raise RuntimeError(
+                f"NSE deals CSV endpoint returned HTTP {result.get('status')} for {dtype} "
+                f"{from_date_str}-{to_date_str}"
+            )
 
         file_path = f"{dtype}_{from_date_str}_{to_date_str}.csv"
-        download.save_as(file_path)
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(result.get("body") or "")
 
         # A zero-byte download is a placeholder/failed fetch, never a valid
         # response -- same guard bhavcopy_downloader.py added for the same

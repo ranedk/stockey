@@ -6,12 +6,21 @@ JUST generated this run -- and asks an LLM to draft a CANDIDATE entry for
 fundamentals_l4_thesis: a falsifiable, dated, non-price prediction, pre-committed
 invalidation criteria, and a calibrated confidence score.
 
-THIS MODULE NEVER WRITES fundamentals_l4_thesis AND NEVER CALLS create_thesis()
-(fundamentals/screens/l4_thesis.py). That table's own docstring is explicit:
-"creating a thesis is always a deliberate, separate human act... L3 never auto-creates
-one" (fundamental_basic_goal.md sec 1's L4 section is the ultimate source for this --
-L4 is "the ONE deliberate human act in this whole pipeline," the only gate capital
-passes through). Automating the DRAFT is not automating the GATE: everything this
+SUPERSEDED FRAMING, 2026-09-04. This module was built to pre-fill a form for the ONE
+deliberate human act the pipeline used to gate capital on: creating an L4 thesis. That
+register (fundamentals_l4_thesis) and its create/resolve endpoints were DELETED when the
+operator removed the human forecast entirely, so there is no longer a human act for these
+drafts to feed, and nothing promotes them to anything.
+
+What they still are: per-company reading, shown in the digest email and on the watchlist
+pages. What they are NOT, and must not become: an input to the portfolio. The nightly
+ruleset (fundamentals/screens/portfolio_ruleset.py) decides entries from the confluence
+axes and systrader's stage read, and the entry adjudicator writes its OWN thesis for every
+name it accepts. Feeding these drafts into that path would put unversioned, unscored LLM
+prose into a capital decision -- exactly what the portfolio PRD's asymmetric design exists
+to prevent.
+
+Automating the DRAFT is not automating the GATE: everything this
 module produces lands in its own table, fundamentals_l4_thesis_draft, is surfaced in
 the daily digest email as clearly-labeled candidate material, and requires a human to
 read it, edit or discard it, and call create_thesis() themselves before it becomes a

@@ -476,7 +476,18 @@ def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
     }
     if not dry_run:
         ensure_factors_table()
-        upsert_to_db(out, ADJUSTMENT_FACTORS_TABLE, unique_keys=["symbol", "date"], timescaledb_column="date")
+        # This rebuilds the FULL history every night, and load_ts is stamped fresh on
+        # every row -- so a plain DO UPDATE rewrote all 5.86M rows across 688 chunks
+        # nightly (~2-4 GB WAL) for factors that almost never move. update_if_changed
+        # compares the real columns only (load_ts is excluded by default) and writes
+        # just the rows whose factor actually changed.
+        upsert_to_db(
+            out,
+            ADJUSTMENT_FACTORS_TABLE,
+            unique_keys=["symbol", "date"],
+            timescaledb_column="date",
+            on_conflict="update_if_changed",
+        )
         ensure_view()  # CREATE OR REPLACE is cheap/idempotent -- self-heals a fresh DB or an accidental drop
     return summary
 

@@ -8,6 +8,7 @@ import redis
 import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.sync_state import persist_sync_state
 from utils.company_master import attach_company_master_id
@@ -79,7 +80,7 @@ def dowload_events(
     Download the calendar csv file for all events
     Returns True on success, False on any exception.
     """
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.nseindia.recent_events")
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()
 

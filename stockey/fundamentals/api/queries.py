@@ -30,7 +30,8 @@ from fundamentals.collectors.rating_agencies import get_unsupported_rating_agenc
 from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
-from fundamentals.screens.l4_thesis import compute_quarterly_scoring, create_thesis, resolve_thesis
+from fundamentals.screens.l5_sizing import CAPITAL_PER_POSITION_RS, MAX_POSITIONS
+from fundamentals.screens.portfolio_resolution import compute_portfolio_scoring
 from fundamentals.screens.l4_thesis_draft import _ensure_draft_table
 from fundamentals.screens.l5_sizing import get_position_size_recommendation as _get_position_size_recommendation
 from fundamentals.screens.signal_pointers import get_stock_signal_pointers, load_satisfied_strategies_by_company
@@ -178,7 +179,7 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     # load_full_watchlist does this exact join), but were never exposed anywhere in
     # this API -- the frontend had no way to show what the email already tells a
     # human. CANDIDATE ONLY, same as the email: never implies anything was saved to
-    # fundamentals_l4_thesis.
+    # the machine portfolio.
     # BUG FOUND LIVE 2026-08-18 (re-audit): draft_thesis was silently absent on
     # every non-active row in this list view -- _load_draft_theses_by_company()
     # unconditionally gated on w.status='active' regardless of the `status` param
@@ -280,6 +281,67 @@ def get_draft_theses() -> list[dict]:
     return list(_load_draft_theses_by_company().values())
 
 
+
+# The five axes confluence_score.py evaluates, in the order its own docstring lists
+# them. Kept here as data rather than five ad-hoc keys so the API shape stays stable if
+# a sixth axis is ever added (SCORE_VERSION exists for exactly that).
+CONFLUENCE_AXES = (
+    ("fundamentals_trajectory", "Debt or CWIP ratio improving, with neither worsening"),
+    ("event_corroboration", "Recent alerts lean corroborating rather than contradicting"),
+    ("sector_cycle", "Sector in capacity discipline, not expansion"),
+    ("ownership", "Institutional accumulation; promoter stake steady, pledge not rising"),
+    ("valuation", "Cheap against its OWN history, not merely cheap in absolute terms"),
+)
+
+
+def load_confluence_for_company(company_master_id: str) -> dict | None:
+    """Latest confluence score for one company, with each axis spelled out.
+
+    The list view only carries the three counts, which is what made the watchlist badge
+    ambiguous: "1/4" reads as "1 of 4, rest unknown" when it actually means 1 supportive
+    and 3 ACTIVELY CONTRADICTING (evaluable_count == confluence_count +
+    contradicting_count). The per-axis detail is what lets a human see WHICH signal
+    disagrees rather than just how many.
+
+    A None axis means "not enough data to call either way" and is deliberately never
+    coerced to a side -- see confluence_score.py's own docstring.
+    """
+    _ensure_confluence_score_table()
+    df = sql_to_df(
+        """
+        SELECT run_date, score_version,
+               axis_fundamentals_trajectory, axis_event_corroboration, axis_sector_cycle,
+               axis_ownership, axis_valuation,
+               confluence_count, contradicting_count, evaluable_count
+          FROM fundamentals_confluence_score
+         WHERE company_master_id = %s
+         ORDER BY run_date DESC
+         LIMIT 1
+        """,
+        params=(company_master_id,),
+    )
+    records = _clean_records(df)
+    if not records:
+        return None
+    row = records[0]
+    return {
+        "run_date": row.get("run_date"),
+        "score_version": row.get("score_version"),
+        "confluence_count": row.get("confluence_count"),
+        "contradicting_count": row.get("contradicting_count"),
+        "evaluable_count": row.get("evaluable_count"),
+        "axes": [
+            {
+                "key": key,
+                "description": description,
+                # True supports, False contradicts, None = not evaluable.
+                "verdict": row.get(f"axis_{key}"),
+            }
+            for key, description in CONFLUENCE_AXES
+        ],
+    }
+
+
 def get_watchlist_detail(company_master_id: str) -> dict | None:
     watchlist_df = sql_to_df("SELECT * FROM fundamentals_watchlist WHERE company_master_id = %s", params=(company_master_id,))
     if watchlist_df.empty:
@@ -301,7 +363,8 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
         alerts.append(alert)
 
     thesis_df = sql_to_df(
-        "SELECT * FROM fundamentals_l4_thesis WHERE company_master_id = %s ORDER BY created_date DESC",
+        "SELECT * FROM fundamentals_portfolio_position WHERE company_master_id = %s "
+        "ORDER BY opened_at DESC",
         params=(company_master_id,),
     )
 
@@ -329,6 +392,9 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
         # this detail page gets the same agency-name/investor-tier/sector-growth
         # context, not a thinner read of the same facts.
         "signal_pointers": get_stock_signal_pointers(company_master_id),
+        # PRD §12 todo #6 follow-up (2026-09-02): the five axes behind the watchlist's
+        # confluence badge. None until confluence_score.py has scored this company.
+        "confluence": load_confluence_for_company(company_master_id),
     }
 
 
@@ -372,39 +438,30 @@ def get_sectors() -> list[dict]:
 
 
 def get_portfolio() -> list[dict]:
-    df = sql_to_df("SELECT * FROM fundamentals_l4_thesis ORDER BY created_date DESC")
+    """The machine portfolio. There is no human register any more (2026-09-04) -- every
+    row here was opened by the ruleset and judged by the entry adjudicator."""
+    df = sql_to_df("SELECT * FROM fundamentals_portfolio_position ORDER BY opened_at DESC")
     return _clean_records(df)
 
 
 def get_portfolio_scoring() -> dict:
-    """Thin wrapper over l4_thesis.compute_quarterly_scoring -- fundamental_basic_
-    goal.md sec 5's actual outcome measure (forecast hit rate, failure-attribution
-    breakdown, time-to-confirmation), not returns. Read-only, computed fresh from
-    whatever's resolved so far -- nothing here is cached or precomputed."""
-    return compute_quarterly_scoring()
+    """Thin wrapper over portfolio_resolution.compute_portfolio_scoring -- forecast hit
+    rate, failure attribution, time-to-confirmation. Not returns. Read-only and computed
+    fresh; nothing here is cached or precomputed.
+
+    Every breakdown is split by resolution_method, because a blended hit rate would let
+    judged resolutions flatter the mechanical ones."""
+    return compute_portfolio_scoring()
 
 
-def get_position_sizing(company_master_id: str, *, total_capital_rs: float, target_position_count: int) -> dict | None:
+def get_position_sizing(company_master_id: str, *, capital_per_position_rs: float | None = None) -> dict | None:
     """Thin wrapper over l5_sizing.get_position_size_recommendation -- PRD §12
-    todo #8. None (-> app.py 404) if this company has no OPEN L4 thesis: the
-    calculator refuses to size a position nobody has committed to yet, same
-    "no capital decision without a human thesis" boundary as everything else in
-    this API. total_capital_rs/target_position_count have no server-side default
-    -- the caller must be explicit, never a guessed sleeve size."""
+    todo #8. None (-> app.py 404) if this company has no OPEN, ACCEPTED position: the
+    calculator refuses to size a name nothing has committed to yet.
+    capital_per_position_rs defaults to the operator-set flat allocation."""
     return _get_position_size_recommendation(
-        company_master_id, total_capital_rs=total_capital_rs, target_position_count=target_position_count
+        company_master_id, capital_per_position_rs=capital_per_position_rs
     )
-
-
-def create_portfolio_entry(payload: dict) -> dict:
-    """Thin wrapper over l4_thesis.create_thesis -- ThesisValidationError propagates
-    to the caller (app.py translates it to a 400, this layer does no validation of
-    its own so there's exactly one place mandatory-field rules live)."""
-    return create_thesis(**payload)
-
-
-def resolve_portfolio_entry(thesis_id: str, payload: dict) -> None:
-    resolve_thesis(thesis_id=thesis_id, **payload)
 
 
 def get_investor_classifications() -> list[dict]:
@@ -478,3 +535,303 @@ def get_todos() -> dict:
     registry, not a stored "done" flag). A dict, not a list, so more todo
     categories can be added later without changing this endpoint's shape."""
     return {"rating_agencies": _clean_records(get_unsupported_rating_agencies())}
+
+
+# --- Data-platform health: collectors ----------------------------------------
+# Reads advisory_sync_state, the per-collector status table. Rides the fundamentals
+# API only because it is stockey's sole HTTP surface -- this is monitoring of the data
+# platform's own state, not research, so it stays inside the pure-TA boundary (see
+# docs/DATA_INVENTORY.md and CLAUDE.md's note on /api/data-health).
+
+# Deliberately unscheduled modules. They are NOT broken -- docs/DATA_INVENTORY.md's
+# BORDERLINE section keeps the files for a possible future FnO event-vol use but does
+# not run them, so any error they left behind is frozen history, not a live failure.
+FROZEN_BY_DESIGN_MODULES = frozenset({
+    "data.nseindia.recent_events",
+    "data.nseindia.earnings_events",
+})
+
+
+def _live_registry_modules() -> set[str]:
+    """Every module the pipeline actually runs today, from the registry itself rather
+    than a hand-maintained list -- so this cannot drift the way a copy would."""
+    from data.download_runner import DOWNLOADER_STEPS, PARSER_STEPS
+
+    return {step["module"] for step in (*DOWNLOADER_STEPS, *PARSER_STEPS)}
+
+
+def _live_registry_scopes() -> set[tuple[str, str]]:
+    """(module, purpose) pairs the pipeline runs today.
+
+    BUG FOUND LIVE 2026-09-06: advisory_sync_state is keyed by (source_name, scope_key)
+    where scope_key is the step's PURPOSE, but the reconcile above matched on module name
+    alone. So renaming a step's purpose orphans its old row at whatever status it last
+    held -- and that row can never be updated again, because nothing writes that
+    (module, purpose) pair any more.
+
+    data.nseindia.offmarket moved from purpose 'market_wide' to 'fundamentals_deal_flow'
+    on 2026-08-14. Its market_wide row froze at 'error' and showed as the ONE failing
+    collector on the Data Health page for three weeks, while the module itself ran green
+    every single day. A permanently-red row for a healthy collector is precisely the
+    alert fatigue this whole view exists to prevent.
+    """
+    from data.download_runner import DOWNLOADER_STEPS, PARSER_STEPS
+
+    return {
+        (step["module"], str(step.get("purpose") or ""))
+        for step in (*DOWNLOADER_STEPS, *PARSER_STEPS)
+    }
+
+
+def _module_of(source_name: str) -> str:
+    """advisory_sync_state keys look like 'download_runner:data.rbi.download_bank_rates',
+    'data.nseindia.holidays', or 'continuous_watch:announcements'. The module is the part
+    after the last ':'."""
+    return source_name.rsplit(":", 1)[-1]
+
+
+def get_collectors() -> dict:
+    """Per-collector status, reconciled against the live registry.
+
+    The reconciliation is the point, not a detail. advisory_sync_state is never pruned,
+    so a module that was deleted or renamed keeps its last error row forever -- on
+    2026-08-31, 9 rows read 'error' but only 3 were live failures: 3 were phantoms
+    (continuous_watch, data.mospi.cpi, data.sharpelydata.sharpely_data -- all removed or
+    renamed) and 1 was a frozen-by-design module. A page that shows 9 red rows when 3 are
+    real and 3 can never go green trains the operator to ignore it, which is the exact
+    alert-fatigue failure this whole view exists to prevent.
+    """
+    df = sql_to_df(
+        """
+        SELECT source_name, scope_key, status, error_text,
+               last_success_at, last_item_ts, updated_at
+          FROM advisory_sync_state
+         ORDER BY source_name
+        """
+    )
+    live = _live_registry_modules()
+    live_scopes = _live_registry_scopes()
+    cleaned = _clean_records(df)
+    # Modules that DO have a row under a scope the registry still runs. Only these can
+    # have a retired-scope row demoted (below): the pairing is what proves the purpose was
+    # renamed rather than the row simply being the module's only record. Without this, a
+    # collector whose scope_key never matched a registry purpose -- 8 such values exist,
+    # written by the fundamentals and continuous_watch paths -- would have a GENUINE
+    # failure demoted to "orphaned" and hidden, which is worse than the stale-red row this
+    # demotion exists to remove.
+    modules_with_a_current_scope = {
+        _module_of(str(r.get("source_name") or ""))
+        for r in cleaned
+        if (_module_of(str(r.get("source_name") or "")), str(r.get("scope_key") or "")) in live_scopes
+    }
+    rows: list[dict] = []
+    for record in cleaned:
+        module = _module_of(str(record.get("source_name") or ""))
+        scope = str(record.get("scope_key") or "")
+        status = str(record.get("status") or "unknown")
+        if module in FROZEN_BY_DESIGN_MODULES:
+            classification = "frozen"
+        elif module not in live:
+            classification = "orphaned"
+        elif (
+            status != "ok"
+            and (module, scope) not in live_scopes
+            and module in modules_with_a_current_scope
+        ):
+            # The module is live, it HAS a row under a scope the registry still runs, and
+            # this row's scope is not one of them -- the signature of a renamed purpose.
+            # The row is frozen at its last status and can never go green again.
+            # Deliberately narrow: only a non-ok row, and only when the replacement row
+            # exists. A lone row under an unrecognised scope stays visible as failing,
+            # because showing a possibly-stale red is safer than hiding a real one.
+            classification = "orphaned"
+        elif status == "ok":
+            classification = "ok"
+        else:
+            classification = "failing"
+        rows.append({**record, "module": module, "classification": classification})
+
+    # failing first, then frozen/orphaned noise, then healthy.
+    order = {"failing": 0, "frozen": 1, "orphaned": 2, "ok": 3}
+    rows.sort(key=lambda r: (order.get(r["classification"], 4), r["source_name"]))
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["classification"]] = counts.get(r["classification"], 0) + 1
+    return {
+        "counts": counts,
+        "failing_count": counts.get("failing", 0),
+        "registry_module_count": len(live),
+        "collectors": rows,
+    }
+
+
+# --- Data-platform health: scheduler ------------------------------------------
+
+def get_scheduler_health() -> dict:
+    """Shell out to scripts/is_cron_running.sh --json.
+
+    Deliberately NOT reimplemented in Python. The shell script is the source of truth
+    for these checks and is what an operator runs on the box; a second copy here would
+    drift from it, which is precisely the class of failure this whole health surface
+    exists to prevent (see docs/FRONTEND_COMPLETION_PLAN.md, B3).
+
+    Exit code 1 means "findings present", not "the check failed" -- the payload is
+    still valid and is returned. Only an unparseable/absent payload is an error.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "is_cron_running.sh"
+    if not script.is_file():
+        raise FileNotFoundError(f"{script} is missing")
+    proc = subprocess.run(
+        [str(script), "--json"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        raise RuntimeError(
+            f"is_cron_running.sh produced no output (exit {proc.returncode}): "
+            f"{(proc.stderr or '').strip()[:300]}"
+        )
+    return json.loads(stdout)
+
+
+# --- Data-platform health: open issues + fallback telemetry -------------------
+
+def get_platform_issues(*, hours: int = 24, limit: int = 100) -> dict:
+    """Open identity issues + a fallback-telemetry rollup.
+
+    READ-ONLY on purpose. scripts/issue_digest.py builds a similar report but gets
+    there via resolve_open_identity_issues(apply=True), which RECHECKS and CLOSES rows
+    as a side effect. An HTTP GET must never mutate pipeline state, so this reuses the
+    read helpers (load_open_identity_issues / summarize_fallback_events) and leaves the
+    recheck to the nightly job that owns it.
+
+    The identity issues here are the same population the completeness check reports as
+    a bare "N symbols have no intraday data" -- this gives that number names and
+    reasons.
+    """
+    from utils.fallback_telemetry import summarize_fallback_events
+    from utils.identity_issues import load_open_identity_issues
+
+    issues_df = load_open_identity_issues(limit=limit)
+    issues = _clean_records(issues_df)
+
+    by_type: dict[str, int] = {}
+    for row in issues:
+        key = str(row.get("issue_type") or "unknown")
+        by_type[key] = by_type.get(key, 0) + 1
+
+    fallback = summarize_fallback_events(hours=hours)
+    return {
+        "identity_issues": {
+            "open_count": len(issues),
+            "by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+            "issues": issues,
+            "limit": limit,
+        },
+        "fallback_events": {"window_hours": hours, **fallback},
+    }
+
+
+# --- Data-platform health: coverage trend -------------------------------------
+
+def get_coverage_report(*, history_days: int = 30) -> dict:
+    """Latest per-table coverage/staleness, plus a short staleness history.
+
+    data_coverage_report has been written nightly for 16 runs and read only as
+    docs/DATA_COVERAGE.md. The trend is the useful part: a feed degrading shows up as
+    rising staleness several days before it fails outright.
+    """
+    latest = sql_to_df(
+        """
+        SELECT table_name, category, check_kind, status, rows, symbols,
+               min_date, max_date, staleness_days, detail, report_date
+          FROM data_coverage_report
+         WHERE report_date = (SELECT max(report_date) FROM data_coverage_report)
+         ORDER BY (status <> 'ok') DESC, table_name
+        """
+    )
+    trend = sql_to_df(
+        """
+        SELECT table_name, report_date, staleness_days
+          FROM data_coverage_report
+         WHERE report_date >= (SELECT max(report_date) FROM data_coverage_report)
+                              - make_interval(days => %s)
+         ORDER BY table_name, report_date
+        """,
+        params=(int(history_days),),
+    )
+    series: dict[str, list[dict]] = {}
+    for row in _clean_records(trend):
+        series.setdefault(str(row["table_name"]), []).append(
+            {"report_date": row["report_date"], "staleness_days": row["staleness_days"]}
+        )
+    rows = _clean_records(latest)
+    return {
+        "report_date": rows[0]["report_date"] if rows else None,
+        "not_ok_count": sum(1 for r in rows if str(r.get("status")) != "ok"),
+        "tables": rows,
+        "staleness_history": series,
+    }
+
+
+# --- Ruleset portfolio (docs/PORTFOLIO_RULESET_PRD.md) ------------------------
+
+def get_ruleset_positions() -> dict:
+    """Positions opened by the mechanical ruleset + LLM adjudicator.
+
+    Shadow rows are returned alongside real ones and clearly separated: they are
+    REJECTED candidates tracked as if taken, which is what makes the adjudicator itself
+    falsifiable. A UI that hides them, or blends them into P&L, throws away the only
+    paired comparison this design has.
+    """
+    from fundamentals.screens.portfolio_adjudicator import _ensure_tables
+
+    _ensure_tables()
+    df = sql_to_df(
+        """
+        SELECT position_id, ticker, company_master_id, ruleset_version, kind, status,
+               opened_at, entry_price, stop_pct, stop_basis,
+               confluence_count, contradicting_count, evaluable_count, stage_at_entry,
+               adjudicator_model, adjudicator_prompt_version, adjudicator_reason,
+               deferral_count, closed_at, close_reason, exit_price,
+               entry_decision, prediction_text, target_date, invalidation_criteria,
+               target_date_basis, position_size_rs, adv_cap_rs, sizing_basis,
+               -- The live distance to the stop, computed here rather than in the client
+               -- so the page and the exit evaluator cannot disagree about what "close to
+               -- the stop" means.
+               (SELECT adj_close FROM advisory_adjusted_ohlcv_daily a
+                 WHERE a.symbol = p.ticker ORDER BY a.date DESC LIMIT 1) AS last_price
+          FROM fundamentals_portfolio_position p
+         ORDER BY (status = 'open') DESC, opened_at DESC
+        """
+    )
+    rows = _clean_records(df)
+    real = [r for r in rows if r["kind"] == "real"]
+    shadow = [r for r in rows if r["kind"] == "shadow"]
+    # Counted on entry_decision, not kind: in record-only mode EVERY row is kind='shadow'
+    # regardless of what the adjudicator said, so kind cannot carry this distinction.
+    accepted = [r for r in rows if r["entry_decision"] == "accept"]
+    rejected = [r for r in rows if r["entry_decision"] == "reject"]
+    return {
+        "ruleset_version": max((r["ruleset_version"] for r in rows), default=None),
+        "real_count": len(real),
+        "shadow_count": len(shadow),
+        "accepted_count": len(accepted),
+        "rejected_count": len(rejected),
+        # Only ACCEPTED positions consume capital -- vetoed ones are counterfactuals.
+        "capital_committed_rs": sum(r["position_size_rs"] or 0 for r in accepted
+                                    if r["status"] == "open"),
+        "capital_per_position_rs": CAPITAL_PER_POSITION_RS,
+        "book_used": sum(1 for r in accepted if r["status"] == "open"),
+        "book_capacity": MAX_POSITIONS,
+        # record-only until at least one real position exists
+        "mode": "live" if real else "record-only",
+        "positions": rows,
+    }

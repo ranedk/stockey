@@ -22,7 +22,20 @@ Ranked by what actually blocks knowing if this system works, per a
 manipulation correctness + pipeline data-utilization + a strategic gap
 review, five independent passes):
 
-1. **`fundamentals_l4_thesis` has zero rows, ever.** The human-committed,
+1. ~~**`fundamentals_l4_thesis` has zero rows, ever.**~~ ✅ **RESOLVED 2026-09-04,
+   by deletion.** The operator removed the human forecast entirely ("only machine
+   created portfolio and forecast"), so the register, its create/resolve endpoints
+   and its frontend forms are gone. The blocker was real and this is the answer to
+   it: a gate nobody ever passed through was not discipline waiting to happen, it
+   was a design that could not run unattended. Forecasts now live on
+   `fundamentals_portfolio_position`, are written by the entry adjudicator, and are
+   resolved nightly by `portfolio_resolution.py` — mechanically where the prediction
+   reduces to an L2 comparison, judged otherwise, with the two hit rates always
+   reported separately so a model cannot flatter its own record. See
+   `docs/PORTFOLIO_RULESET_PRD.md`. **The `POST /api/portfolio` endpoint referenced
+   below no longer exists.**
+
+   Original text, for the record: The human-committed,
    falsifiable, dated prediction is the only gate capital is supposed to
    pass through (`fundamental_basic_goal.md` §1/§4) and the only input to
    `compute_quarterly_scoring()` (forecast hit rate, `thesis_wrong` vs

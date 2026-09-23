@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
@@ -100,6 +101,91 @@ def clear_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# CONSENT RATIONING (incident 2026-09-04/05)
+#
+# Dhan returned CONSENT_LIMIT_EXCEED and ALL Dhan collection stopped. Cause: every
+# Dhan-backed job independently called get_token_id_from_auto_login() whenever it found no
+# cached token, and each call MINTS A NEW CONSENT. 22 attempts were logged across five
+# different jobs (dhan_intraday_sync, complete_data, complete_data_eod, data_readiness,
+# go_crond_watchdog). The existing _dhan_login_lock did not help and was never meant to:
+# it serialises callers so they do not fight over the browser, but serialising N callers
+# still mints N consents. Once the quota was gone, every job failed to authenticate, which
+# made every job try again -- self-sustaining.
+#
+# Two independent guards, because either alone is insufficient:
+#
+#   1. OWNER GATE -- only the designated refresher (auth_cli's --auto-login path, run by
+#      all_dhan_auth_ensure.sh) may mint a consent. Library callers that merely NEED a
+#      token no longer mint one; they fail fast and visibly, which is the honest state:
+#      "the auth job has not produced a token", not "Dhan is broken".
+#   2. DAILY BUDGET -- a hard cap on consents per IST day, persisted across processes. The
+#      owner gate depends on callers being well-behaved; the budget holds even if a future
+#      caller is not, and is what actually prevents a repeat of this incident.
+CONSENT_BUDGET_PATH = Path(
+    env("DHAN_CONSENT_BUDGET_PATH", default="")
+    or Path(__file__).resolve().parents[2] / ".cache" / "dhan_consent_budget.json"
+)
+MAX_CONSENTS_PER_DAY = env.int("DHAN_MAX_CONSENTS_PER_DAY", default=10)
+CONSENT_OWNER_ENV = "DHAN_CONSENT_OWNER"
+
+
+def _ist_today_str() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+
+
+def is_consent_owner() -> bool:
+    """Only the designated auth refresher may mint consents. See CONSENT RATIONING."""
+    return str(os.environ.get(CONSENT_OWNER_ENV, "")).strip().lower() in ("1", "true", "yes")
+
+
+def claim_consent_owner() -> None:
+    """Marks THIS process as the consent owner. Called by auth_cli's --auto-login path --
+    that command IS the designated refresher, so it grants itself the right rather than
+    depending on the caller remembering to export a variable."""
+    os.environ[CONSENT_OWNER_ENV] = "1"
+
+
+def _consent_budget_state() -> dict:
+    try:
+        data = json.loads(CONSENT_BUDGET_PATH.read_text())
+        if str(data.get("date")) == _ist_today_str():
+            return {"date": data["date"], "count": int(data.get("count", 0))}
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return {"date": _ist_today_str(), "count": 0}
+
+
+def consent_budget_remaining() -> int:
+    return max(0, MAX_CONSENTS_PER_DAY - _consent_budget_state()["count"])
+
+
+def _spend_consent_budget() -> None:
+    """Charge one consent against today's budget, refusing when exhausted.
+
+    Charged BEFORE the network call, deliberately: a request that reaches Dhan has already
+    cost quota whether or not we like its answer, so counting only successes would let a
+    failing loop mint consents forever -- which is exactly how this incident happened.
+    """
+    state = _consent_budget_state()
+    if state["count"] >= MAX_CONSENTS_PER_DAY:
+        raise DhanAuthError(
+            f"Dhan consent budget exhausted: {state['count']}/{MAX_CONSENTS_PER_DAY} "
+            f"consents already generated on {state['date']} (IST). Refusing to mint another "
+            f"-- exceeding Dhan's own limit is what caused the 2026-09-04 outage, and it "
+            f"locks out ALL collection, not just this job. Raise "
+            f"DHAN_MAX_CONSENTS_PER_DAY only if you know the account's real quota."
+        )
+    state["count"] += 1
+    try:
+        CONSENT_BUDGET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONSENT_BUDGET_PATH.write_text(json.dumps(state))
+    except OSError as exc:
+        # Cannot persist the budget -> cannot enforce it. Refuse rather than proceed
+        # unmetered: an unenforceable cap is the state that caused the outage.
+        raise DhanAuthError(f"Cannot record Dhan consent budget at {CONSENT_BUDGET_PATH}: {exc}") from exc
+
+
 def generate_consent_app_id(
     *,
     client_id: str | None = None,
@@ -110,6 +196,8 @@ def generate_consent_app_id(
     client_id = client_id or env("DHAN_CLIENT_ID")
     api_key = api_key or env("DHAN_API_KEY")
     api_secret = api_secret or env("DHAN_API_SECRET")
+
+    _spend_consent_budget()   # charged before the call -- see CONSENT RATIONING
 
     response = requests.post(
         f"{AUTH_BASE_URL}/app/generate-consent",
@@ -330,10 +418,36 @@ def get_access_token() -> str:
         if cached:
             return cached
         if is_auto_login_configured():
+            _require_consent_owner("get_access_token")
             return str(consume_consent_token(get_token_id_from_auto_login())["accessToken"])
         consent_url = begin_browser_consent()
         pasted_token_id = prompt_for_token_id(consent_url)
         return str(consume_consent_token(pasted_token_id)["accessToken"])
+
+
+def _require_consent_owner(caller: str) -> None:
+    """Refuse to mint a consent from an ordinary collector.
+
+    A job that needs a token is not entitled to create one. Before this, each such job
+    minted its own and 22 attempts across five jobs exhausted Dhan's quota. Failing here
+    is also more honest than the alternative: the fault is "the auth job has not produced
+    a token yet", which names something an operator can act on.
+    """
+    if is_consent_owner():
+        return
+    _record_dhan_auth_fallback(
+        fallback_type="dhan_consent_generation_refused_not_owner",
+        reason=(f"{caller} needed a Dhan token but is not the consent owner; only "
+                f"all_dhan_auth_ensure.sh (auth_cli --auto-login) may mint consents."),
+        error="consent generation refused",
+        metadata={"caller": caller, "consent_budget_remaining": consent_budget_remaining()},
+    )
+    raise DhanAuthError(
+        f"No usable Dhan token and {caller} is not the consent owner. Only "
+        f"all_dhan_auth_ensure.sh may log in (it runs daily at 19:15 IST); every job "
+        f"minting its own consent is what exhausted Dhan's quota on 2026-09-04. "
+        f"To refresh now: python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login"
+    )
 
 
 def force_refresh_access_token(current_token: str | None = None) -> str:
@@ -349,6 +463,7 @@ def force_refresh_access_token(current_token: str | None = None) -> str:
             return cached
         clear_cached_access_token()
         if is_auto_login_configured():
+            _require_consent_owner("force_refresh_access_token")
             token_id = get_token_id_from_auto_login()
         else:
             consent_url = begin_browser_consent()

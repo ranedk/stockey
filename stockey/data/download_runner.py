@@ -65,6 +65,15 @@ PARSER_STEPS = [
     # refreshed) -- purely derived and idempotent, safe to recompute every run.
     {"module": "data.nseindia.corporate_action_events", "args": [], "purpose": "corporate_action_normalize"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
+    # RESTORED 2026-09-02. dim_trading_days lost its only producer in fb84396's Phase 4
+    # cut -- the writer lived in features/, a REMOVE-scope directory, while the TABLE is
+    # KEEP scope (docs/DATA_INVENTORY.md, NSE calendar). Nothing noticed for five weeks
+    # because the table was already filled through 2026-12-31: a dated fuse, not a
+    # visible break, on the one table every trading-day-aware check resolves against.
+    # Placed after bhavcopy_parser (it derives history from nseindia_ohlcv) and after the
+    # holidays downloader has refreshed nseindia_holidays, which is what extends the
+    # runway into future years.
+    {"module": "data.nseindia.calendar_creator", "args": [], "purpose": "trading_calendar"},
     # No dependency on anything after it -- placed before benchmark_sync only to
     # preserve benchmark_sync as the literal last parser step (it depends on the
     # rest of the chain having already run; offmarket_parser depends on nothing

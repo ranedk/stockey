@@ -21,6 +21,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 | NSE calendar | `nseindia/holidays` | `nseindia_holidays`, `dim_trading_days` |
 | NSE off-market deals | `data/nseindia/{offmarket,offmarket_parser}.py` (revived 2026-08-29, see "Retired 2026-08-15" below for history) | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_short_selling` — fundamentals-screener deal-flow signal (PRD §12), not systrader's PRIMARY series |
 | Dhan broker | `dhanlive/*` (incl. auth/web_login) | `master_dhan_instruments`, `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` (1-min bars) |
+| Intraday backfill state | `scripts/backfill_intraday_5yr.py` | `dhan_intraday_backfill_state` — per-(ticker, interval) completion marker for the one-off 5-year fill. Added 2026-08-31: the previous resume signal ("earliest stored bar reaches target_start") could never match for a symbol whose history genuinely starts inside the window, so every restart re-fetched and re-upserted those symbols in full. Bookkeeping only; no market data, no readers outside that script |
 | RBI/FBIL | `rbi/*` | `rbi_bank_rates`, `rbi_currency_rates`, `fbil_gsec_par` |
 | Identity | `company_master`, `nseindia/security_history` | `company_master`, `dim_security*` |
 | Sharpely identity/sector mapping | `sharpelydata/scrip_master.py` | `master_sharpely_equity` — feeds `company_master`'s `sharpely_id` identity fallback and `fundamentals/collectors/sector_data.py`'s NSE→BSE sector-code mapping |
@@ -113,45 +114,18 @@ retired:
 
 ## Cron
 
-Seven core jobs (`config/stockey.crontab.template`, times are intended IST
-wall-clock — the crontab file itself is written in UTC since go-crond has no
-`CRON_TZ`/`TZ` support):
+The schedule lives in **`config/stockey.crontab.template`** (the source of truth) with a
+convenience table in **`CLAUDE.md`**'s "Current Architecture".
 
-1. `complete_data.sh` (07:10 + 17:30) — `data.download_runner --phase all`:
-   downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
-   scrip master + OHLCV, RBI/FBIL rates, and normalizes corporate actions.
-   `data/download_runner.py`'s `DOWNLOADER_STEPS`/`PARSER_STEPS` are the
-   source of truth for the exact registry and order.
-2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30
-   and +5 min) — queue single-client NSE/Dhan work
-   (`data/download_queue.py`) and drain it (`utils/external_task_queue.py`)
-   so parallel NSE/Dhan sessions don't collide. `all_downloaders_queue.sh`
-   routes every `data.nseindia.*` module plus Dhan `scrip_master`/`ohlcv`
-   into queues; cutting `all_external_workers.sh` while keeping the queue
-   job would silently no-op that entire lane.
-3. `all_ohlcv_reconcile.sh` (18:45) — backfills any universe symbol whose
-   latest Dhan daily bar predates the last completed trading day
-   (`data/dhanlive/ohlcv_reconcile.py`; universe from
-   `utils/universe.py`'s `get_equity_universe()`).
-4. `all_price_adjustment.sh` (18:50, right after the reconcile) — rebuilds
-   `nseindia_adjustment_factors`; `advisory_adjusted_ohlcv_daily` (systrader's
-   PRIMARY series) is a view over it, not a written table.
-5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
-   freshness and runs bounded repairs.
-6. `all_data_coverage_report.sh` (17:10, weekdays) — non-fatal per-table coverage
-   report (`docs/DATA_COVERAGE.md`), monitoring only, not a data producer.
-7. Log rotation (06:50, `scripts/rotate_logs.sh`).
+This document used to carry its own copy of the job list. It was removed 2026-09-06
+because it had silently drifted: after the collection times were retimed, this copy still
+showed the old ones and was wrong by hours on nearly every job, while claiming to be
+authoritative. Two copies of a schedule do not stay in step, and the stale one is worse
+than none — check the template, or `python builder.py --check-crontab` for drift between
+the template and the generated file.
 
-Plus, for the fundamentals-screener carve-out:
-
-8. `all_fundamentals_screener.sh` (19:15, weekdays) —
-   `fundamentals.run_pipeline`: sector reference, L1/L2 refresh, event
-   collectors, OCR + structured extraction, sector capital-cycle, L3 alerts,
-   descriptive technicals, and the watchlist/narrative/email pipeline, in
-   dependency order. `fundamentals/run_pipeline.py`'s `STEPS` is the source
-   of truth.
-9. `all_fundamentals_api.sh` (every 5 min) — long-running FastAPI service
-   (`fundamentals/api/app.py`) serving the `screener/` Nuxt frontend.
+What remains authoritative here is the **collector/table inventory** above: which module
+writes which table, and what is deliberately out of scope.
 
 ## Not collected
 

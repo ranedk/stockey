@@ -134,6 +134,32 @@ def classify_offmarket_parse_failure(exc: Exception) -> str:
     return "parser_bug"
 
 
+def _to_number(series: pd.Series) -> pd.Series:
+    """Coerce an NSE numeric column that may carry Indian digit grouping.
+
+    2026-09-01: the deals CSV now comes from NSE's own `&csv=true` endpoint (see
+    data/nseindia/offmarket.py for why we stopped driving the download button), and it
+    formats quantities with Indian grouping -- "1,70,00,000" rather than 17000000.
+    Postgres rejects that for a bigint column, so four files failed to parse with
+    InvalidTextRepresentation while short_selling (whose numbers were small enough to
+    have no separator) went through fine.
+
+    Written to normalize BOTH shapes rather than the new one only: a parser should not
+    depend on which producer wrote the file, and the archive on disk contains years of
+    files from the older download path. Non-numeric junk becomes NaN rather than
+    raising, so one bad cell cannot fail an entire block.
+    """
+    if series.dtype.kind in "iuf":
+        return series
+    cleaned = (
+        series.astype("string")
+        .str.replace(",", "", regex=False)
+        .str.replace("\u00a0", "", regex=False)
+        .str.strip()
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
 def process_csv(file_name, csv_path):
     """Process a block deals, bulk deals and short selling CSV file."""
     print("Processing %s - %s" % (file_name, csv_path))
@@ -163,6 +189,9 @@ def process_csv(file_name, csv_path):
         raise ValueError("file %s type not supported" % file_name)
 
     df["date"] = pd.to_datetime(df["date"], format="%d-%b-%Y", errors="coerce")
+    for numeric_column in ("quantity", "price"):
+        if numeric_column in df.columns:
+            df[numeric_column] = _to_number(df[numeric_column])
     df = df.dropna(subset=["date", "symbol"]).copy()
     df = df.drop_duplicates(subset=unique_keys, keep="last").reset_index(drop=True)
     df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")

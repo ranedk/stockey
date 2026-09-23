@@ -7,6 +7,7 @@ import pandas as pd
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import upsert_to_db
@@ -178,7 +179,7 @@ def download_latest_rates(playwright) -> dict[str, object]:
     rates_page = None
 
     try:
-        browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+        browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.rbi.download_bank_rates")
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
 

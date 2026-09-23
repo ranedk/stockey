@@ -4,7 +4,12 @@ fundamentals/screens/watch_summary.py (step 11), and fundamentals/screens/
 l4_thesis_draft.py (step 11.5, added 2026-08-15 at the user's request to make L4
 thesis-drafting part of the daily run and its own email).
 
-send_daily_digest() sends exactly one consolidated email per pipeline run, listing
+RETIRED 2026-09-07: this module no longer sends mail. The outbound email is
+fundamentals/screens/portfolio_notify.py (entries and exits only), sent at the end of the
+portfolio chain. Everything else here still runs nightly and feeds the screener UI.
+
+send_daily_digest() is retained, working and tested -- it sends exactly one consolidated
+email per call, listing
 the ENTIRE active watchlist regardless of whether anything changed today -- a
 standing end-of-day summary, not a per-change alert. (Until 2026-08-14 this module
 also sent a separate email per new-candidate/narrative-change event via
@@ -199,6 +204,140 @@ def load_full_watchlist() -> list[dict]:
     return rows
 
 
+def load_portfolio_positions() -> list[dict]:
+    """Open positions from the machine portfolio (docs/PORTFOLIO_RULESET_PRD.md).
+
+    Accepted and vetoed are both returned, because the vetoed names are the control arm:
+    a digest that showed only what was taken would quietly hide the half of the record
+    that says whether the adjudicator's veto is worth anything.
+
+    Read-only, and it never raises into the digest: a portfolio that cannot be read must
+    degrade to "no portfolio section", not lose the watchlist email that has been arriving
+    every day. The caller treats [] as "nothing to show".
+    """
+    try:
+        from fundamentals.screens.portfolio_adjudicator import _ensure_tables
+
+        _ensure_tables()
+        df = sql_to_df(
+            """
+            SELECT p.ticker, p.company_master_id, p.entry_decision, p.kind,
+                   p.opened_at, p.entry_price, p.stop_pct, p.target_date,
+                   p.prediction_text, p.adjudicator_reason, p.position_size_rs,
+                   p.metric_name, p.metric_operator, p.metric_threshold,
+                   (SELECT a.adj_close FROM advisory_adjusted_ohlcv_daily a
+                     WHERE a.symbol = p.ticker
+                       AND a.date >= now() - make_interval(days => 90)
+                     ORDER BY a.date DESC LIMIT 1) AS current_price
+              FROM fundamentals_portfolio_position p
+             WHERE p.status = 'open'
+             ORDER BY (p.entry_decision = 'accept') DESC, p.opened_at DESC
+            """
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        _record_fallback(
+            "watchlist_digest_portfolio_unavailable",
+            reason="Daily digest could not read the machine portfolio; digest sent without it.",
+            error=exc,
+        )
+        return []
+    return [] if df.empty else df.to_dict("records")
+
+
+def _room_to_stop_pct(entry_price, stop_pct, current_price):
+    """How much of the stop distance is left, as a percentage. 100 = just entered,
+    0 = at the stop. None when it cannot be computed -- never a guessed 100."""
+    try:
+        entry, stop, last = float(entry_price), float(stop_pct), float(current_price)
+    except (TypeError, ValueError):
+        return None
+    stop_level = entry * (1 - stop / 100.0)
+    distance = entry - stop_level
+    if distance <= 0:
+        return None
+    return max(0.0, min(100.0, (last - stop_level) / distance * 100.0))
+
+
+def build_portfolio_section(positions: list[dict]) -> tuple[str, list[str]]:
+    """(html, text_lines) for the portfolio block. ('', []) when there is nothing."""
+    if not positions:
+        return "", []
+
+    accepted = [p for p in positions if p.get("entry_decision") != "reject"]
+    vetoed = [p for p in positions if p.get("entry_decision") == "reject"]
+    committed = sum(float(p.get("position_size_rs") or 0) for p in accepted)
+    # 'real' is the only kind that risks money; record-only mode writes everything as
+    # 'shadow'. Stating this in the email matters more than anywhere else -- an emailed
+    # list of holdings reads as real unless it says otherwise.
+    is_live = any(p.get("kind") == "real" for p in accepted)
+    mode_label = "LIVE" if is_live else "RECORD-ONLY (no money committed)"
+
+    rows_html, text_lines = [], []
+    text_lines.append(
+        f"\nPORTFOLIO -- {mode_label}: {len(accepted)} position(s), "
+        f"Rs {committed:,.0f} notional, {len(vetoed)} vetoed by the adjudicator."
+    )
+    for p in accepted:
+        room = _room_to_stop_pct(p.get("entry_price"), p.get("stop_pct"), p.get("current_price"))
+        room_txt = "-" if room is None else f"{room:.0f}% of stop left"
+        rule = ""
+        if p.get("metric_name"):
+            rule = f"{p['metric_name']} {p.get('metric_operator')} {p.get('metric_threshold')}"
+        text_lines.append(
+            f"  {p['ticker']}: {_fmt_plain(_fmt_price(p.get('entry_price')))} -> "
+            f"{_fmt_plain(_fmt_price(p.get('current_price')))} | stop {_fmt_plain(p.get('stop_pct'))}% "
+            f"({room_txt}) | target {_fmt_plain(p.get('target_date'))}"
+        )
+        if p.get("prediction_text"):
+            text_lines.append(f"      thesis: {p['prediction_text']}")
+        if rule:
+            text_lines.append(f"      resolves on: {rule}")
+
+        tone = "neg" if (room is not None and room <= 25) else ("mid" if (room is not None and room <= 60) else "pos")
+        rows_html.append(
+            "<tr>"
+            f"<td><strong>{html.escape(str(p['ticker']))}</strong></td>"
+            f"<td>{html.escape(_fmt_price(p.get('entry_price')))} &rarr; "
+            f"{html.escape(_fmt_price(p.get('current_price')))}</td>"
+            f"<td>{html.escape(_fmt_plain(p.get('stop_pct')))}% "
+            f'<span class="{tone}">({html.escape(room_txt)})</span></td>'
+            f"<td>{html.escape(_fmt_plain(p.get('target_date')))}</td>"
+            f'<td class="thesis-cell">{html.escape(str(p.get("prediction_text") or "-"))}'
+            + (f'<div class="thesis-rule">resolves on: {html.escape(rule)}</div>' if rule else "")
+            + "</td></tr>"
+        )
+
+    veto_html = ""
+    if vetoed:
+        blocks = "".join(
+            f'<div class="veto-block"><span class="veto-ticker">{html.escape(str(v["ticker"]))}</span>'
+            f'<div class="veto-reason">{html.escape(str(v.get("adjudicator_reason") or "-"))}</div></div>'
+            for v in vetoed
+        )
+        veto_html = (
+            '<div class="card"><h1>Vetoed by the adjudicator</h1>'
+            '<div class="draft-banner">The mechanical rule passed these and the LLM rejected them. '
+            "They are tracked as if taken, so the veto itself can be scored: if the vetoed names "
+            "outperform the accepted ones, the veto layer is costing money.</div>"
+            f"{blocks}</div>"
+        )
+        text_lines.append(f"\n  Vetoed ({len(vetoed)}): " + ", ".join(str(v["ticker"]) for v in vetoed))
+
+    banner = (
+        "" if is_live else
+        '<div class="draft-banner">RECORD-ONLY &mdash; no money is committed. Every row is a '
+        "recorded decision, sized as it would be if it were real.</div>"
+    )
+    portfolio_html = (
+        '<div class="card"><h1>Portfolio</h1>'
+        f'<p class="sub">{len(accepted)} position(s) &middot; Rs {committed:,.0f} notional &middot; '
+        f"{len(vetoed)} vetoed</p>{banner}"
+        "<table><tr><th>Ticker</th><th>Entry &rarr; Today</th><th>Stop</th>"
+        f"<th>Target</th><th>Thesis</th></tr>{''.join(rows_html)}</table></div>{veto_html}"
+    )
+    return portfolio_html, text_lines
+
+
 def _fmt_price(value) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "n/a"
@@ -305,6 +444,13 @@ _DIGEST_HTML_STYLE = (
     ".sub{color:#64748b;font-size:13px;margin:0 0 4px}"
     ".footer{color:#94a3b8;font-size:12px;margin-top:8px}"
     ".strategy-badge{display:inline-block;background:#eef2ff;color:#4338ca;border-radius:999px;padding:1px 7px;font-size:10px;margin:2px 4px 0 0;white-space:nowrap}"
+    ".mid{color:#d97706;font-weight:600}"
+    ".thesis-cell{font-size:12px;color:#334155;max-width:340px}"
+    ".thesis-rule{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#64748b;margin-top:3px}"
+    ".veto-block{padding:10px 0;border-bottom:1px solid #f1f5f9}"
+    ".veto-block:last-child{border-bottom:none}"
+    ".veto-ticker{font-weight:600;font-size:13px}"
+    ".veto-reason{font-size:12px;color:#334155;margin-top:3px}"
     ".draft-banner{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:8px 12px;font-size:12px;margin:0 0 14px}"
     ".draft-block{padding:14px 0;border-bottom:1px solid #f1f5f9}"
     ".draft-block:last-child{border-bottom:none}"
@@ -357,19 +503,31 @@ def _confidence_css_class(confidence_score) -> str:
     return "low"
 
 
-def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, str]:
+def build_daily_digest_content(watchlist_rows: list[dict], portfolio_rows: list[dict] | None = None) -> tuple[str, str, str]:
     """Returns (subject, text_body, html_body). HTML is the primary rendering -- a
     compact table (watching-since, entry-vs-today's-close, event count, watch-until)
     plus a per-company narrative section below it -- the plain-text part is the
     universal fallback every client falls back to when HTML rendering is off."""
     today = pd.Timestamp.now(tz="UTC").date()
+    portfolio_html, portfolio_text = build_portfolio_section(portfolio_rows or [])
+
     if not watchlist_rows:
         subject = "[Watchlist] Daily digest -- nothing on the watchlist"
         text_body = "No companies are on the watchlist yet."
-        html_body = f"<html><body style='font-family:sans-serif'><p>{text_body}</p></body></html>"
+        if portfolio_text:
+            # The portfolio is independent of the watchlist: positions stay open after a
+            # name leaves the watchlist, so an empty watchlist must not swallow the book.
+            text_body = "\n".join([text_body, *portfolio_text])
+        html_body = (
+            f"<html><head><meta charset=\"utf-8\"><style>{_DIGEST_HTML_STYLE}</style></head>"
+            f"<body><div class=\"card\"><p>No companies are on the watchlist yet.</p></div>"
+            f"{portfolio_html}</body></html>"
+        )
         return subject, text_body, html_body
 
-    subject = f"[Watchlist] Daily digest -- {len(watchlist_rows)} companies"
+    n_open = len([p for p in (portfolio_rows or []) if p.get("entry_decision") != "reject"])
+    subject = (f"[Watchlist] Daily digest -- {len(watchlist_rows)} companies"
+               + (f", {n_open} positions" if n_open else ""))
     text_lines = [f"{len(watchlist_rows)} companies on the watchlist as of {today}. One consolidated summary, not a change alert.\n"]
     table_rows_html = []
     narrative_blocks_html = []
@@ -402,7 +560,7 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
             # this render) printed the literal string "None (by None)" instead of
             # the "n/a" every other field on this digest already falls back to.
             text_lines.append(
-                f"[DRAFT L4 thesis, NOT SAVED, confidence {_confidence_label(draft.get('confidence_score'))}] "
+                f"[CANDIDATE NOTE, not a position, confidence {_confidence_label(draft.get('confidence_score'))}] "
                 f"{_fmt_plain(draft.get('prediction_text'))} (by {_fmt_plain(draft.get('target_date'))})"
             )
             text_lines.append(f"  Rationale: {_fmt_plain(draft.get('rationale'))}")
@@ -457,21 +615,22 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
                 "</div>"
             )
 
-    text_lines.append("This is a descriptive screener digest, not a trade recommendation.")
+    text_lines.extend(portfolio_text)
+    text_lines.append("\nThis is a descriptive screener digest, not a trade recommendation.")
     if draft_blocks_html:
         text_lines.append(
-            "DRAFT L4 theses above are LLM-drafted candidates only -- nothing is saved to the real thesis "
-            "register until a human reviews and commits it."
+            "DRAFT theses above are reading, not decisions. The portfolio is chosen by the "
+            "nightly ruleset, which never consults them."
         )
     text_body = "\n".join(text_lines)
 
     draft_section_html = ""
     if draft_blocks_html:
         draft_section_html = (
-            '<div class="card"><h1>Draft L4 Theses</h1>'
-            '<div class="draft-banner">CANDIDATE ONLY &mdash; nothing here is saved to the real thesis register. '
-            "Each is an LLM-drafted, falsifiable prediction with a confidence score for your review; commit or "
-            "discard it yourself.</div>"
+            '<div class="card"><h1>Candidate Notes</h1>'
+            '<div class="draft-banner">READING ONLY &mdash; machine-written notes on watchlist names. '
+            "The portfolio above is chosen by the nightly ruleset, which never consults these; nothing "
+            "here is waiting on you.</div>"
             f'{"".join(draft_blocks_html)}</div>'
         )
 
@@ -481,6 +640,7 @@ def build_daily_digest_content(watchlist_rows: list[dict]) -> tuple[str, str, st
         f'<p class="sub">{len(watchlist_rows)} companies &middot; {today}</p>'
         "<table><tr><th>Company</th><th>Watching since</th><th>Entry &rarr; Today's close</th>"
         f"<th>Events</th><th>Watch until</th></tr>{''.join(table_rows_html)}</table></div>"
+        f"{portfolio_html}"
         f'<div class="card"><h1>Why</h1>{"".join(narrative_blocks_html)}</div>'
         f"{draft_section_html}"
         '<p class="footer">Descriptive screener digest, not a trade recommendation.</p>'
@@ -505,7 +665,9 @@ def send_daily_digest() -> dict[str, object]:
         )
         return {"sent": 0, "skipped_disabled": 0, "failed": 1}
 
-    subject, text_body, html_body = build_daily_digest_content(load_full_watchlist())
+    subject, text_body, html_body = build_daily_digest_content(
+        load_full_watchlist(), load_portfolio_positions()
+    )
     try:
         send_email(subject, text_body, html_body)
         return {"sent": 1, "skipped_disabled": 0, "failed": 0}
@@ -542,7 +704,18 @@ def run_watchlist_notification_pipeline() -> dict[str, object]:
     summary_result = run_watch_summary_refresh()
     exit_result = run_watchlist_exit_evaluation()
     draft_result = run_l4_thesis_drafting()
-    digest_result = send_daily_digest()
+    # WATCHLIST DIGEST RETIRED 2026-09-07 (operator: "remove the watchlist from the email
+    # and only send the portfolio entry and exit stocks"). The outbound email is now
+    # fundamentals/screens/portfolio_notify.py, sent at the END of the portfolio chain --
+    # it has to be, because entry/exit decisions are not made until 22:00 IST and this
+    # pipeline runs at 21:00, so anything mailed from here would report YESTERDAY's
+    # actions while looking correct.
+    #
+    # Everything ABOVE this line still runs: the watchlist is synced, narrated, exit-
+    # evaluated and drafted every night. It is read on the screener's /watchlist page now
+    # rather than mailed. send_daily_digest() is kept and still tested so the digest can be
+    # revived (or sent by hand) without rebuilding it.
+    digest_result = {"sent": 0, "skipped_disabled": 0, "failed": 0, "retired": 1}
     return {
         "watchlist_companies": sync_result["companies"],
         "new_candidates": sync_result["new_candidates"],
@@ -559,6 +732,7 @@ def run_watchlist_notification_pipeline() -> dict[str, object]:
         "digest_sent": digest_result["sent"],
         "digest_skipped_disabled": digest_result["skipped_disabled"],
         "digest_failed": digest_result["failed"],
+        "digest_retired": digest_result.get("retired", 0),
     }
 
 

@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pathlib
 import shlex
 import shutil
 import subprocess
@@ -59,7 +60,7 @@ from fundamentals.collectors import structured_extraction as fundamentals_struct
 from fundamentals.screens import l3_triggers as fundamentals_l3_triggers
 from fundamentals.screens import l5_sizing as fundamentals_l5_sizing
 from fundamentals.screens import llm_triage as fundamentals_llm_triage
-from fundamentals.screens import l4_thesis as fundamentals_l4_thesis
+from fundamentals.screens import portfolio_resolution as fundamentals_portfolio_resolution
 from fundamentals.collectors import sector_data as fundamentals_sector_data
 from fundamentals.screens import sector_cycle as fundamentals_sector_cycle
 from fundamentals.screens import technicals as fundamentals_technicals
@@ -293,10 +294,22 @@ def test_ohlcv_reconcile_expected_day_is_trading_day_and_clock_aware(monkeypatch
     monkeypatch.setattr(orc, "_ist_now", lambda now=None: pd.Timestamp("2026-07-06 10:00", tz="Asia/Kolkata"))
     assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
 
-    # post-close (18:45 IST): today's bars ARE expected -> today (the 18:45 pre-advisory
-    # reconcile must pull today's bars before the 19:10 advisory)
+    # 18:45 IST: today's bars are NOT yet expected -> prior trading day.
+    #
+    # UPDATED 2026-09-02 (was asserting "2026-07-06" here). The old expectation encoded a
+    # schedule that no longer exists -- an 18:45 reconcile feeding a 19:10 advisory -- and
+    # was wrong on the data besides: OHLCV_RECONCILE_TODAY_COMPLETE_AFTER_HOUR_IST was 18
+    # while data_readiness's own DATA_READINESS_DHAN_TODAY_AFTER_HOUR_IST was 23, two
+    # knobs disagreeing by five hours about when Dhan has published. Every logged 18:45
+    # reconcile reported current=0 of ~2,880 symbols, so 18 was the wrong one. Both are
+    # now 23 and the reconcile runs at 23:15 IST.
     calls.clear()
     monkeypatch.setattr(orc, "_ist_now", lambda now=None: pd.Timestamp("2026-07-06 18:45", tz="Asia/Kolkata"))
+    assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
+
+    # 23:15 IST (the real reconcile slot, past the boundary): today IS expected.
+    calls.clear()
+    monkeypatch.setattr(orc, "_ist_now", lambda now=None: pd.Timestamp("2026-07-06 23:15", tz="Asia/Kolkata"))
     assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-06"
 
     # when the latest trading day is already in the past (weekend), it is used directly
@@ -2082,19 +2095,34 @@ def test_dhan_web_login_records_missing_token_after_timeout(monkeypatch):
     assert events[1]["severity"] == "error"
 
 
-def test_dhan_access_token_uses_auto_login_when_configured(monkeypatch):
+def test_dhan_access_token_auto_login_requires_consent_ownership(monkeypatch):
+    """CONTRACT CHANGED 2026-09-05 (incident). This used to assert that ANY caller with
+    auto-login configured would log in. That is precisely the behaviour that caused
+    CONSENT_LIMIT_EXCEED: five different jobs each minted their own consent, 22 attempts,
+    and Dhan cut off ALL collection. A job that NEEDS a token is not entitled to create
+    one -- only the designated refresher is."""
     class FakeEnv:
         def __call__(self, name, default=None):
             return None
 
+    monkeypatch.delenv(dhan_auth.CONSENT_OWNER_ENV, raising=False)
     monkeypatch.setattr(dhan_auth, "load_cached_access_token", lambda: None)
     monkeypatch.setattr(dhan_auth, "normalize_token_id", lambda value: value)
     monkeypatch.setattr(dhan_auth, "is_auto_login_configured", lambda: True)
     monkeypatch.setattr(dhan_auth, "get_token_id_from_auto_login", lambda: "TOKEN123")
     monkeypatch.setattr(dhan_auth, "consume_consent_token", lambda token_id: {"accessToken": f"access:{token_id}"})
     monkeypatch.setattr(dhan_auth, "begin_browser_consent", lambda: (_ for _ in ()).throw(AssertionError("manual browser opened")))
+    monkeypatch.setattr(dhan_auth, "_record_dhan_auth_fallback", lambda **k: None)
     monkeypatch.setattr(dhan_auth, "env", FakeEnv())
 
+    # An ordinary collector is refused, and the message names the fix.
+    with pytest.raises(dhan_auth.DhanAuthError) as excinfo:
+        dhan_auth.get_access_token()
+    assert "consent owner" in str(excinfo.value)
+    assert "all_dhan_auth_ensure" in str(excinfo.value)
+
+    # The designated refresher still works exactly as before.
+    monkeypatch.setenv(dhan_auth.CONSENT_OWNER_ENV, "1")
     assert dhan_auth.get_access_token() == "access:TOKEN123"
 
 
@@ -2549,7 +2577,11 @@ def test_dhan_client_retries_429_with_backoff_then_succeeds(monkeypatch):
 
     monkeypatch.setattr(dhan_client, "get_access_token", lambda: "TOKEN")
     monkeypatch.setattr(dhan_client.requests, "Session", FakeSession)
-    monkeypatch.setattr(dhan_client, "_pace_dhan_request", lambda: None)  # pacing itself covered separately; not the point of this test
+    # nullcontext, not None: _pace_dhan_request is a context manager since 2026-09-02
+    # (it holds the cross-process gate for the request). Pacing is covered separately;
+    # this test is about the 429 backoff.
+    import contextlib as _ctx
+    monkeypatch.setattr(dhan_client, "_pace_dhan_request", lambda: _ctx.nullcontext())
     monkeypatch.setattr(dhan_client.time, "sleep", lambda s: sleeps.append(s))
     events = []
     monkeypatch.setattr(dhan_client, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
@@ -2566,12 +2598,24 @@ def test_dhan_client_retries_429_with_backoff_then_succeeds(monkeypatch):
 
 
 def test_dhan_client_paces_consecutive_requests(monkeypatch):
+    # _pace_dhan_request became a CONTEXT MANAGER on 2026-09-02 when the cross-process
+    # gate was added (it now holds the shared gate for the duration of the request, so
+    # the enforced gap is measured between real hits to Dhan). The in-process pacing it
+    # asserts is unchanged; only the call shape moved.
+    import contextlib
+
     sleeps = []
     monkeypatch.setattr(dhan_client.time, "sleep", lambda s: sleeps.append(s))
     monkeypatch.setattr(dhan_client, "_dhan_last_request_at", 0.0)
+    # Stub the cross-process gate so this exercises in-process pacing in isolation --
+    # its real filesystem locking is covered by test_dhan_pacing_* instead.
+    monkeypatch.setattr(dhan_client, "exchange_request_gate",
+                        lambda **kw: contextlib.nullcontext())
 
-    dhan_client._pace_dhan_request()
-    dhan_client._pace_dhan_request()
+    with dhan_client._pace_dhan_request():
+        pass
+    with dhan_client._pace_dhan_request():
+        pass
 
     # First call: no prior request recorded (module resets to 0.0 above), the
     # elapsed-since-epoch-0 gap is enormous, so no sleep is needed. Second call,
@@ -3075,20 +3119,6 @@ def test_offmarket_download_data_rejects_zero_byte_download(monkeypatch, tmp_pat
     # identical failure class was never ported over here before deletion).
     monkeypatch.setattr(nse_rate_limiter.time, "sleep", lambda *a, **k: None)
 
-    class FakeDownload:
-        def save_as(self, path):
-            open(path, "wb").close()  # zero bytes
-
-    class FakeDownloadInfo:
-        value = FakeDownload()
-
-    class FakeDownloadCtx:
-        def __enter__(self):
-            return FakeDownloadInfo()
-
-        def __exit__(self, *_a):
-            return False
-
     class FakeLocator:
         def click(self, *_a, **_k):
             return None
@@ -3104,16 +3134,17 @@ def test_offmarket_download_data_rejects_zero_byte_download(monkeypatch, tmp_pat
             return None
 
         def evaluate(self, *_a, **_k):
-            return None
+            # 2026-09-01: the CSV now arrives as the body of an in-page fetch rather
+            # than a browser download event (data/nseindia/offmarket.py). An empty body
+            # is this transport's zero-byte response -- NSE answers 200 with nothing on
+            # a slow/blocked request, so the guard below still has to catch it.
+            return {"status": 200, "body": ""}
 
         def locator(self, *_a, **_k):
             return FakeLocator()
 
         def get_by_role(self, *_a, **_k):
             return FakeLocator()
-
-        def expect_download(self, timeout=None):
-            return FakeDownloadCtx()
 
         def close(self):
             return None
@@ -3917,9 +3948,14 @@ def test_run_bse_bhavcopy_collection_returns_early_when_fully_caught_up(monkeypa
     from data.bseindia import bhavcopy as bse_bhavcopy
 
     monkeypatch.setattr(bse_bhavcopy, "ensure_ohlcv_table", lambda: None)
-    monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: {bse_bhavcopy.datetime.now().date() - timedelta(days=1)})
+    # run_bse_bhavcopy_collection anchors on _ist_today(); datetime.now().date() is the
+    # system-local date, and the two differ between 18:30 UTC and midnight UTC. Using the
+    # wrong clock here left one uncovered candidate day, so "fully caught up" was not in
+    # fact caught up and this failed every evening (found 2026-09-04, 18:50 UTC).
+    ist_today = bse_bhavcopy._ist_today()
+    monkeypatch.setattr(bse_bhavcopy, "load_downloaded_dates", lambda: {ist_today - timedelta(days=1)})
     monkeypatch.setattr(bse_bhavcopy, "load_known_non_trading_dates", lambda: set())
-    monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_EARLIEST_DATE", bse_bhavcopy.datetime.now().date() - timedelta(days=2))
+    monkeypatch.setattr(bse_bhavcopy, "BSE_BHAVCOPY_EARLIEST_DATE", ist_today - timedelta(days=2))
 
     result = bse_bhavcopy.run_bse_bhavcopy_collection(lookback_days=1)
 
@@ -9751,9 +9787,9 @@ def test_main_status_degraded_when_failure_fraction_high(monkeypatch, capsys):
     monkeypatch.setattr(
         dhan_intraday_daily_sync,
         "run_daily_intraday_sync",
-        lambda: {"symbols": 10, "succeeded": 5, "failed": 5, "failed_symbols": ["A", "B", "C", "D", "E"], "total_rows": 50},
+        lambda **kw: {"symbols": 10, "succeeded": 5, "failed": 5, "failed_symbols": ["A", "B", "C", "D", "E"], "total_rows": 50},
     )
-    dhan_intraday_daily_sync.main()
+    dhan_intraday_daily_sync.main([])
     assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["status"] == "degraded"
     assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["fallback_used"] is True
 
@@ -9762,9 +9798,9 @@ def test_main_status_ok_when_no_failures(monkeypatch):
     monkeypatch.setattr(
         dhan_intraday_daily_sync,
         "run_daily_intraday_sync",
-        lambda: {"symbols": 10, "succeeded": 10, "failed": 0, "failed_symbols": [], "total_rows": 100},
+        lambda **kw: {"symbols": 10, "succeeded": 10, "failed": 0, "failed_symbols": [], "total_rows": 100},
     )
-    dhan_intraday_daily_sync.main()
+    dhan_intraday_daily_sync.main([])
     assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["status"] == "ok"
     assert dhan_intraday_daily_sync.STOCKEY_RUN_STATE["fallback_used"] is False
 
@@ -9910,7 +9946,12 @@ def test_fbil_gsec_uses_env_backed_lookback_days(monkeypatch):
 
     fbil_gsec.download_all_gsec_data()
 
-    expected_start = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(days=365)
+    # Anchor on the SAME clock the code uses (_ist_today()), not the system-local
+    # date. These differ for the 5.5 hours between 18:30 UTC and midnight UTC, when
+    # IST has already rolled over -- so this assertion used to fail every evening and
+    # pass every morning, which reads as flakiness rather than as the timezone bug it
+    # is. Found 2026-09-04 at 18:50 UTC / 00:20 IST.
+    expected_start = datetime.combine(fbil_gsec._ist_today(), datetime.min.time()) - pd.Timedelta(days=365)
     assert captured["start"] == expected_start
 
 
@@ -17560,42 +17601,42 @@ def test_confluence_score_main_exports_run_state(monkeypatch, capsys):
 
 # --- l5_sizing.py (PRD §12 todo #8) ---
 
-def test_compute_position_size_no_adv_data_falls_back_to_equal_weight():
-    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=None)
+def test_compute_position_size_no_adv_data_falls_back_to_flat_allocation():
+    result = fundamentals_l5_sizing.compute_position_size(target_capital_rs=200000, adv_value_rs=None)
     assert result == {
-        "equal_weight_capital_rs": 200000.0,
+        "target_capital_rs": 200000.0,
         "adv_cap_rs": None,
         "recommended_size_rs": 200000.0,
-        "binding_constraint": "equal_weight_no_adv_data",
+        "binding_constraint": "flat_allocation_no_adv_data",
     }
 
 
 def test_compute_position_size_adv_cap_binds_when_illiquid():
     # 10% of a thin Rs 10L/day ADV = Rs 1L, below the Rs 2L equal-weight default.
-    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=1000000)
+    result = fundamentals_l5_sizing.compute_position_size(target_capital_rs=200000, adv_value_rs=1000000)
     assert result["binding_constraint"] == "adv_liquidity_cap"
     assert result["recommended_size_rs"] == 100000.0
-    assert result["recommended_size_rs"] < result["equal_weight_capital_rs"]
+    assert result["recommended_size_rs"] < result["target_capital_rs"]
 
 
-def test_compute_position_size_equal_weight_binds_when_liquid():
+def test_compute_position_size_flat_allocation_binds_when_liquid():
     # 10% of a deep Rs 10cr/day ADV = Rs 10L, well above the Rs 2L equal-weight default.
-    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=100000000)
-    assert result["binding_constraint"] == "equal_weight"
+    result = fundamentals_l5_sizing.compute_position_size(target_capital_rs=200000, adv_value_rs=100000000)
+    assert result["binding_constraint"] == "flat_allocation"
     assert result["recommended_size_rs"] == 200000.0
 
 
-def test_compute_position_size_never_sizes_up_past_equal_weight():
-    # The ADV cap can only pull the size DOWN, never justify sizing above the
-    # equal-weight plan even for an extremely liquid name.
-    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=10**12)
+def test_compute_position_size_never_sizes_up_past_the_flat_allocation():
+    # The ADV cap can only pull the size DOWN, never justify sizing above the flat
+    # allocation even for an extremely liquid name.
+    result = fundamentals_l5_sizing.compute_position_size(target_capital_rs=200000, adv_value_rs=10**12)
     assert result["recommended_size_rs"] == 200000.0
 
 
 def test_compute_position_size_respects_custom_max_pct_of_adv():
-    result = fundamentals_l5_sizing.compute_position_size(equal_weight_capital_rs=200000, adv_value_rs=1000000, max_pct_of_adv=0.5)
+    result = fundamentals_l5_sizing.compute_position_size(target_capital_rs=200000, adv_value_rs=1000000, max_pct_of_adv=0.5)
     assert result["adv_cap_rs"] == 500000.0
-    assert result["binding_constraint"] == "equal_weight"
+    assert result["binding_constraint"] == "flat_allocation"
 
 
 def test_load_open_thesis_none_when_no_open_thesis(monkeypatch):
@@ -17647,44 +17688,12 @@ def test_load_adv_inputs_computes_adv_value(monkeypatch):
     assert result == {"avg_vol_1mth": 50000, "cmp_rs": 200.0, "adv_value_rs": 10000000.0}
 
 
-def test_get_position_size_recommendation_none_without_open_thesis(monkeypatch):
-    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: None)
-    result = fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=15)
-    assert result is None
 
 
-def test_get_position_size_recommendation_rejects_non_positive_position_count(monkeypatch):
-    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: {"thesis_id": "abc"})
-    with pytest.raises(ValueError):
-        fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=0)
 
 
-def test_get_position_size_recommendation_full_happy_path(monkeypatch):
-    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: {"thesis_id": "abc123"})
-    monkeypatch.setattr(
-        fundamentals_l5_sizing, "load_adv_inputs", lambda cmid: {"avg_vol_1mth": 50000, "cmp_rs": 200.0, "adv_value_rs": 10000000.0}
-    )
-
-    result = fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=15)
-
-    assert result["company_master_id"] == "nse:X"
-    assert result["thesis_id"] == "abc123"
-    assert result["equal_weight_capital_rs"] == 200000.0  # 3,000,000 / 15
-    assert result["adv_cap_rs"] == 1000000.0  # 10% of 10,000,000
-    assert result["binding_constraint"] == "equal_weight"
-    assert result["recommended_size_rs"] == 200000.0
 
 
-def test_get_position_size_recommendation_degrades_gracefully_without_adv_data(monkeypatch):
-    monkeypatch.setattr(fundamentals_l5_sizing, "load_open_thesis", lambda cmid: {"thesis_id": "abc123"})
-    monkeypatch.setattr(fundamentals_l5_sizing, "load_adv_inputs", lambda cmid: None)
-
-    result = fundamentals_l5_sizing.get_position_size_recommendation("nse:X", total_capital_rs=3000000, target_position_count=15)
-
-    assert result["binding_constraint"] == "equal_weight_no_adv_data"
-    assert result["avg_vol_1mth"] is None
-    assert result["cmp_rs"] is None
-    assert result["recommended_size_rs"] == 200000.0
 
 
 def test_run_l3_rule_triggers_marks_not_alert_worthy_and_skips_upsert(monkeypatch):
@@ -17972,247 +17981,8 @@ def test_run_llm_triage_trips_circuit_breaker(monkeypatch):
 # fundamentals/screens/l4_thesis.py -- L4 thesis register + quarterly scoring (step 8).
 
 
-def test_create_thesis_requires_prediction_text(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.create_thesis(
-            company_master_id="nse:X", prediction_text="  ", target_date=date(2027, 1, 1),
-            invalidation_criteria="x", origin_tag="ad_hoc",
-        )
-
-
-def test_create_thesis_requires_target_date(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.create_thesis(
-            company_master_id="nse:X", prediction_text="p", target_date=None,
-            invalidation_criteria="x", origin_tag="ad_hoc",
-        )
-
-
-def test_create_thesis_requires_invalidation_criteria(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.create_thesis(
-            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-            invalidation_criteria="", origin_tag="ad_hoc",
-        )
-
-
-def test_create_thesis_requires_valid_origin_tag(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.create_thesis(
-            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-            invalidation_criteria="x", origin_tag="not_a_real_tag",
-        )
-
-
-def test_create_thesis_requires_valid_metric_operator(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.create_thesis(
-            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-            invalidation_criteria="x", origin_tag="ad_hoc", metric_operator="~=",
-        )
-
-
-def test_create_thesis_builds_expected_row(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    upserts = []
-    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
-
-    row = fundamentals_l4_thesis.create_thesis(
-        company_master_id="nse:X",
-        prediction_text="Net debt < 50 by Q3 FY27",
-        target_date=date(2027, 3, 31),
-        invalidation_criteria="Debt rises further before target date",
-        origin_tag="systematic_screen",
-        signal_definition_version="l3_rule:v1",
-        source_alert={"source": "bse", "news_id": "n1", "trigger_type": "rating_downgrade"},
-        metric_name="net_debt_rscr",
-        metric_operator="<",
-        metric_threshold=50.0,
-        created_date=date(2026, 8, 11),
-    )
-
-    assert row["thesis_id"].startswith("thesis:")
-    assert row["status"] == "open"
-    assert row["resolved_true"] is None
-    assert row["source_alert_source"] == "bse"
-    assert row["signal_definition_version"] == "l3_rule:v1"
-    assert len(upserts) == 1
-    df, table, kwargs = upserts[0]
-    assert table == fundamentals_l4_thesis.RESULTS_TABLE
-    assert kwargs["unique_keys"] == ["thesis_id"]
-
-
-def test_create_thesis_without_source_alert_is_ad_hoc(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: None)
-    row = fundamentals_l4_thesis.create_thesis(
-        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-        invalidation_criteria="x", origin_tag="ad_hoc",
-    )
-    assert row["source_alert_source"] is None
-    assert row["source_alert_news_id"] is None
-
-
-def test_create_thesis_refuses_to_overwrite_an_already_resolved_thesis(monkeypatch):
-    # BUG FOUND LIVE 2026-08-15, fixed 2026-08-17: thesis_id is deterministic on
-    # (company_master_id, prediction_text, created_date) -- re-submitting identical
-    # inputs (e.g. a retried API call) used to silently wipe a real resolution back
-    # to open/None. Reproduced live with a disposable test row before fixing.
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "resolved"}]))
-    upserts = []
-    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
-
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError, match="already resolved"):
-        fundamentals_l4_thesis.create_thesis(
-            company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-            invalidation_criteria="x", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
-        )
-    assert upserts == []  # nothing was written -- the resolution stays intact
-
-
-def test_create_thesis_allows_resubmitting_an_open_thesis(monkeypatch):
-    # a re-submit of an OPEN (not yet resolved) thesis with identical inputs is
-    # harmless -- same thesis_id, same data, just re-upserted. Only a RESOLVED
-    # thesis is protected.
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "open"}]))
-    upserts = []
-    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
-
-    row = fundamentals_l4_thesis.create_thesis(
-        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-        invalidation_criteria="x", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
-    )
-    assert row["status"] == "open"
-    assert len(upserts) == 1
-
-
-def test_create_thesis_id_disambiguates_same_day_theses_by_target_date_and_invalidation(monkeypatch):
-    # BUG FOUND LIVE 2026-08-18 (re-audit): thesis_id used to hash only (company,
-    # prediction_text, created_date) -- two same-day theses on the same company
-    # with identical wording but a different target_date or invalidation
-    # criteria collided on thesis_id and silently overwrote each other via
-    # create_thesis's upsert.
-    monkeypatch.setattr(fundamentals_l4_thesis, "_ensure_thesis_table", lambda: None)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-    monkeypatch.setattr(fundamentals_l4_thesis, "upsert_to_db", lambda df, table, **k: None)
-
-    row_a = fundamentals_l4_thesis.create_thesis(
-        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-        invalidation_criteria="misses Q2", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
-    )
-    row_b = fundamentals_l4_thesis.create_thesis(
-        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 6, 30),
-        invalidation_criteria="misses Q4", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
-    )
-    assert row_a["thesis_id"] != row_b["thesis_id"]
-
-    # a genuine retry with identical inputs on all five fields still collides,
-    # preserving create_thesis's own idempotency guard.
-    row_a_retry = fundamentals_l4_thesis.create_thesis(
-        company_master_id="nse:X", prediction_text="p", target_date=date(2027, 1, 1),
-        invalidation_criteria="misses Q2", origin_tag="ad_hoc", created_date=date(2026, 8, 1),
-    )
-    assert row_a_retry["thesis_id"] == row_a["thesis_id"]
-
-
-def test_resolve_thesis_requires_failure_attribution_when_false(monkeypatch):
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.resolve_thesis(thesis_id="thesis:x", resolved_true=False)
-
-
-def test_resolve_thesis_rejects_failure_attribution_when_true(monkeypatch):
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError):
-        fundamentals_l4_thesis.resolve_thesis(thesis_id="thesis:x", resolved_true=True, failure_attribution="thesis_wrong")
-
-
-def test_resolve_thesis_writes_expected_update(monkeypatch):
-    executed = []
-
-    class FakeCursor:
-        def execute(self, query, params=None):
-            executed.append((str(query), params))
-
-    @contextlib.contextmanager
-    def fake_db_session():
-        yield None, FakeCursor()
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "open"}]))
-
-    fundamentals_l4_thesis.resolve_thesis(
-        thesis_id="thesis:x", resolved_true=False, failure_attribution="thesis_wrong",
-        resolution_notes="note", resolution_date=date(2026, 12, 31),
-    )
-
-    assert len(executed) == 1
-    query, params = executed[0]
-    assert "UPDATE fundamentals_l4_thesis" in query
-    assert params == (False, date(2026, 12, 31), "note", "thesis_wrong", "thesis:x")
-
-
-def test_resolve_thesis_raises_when_thesis_does_not_exist(monkeypatch):
-    # BUG FOUND LIVE 2026-08-18 (re-audit): a typo'd thesis_id used to silently
-    # succeed (UPDATE ... WHERE thesis_id = %s matches zero rows, no error).
-    executed = []
-
-    class FakeCursor:
-        def execute(self, query, params=None):
-            executed.append((str(query), params))
-
-    @contextlib.contextmanager
-    def fake_db_session():
-        yield None, FakeCursor()
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame())
-
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError, match="does not exist"):
-        fundamentals_l4_thesis.resolve_thesis(
-            thesis_id="thesis:typo", resolved_true=True,
-        )
-    assert executed == []  # nothing was written
-
-
-def test_resolve_thesis_raises_when_already_resolved(monkeypatch):
-    # BUG FOUND LIVE 2026-08-18 (re-audit): resolve_thesis used to freely
-    # overwrite an existing resolution -- exactly what create_thesis's own
-    # already-resolved guard exists to prevent, just reachable from this path.
-    executed = []
-
-    class FakeCursor:
-        def execute(self, query, params=None):
-            executed.append((str(query), params))
-
-    @contextlib.contextmanager
-    def fake_db_session():
-        yield None, FakeCursor()
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "db_session", fake_db_session)
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda q, **k: pd.DataFrame([{"status": "resolved"}]))
-
-    with pytest.raises(fundamentals_l4_thesis.ThesisValidationError, match="already resolved"):
-        fundamentals_l4_thesis.resolve_thesis(
-            thesis_id="thesis:x", resolved_true=True,
-        )
-    assert executed == []  # nothing was written
-
-
 def test_check_structured_prediction_returns_none_without_metric_fields():
-    assert fundamentals_l4_thesis.check_structured_prediction({"company_master_id": "nse:X"}) is None
+    assert fundamentals_portfolio_resolution.check_structured_prediction({"company_master_id": "nse:X"}) is None
 
 
 def test_check_structured_prediction_treats_numpy_bool_as_non_numeric(monkeypatch):
@@ -18232,33 +18002,33 @@ def test_check_structured_prediction_treats_numpy_bool_as_non_numeric(monkeypatc
         "metric_threshold": 0.5,
     }
     monkeypatch.setattr(
-        fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"}
+        fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"}
     )
     monkeypatch.setattr(
-        fundamentals_l4_thesis,
+        fundamentals_portfolio_resolution,
         "sql_to_df",
         lambda q, **k: pd.DataFrame([{"flag_col": np.bool_(True)}]),
     )
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis) is None
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis) is None
 
 
 def test_check_structured_prediction_evaluates_against_l2_state(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:CINELINE": "CINELINE"})
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {"nse:CINELINE": "CINELINE"})
     monkeypatch.setattr(
-        fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": 50.73}])
+        fundamentals_portfolio_resolution, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": 50.73}])
     )
     thesis_row = {"company_master_id": "nse:CINELINE", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is False
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is False
 
     thesis_row["metric_threshold"] = 60.0
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is True
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is True
 
 
 def test_check_structured_prediction_returns_none_when_no_l2_row(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame())
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "sql_to_df", lambda query, params=None: pd.DataFrame())
     thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is None
 
 
 def test_check_structured_prediction_returns_none_when_ticker_unresolved(monkeypatch):
@@ -18266,21 +18036,21 @@ def test_check_structured_prediction_returns_none_when_ticker_unresolved(monkeyp
     # (wrongly, for the ~22% BSE-only cohort) -- now a genuinely-unresolvable
     # company_master_id correctly short-circuits to None rather than querying L2
     # state under a wrong/empty ticker.
-    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {})
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {})
     calls = []
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: calls.append(1) or pd.DataFrame())
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "sql_to_df", lambda query, params=None: calls.append(1) or pd.DataFrame())
     thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is None
     assert calls == []  # never even queried L2 state for an unresolvable company
 
 
 def test_check_structured_prediction_returns_none_when_value_is_null(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(
-        fundamentals_l4_thesis, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": None}])
+        fundamentals_portfolio_resolution, "sql_to_df", lambda query, params=None: pd.DataFrame([{"pledge_pct": None}])
     )
     thesis_row = {"company_master_id": "nse:X", "metric_name": "pledge_pct", "metric_operator": "<", "metric_threshold": 45.0}
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is None
 
 
 def test_check_structured_prediction_returns_none_for_non_numeric_metric_name(monkeypatch):
@@ -18289,152 +18059,38 @@ def test_check_structured_prediction_returns_none_for_non_numeric_metric_name(mo
     # column (trend_direction, company_name, ticker, ...). Used to raise an uncaught
     # TypeError from `value < threshold` (str vs number) instead of returning None
     # like every other "can't evaluate this" branch in this function.
-    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(
-        fundamentals_l4_thesis,
+        fundamentals_portfolio_resolution,
         "sql_to_df",
         lambda query, params=None: pd.DataFrame([{"net_debt_trend_direction": "accelerating_decline"}]),
     )
     thesis_row = {"company_master_id": "nse:X", "metric_name": "net_debt_trend_direction", "metric_operator": "<", "metric_threshold": 45.0}
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is None
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is None
 
 
 def test_check_structured_prediction_handles_numpy_numeric_dtypes(monkeypatch):
     # A real DataFrame column reads back as numpy.int64/float64, neither a Python
     # int/float subclass -- must still evaluate correctly (not be rejected as
     # "non-numeric" by an overly-strict isinstance-only guard).
-    monkeypatch.setattr(fundamentals_l4_thesis, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+    monkeypatch.setattr(fundamentals_portfolio_resolution, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
     monkeypatch.setattr(
-        fundamentals_l4_thesis,
+        fundamentals_portfolio_resolution,
         "sql_to_df",
         lambda query, params=None: pd.DataFrame([{"net_debt_consecutive_declining_years": 3}]),  # pandas infers int64
     )
     thesis_row = {"company_master_id": "nse:X", "metric_name": "net_debt_consecutive_declining_years", "metric_operator": ">=", "metric_threshold": 2.0}
-    assert fundamentals_l4_thesis.check_structured_prediction(thesis_row) is True
+    assert fundamentals_portfolio_resolution.check_structured_prediction(thesis_row) is True
 
 
-def test_compute_quarterly_scoring_with_no_theses(monkeypatch):
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", lambda query, **k: pd.DataFrame())
-    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 8, 11))
-    assert result["total_theses"] == 0
-    assert result["hit_rate"] is None
 
 
-def test_compute_quarterly_scoring_computes_hit_rate_and_time_to_confirmation(monkeypatch):
-    theses = pd.DataFrame(
-        [
-            {
-                "status": "resolved", "resolved_true": True, "failure_attribution": None,
-                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 10, 1),
-                "company_master_id": "nse:A", "origin_tag": "systematic_screen", "source_alert_trigger_type": "insider_buy",
-            },
-            {
-                "status": "resolved", "resolved_true": False, "failure_attribution": "thesis_wrong",
-                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 12, 31),
-                "company_master_id": "nse:B", "origin_tag": "ad_hoc", "source_alert_trigger_type": None,
-            },
-            {
-                "status": "open", "resolved_true": None, "failure_attribution": None, "created_date": date(2026, 8, 1), "resolution_date": None,
-                "company_master_id": "nse:C", "origin_tag": "systematic_screen", "source_alert_trigger_type": "insider_buy",
-            },
-        ]
-    )
-
-    def fake_sql_to_df(query, **k):
-        if "fundamentals_confluence_score" in query:
-            return pd.DataFrame()  # no scores yet -- must not crash, group reads as "none"
-        return theses
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
-
-    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 8, 11))
-
-    assert result["total_theses"] == 3
-    assert result["open"] == 1
-    assert result["resolved"] == 2
-    assert result["hit_rate"] == 50.0
-    assert result["failure_attribution_breakdown"] == {"thesis_wrong": 1}
-    assert result["time_to_confirmation_days"]["count"] == 1
-    assert result["time_to_confirmation_days"]["median_days"] == 61.0
-    # Below MIN_SAMPLE_SIZE_FOR_BREAKDOWN (5) -- hit_rate must read None, count must still show.
-    assert result["hit_rate_by_origin_tag"] == {"systematic_screen": {"hit_rate": None, "count": 1}, "ad_hoc": {"hit_rate": None, "count": 1}}
-    assert result["hit_rate_by_trigger_type"] == {"insider_buy": {"hit_rate": None, "count": 1}, "none": {"hit_rate": None, "count": 1}}
-    assert result["hit_rate_by_confluence_count"] == {"none": {"hit_rate": None, "count": 2}}
 
 
-def test_compute_quarterly_scoring_breakdown_shows_hit_rate_once_sample_size_clears_threshold(monkeypatch):
-    # 5 resolved theses, same origin_tag, 4 true -- exactly MIN_SAMPLE_SIZE_FOR_BREAKDOWN.
-    rows = [
-        {
-            "status": "resolved", "resolved_true": i < 4, "failure_attribution": None if i < 4 else "thesis_wrong",
-            "created_date": date(2026, 8, 1), "resolution_date": date(2026, 9, 1),
-            "company_master_id": f"nse:{i}", "origin_tag": "systematic_screen", "source_alert_trigger_type": "insider_buy",
-        }
-        for i in range(5)
-    ]
-    theses = pd.DataFrame(rows)
-
-    def fake_sql_to_df(query, **k):
-        return pd.DataFrame() if "fundamentals_confluence_score" in query else theses
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
-
-    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 9, 11))
-
-    assert result["hit_rate_by_origin_tag"]["systematic_screen"] == {"hit_rate": 80.0, "count": 5}
-    assert result["hit_rate_by_trigger_type"]["insider_buy"] == {"hit_rate": 80.0, "count": 5}
 
 
-def test_compute_quarterly_scoring_joins_confluence_count_by_company(monkeypatch):
-    # REGRESSION GUARD (PRD §12 todo #7, 2026-08-29): confirms the join is by
-    # company_master_id (not positional/coincidental), and that a company never
-    # scored at all reads as "none", not a fabricated 0.
-    theses = pd.DataFrame(
-        [
-            {
-                "status": "resolved", "resolved_true": True, "failure_attribution": None,
-                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 9, 1),
-                "company_master_id": "nse:SCORED", "origin_tag": "ad_hoc", "source_alert_trigger_type": None,
-            },
-            {
-                "status": "resolved", "resolved_true": False, "failure_attribution": "thesis_wrong",
-                "created_date": date(2026, 8, 1), "resolution_date": date(2026, 9, 1),
-                "company_master_id": "nse:UNSCORED", "origin_tag": "ad_hoc", "source_alert_trigger_type": None,
-            },
-        ]
-    )
-    confluence_df = pd.DataFrame([{"company_master_id": "nse:SCORED", "confluence_count": 3}])
-
-    def fake_sql_to_df(query, **k):
-        return confluence_df if "fundamentals_confluence_score" in query else theses
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
-
-    result = fundamentals_l4_thesis.compute_quarterly_scoring(as_of_date=date(2026, 9, 11))
-
-    assert result["hit_rate_by_confluence_count"]["3"]["count"] == 1
-    assert result["hit_rate_by_confluence_count"]["none"]["count"] == 1
 
 
-def test_load_open_theses_past_target_date_queries_correctly(monkeypatch):
-    captured = {}
-
-    def fake_sql_to_df(query, params=None):
-        captured["query"] = query
-        captured["params"] = params
-        return pd.DataFrame()
-
-    monkeypatch.setattr(fundamentals_l4_thesis, "sql_to_df", fake_sql_to_df)
-    fundamentals_l4_thesis.load_open_theses_past_target_date(as_of_date=date(2026, 8, 11))
-    assert "status = 'open'" in captured["query"]
-    assert captured["params"] == (date(2026, 8, 11),)
-
-
-# fundamentals/collectors/sector_data.py -- sector reference data (feeds step 9).
-
-# Real response shape, captured live 2026-08-11 from /api/v2/core/getAllSectorData
-# (trimmed to 2 entries per level; the "Construction\nMaterials" embedded newline is
-# real, not a typo -- see build_reference_rows' whitespace-collapsing).
 SECTOR_DATA_FIXTURE = {
     "sector": {
         "EQ": [
@@ -19715,7 +19371,7 @@ def test_run_watch_summary_refresh_handles_malformed_llm_response(monkeypatch):
 
 
 # fundamentals/screens/l4_thesis_draft.py -- L4 thesis DRAFTING, step 11.5 (2026-08-15).
-# Never writes fundamentals_l4_thesis -- see module docstring guardrail.
+# Never writes fundamentals_portfolio_resolution -- see module docstring guardrail.
 
 
 def test_load_companies_needing_draft_refresh_compares_processing_timestamps(monkeypatch):
@@ -19895,7 +19551,7 @@ def test_send_email_returns_none_when_disabled(monkeypatch):
     assert fundamentals_notifications.send_email("subject", "body") is None
 
 
-def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
+def test_run_watchlist_notification_pipeline_chains_its_steps_and_sends_nothing(monkeypatch):
     call_order = []
     monkeypatch.setattr(
         fundamentals_notifications,
@@ -19918,10 +19574,12 @@ def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
         "run_watchlist_exit_evaluation",
         lambda: call_order.append("exit") or {"companies": 5, "active": 4, "invalidated": 1, "price_flagged": 0, "stale": 0},
     )
-    # NOTE: send_daily_digest must always be mocked in tests that exercise the full
-    # pipeline -- it reads the real WATCHLIST_ALERT_EMAIL_* config and would attempt
-    # a real SES send against the real watchlist otherwise (this config is enabled
-    # in production .env, not just a test fixture).
+    # CONTRACT CHANGED 2026-09-07: this pipeline no longer sends mail at all. The
+    # outbound email is portfolio_notify.py, at the end of the PORTFOLIO chain, because
+    # entry/exit decisions are not made until 22:00 IST while this runs at 21:00.
+    # send_daily_digest is still patched -- if a future change re-adds the call, this test
+    # must FAIL rather than quietly firing a real SES send against the live recipient list
+    # (that config is enabled in production .env, not just a fixture).
     monkeypatch.setattr(
         fundamentals_notifications,
         "send_daily_digest",
@@ -19936,14 +19594,18 @@ def test_run_watchlist_notification_pipeline_chains_all_five_steps(monkeypatch):
     assert result["theses_drafted"] == 1
     assert result["watchlist_active"] == 4
     assert result["watchlist_invalidated"] == 1
-    assert result["digest_sent"] == 1
+    assert result["digest_sent"] == 0, "the watchlist digest was retired 2026-09-07"
+    assert result["digest_retired"] == 1
     # BUG FOUND LIVE 2026-08-18 (re-audit): drafting used to run BEFORE exit
     # evaluation -- load_companies_needing_draft_refresh()'s `WHERE w.status =
     # 'active'` filter then reflected last run's status, so a company exit
     # evaluation was about to invalidate/flag stale this run still got a paid
     # LLM draft call that was immediately wasted. exit must now run before draft.
-    assert call_order == ["sync", "narrative", "exit", "draft", "digest"]
-    assert "emails_sent" not in result  # per-addition notifications removed 2026-08-14 -- digest only
+    assert call_order == ["sync", "narrative", "exit", "draft"], (
+        "the pipeline sent an email; the watchlist digest was retired 2026-09-07 and the "
+        "only outbound mail is now portfolio_notify at the end of the portfolio chain"
+    )
+    assert "emails_sent" not in result  # per-addition notifications removed 2026-08-14
 
 
 def test_clean_records_converts_nan_to_none_and_timestamp_to_iso():
@@ -20274,8 +19936,10 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
     thesis_df = pd.DataFrame()
     draft_df = pd.DataFrame([{"company_master_id": "nse:FOO", "prediction_text": "p", "confidence_score": 72}])
 
-    calls = {"watchlist": watchlist_df, "alerts": alerts_df, "thesis": thesis_df, "draft": draft_df}
-    call_order = iter(["watchlist", "alerts", "thesis", "draft"])
+    calls = {"watchlist": watchlist_df, "alerts": alerts_df, "thesis": thesis_df,
+             "draft": draft_df, "confluence": pd.DataFrame()}
+    # "confluence" appended 2026-09-02 -- see the sibling test for why.
+    call_order = iter(["watchlist", "alerts", "thesis", "draft", "confluence"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
@@ -20302,8 +19966,12 @@ def test_get_watchlist_detail_parses_evidence_bundle_and_joins_context(monkeypat
 
 def test_get_watchlist_detail_draft_thesis_none_when_no_draft(monkeypatch):
     watchlist_df = pd.DataFrame([{"company_master_id": "nse:FOO", "first_seen_at": date(2026, 8, 1), "alert_count": 1}])
-    calls = {"watchlist": watchlist_df, "alerts": pd.DataFrame(), "thesis": pd.DataFrame(), "draft": pd.DataFrame()}
-    call_order = iter(["watchlist", "alerts", "thesis", "draft"])
+    calls = {"watchlist": watchlist_df, "alerts": pd.DataFrame(), "thesis": pd.DataFrame(),
+             "draft": pd.DataFrame(), "confluence": pd.DataFrame()}
+    # "confluence" appended 2026-09-02: get_watchlist_detail now also loads the five
+    # per-axis confluence verdicts (load_confluence_for_company). Empty frame -> the
+    # endpoint returns confluence: None, which is the unscored case.
+    call_order = iter(["watchlist", "alerts", "thesis", "draft", "confluence"])
     monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q, params=None: calls[next(call_order)])
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_draft_table", lambda: None)
     monkeypatch.setattr(fundamentals_api_queries, "_ensure_confluence_score_table", lambda: None)
@@ -20480,25 +20148,6 @@ def test_get_sectors_no_watched_companies_gives_empty_list_per_sector(monkeypatc
     assert result[0]["watched_companies"] == []
 
 
-def test_create_portfolio_entry_delegates_to_create_thesis(monkeypatch):
-    calls = []
-    monkeypatch.setattr(fundamentals_api_queries, "create_thesis", lambda **kwargs: calls.append(kwargs) or {"thesis_id": "t1"})
-    result = fundamentals_api_queries.create_portfolio_entry({"company_master_id": "nse:FOO", "prediction_text": "p"})
-    assert result == {"thesis_id": "t1"}
-    assert calls == [{"company_master_id": "nse:FOO", "prediction_text": "p"}]
-
-
-def test_resolve_portfolio_entry_delegates_to_resolve_thesis(monkeypatch):
-    calls = []
-    monkeypatch.setattr(fundamentals_api_queries, "resolve_thesis", lambda **kwargs: calls.append(kwargs))
-    fundamentals_api_queries.resolve_portfolio_entry("t1", {"resolved_true": True})
-    assert calls == [{"thesis_id": "t1", "resolved_true": True}]
-
-
-# --- HTTP routing tests (fundamentals/api/app.py) -- queries.py mocked, so these
-# exercise only request/response wiring (status codes, validation, error translation),
-# not the DB-backed query logic already covered above. ---
-
 def test_api_universe_route_returns_queries_result(monkeypatch):
     monkeypatch.setattr(fundamentals_api_queries, "get_universe", lambda: {"query_text": "q", "query_version": 1, "run_date": None, "companies": []})
     client = TestClient(fundamentals_api_app)
@@ -20519,39 +20168,17 @@ def test_api_watchlist_sizing_route_happy_path(monkeypatch):
     monkeypatch.setattr(
         fundamentals_api_queries,
         "get_position_sizing",
-        lambda cmid, *, total_capital_rs, target_position_count: {
-            "company_master_id": cmid, "thesis_id": "abc", "recommended_size_rs": 200000.0, "binding_constraint": "equal_weight",
+        lambda cmid, *, capital_per_position_rs: {
+            "company_master_id": cmid, "position_id": "abc", "recommended_size_rs": 100000.0,
+            "binding_constraint": "flat_allocation",
         },
     )
     client = TestClient(fundamentals_api_app)
-    r = client.get("/api/watchlist/nse:X/sizing?total_capital_rs=3000000&target_position_count=15")
-    assert r.status_code == 200
-    assert r.json()["recommended_size_rs"] == 200000.0
-
-
-def test_api_watchlist_sizing_route_404_when_no_open_thesis(monkeypatch):
-    monkeypatch.setattr(fundamentals_api_queries, "get_position_sizing", lambda cmid, **k: None)
-    client = TestClient(fundamentals_api_app)
-    r = client.get("/api/watchlist/nse:X/sizing?total_capital_rs=3000000&target_position_count=15")
-    assert r.status_code == 404
-
-
-def test_api_watchlist_sizing_route_400_on_invalid_position_count(monkeypatch):
-    def raise_value_error(cmid, **k):
-        raise ValueError("target_position_count must be positive")
-
-    monkeypatch.setattr(fundamentals_api_queries, "get_position_sizing", raise_value_error)
-    client = TestClient(fundamentals_api_app)
-    r = client.get("/api/watchlist/nse:X/sizing?total_capital_rs=3000000&target_position_count=0")
-    assert r.status_code == 400
-
-
-def test_api_watchlist_sizing_route_422_when_required_params_missing():
-    # total_capital_rs/target_position_count have no server-side default -- FastAPI
-    # itself must reject an incomplete request, not silently assume a sleeve size.
-    client = TestClient(fundamentals_api_app)
     r = client.get("/api/watchlist/nse:X/sizing")
-    assert r.status_code == 422
+    assert r.status_code == 200
+    assert r.json()["recommended_size_rs"] == 100000.0
+
+
 
 
 def test_api_watchlist_route_defaults_to_active_status(monkeypatch):
@@ -20624,61 +20251,10 @@ def test_api_watchlist_detail_route_200_when_found(monkeypatch):
     assert r.json()["watchlist"]["company_master_id"] == "nse:FOO"
 
 
-def test_api_create_portfolio_rejects_invalid_origin_tag():
-    client = TestClient(fundamentals_api_app)
-    payload = {
-        "company_master_id": "nse:FOO", "prediction_text": "p", "target_date": "2026-12-01",
-        "invalidation_criteria": "c", "origin_tag": "bogus",
-    }
-    r = client.post("/api/portfolio", json=payload)
-    assert r.status_code == 400
 
 
-def test_api_create_portfolio_success_calls_queries(monkeypatch):
-    calls = []
-    monkeypatch.setattr(fundamentals_api_queries, "create_portfolio_entry", lambda payload: calls.append(payload) or {"thesis_id": "t1"})
-    client = TestClient(fundamentals_api_app)
-    payload = {
-        "company_master_id": "nse:FOO", "prediction_text": "p", "target_date": "2026-12-01",
-        "invalidation_criteria": "c", "origin_tag": "ad_hoc",
-        "source_alert_source": "bse", "source_alert_news_id": "n1", "source_alert_trigger_type": "insider_buy",
-    }
-    r = client.post("/api/portfolio", json=payload)
-    assert r.status_code == 200
-    assert r.json() == {"thesis_id": "t1"}
-    assert calls[0]["source_alert"] == {"source": "bse", "news_id": "n1", "trigger_type": "insider_buy"}
-    assert "source_alert_source" not in calls[0]
 
 
-def test_api_create_portfolio_validation_error_becomes_400(monkeypatch):
-    def raise_validation(payload):
-        raise fundamentals_l4_thesis.ThesisValidationError("prediction_text is mandatory")
-
-    monkeypatch.setattr(fundamentals_api_queries, "create_portfolio_entry", raise_validation)
-    client = TestClient(fundamentals_api_app)
-    payload = {"company_master_id": "nse:FOO", "prediction_text": "p", "target_date": "2026-12-01", "invalidation_criteria": "c", "origin_tag": "ad_hoc"}
-    r = client.post("/api/portfolio", json=payload)
-    assert r.status_code == 400
-    assert "mandatory" in r.json()["detail"]
-
-
-def test_api_resolve_portfolio_validation_error_becomes_400(monkeypatch):
-    def raise_validation(thesis_id, payload):
-        raise fundamentals_l4_thesis.ThesisValidationError("failure_attribution required")
-
-    monkeypatch.setattr(fundamentals_api_queries, "resolve_portfolio_entry", raise_validation)
-    client = TestClient(fundamentals_api_app)
-    r = client.post("/api/portfolio/t1/resolve", json={"resolved_true": False})
-    assert r.status_code == 400
-    assert "failure_attribution" in r.json()["detail"]
-
-
-def test_api_resolve_portfolio_success(monkeypatch):
-    monkeypatch.setattr(fundamentals_api_queries, "resolve_portfolio_entry", lambda thesis_id, payload: None)
-    client = TestClient(fundamentals_api_app)
-    r = client.post("/api/portfolio/t1/resolve", json={"resolved_true": True})
-    assert r.status_code == 200
-    assert r.json() == {"status": "resolved", "thesis_id": "t1"}
 
 
 def _fake_step_module(*, main_fn, run_state=None):
@@ -20894,13 +20470,6 @@ def test_api_health_route():
     assert r.json() == {"status": "ok"}
 
 
-def test_get_portfolio_scoring_delegates_to_compute_quarterly_scoring(monkeypatch):
-    canned = {"as_of_date": "2026-08-12", "total_theses": 3, "open": 1, "resolved": 2, "hit_rate": 50.0, "failure_attribution_breakdown": {"thesis_wrong": 1}, "time_to_confirmation_days": {"median_days": 90.0}}
-    monkeypatch.setattr(fundamentals_api_queries, "compute_quarterly_scoring", lambda: canned)
-
-    result = fundamentals_api_queries.get_portfolio_scoring()
-
-    assert result == canned
 
 
 def test_api_portfolio_scoring_route_returns_queries_result(monkeypatch):
@@ -21205,13 +20774,17 @@ def test_build_daily_digest_content_renders_draft_thesis_with_confidence(monkeyp
 
     subject, text_body, html_body = fundamentals_notifications.build_daily_digest_content(rows)
 
-    assert "DRAFT L4 thesis, NOT SAVED, confidence 72/100" in text_body
+    assert "CANDIDATE NOTE, not a position, confidence 72/100" in text_body
     assert "Net debt/RSCR falls below 45 by Q2 FY27." in text_body
     assert "Invalidation: Net debt stays flat or rises." in text_body
-    assert "nothing is saved to the real thesis register" in text_body
+    # WORDING CHANGED 2026-09-06: the human thesis register was deleted, so "not saved
+    # to the register" described something that no longer exists. These are reading; the
+    # ruleset picks the portfolio and never consults them.
+    assert "reading, not decisions" in text_body
+    assert "never consults them" in text_body
 
-    assert "Draft L4 Theses" in html_body
-    assert "CANDIDATE ONLY" in html_body
+    assert "Candidate Notes" in html_body   # renamed with the register removal
+    assert "READING ONLY" in html_body
     assert 'class="draft-confidence high"' in html_body  # 72 >= 66
     assert "Net debt/RSCR falls below 45 by Q2 FY27." in html_body
 
@@ -22430,6 +22003,2534 @@ def test_run_watchlist_exit_evaluation_falls_back_to_stored_price_when_live_look
     result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
 
     assert result["price_flagged"] == 1  # 100 -> 200 is +100%, still flagged using the stored fallback
+
+
+# ---------------------------------------------------------------------------
+# upsert_to_db on_conflict modes + the CDP preflight guard (2026-08-31 incident)
+# ---------------------------------------------------------------------------
+
+
+def _render(clause, conn):
+    return clause.as_string(conn)
+
+
+@pytest.fixture(scope="module")
+def _pg_conn():
+    """A raw driver connection, needed only so psycopg2 can quote identifiers."""
+    from utils.db import _engine
+
+    raw = _engine.raw_connection()
+    try:
+        yield raw.driver_connection
+    finally:
+        raw.close()
+
+
+def test_build_on_conflict_update_is_the_unchanged_default(_pg_conn):
+    from utils.db import _build_on_conflict_clause
+
+    out = _render(
+        _build_on_conflict_clause(
+            cols=["a", "b", "val"], unique_keys=["a", "b"], table_name="t"
+        ),
+        _pg_conn,
+    )
+    assert out == 'DO UPDATE SET "val" = EXCLUDED."val"'
+
+
+def test_build_on_conflict_nothing_skips_conflicting_rows(_pg_conn):
+    from utils.db import _build_on_conflict_clause
+
+    out = _render(
+        _build_on_conflict_clause(
+            cols=["a", "b", "val"],
+            unique_keys=["a", "b"],
+            table_name="t",
+            on_conflict="nothing",
+        ),
+        _pg_conn,
+    )
+    assert out == "DO NOTHING"
+
+
+def test_build_on_conflict_update_if_changed_excludes_load_ts_from_comparison(_pg_conn):
+    """load_ts must still be WRITTEN, but must not be what makes a row look changed --
+    that is the whole-table nightly rewrite this mode exists to stop."""
+    from utils.db import _build_on_conflict_clause
+
+    out = _render(
+        _build_on_conflict_clause(
+            cols=["symbol", "date", "factor", "load_ts"],
+            unique_keys=["symbol", "date"],
+            table_name="nseindia_adjustment_factors",
+            on_conflict="update_if_changed",
+        ),
+        _pg_conn,
+    )
+    assert '"load_ts" = EXCLUDED."load_ts"' in out          # written
+    assert "IS DISTINCT FROM" in out
+    comparison = out.split("WHERE", 1)[1]
+    assert "load_ts" not in comparison                       # but not compared
+    # the existing row is addressed by the target's BASE name, not schema-qualified
+    assert '"nseindia_adjustment_factors"."factor"' in comparison
+
+
+def test_build_on_conflict_update_if_changed_uses_base_name_for_qualified_table(_pg_conn):
+    from utils.db import _build_on_conflict_clause
+
+    out = _render(
+        _build_on_conflict_clause(
+            cols=["a", "val", "load_ts"],
+            unique_keys=["a"],
+            table_name="public.some_table",
+            on_conflict="update_if_changed",
+        ),
+        _pg_conn,
+    )
+    assert '"some_table"."val"' in out
+    assert '"public"."some_table"."val"' not in out
+
+
+def test_build_on_conflict_degrades_to_do_nothing_when_nothing_is_comparable(_pg_conn):
+    """Excluding every comparable column must not leave a bare DO UPDATE that rewrites
+    every row purely to bump bookkeeping columns."""
+    from utils.db import _build_on_conflict_clause
+
+    out = _render(
+        _build_on_conflict_clause(
+            cols=["a", "load_ts"],
+            unique_keys=["a"],
+            table_name="t",
+            on_conflict="update_if_changed",
+        ),
+        _pg_conn,
+    )
+    assert out == "DO NOTHING"
+
+
+def test_build_on_conflict_rejects_an_unknown_mode():
+    from utils.db import _build_on_conflict_clause
+
+    with pytest.raises(ValueError, match="on_conflict must be"):
+        _build_on_conflict_clause(
+            cols=["a", "v"], unique_keys=["a"], table_name="t", on_conflict="upsert"
+        )
+
+
+def test_cdp_status_reports_unreachable_without_raising():
+    from utils.cdp import cdp_status
+
+    reachable, detail = cdp_status("http://127.0.0.1:9")  # discard port, always refused
+    assert reachable is False
+    assert "cannot reach" in detail
+
+
+def test_cdp_status_reports_missing_endpoint():
+    from utils.cdp import cdp_status
+
+    reachable, detail = cdp_status("")
+    assert reachable is False
+    assert "not set" in detail
+
+
+def test_require_cdp_exits_3_and_names_the_caller(capsys):
+    """A dead Chrome must fail fast and loudly, not hang 30s inside Playwright and
+    surface a traceback that names _browser_type.py -- that is what hid the
+    2026-08-26..28 collection outage."""
+    from utils.cdp import CDP_UNAVAILABLE_EXIT_CODE, require_cdp
+
+    with pytest.raises(SystemExit) as excinfo:
+        require_cdp("http://127.0.0.1:9", caller="data.nseindia.bhavcopy_downloader")
+    assert excinfo.value.code == CDP_UNAVAILABLE_EXIT_CODE == 3
+    err = capsys.readouterr().err
+    assert "CHROME IS NOT RUNNING" in err
+    assert "data.nseindia.bhavcopy_downloader" in err
+    assert "start_chrome_cdp.sh" in err
+
+
+def test_require_cdp_is_a_noop_when_chrome_is_reachable(monkeypatch):
+    import utils.cdp as cdp
+
+    monkeypatch.setattr(cdp, "cdp_status", lambda _e: (True, "Chrome/151"))
+    cdp.require_cdp("http://localhost:9222", caller="test")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# scripts/data_completeness.py -- breadth + last-complete-trading-day semantics
+# ---------------------------------------------------------------------------
+
+
+def test_breadth_verdict_flags_a_collapsed_feed_as_error():
+    """The 2026-08-27 failure: real collection died but the Dhan smoke test kept
+    writing one ticker a day, so every max(timestamp) check stayed green."""
+    from scripts.data_completeness import ERROR, _breadth_verdict
+
+    level, detail = _breadth_verdict(1, 2439.0)
+    assert level == ERROR
+    assert "COLLAPSED" in detail
+
+
+def test_breadth_verdict_warns_on_a_partial_shortfall():
+    from scripts.data_completeness import WARN, _breadth_verdict
+
+    level, _ = _breadth_verdict(70, 100.0)
+    assert level == WARN
+
+
+def test_breadth_verdict_passes_normal_breadth():
+    from scripts.data_completeness import OK, _breadth_verdict
+
+    level, _ = _breadth_verdict(2590, 2593.0)
+    assert level == OK
+
+
+def test_breadth_verdict_without_a_baseline_warns_rather_than_dividing_by_zero():
+    from scripts.data_completeness import WARN, _breadth_verdict
+
+    level, detail = _breadth_verdict(5, 0.0)
+    assert level == WARN
+    assert "baseline" in detail
+
+
+def test_last_complete_trading_day_excludes_a_session_still_running(monkeypatch):
+    """Mid-session, 'today' is not yet an expectable trading day -- treating it as one
+    made every feed look days behind purely because the market had not closed."""
+    import scripts.data_completeness as dc
+
+    captured = {}
+
+    def fake_scalar(query, params=()):
+        captured["params"] = params
+        return pd.Timestamp("2026-08-28")
+
+    # 09:20 UTC == 14:50 IST, market open, before the 19:00 IST cutoff
+    monkeypatch.setattr(dc.pd.Timestamp, "utcnow",
+                        staticmethod(lambda: pd.Timestamp("2026-08-31 09:20:00")))
+    monkeypatch.setattr(dc, "_scalar", fake_scalar)
+    dc._last_complete_trading_day()
+    assert captured["params"][0] == date(2026, 8, 30)  # yesterday, not today
+
+
+def test_last_complete_trading_day_includes_today_after_the_publish_cutoff(monkeypatch):
+    import scripts.data_completeness as dc
+
+    captured = {}
+
+    def fake_scalar(query, params=()):
+        captured["params"] = params
+        return pd.Timestamp("2026-08-31")
+
+    # 14:00 UTC == 19:30 IST, past the cutoff
+    monkeypatch.setattr(dc.pd.Timestamp, "utcnow",
+                        staticmethod(lambda: pd.Timestamp("2026-08-31 14:00:00")))
+    monkeypatch.setattr(dc, "_scalar", fake_scalar)
+    dc._last_complete_trading_day()
+    assert captured["params"][0] == date(2026, 8, 31)
+
+
+def test_naive_utc_normalizes_mixed_date_and_timestamptz_columns():
+    from scripts.data_completeness import _naive_utc
+
+    aware = _naive_utc(pd.Timestamp("2026-08-28 00:00:00+00:00"))
+    plain = _naive_utc(pd.Timestamp("2026-08-28"))
+    assert aware.tzinfo is None and plain.tzinfo is None
+    assert (aware - plain).days == 0          # subtraction must not raise
+    assert _naive_utc(None) is None
+
+
+def test_findings_exit_status_is_driven_by_errors_only():
+    from scripts.data_completeness import ERROR, OK, WARN, Findings
+
+    f = Findings()
+    f.add(OK, "a", "fine")
+    f.add(WARN, "b", "meh")
+    assert not f.errors and len(f.warnings) == 1
+    f.add(ERROR, "c", "broken")
+    assert len(f.errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# intraday_daily_sync bounded-recovery args (2026-08-31 outage repair)
+# ---------------------------------------------------------------------------
+
+
+def test_run_daily_intraday_sync_defaults_to_the_whole_universe(monkeypatch):
+    """The nightly run must be unchanged by the recovery flags."""
+    import data.dhanlive.intraday_daily_sync as mod
+
+    seen = {}
+    monkeypatch.setattr(mod, "get_equity_universe", lambda: ["A", "B", "C"])
+    def _record(syms, **kw):
+        seen["symbols"] = list(syms)
+        return []
+
+    monkeypatch.setattr(mod, "sync_many_intraday", _record)
+    mod.run_daily_intraday_sync()
+    assert seen["symbols"] == ["A", "B", "C"]
+
+
+def test_run_daily_intraday_sync_caps_symbols_for_a_bounded_repair(monkeypatch):
+    import data.dhanlive.intraday_daily_sync as mod
+
+    seen = {}
+    monkeypatch.setattr(mod, "get_equity_universe", lambda: ["A", "B", "C", "D"])
+    def _record(syms, **kw):
+        seen["symbols"] = list(syms)
+        return []
+
+    monkeypatch.setattr(mod, "sync_many_intraday", _record)
+    mod.run_daily_intraday_sync(max_symbols=2)
+    assert seen["symbols"] == ["A", "B"]
+
+
+def test_run_daily_intraday_sync_only_stale_skips_already_current_symbols(monkeypatch):
+    import data.dhanlive.intraday_daily_sync as mod
+
+    seen = {}
+    monkeypatch.setattr(mod, "get_equity_universe", lambda: ["A", "B", "C"])
+    monkeypatch.setattr(mod, "_stale_symbols", lambda syms: ["B", "C"])
+    def _record(syms, **kw):
+        seen["symbols"] = list(syms)
+        return []
+
+    monkeypatch.setattr(mod, "sync_many_intraday", _record)
+    mod.run_daily_intraday_sync(only_stale=True)
+    assert seen["symbols"] == ["B", "C"]
+
+
+def test_run_daily_intraday_sync_reports_an_empty_universe_rather_than_syncing(monkeypatch):
+    import data.dhanlive.intraday_daily_sync as mod
+
+    called = {"sync": False}
+    monkeypatch.setattr(mod, "get_equity_universe", lambda: [])
+    monkeypatch.setattr(mod, "record_local_fallback_event", lambda **kw: None)
+    monkeypatch.setattr(mod, "sync_many_intraday",
+                        lambda *a, **k: called.__setitem__("sync", True) or [])
+    result = mod.run_daily_intraday_sync()
+    assert called["sync"] is False
+    assert result["symbols"] == 0
+
+
+def test_run_daily_intraday_sync_max_symbols_zero_syncs_nothing(monkeypatch):
+    """A zero cap must be an empty run, not a silent full-universe run."""
+    import data.dhanlive.intraday_daily_sync as mod
+
+    called = {"sync": False}
+    monkeypatch.setattr(mod, "get_equity_universe", lambda: ["A", "B"])
+    monkeypatch.setattr(mod, "record_local_fallback_event", lambda **kw: None)
+    monkeypatch.setattr(mod, "sync_many_intraday",
+                        lambda *a, **k: called.__setitem__("sync", True) or [])
+    result = mod.run_daily_intraday_sync(max_symbols=0)
+    assert called["sync"] is False
+    assert result["symbols"] == 0
+
+
+def test_check_dhan_daily_flags_the_collapse_pattern(monkeypatch):
+    """The real 2026-08-26..28 shape: 1350 -> 375 -> 373 -> 3 tickers/day."""
+    import scripts.data_completeness as dc
+
+    frame = pd.DataFrame({
+        "session": pd.to_datetime(["2026-08-24", "2026-08-25", "2026-08-26",
+                                   "2026-08-27", "2026-08-28"]).date,
+        "tickers": [1357, 1350, 375, 373, 3],
+    })
+    monkeypatch.setattr(dc, "sql_to_df", lambda *a, **k: frame)
+    f = dc.Findings()
+    dc.check_dhan_daily(f, 30, pd.Timestamp("2026-08-28"))
+    breadth = [i for i in f.items if i["check"] == "dhan_daily"][0]
+    assert breadth["level"] == dc.ERROR
+    assert "COLLAPSED" in breadth["message"]
+
+
+def test_check_dhan_daily_ignores_a_still_running_session(monkeypatch):
+    """Today's partial bar count must not be judged against a median of complete days."""
+    import scripts.data_completeness as dc
+
+    frame = pd.DataFrame({
+        "session": pd.to_datetime(["2026-08-27", "2026-08-28", "2026-08-31"]).date,
+        "tickers": [1350, 1355, 4],          # 08-31 is mid-session
+    })
+    monkeypatch.setattr(dc, "sql_to_df", lambda *a, **k: frame)
+    f = dc.Findings()
+    dc.check_dhan_daily(f, 30, pd.Timestamp("2026-08-28"))   # last COMPLETE day
+    breadth = [i for i in f.items if i["check"] == "dhan_daily"][0]
+    assert breadth["level"] == dc.OK
+    assert breadth["metrics"]["session"] == "2026-08-28"
+
+
+def test_check_dhan_daily_reports_a_stale_feed_as_an_error(monkeypatch):
+    import scripts.data_completeness as dc
+
+    frame = pd.DataFrame({
+        "session": pd.to_datetime(["2026-08-24", "2026-08-25"]).date,
+        "tickers": [1357, 1350],
+    })
+    monkeypatch.setattr(dc, "sql_to_df", lambda *a, **k: frame)
+    f = dc.Findings()
+    dc.check_dhan_daily(f, 30, pd.Timestamp("2026-08-28"))
+    assert any(i["check"] == "dhan_daily_freshness" and i["level"] == dc.ERROR for i in f.items)
+
+
+def test_check_dhan_daily_errors_when_the_table_is_empty_in_the_window(monkeypatch):
+    import scripts.data_completeness as dc
+
+    monkeypatch.setattr(dc, "sql_to_df", lambda *a, **k: pd.DataFrame())
+    f = dc.Findings()
+    dc.check_dhan_daily(f, 30, pd.Timestamp("2026-08-28"))
+    assert f.errors and f.errors[0]["check"] == "dhan_daily"
+
+
+# ---------------------------------------------------------------------------
+# /api/data-health -- the screener's Data Health page
+# ---------------------------------------------------------------------------
+
+
+def _health_client():
+    from fastapi.testclient import TestClient
+
+    from fundamentals.api import app as app_module
+
+    app_module._HEALTH_CACHE.update({"at": 0.0, "payload": None, "window_days": None})
+    return TestClient(app_module.app), app_module
+
+
+def test_data_health_reports_ok_when_every_check_passes(monkeypatch):
+    import scripts.data_completeness as dc
+
+    client, _ = _health_client()
+    f = dc.Findings()
+    f.add(dc.OK, "bhavcopy", "fine")
+    monkeypatch.setattr(dc, "run_all_checks", lambda **kw: f)
+
+    body = client.get("/api/data-health").json()
+    assert body["status"] == "ok"
+    assert body["error_count"] == 0 and body["warn_count"] == 0
+    assert body["cached"] is False
+    assert body["findings"][0]["check"] == "bhavcopy"
+
+
+def test_data_health_status_is_error_when_any_check_fails(monkeypatch):
+    """A page that shows green while a feed is dead is the exact failure this whole
+    thing exists to prevent."""
+    import scripts.data_completeness as dc
+
+    client, _ = _health_client()
+    f = dc.Findings()
+    f.add(dc.OK, "bhavcopy", "fine")
+    f.add(dc.WARN, "universe_coverage", "some missing")
+    f.add(dc.ERROR, "intraday_breadth", "feed has COLLAPSED")
+    monkeypatch.setattr(dc, "run_all_checks", lambda **kw: f)
+
+    body = client.get("/api/data-health").json()
+    assert body["status"] == "error"
+    assert body["error_count"] == 1 and body["warn_count"] == 1
+
+
+def test_data_health_caches_then_refresh_forces_a_recompute(monkeypatch):
+    import scripts.data_completeness as dc
+
+    client, _ = _health_client()
+    calls = {"n": 0}
+
+    def fake_run(**kw):
+        calls["n"] += 1
+        f = dc.Findings()
+        f.add(dc.OK, "bhavcopy", "fine")
+        return f
+
+    monkeypatch.setattr(dc, "run_all_checks", fake_run)
+
+    assert client.get("/api/data-health").json()["cached"] is False
+    assert client.get("/api/data-health").json()["cached"] is True
+    assert calls["n"] == 1                                    # served from cache
+    assert client.get("/api/data-health?refresh=true").json()["cached"] is False
+    assert calls["n"] == 2                                    # forced recompute
+
+
+def test_data_health_cache_does_not_leak_across_window_sizes(monkeypatch):
+    """A 7-day answer must never be served for a 30-day request."""
+    import scripts.data_completeness as dc
+
+    client, _ = _health_client()
+    seen = []
+
+    def fake_run(*, window_days=30):
+        seen.append(window_days)
+        f = dc.Findings()
+        f.add(dc.OK, "bhavcopy", "fine")
+        return f
+
+    monkeypatch.setattr(dc, "run_all_checks", fake_run)
+    client.get("/api/data-health?window_days=30")
+    client.get("/api/data-health?window_days=7")
+    assert seen == [30, 7]
+
+
+def test_data_health_surfaces_a_check_failure_as_503_not_a_blank_green_page(monkeypatch):
+    import scripts.data_completeness as dc
+
+    client, _ = _health_client()
+
+    def boom(**kw):
+        raise RuntimeError("postgres is down")
+
+    monkeypatch.setattr(dc, "run_all_checks", boom)
+    r = client.get("/api/data-health")
+    assert r.status_code == 503
+    assert "postgres is down" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Data-platform health endpoints (FRONTEND_COMPLETION_PLAN Part B)
+# ---------------------------------------------------------------------------
+
+
+def test_get_collectors_separates_real_failures_from_orphaned_rows(monkeypatch):
+    """The whole design point: advisory_sync_state is never pruned, so a deleted or
+    renamed module keeps its error row forever. Counting those as failures is how a
+    health page teaches the operator to ignore it."""
+    from fundamentals.api import queries
+
+    df = pd.DataFrame([
+        {"source_name": "download_runner:data.rbi.download_bank_rates", "scope_key": "macro",
+         "status": "error", "error_text": "source_unavailable",
+         "last_success_at": None, "last_item_ts": None, "updated_at": "2026-08-31"},
+        {"source_name": "download_runner:data.mospi.cpi", "scope_key": None,
+         "status": "error", "error_text": "source_unavailable",
+         "last_success_at": None, "last_item_ts": None, "updated_at": "2026-08-01"},
+        {"source_name": "data.nseindia.recent_events", "scope_key": None,
+         "status": "error", "error_text": "TimeoutError",
+         "last_success_at": None, "last_item_ts": None, "updated_at": "2026-08-28"},
+        {"source_name": "data.nseindia.holidays", "scope_key": None,
+         "status": "ok", "error_text": None,
+         "last_success_at": "2026-08-31", "last_item_ts": None, "updated_at": "2026-08-31"},
+    ])
+    monkeypatch.setattr(queries, "sql_to_df", lambda *a, **k: df)
+    monkeypatch.setattr(queries, "_live_registry_modules",
+                        lambda: {"data.rbi.download_bank_rates", "data.nseindia.holidays"})
+
+    out = queries.get_collectors()
+    by_source = {c["source_name"]: c["classification"] for c in out["collectors"]}
+    assert by_source["download_runner:data.rbi.download_bank_rates"] == "failing"
+    assert by_source["download_runner:data.mospi.cpi"] == "orphaned"     # module gone
+    assert by_source["data.nseindia.recent_events"] == "frozen"          # unscheduled by design
+    assert by_source["data.nseindia.holidays"] == "ok"
+    # 3 of the 4 rows say "error", but only ONE is a live failure.
+    assert out["failing_count"] == 1
+
+
+def test_get_collectors_sorts_failures_first(monkeypatch):
+    from fundamentals.api import queries
+
+    df = pd.DataFrame([
+        {"source_name": "data.ok.one", "scope_key": None, "status": "ok", "error_text": None,
+         "last_success_at": None, "last_item_ts": None, "updated_at": None},
+        {"source_name": "data.bad.two", "scope_key": None, "status": "error", "error_text": "boom",
+         "last_success_at": None, "last_item_ts": None, "updated_at": None},
+    ])
+    monkeypatch.setattr(queries, "sql_to_df", lambda *a, **k: df)
+    monkeypatch.setattr(queries, "_live_registry_modules", lambda: {"data.ok.one", "data.bad.two"})
+    assert queries.get_collectors()["collectors"][0]["classification"] == "failing"
+
+
+def test_module_of_strips_the_source_prefix():
+    from fundamentals.api.queries import _module_of
+
+    assert _module_of("download_runner:data.rbi.download_bank_rates") == "data.rbi.download_bank_rates"
+    assert _module_of("data.nseindia.holidays") == "data.nseindia.holidays"
+    assert _module_of("continuous_watch:announcements") == "announcements"
+
+
+def test_live_registry_modules_reads_the_real_registry():
+    """If this list is ever hand-copied it will drift; assert it comes from the registry."""
+    from fundamentals.api.queries import _live_registry_modules
+
+    modules = _live_registry_modules()
+    assert "data.nseindia.holidays" in modules
+    assert "data.mospi.cpi" not in modules          # removed in the pure-TA cut
+
+
+def test_get_platform_issues_never_mutates(monkeypatch):
+    """issue_digest gets its report via resolve_open_identity_issues(apply=True), which
+    CLOSES rows. A GET must not do that."""
+    import utils.identity_issues as ii
+    from fundamentals.api import queries
+
+    called = {"resolve": False}
+    monkeypatch.setattr(ii, "resolve_open_identity_issues",
+                        lambda **kw: called.__setitem__("resolve", True))
+    monkeypatch.setattr(ii, "load_open_identity_issues",
+                        lambda **kw: pd.DataFrame([{"issue_key": "k1", "issue_type": "dhan_security_id_missing",
+                                                    "symbol": "AAA", "status": "open"}]))
+    import utils.fallback_telemetry as ft
+    monkeypatch.setattr(ft, "summarize_fallback_events",
+                        lambda **kw: {"active_count": 2, "error_count": 1, "warn_count": 1})
+
+    out = queries.get_platform_issues()
+    assert called["resolve"] is False
+    assert out["identity_issues"]["open_count"] == 1
+    assert out["identity_issues"]["by_type"] == {"dhan_security_id_missing": 1}
+
+
+def test_scheduler_health_surfaces_a_missing_script(monkeypatch):
+    from fundamentals.api import queries
+
+    monkeypatch.setattr("pathlib.Path.is_file", lambda self: False)
+    with pytest.raises(FileNotFoundError):
+        queries.get_scheduler_health()
+
+
+# ---------------------------------------------------------------------------
+# NSE off-market deals: CSV endpoint + Indian digit grouping (2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+def test_offmarket_to_number_handles_indian_digit_grouping():
+    """NSE's csv=true endpoint formats quantities as "1,70,00,000". Postgres rejects
+    that for a bigint column -- four blocks failed to parse before this coercion."""
+    from data.nseindia.offmarket_parser import _to_number
+
+    out = _to_number(pd.Series(["1,70,00,000", "5,00,000", "2,35,306"]))
+    assert out.tolist() == [17000000, 500000, 235306]
+
+
+def test_offmarket_to_number_still_handles_the_old_comma_free_format():
+    """The archive on disk holds years of files from the previous download path -- the
+    parser must not care which producer wrote the file."""
+    from data.nseindia.offmarket_parser import _to_number
+
+    assert _to_number(pd.Series(["17000000", "500000"])).tolist() == [17000000, 500000]
+    assert _to_number(pd.Series([123, 456])).tolist() == [123, 456]
+
+
+def test_offmarket_to_number_coerces_junk_to_nan_rather_than_raising():
+    """One bad cell must not fail an entire date block."""
+    from data.nseindia.offmarket_parser import _to_number
+
+    out = _to_number(pd.Series(["-", "", "abc", "1,234.56"]))
+    assert out.isna().sum() == 3
+    assert out.dropna().tolist() == [1234.56]
+
+
+def test_offmarket_builds_the_csv_endpoint_url_with_the_requested_range():
+    """The date range is passed to the endpoint explicitly. It used to be injected into
+    a jQuery datepicker and hoped for -- which still worked, but the CSV that came back
+    was produced by a download button that no longer fires a browser download event."""
+    from datetime import datetime
+
+    import data.nseindia.offmarket as om
+
+    captured = {}
+
+    class _Loc:
+        def __init__(self, **kw): pass
+        def select_option(self, *a, **k): pass
+
+    class _Page:
+        def goto(self, *a, **k): return None
+        def wait_for_timeout(self, *a, **k): pass
+        def close(self): pass
+        def evaluate(self, _js, url):
+            captured["url"] = url
+            return {"status": 200, "body": "hdr\nrow\n"}
+
+    page = _Page()
+    url_seen: list[str] = []
+
+    def fake_goto(_page, url, **kw):
+        url_seen.append(url)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(om, "nse_goto", fake_goto)
+        monkey.setattr(om, "get_random", lambda a, b: 0)
+        # Exercise only the fetch-url construction, which is the part that changed.
+        from_date = datetime(2026, 8, 1)
+        to_date = datetime(2026, 8, 29)
+        expected = (
+            "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
+            "?optionType=bulk_deals&from=01-08-2026&to=29-08-2026&csv=true"
+        )
+        built = (
+            "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
+            f"?optionType=bulk_deals&from={from_date.strftime('%d-%m-%Y')}"
+            f"&to={to_date.strftime('%d-%m-%Y')}&csv=true"
+        )
+        assert built == expected
+    finally:
+        monkey.undo()
+
+
+def test_offmarket_module_no_longer_waits_on_a_browser_download_event():
+    """Regression guard: expect_download timed out on 12 of 12 attempts because NSE
+    builds that CSV client-side now. If someone reinstates the button dance, this fails."""
+    from pathlib import Path
+
+    src = Path("data/nseindia/offmarket.py").read_text()
+    # Match the CALL, not the word -- the module comment explains why the old approach
+    # was abandoned and legitimately names expect_download.
+    assert "page.expect_download(" not in src
+    assert "historicalOR/bulk-block-short-deals" in src
+    assert "csv=true" in src
+
+
+# ---------------------------------------------------------------------------
+# FBIL G-Sec: stop requesting files the source has not published yet (2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+def test_fbil_gsec_excludes_today_before_the_publication_cutoff(monkeypatch):
+    """Asking for a file FBIL has not written yet is not a failure -- but it counted as
+    one, which pinned this collector to `error` permanently."""
+    import data.rbi.download_fbil_gsec as mod
+
+    monkeypatch.setattr(mod.pd.Timestamp, "now",
+                        staticmethod(lambda tz=None: pd.Timestamp("2026-09-01 13:33", tz="Asia/Kolkata")))
+    assert mod._last_publishable_date().date() == date(2026, 8, 31)
+
+
+def test_fbil_gsec_includes_today_after_the_publication_cutoff(monkeypatch):
+    import data.rbi.download_fbil_gsec as mod
+
+    monkeypatch.setattr(mod.pd.Timestamp, "now",
+                        staticmethod(lambda tz=None: pd.Timestamp("2026-09-01 19:05", tz="Asia/Kolkata")))
+    assert mod._last_publishable_date().date() == date(2026, 9, 1)
+
+
+def test_fbil_gsec_cutoff_boundary_is_inclusive_of_the_cutoff_hour(monkeypatch):
+    import data.rbi.download_fbil_gsec as mod
+
+    monkeypatch.setattr(mod.pd.Timestamp, "now",
+                        staticmethod(lambda tz=None: pd.Timestamp("2026-09-01 18:00", tz="Asia/Kolkata")))
+    assert mod._last_publishable_date().date() == date(2026, 9, 1)
+
+
+def test_fbil_gsec_uses_the_publishable_date_not_ist_today():
+    """Regression guard: the range must not run through _ist_today() again."""
+    from pathlib import Path
+
+    src = Path("data/rbi/download_fbil_gsec.py").read_text()
+    assert "today = _last_publishable_date()" in src
+    assert "today = _ist_today()" not in src
+
+
+# ---------------------------------------------------------------------------
+# dim_trading_days producer, restored 2026-09-02 (deleted in fb84396's Phase 4 cut)
+# ---------------------------------------------------------------------------
+
+
+def test_calendar_creator_is_registered_in_the_parser_pipeline():
+    """The bug being guarded against is not a code bug -- it is a table whose only writer
+    was deleted with a REMOVE-scope directory while the table stayed KEEP scope."""
+    from data.download_runner import PARSER_MODULES
+
+    assert "data.nseindia.calendar_creator" in PARSER_MODULES
+
+
+def test_calendar_creator_fiscal_year_and_quarter_are_april_to_march():
+    from data.nseindia.calendar_creator import _fy_quarter, _fy_year
+
+    assert _fy_year(pd.Timestamp("2026-04-01")) == 2026
+    assert _fy_year(pd.Timestamp("2026-03-31")) == 2025      # still FY2025
+    assert _fy_quarter(pd.Timestamp("2026-04-01")) == 1      # Apr-Jun
+    assert _fy_quarter(pd.Timestamp("2026-01-15")) == 4      # Jan-Mar
+
+
+def test_calendar_creator_keeps_weekend_muhurat_sessions(monkeypatch):
+    """2026-11-08 is a SUNDAY Diwali Muhurat session. A plain business-day calendar drops
+    it, which is the class of bug 277774a fixed in clamp_to_last_trading_day."""
+    import data.nseindia.calendar_creator as cc
+
+    def fake_sql(query, params=None):
+        if "nseindia_ohlcv" in query:
+            return pd.DataFrame({"date": pd.to_datetime(["2026-01-01"], utc=True)})
+        if "ILIKE" in query or "ilike" in query:
+            return pd.DataFrame({"date": pd.to_datetime(["2026-11-08"], utc=True)})
+        return pd.DataFrame({"date": pd.to_datetime(["2026-11-08"], utc=True)})
+
+    monkeypatch.setattr(cc, "sql_to_df", fake_sql)
+    out = cc.compute_trading_days()
+    days = set(pd.to_datetime(out["date"]).dt.date)
+    assert date(2026, 11, 8) in days
+
+
+def test_calendar_creator_prune_never_deletes_a_day_the_market_traded():
+    """The safety property that makes pruning runnable unattended: the holiday feed is an
+    input we do not control, so it must not be able to erase a real session. The guard is
+    a NOT EXISTS against nseindia_ohlcv in the delete's own selection query."""
+    from pathlib import Path
+
+    src = Path("data/nseindia/calendar_creator.py").read_text()
+    prune = src[src.index("def _prune_stale_days"):src.index("def run_calendar_build")]
+    assert "NOT EXISTS" in prune
+    assert "nseindia_ohlcv" in prune
+    # the DELETE must only ever act on rows that selection returned
+    assert "DELETE FROM dim_trading_days WHERE date::date = ANY(%s)" in prune
+
+
+def test_calendar_creator_uses_update_if_changed_not_a_blanket_rewrite():
+    """It rebuilds the full calendar every run; a plain DO UPDATE would rewrite ~3,200
+    rows nightly for data that essentially never moves."""
+    from pathlib import Path
+
+    src = Path("data/nseindia/calendar_creator.py").read_text()
+    assert 'on_conflict="update_if_changed"' in src
+
+
+# ---------------------------------------------------------------------------
+# Dhan rate limiting is cross-process (2026-09-02)
+# ---------------------------------------------------------------------------
+
+
+def test_dhan_pacing_holds_the_shared_cross_process_gate():
+    """Per-process pacing alone is not enough once two jobs overlap.
+
+    The retimed schedule runs ohlcv_reconcile (1500 symbols, ~32 min from 23:15 IST) into
+    dhan_intraday_sync at 23:40. Two processes each pacing at ~4.5 req/sec is ~9 req/sec
+    against Dhan's documented 5/sec cap. The client's own comment used to say this needed
+    the cross-process treatment NSE has; this asserts it now does.
+    """
+    from pathlib import Path
+
+    src = Path("data/dhanlive/client.py").read_text()
+    pace = src[src.index("def _pace_dhan_request"):src.index("class DhanAPIError")]
+    assert 'exchange_request_gate(' in pace
+    assert 'domain="dhan"' in pace
+    # and the gate must wrap the actual request, not just precede it
+    assert "with _pace_dhan_request():" in src
+
+
+def test_dhan_pacing_stays_under_the_documented_rate_cap():
+    """Steady-state, not the first call -- N calls have only N-1 gaps, so a short burst
+    reads high for a reason that has nothing to do with the limiter."""
+    import time
+
+    from data.dhanlive.client import _pace_dhan_request
+
+    with _pace_dhan_request():
+        pass  # prime: the first call waits for nothing
+    n = 12
+    started = time.monotonic()
+    for _ in range(n):
+        with _pace_dhan_request():
+            pass
+    rate = n / (time.monotonic() - started)
+    assert rate < 5.0, f"paced at {rate:.2f} req/sec, over Dhan's 5/sec cap"
+
+
+def test_dhan_min_interval_leaves_headroom_under_the_cap():
+    from data.dhanlive.client import DHAN_MIN_REQUEST_INTERVAL_SECONDS
+
+    assert 1.0 / DHAN_MIN_REQUEST_INTERVAL_SECONDS < 5.0
+
+
+def test_coverage_report_does_not_judge_a_frozen_archive_on_staleness():
+    """historical_mcap's collector was removed ON PURPOSE (2abe32a); docs/DATA_INVENTORY.md
+    keeps the table as a frozen archive. Scoring it against a 7-day threshold made it a
+    permanently-red row that could never go green -- the alert-fatigue failure this whole
+    health surface exists to avoid."""
+    import scripts.data_coverage_report as dcr
+
+    spec = [t for t in dcr.TABLES if t[0] == "historical_mcap"]
+    assert spec, "historical_mcap missing from the coverage spec"
+    assert spec[0][3] == "frozen"
+
+
+def test_coverage_report_frozen_tables_still_fail_when_empty():
+    """Freshness is not applicable to a frozen archive; EXISTENCE still is. An empty
+    archive is a real loss and must not be silenced along with the staleness check."""
+    from pathlib import Path
+
+    src = Path("scripts/data_coverage_report.py").read_text()
+    # the rows<=0 -> error branch must be evaluated before any check_kind dispatch
+    assert src.index('row["detail"] = "table is empty"') < src.index('elif check_kind == "frozen"')
+
+
+# ---------------------------------------------------------------------------
+# Ops health alarm (2026-09-02)
+# ---------------------------------------------------------------------------
+
+
+def test_ops_alert_parses_space_separated_recipients(monkeypatch):
+    """WATCHLIST_ALERT_EMAIL_TO is SPACE separated. Splitting only on commas made the
+    whole line one malformed address and SES rejected the send outright
+    ("Domain contains control or whitespace") -- caught only by actually sending."""
+    import utils.ops_alert as oa
+
+    monkeypatch.setattr(oa, "OPS_ALERT_EMAIL_TO", "a@x.com b@y.com")
+    assert oa._recipients() == ["a@x.com", "b@y.com"]
+    monkeypatch.setattr(oa, "OPS_ALERT_EMAIL_TO", "a@x.com, b@y.com; c@z.com")
+    assert oa._recipients() == ["a@x.com", "b@y.com", "c@z.com"]
+
+
+def test_ops_alert_never_raises_when_ses_fails(monkeypatch):
+    """An alerter that throws while reporting bad health reports nothing at all."""
+    import utils.ops_alert as oa
+
+    monkeypatch.setattr(oa, "OPS_ALERT_EMAIL_ENABLED", True)
+    monkeypatch.setattr(oa, "OPS_ALERT_EMAIL_FROM", "ops@x.com")
+    monkeypatch.setattr(oa, "OPS_ALERT_EMAIL_TO", "me@x.com")
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def boom(name, *a, **k):
+        if name == "boto3":
+            raise RuntimeError("no credentials")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert oa.send_ops_alert("subject", "body") is False   # returns False, does not raise
+
+
+def test_ops_alert_declines_when_disabled(monkeypatch):
+    import utils.ops_alert as oa
+
+    monkeypatch.setattr(oa, "OPS_ALERT_EMAIL_ENABLED", False)
+    assert oa.send_ops_alert("s", "b") is False
+
+
+def test_ops_health_alert_treats_maintenance_mode_as_expected(monkeypatch, tmp_path):
+    """A deliberate ./stop_cron.sh must not page anyone at 03:00."""
+    import scripts.ops_health_alert as mod
+
+    monkeypatch.setattr(mod.shutil, "which", lambda n: "/usr/bin/pgrep")
+    monkeypatch.setattr(mod.subprocess, "run",
+                        lambda *a, **k: type("P", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    sentinel = Path("/tmp/stockey_cron_maintenance")
+    existed = sentinel.exists()
+    sentinel.touch()
+    try:
+        ok, detail = mod.check_go_crond()
+        assert ok is True
+        assert "maintenance" in detail
+    finally:
+        if not existed:
+            sentinel.unlink(missing_ok=True)
+
+
+def test_ops_health_alert_is_not_scheduled_by_go_crond():
+    """It detects go-crond being dead, so go-crond cannot be what schedules it."""
+    from pathlib import Path
+
+    generated = Path("config/stockey.generated.crontab")
+    if generated.exists():
+        assert "ops_health_alert" not in generated.read_text()
+    assert "OS-LEVEL user crontab" in Path("scripts/ops_health_alert.sh").read_text()
+
+
+# ---------------------------------------------------------------------------
+# company_master identity resolution (2026-09-02)
+# ---------------------------------------------------------------------------
+
+
+def test_company_master_prefers_the_eq_series_over_be():
+    """A symbol listed in BOTH the rolling (EQ) and trade-to-trade (BE) segments has two
+    Dhan security_ids. The tie used to break on load_ts alone -- arbitrary with respect
+    to series -- and Dhan serves NO intraday for a BE listing, so those symbols returned
+    zero candles with no error at all. Measured: 151 of 227 missing symbols had resolved
+    to BE, 145 of them with an EQ listing available."""
+    from pathlib import Path
+
+    src = Path("utils/company_master.py").read_text()
+    nse_query = src[src.index("SELECT DISTINCT ON (underlying_symbol)"):src.index('operation="sync_dhan_nse"')]
+    assert "(series = 'EQ') DESC" in nse_query
+    # it must be a TIEBREAK, not a filter -- a BE-only symbol still needs its BE id
+    assert "series = 'EQ'" not in nse_query.split("ORDER BY")[0].replace("(series = 'EQ') DESC", "")
+
+
+def test_company_master_admits_traded_symbols_dhan_labels_other():
+    """Dhan files some real, traded instruments as instrument_type='Other' (LIQGRWBEES, a
+    Nippon liquid ETF). Admitting that bucket wholesale would be wrong -- 732 of its 747
+    NSE rows are exchange TEST symbols and zero-coupon bonds -- so membership of the live
+    bhavcopy universe is what admits them."""
+    from pathlib import Path
+
+    src = Path("utils/company_master.py").read_text()
+    nse_query = src[src.index("SELECT DISTINCT ON (underlying_symbol)"):src.index('operation="sync_dhan_nse"')]
+    assert "instrument_type IN ('ES', 'ETF')" in nse_query
+    assert "FROM nseindia_ohlcv" in nse_query      # the universe escape hatch
+    assert "series IN ('EQ', 'BE')" in nse_query
+
+
+def test_company_master_sql_contains_no_literal_percent():
+    """psycopg2 parses '%' as a parameter placeholder even inside a SQL COMMENT -- a
+    percent sign in an explanatory comment killed this query with
+    'IndexError: tuple index out of range'."""
+    from pathlib import Path
+
+    src = Path("utils/company_master.py").read_text()
+    for marker, op in (("sync_dhan_nse", "NSE"), ("sync_dhan_bse", "BSE")):
+        q = src[src.rindex('"""', 0, src.index(f'operation="{marker}"')) : src.index(f'operation="{marker}"')]
+        assert "%" not in q, f"literal percent in the {op} query will break psycopg2"
+
+
+# ---------------------------------------------------------------------------
+# Confluence: per-axis detail + the corrected badge contract (2026-09-02)
+# ---------------------------------------------------------------------------
+
+
+def test_confluence_evaluable_equals_supportive_plus_contradicting():
+    """The identity that makes a bare "1/4" badge misleading: the denominator counts only
+    axes that COULD be judged, so anything in it that is not supportive is actively
+    against -- not unknown."""
+    from utils.db import sql_to_df
+
+    df = sql_to_df(
+        "SELECT confluence_count, contradicting_count, evaluable_count "
+        "FROM fundamentals_confluence_score LIMIT 200"
+    )
+    if df.empty:
+        pytest.skip("no confluence rows scored yet")
+    mismatched = df[df.confluence_count + df.contradicting_count != df.evaluable_count]
+    assert mismatched.empty, f"{len(mismatched)} rows break evaluable = supportive + contradicting"
+
+
+def test_load_confluence_for_company_returns_every_axis(monkeypatch):
+    from fundamentals.api import queries
+
+    row = {
+        "run_date": "2026-09-01", "score_version": 1,
+        "axis_fundamentals_trajectory": None, "axis_event_corroboration": False,
+        "axis_sector_cycle": True, "axis_ownership": False, "axis_valuation": False,
+        "confluence_count": 1, "contradicting_count": 3, "evaluable_count": 4,
+    }
+    monkeypatch.setattr(queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(queries, "sql_to_df", lambda *a, **k: pd.DataFrame([row]))
+
+    out = queries.load_confluence_for_company("nse:X")
+    assert [a["key"] for a in out["axes"]] == [k for k, _ in queries.CONFLUENCE_AXES]
+    verdicts = {a["key"]: a["verdict"] for a in out["axes"]}
+    assert verdicts["sector_cycle"] is True
+    assert verdicts["ownership"] is False
+    # None must survive as None -- never coerced to a side.
+    assert verdicts["fundamentals_trajectory"] is None
+    assert out["contradicting_count"] == 3
+
+
+def test_load_confluence_for_company_is_none_when_unscored(monkeypatch):
+    from fundamentals.api import queries
+
+    monkeypatch.setattr(queries, "_ensure_confluence_score_table", lambda: None)
+    monkeypatch.setattr(queries, "sql_to_df", lambda *a, **k: pd.DataFrame())
+    assert queries.load_confluence_for_company("nse:NOPE") is None
+
+
+def test_watchlist_badge_shows_contradicting_not_a_bare_ratio():
+    """Regression guard for the actual UI bug: `confluence 1/4` read as "1 of 4, rest
+    unknown" when it meant 1 supportive and 3 against. confluence_score.py tracks
+    contradicting_count precisely so a human can tell those apart; the badge dropped it."""
+    from pathlib import Path
+
+    page = Path("../screener/app/pages/watchlist/index.vue").read_text()
+    assert "confluence ${item.confluence_count}/${item.evaluable_count}" not in page
+    assert "ConfluenceBadge" in page
+    assert ":contradicting=" in page
+
+    badge = Path("../screener/app/components/ConfluenceBadge.vue").read_text()
+    assert "against" in badge
+    # tone must follow the BALANCE, not merely "is anything supportive"
+    assert "no > yes" in badge
+
+
+# ---------------------------------------------------------------------------
+# is_cron_running.sh lock check (2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+def test_lock_check_tests_ownership_not_file_existence():
+    """A lock FILE outlives the lock -- flock releases on exit but leaves the file. The
+    check reported "held 1 min (a job is running)" about a lock nothing held, right after
+    go-crond correctly released it before exec'ing. A health check that cries wolf is the
+    one failure this script exists to prevent."""
+    from pathlib import Path
+
+    src = Path("scripts/is_cron_running.sh").read_text()
+    block = src[src.index('hdr "job locks"'):src.index('hdr "OS crontab')]
+    assert "fuser" in block, "lock ownership must be tested, not inferred from the file"
+    assert "stale file, nobody holds it" in block
+
+
+def test_lock_check_does_not_acquire_the_lock_it_inspects():
+    """`flock -n` would momentarily TAKE the lock to test it, and a job starting in that
+    instant would find it held and silently no-op. A monitor must not be able to cause
+    the outage it watches for."""
+    from pathlib import Path
+
+    block = Path("scripts/is_cron_running.sh").read_text()
+    block = block[block.index('hdr "job locks"'):block.index('hdr "OS crontab')]
+    # Strip comments before asserting: the comment legitimately quotes `flock -n` while
+    # explaining why it was rejected, so matching raw text flags the explanation itself.
+    # (Matching a bare word is the mistake this file already made once with
+    # expect_download -- the guard has to look at CODE.)
+    code = "\n".join(
+        line for line in block.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "flock" not in code
+
+
+def test_lock_age_comes_from_the_holder_not_the_file_mtime():
+    """Opening a file for flock updates its mtime, so a lock held for nine hours still
+    shows a brand-new file -- which silently defeated the stuck-job threshold (a
+    deliberately 9-hour-old lock reported "held 0 min")."""
+    from pathlib import Path
+
+    block = Path("scripts/is_cron_running.sh").read_text()
+    block = block[block.index('hdr "job locks"'):block.index('hdr "OS crontab')]
+    assert "ps -o etimes=" in block
+    assert "stat -c %Y" not in block
+
+
+def test_stuck_lock_threshold_is_overridable_for_testing():
+    """A threshold you can only exercise by waiting six hours is one nobody verifies."""
+    from pathlib import Path
+
+    src = Path("scripts/is_cron_running.sh").read_text()
+    assert 'STUCK_LOCK_MINUTES="${STUCK_LOCK_MINUTES:-360}"' in src
+    assert '-gt "$STUCK_LOCK_MINUTES"' in src
+
+
+# ---------------------------------------------------------------------------
+# Portfolio ruleset + adjudicator (docs/PORTFOLIO_RULESET_PRD.md, 2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+def _pf_candidate(ticker):
+    """Minimal candidate shaped like evaluate_entry_candidates() emits."""
+    return {"company_master_id": f"nse:{ticker}", "ticker": ticker, "stage": 2,
+            "confluence_count": 2, "contradicting_count": 0, "evaluable_count": 2,
+            "axes": {}, "narrative_text": "", "first_seen_price": 1.0,
+            "first_seen_at": None, "scored_on": None, "checks": {},
+            "stop": {"stop_pct": 9.0, "basis": "test"}}
+
+
+def test_stop_loss_exit_is_never_adjudicated():
+    """The single safety property of the whole design. A stop is a statement about
+    capital, not about the thesis, and every argument for holding through it is available
+    at every price -- so it must not be arguable. Asserted WITHOUT an LLM call, because a
+    property that only holds when a network call succeeds is not a property."""
+    from fundamentals.screens.portfolio_adjudicator import adjudicate_exit
+
+    out = adjudicate_exit({"ticker": "X", "deferral_count": 0}, "stop_loss")
+    assert out["decision"] == "exit"
+    assert out["model"] is None      # no model was consulted at all
+
+
+def test_exit_deferral_is_capped_not_indefinite():
+    """"Defer, not cancel": a veto that silently persists is indistinguishable from
+    having no exit rule."""
+    from fundamentals.screens.portfolio_adjudicator import MAX_DEFERRALS, adjudicate_exit
+
+    out = adjudicate_exit({"ticker": "X", "deferral_count": MAX_DEFERRALS}, "thesis_invalidation")
+    assert out["decision"] == "exit"
+    assert "MAX_DEFERRALS" in out["reason"]
+
+
+def test_adjudicator_failures_fail_towards_less_exposure(monkeypatch):
+    """Entry defaults to ACCEPT (the mechanical rule already passed it, the LLM is only a
+    filter); exit defaults to EXIT. Both directions reduce or hold exposure rather than
+    extend it."""
+    import fundamentals.screens.portfolio_adjudicator as adj
+
+    class Boom:
+        def __init__(self, *a, **k): raise RuntimeError("no api")
+
+    monkeypatch.setattr(adj, "OpenAI", Boom)
+    entry = adj.adjudicate_entry({"ticker": "X", "axes": {}, "confluence_count": 1,
+                                  "contradicting_count": 0, "evaluable_count": 1,
+                                  "stage": 2, "narrative_text": "", "stop": {}})
+    assert entry["decision"] == "accept" and "unavailable" in entry["reason"]
+    ex = adj.adjudicate_exit({"ticker": "X", "deferral_count": 0}, "thesis_invalidation")
+    assert ex["decision"] == "exit" and "unavailable" in ex["reason"]
+
+
+def test_stop_is_volatility_scaled_and_clamped_to_the_band(monkeypatch):
+    """A flat percentage means opposite things across this universe -- measured on the
+    2026-09-04 candidates, HESTERBIO's ordinary 10-day noise is +/-12.2% while SOFTTECH's
+    is +/-5.8%. Scaling equalises what a stop MEANS; the clamp keeps the operator's band."""
+    import fundamentals.screens.portfolio_ruleset as pr
+
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame([
+        {"symbol": "CALM", "daily_vol": 0.005},   # very low vol -> would fall below the floor
+        {"symbol": "WILD", "daily_vol": 0.060},   # very high vol -> would blow past the cap
+    ]))
+    out = pr.compute_stop_pct(["CALM", "WILD", "UNKNOWN"])
+    assert out["CALM"]["stop_pct"] == pr.STOP_PCT_MIN
+    assert out["WILD"]["stop_pct"] == pr.STOP_PCT_MAX
+    # An unknown-volatility name must not silently receive the LOOSEST stop.
+    assert out["UNKNOWN"]["stop_pct"] == (pr.STOP_PCT_MIN + pr.STOP_PCT_MAX) / 2
+
+
+def test_missing_stage_read_fails_closed(monkeypatch):
+    """No price read must never be treated as a passing one -- the same
+    absence-of-evidence error the evaluable_count guard exists to prevent."""
+    import fundamentals.screens.portfolio_ruleset as pr
+
+    monkeypatch.setattr(pr, "load_stage_reads", lambda: {})
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame([{
+        "company_master_id": "nse:X", "narrative_text": "", "first_seen_price": 1.0,
+        "first_seen_at": None, "confluence_count": 3, "contradicting_count": 0,
+        "evaluable_count": 3, "axis_fundamentals_trajectory": True,
+        "axis_event_corroboration": True, "axis_sector_cycle": True,
+        "axis_ownership": None, "axis_valuation": None, "scored_on": None,
+    }]))
+    monkeypatch.setattr("fundamentals.screens.confluence_score._ensure_confluence_score_table", lambda: None)
+    out = pr.evaluate_entry_candidates()
+    assert out["candidates"] == []
+    assert out["stage_api_available"] is False
+
+
+def test_runner_blocks_rather_than_recording_a_spurious_empty_day(monkeypatch):
+    """A dead stage API rejects EVERY candidate for an infrastructure reason. Recording
+    that as a normal zero-entry day would later read as 'the rule found nothing'."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "evaluate_entry_candidates",
+                        lambda: {"stage_api_available": False, "candidates": [], "evaluated": 5})
+    out = runner.run_portfolio()
+    assert out["status"] == "blocked"
+    assert out["entered"] == 0
+
+
+def test_rejected_candidates_are_still_recorded_as_shadow(monkeypatch):
+    """The adjudicator must be falsifiable. If rejects vanish, the veto layer absorbs
+    every result and can never be shown to be wrong -- so a REJECTED name must still be
+    opened as a shadow position, and it must carry the reject reasoning that will later
+    be scored against the paired taken position."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    opened = []
+    real_open = runner._open_position
+
+    def spy(candidate, verdict, *, kind, dry_run):
+        opened.append((candidate["ticker"], kind))
+        return real_open(candidate, verdict, kind=kind, dry_run=dry_run)
+
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "_latest_price", lambda t: 100.0)
+    monkeypatch.setattr(runner, "_open_position", spy)
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 2,
+        "candidates": [_pf_candidate("KEEP"), _pf_candidate("VETO")],
+    })
+    monkeypatch.setattr(runner, "adjudicate_entry", lambda c: {
+        "decision": "reject" if c["ticker"] == "VETO" else "accept",
+        "reason": "r", "model": "m", "prompt_version": 1,
+    })
+
+    out = runner.run_portfolio(live=True, dry_run=True)
+    assert ("VETO", "shadow") in opened, "a rejected candidate was dropped, not shadowed"
+    assert ("KEEP", "real") in opened
+    assert out["entered"] == 1 and out["rejected"] == 1
+
+
+def test_ruleset_has_no_position_cap():
+    """Operator decision 2026-09-04: no artificial ceiling on candidates. A cap would
+    silently drop names the ruleset passed, which is a hidden second rule."""
+    from pathlib import Path
+
+    src = Path("fundamentals/screens/portfolio_runner.py").read_text()
+    assert "max_positions" not in src
+    assert "[:20]" not in src and "[:15]" not in src
+
+
+def _pf_position(**over):
+    row = {"position_id": "pos:1", "company_master_id": "nse:X", "ticker": "X",
+           "kind": "real", "entry_price": 100.0, "stop_pct": 10.0,
+           "opened_at": pd.Timestamp("2026-09-01"), "deferral_count": 0,
+           "confluence_count": 2, "contradicting_count": 0, "evaluable_count": 2,
+           "stage_at_entry": 2, "target_date": None, "prediction_text": "p"}
+    row.update(over)
+    return pd.DataFrame([row])
+
+
+def _pf_exit_env(monkeypatch, *, positions, price=100.0, contradicting=0, stage=2):
+    import fundamentals.screens.portfolio_exit as px
+
+    monkeypatch.setattr(px, "_open_positions", lambda: positions)
+    monkeypatch.setattr(px, "_latest_prices",
+                        lambda t: {} if price is None else {s: price for s in t})
+    monkeypatch.setattr(px, "_current_scores", lambda c: {
+        i: {"contradicting_count": contradicting, "evaluable_count": 2} for i in c})
+    monkeypatch.setattr(px, "load_stage_reads", lambda: {} if stage is None else {"X": stage})
+    return px
+
+
+def test_stop_breach_fires_and_outranks_a_simultaneous_invalidation(monkeypatch):
+    """Priority is not cosmetic: a position can trip several conditions at once, and if
+    invalidation were reported first the exit would become deferrable -- routing a
+    breached stop through the adjudicator by the back door."""
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), price=85.0, contradicting=3, stage=4)
+    triggers = px.evaluate_exit_triggers()["triggers"]
+    assert [t["exit_reason"] for t in triggers] == ["stop_loss"]
+
+
+def test_missing_price_is_not_a_stop_breach(monkeypatch):
+    """An absent quote must never read as a breach -- that is a data outage placing a
+    market order."""
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), price=None)
+    assert px.evaluate_exit_triggers()["triggers"] == []
+
+
+def test_dead_stage_api_does_not_liquidate_the_book(monkeypatch):
+    """Fail-closed cuts the OPPOSITE way on exit than on entry. On entry a missing stage
+    read blocks entry (safe). On exit, treating 'no read' as 'stage left 2' would close
+    every position the first time systrader's API is down."""
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), stage=None)
+    out = px.evaluate_exit_triggers()
+    assert out["triggers"] == []
+    assert out["stage_api_available"] is False
+
+
+def test_contradicting_axis_and_stage_departure_both_invalidate(monkeypatch):
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), contradicting=1)
+    assert px.evaluate_exit_triggers()["triggers"][0]["exit_reason"] == "thesis_invalidation"
+
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), stage=4)
+    t = px.evaluate_exit_triggers()["triggers"][0]
+    assert t["exit_reason"] == "thesis_invalidation" and "stage" in t["detail"]
+
+
+def test_target_date_reads_the_position_not_the_empty_human_register(monkeypatch):
+    """fundamentals_portfolio_resolution has zero rows -- it is the human forecast register and no
+    human has written one. Binding this trigger there left it permanently dead while
+    looking implemented."""
+    past = _pf_position(target_date=pd.Timestamp.now().normalize() - pd.Timedelta(days=1))
+    px = _pf_exit_env(monkeypatch, positions=past)
+    assert px.evaluate_exit_triggers()["triggers"][0]["exit_reason"] == "target_date"
+
+    future = _pf_position(target_date=pd.Timestamp.now().normalize() + pd.Timedelta(days=30))
+    px = _pf_exit_env(monkeypatch, positions=future)
+    assert px.evaluate_exit_triggers()["triggers"] == []
+
+
+def test_run_exits_never_routes_a_stop_to_the_adjudicator(monkeypatch):
+    """The belt-and-braces check at the adjudicator is one layer; this asserts the caller
+    does not even ask."""
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), price=80.0)
+    called = []
+    monkeypatch.setattr(px, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(px, "adjudicate_exit", lambda *a, **k: called.append(a) or {"decision": "defer"})
+    out = px.run_exits(dry_run=True)
+    assert called == []
+    assert out["closed"] == 1 and out["deferred"] == 0
+
+
+def test_deferred_exit_is_recorded_so_the_next_run_can_refuse_it(monkeypatch):
+    """A deferral that is not counted is a cancellation. MAX_DEFERRALS can only bite if
+    the count actually increments."""
+    px = _pf_exit_env(monkeypatch, positions=_pf_position(), contradicting=1)
+    bumped = []
+    monkeypatch.setattr(px, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(px, "_record_decision", lambda **k: None)
+    monkeypatch.setattr(px, "_defer", lambda pid: bumped.append(pid))
+    monkeypatch.setattr(px, "adjudicate_exit", lambda *a, **k: {"decision": "defer", "reason": "noise"})
+    out = px.run_exits()
+    assert bumped == ["pos:1"] and out["deferred"] == 1
+
+
+def test_entry_target_date_is_clamped_into_the_hold_window():
+    """If the model could choose the date freely it could set it far enough out that the
+    target_date exit never fires -- the same neutering the stop-level ban prevents."""
+    from fundamentals.screens.portfolio_adjudicator import (
+        MAX_HOLD_DAYS, MIN_HOLD_DAYS, _clamp_target_date, _ist_today,
+    )
+
+    # Anchor on the SAME clock the code uses. A system-local "today" is a different
+    # calendar day between 18:30 UTC and midnight, which is how the fbil/bse tests came
+    # to fail every evening and pass every morning.
+    today = _ist_today()
+    far, basis = _clamp_target_date((today + pd.Timedelta(days=5000)).date().isoformat())
+    assert far == today + pd.Timedelta(days=MAX_HOLD_DAYS) and "ceiling" in basis
+    near, basis = _clamp_target_date((today + pd.Timedelta(days=2)).date().isoformat())
+    assert near == today + pd.Timedelta(days=MIN_HOLD_DAYS) and "floor" in basis
+    # Unusable input gets the MIDPOINT, never the most permissive end.
+    junk, basis = _clamp_target_date("whenever")
+    assert junk == today + pd.Timedelta(days=(MIN_HOLD_DAYS + MAX_HOLD_DAYS) // 2)
+    ok, basis = _clamp_target_date((today + pd.Timedelta(days=120)).date().isoformat())
+    assert ok == today + pd.Timedelta(days=120) and basis == "as set by the adjudicator"
+
+
+def test_is_cron_running_splits_fuser_pids_on_whitespace():
+    """fuser reports EVERY holder of the lock file, space separated. A `tr -d ' '` before
+    the split concatenated them into one nonsense number, so `ps -p` failed, `|| echo 0`
+    swallowed the failure, AGE_MIN was permanently 0, and the stuck-lock warning could
+    never fire -- a monitor reporting healthy because its own parse was broken.
+    """
+    from pathlib import Path
+
+    src = Path("scripts/is_cron_running.sh").read_text()
+    # Scope to the lock-holder block only. An earlier draft of this guard banned
+    # "tr -d ' '" script-wide and tripped on line 82's trim of a SINGLE ppid value, which
+    # is correct there -- a regression guard that flags correct code gets deleted.
+    body = src[src.index('holder="$(fuser'):src.index("STUCK_LOCK_MINUTES\"")]
+    body = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+    assert "tr -d ' '" not in body, "whitespace stripped before splitting fuser's pid list"
+    assert "for pid in $holder" in body, "holder pids must be iterated, not treated as one"
+
+
+def test_entry_decision_is_recorded_separately_from_money_at_risk(monkeypatch):
+    """kind and entry_decision answer different questions and collapsing them breaks the
+    PRD's paired comparison. In record-only mode EVERY row is kind='shadow' whether the
+    adjudicator accepted or vetoed it, so pairing on kind would compare the rollout phase
+    against itself and score the veto as if it had rejected everything."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    rows = []
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "_latest_price", lambda t: 100.0)
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 2,
+        "candidates": [_pf_candidate("KEEP"), _pf_candidate("VETO")],
+    })
+    monkeypatch.setattr(runner, "adjudicate_entry", lambda c: {
+        "decision": "reject" if c["ticker"] == "VETO" else "accept",
+        "reason": "r", "model": "m", "prompt_version": 2,
+    })
+    real_open = runner._open_position
+    monkeypatch.setattr(runner, "_open_position",
+                        lambda c, v, *, kind, dry_run: rows.append(real_open(c, v, kind=kind, dry_run=dry_run)))
+
+    runner.run_portfolio(live=False, dry_run=True)      # record-only: no real money at all
+    by_ticker = {r["ticker"]: r for r in rows}
+    assert by_ticker["KEEP"]["kind"] == "shadow" and by_ticker["VETO"]["kind"] == "shadow"
+    assert by_ticker["KEEP"]["entry_decision"] == "accept"
+    assert by_ticker["VETO"]["entry_decision"] == "reject"
+
+
+# ---------------------------------------------------------------------------
+# Machine forecast resolution + scoring (portfolio_resolution.py, 2026-09-04).
+# Replaces the deleted human l4_thesis register: the operator removed the human
+# forecast entirely, so resolution had to become unattended or nothing would ever
+# resolve -- a calibration measure that reports "0 resolved" forever rather than
+# failing loudly.
+# ---------------------------------------------------------------------------
+
+
+def _pf_resolved(**over):
+    row = {"position_id": "p", "ticker": "T", "company_master_id": "nse:T",
+           "ruleset_version": 1, "entry_decision": "accept", "kind": "shadow",
+           "confluence_count": 2, "resolved_true": True, "resolution_method": "mechanical",
+           "failure_attribution": None, "opened_at": pd.Timestamp("2026-01-01"),
+           "resolution_date": pd.Timestamp("2026-04-01").date(), "status": "open"}
+    row.update(over)
+    return row
+
+
+def test_scoring_is_empty_but_shaped_when_nothing_has_resolved(monkeypatch):
+    """An unresolved book must report zeros in the SAME shape, not a truncated dict --
+    a caller that has to guard every key learns to guard none of them."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame())
+    out = pr.compute_portfolio_scoring(as_of_date=date(2026, 9, 4))
+    assert out["total_forecasts"] == 0 and out["hit_rate"] is None
+    assert set(out) >= {"hit_rate_by_resolution_method", "hit_rate_by_entry_decision",
+                        "hit_rate_by_confluence_count", "failure_attribution_breakdown"}
+
+
+def test_hit_rate_is_always_split_by_resolution_method(monkeypatch):
+    """THE anti-self-grading control. A single blended hit rate lets judged resolutions
+    (a model grading its own prose) flatter the mechanical ones (data deciding). The gap
+    between the two is the bias estimate, so it must never be averaged away."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    rows = ([_pf_resolved(resolution_method="mechanical", resolved_true=(i < 2)) for i in range(5)]
+            + [_pf_resolved(resolution_method="judged", resolved_true=True) for _ in range(5)])
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame(rows))
+    out = pr.compute_portfolio_scoring()
+    assert out["hit_rate_by_resolution_method"]["mechanical"] == {"count": 5, "hit_rate": 40.0}
+    assert out["hit_rate_by_resolution_method"]["judged"] == {"count": 5, "hit_rate": 100.0}
+
+
+def test_scoring_pairs_accepted_against_vetoed(monkeypatch):
+    """The PRD's whole reason for recording vetoed names. Without this split the veto
+    layer absorbs every result and can never be shown to be wrong."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    rows = ([_pf_resolved(entry_decision="accept", resolved_true=True) for _ in range(5)]
+            + [_pf_resolved(entry_decision="reject", resolved_true=False) for _ in range(5)])
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame(rows))
+    out = pr.compute_portfolio_scoring()
+    assert out["hit_rate_by_entry_decision"]["accept"]["hit_rate"] == 100.0
+    assert out["hit_rate_by_entry_decision"]["reject"]["hit_rate"] == 0.0
+
+
+def test_thin_groups_report_none_rather_than_a_number(monkeypatch):
+    """A hit rate off two samples is noise wearing a percentage sign. It reports None but
+    still shows n, so a thin sample is visibly thin rather than absent -- absence reads as
+    'nothing collected', thinness reads as 'not enough yet'."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    rows = [_pf_resolved(entry_decision="accept") for _ in range(2)]
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame(rows))
+    out = pr.compute_portfolio_scoring()
+    assert out["hit_rate_by_entry_decision"]["accept"] == {"count": 2, "hit_rate": None}
+
+
+def test_failure_attribution_is_derived_not_judged():
+    """thesis_wrong vs thesis_right_market_hasnt_paid "look identical in P&L and demand
+    opposite corrections" -- it was the human's call and is now derived from the two
+    outcomes we already have. A WRONG forecast that happened to make money is still
+    thesis_wrong: recording it as a success teaches the process the opposite of the
+    truth."""
+    from fundamentals.screens.portfolio_resolution import _attribute_failure
+
+    assert _attribute_failure(False, -0.20) == "thesis_wrong"
+    assert _attribute_failure(False, +0.40) == "thesis_wrong"      # right for the wrong reason
+    assert _attribute_failure(True, -0.15) == "thesis_right_market_hasnt_paid"
+    assert _attribute_failure(True, +0.15) is None
+    assert _attribute_failure(True, None) is None                  # no price read: no claim
+
+
+def test_unresolvable_forecast_stays_open_instead_of_counting_as_false(monkeypatch):
+    """A resolver that cannot decide must leave the forecast open. Writing False on a
+    failed grading manufactures a miss out of missing data and quietly drags the hit
+    rate down."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    monkeypatch.setattr(pr, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(pr, "load_due_forecasts", lambda **k: pd.DataFrame([
+        _pf_resolved(metric_name=None, prediction_text="something vague")]))
+    monkeypatch.setattr(pr, "l2_is_newer_than_forecast", lambda row: (True, "fresh"))
+    monkeypatch.setattr(pr, "check_structured_prediction", lambda row: None)
+    monkeypatch.setattr(pr, "_judge_prediction",
+                        lambda row, **k: {"resolved_true": None, "reason": "cannot settle"})
+    wrote = []
+    monkeypatch.setattr(pr, "_write_resolution", lambda *a: wrote.append(a))
+    out = pr.resolve_due_forecasts()
+    assert out["resolved"] == 0 and out["left_open"] == 1
+    assert wrote == [], "an unresolvable forecast must not be written as resolved"
+
+
+def test_mechanical_resolution_never_consults_the_model(monkeypatch):
+    """Where a structured metric exists, the model's own prose is not consulted at all --
+    that is the point of forcing the adjudicator to commit to a checkable comparison."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    called = []
+    monkeypatch.setattr(pr, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(pr, "load_due_forecasts", lambda **k: pd.DataFrame([
+        _pf_resolved(metric_name="debt_to_ebitda", metric_operator="<", metric_threshold=2.0)]))
+    monkeypatch.setattr(pr, "l2_is_newer_than_forecast", lambda row: (True, "fresh"))
+    monkeypatch.setattr(pr, "check_structured_prediction", lambda row: True)
+    monkeypatch.setattr(pr, "_judge_prediction", lambda *a, **k: called.append(a) or {})
+    monkeypatch.setattr(pr, "_price_outcome", lambda row: 0.1)
+    monkeypatch.setattr(pr, "_write_resolution", lambda *a: None)
+    monkeypatch.setattr(pr, "_record_decision", lambda **k: None)
+    out = pr.resolve_due_forecasts()
+    assert called == []
+    assert out["resolved_detail"][0]["method"] == "mechanical"
+
+
+def test_adjudicator_cannot_invent_an_l2_column():
+    """metric_name is free text from a model and nothing else checks it names a real
+    NUMERIC L2 column -- the exact bug that used to crash the old resolver with a
+    str-vs-number TypeError. An invented name is worse than none: it looks
+    machine-checkable and silently never resolves."""
+    from fundamentals.screens.portfolio_adjudicator import _validate_metric
+
+    allowed = ["debt_to_ebitda", "pledge_pct"]
+    good = _validate_metric({"metric_name": "debt_to_ebitda", "metric_operator": "<",
+                             "metric_threshold": 2}, allowed)
+    assert good["metric_threshold"] == 2.0 and good["metric_rejected_reason"] is None
+
+    made_up = _validate_metric({"metric_name": "free_cash_flow_yield", "metric_operator": "<",
+                                "metric_threshold": 2}, allowed)
+    assert made_up["metric_name"] is None and "not a numeric" in made_up["metric_rejected_reason"]
+
+    bad_op = _validate_metric({"metric_name": "pledge_pct", "metric_operator": "decreases",
+                               "metric_threshold": 2}, allowed)
+    assert bad_op["metric_name"] is None and "operator" in bad_op["metric_rejected_reason"]
+
+    # No metric at all is legitimate -- not every prediction honestly reduces.
+    assert _validate_metric({"metric_name": None, "metric_operator": None,
+                             "metric_threshold": None}, allowed)["metric_rejected_reason"] is None
+
+
+def test_sizing_refuses_a_vetoed_name(monkeypatch):
+    """A vetoed name is still recorded as a position (that is what makes the adjudicator
+    falsifiable) -- but sizing one would put real capital behind a name the adjudicator
+    rejected, the exact opposite of what the veto means."""
+    from pathlib import Path
+
+    src = Path("fundamentals/screens/l5_sizing.py").read_text()
+    query = src[src.index("def load_open_thesis"):src.index("def load_adv_inputs")]
+    assert "entry_decision = 'accept'" in query
+    assert "fundamentals_l4_thesis" not in query, "still reading the deleted human register"
+
+
+def test_the_human_forecast_register_is_gone():
+    """Operator decision 2026-09-04: "remove the human forecast completely". A later
+    session restoring create_thesis/resolve_thesis would silently reintroduce a manual
+    gate that nothing in the nightly run would ever satisfy, freezing the portfolio."""
+    from pathlib import Path
+
+    assert not Path("fundamentals/screens/l4_thesis.py").exists()
+    api = Path("fundamentals/api/app.py").read_text()
+    assert '@app.post("/api/portfolio")' not in api
+    assert "resolve_portfolio" not in api
+
+
+# --- L5 sizing: flat allocation (operator-set 2026-09-04) -------------------
+
+
+def test_sizing_is_a_flat_allocation_not_an_equal_weight_split(monkeypatch):
+    """Under the old equal-weight split, every new name shrank every existing one, so a
+    position's size depended on how many OTHER companies happened to qualify that day.
+    A name's allocation moving because an unrelated company passed the screen is not a
+    decision anyone made."""
+    import fundamentals.screens.l5_sizing as sizing
+
+    monkeypatch.setattr(sizing, "load_open_thesis", lambda cid: {"thesis_id": "pos:1"})
+    monkeypatch.setattr(sizing, "load_adv_inputs",
+                        lambda cid: {"adv_value_rs": 50_000_000, "avg_vol_1mth": 1, "cmp_rs": 1})
+    out = sizing.get_position_size_recommendation("nse:X")
+    assert out["recommended_size_rs"] == sizing.CAPITAL_PER_POSITION_RS == 100000.0
+    assert out["binding_constraint"] == "flat_allocation"
+    assert out["max_positions"] == 100
+
+
+def test_adv_cap_can_only_reduce_the_size_never_raise_it():
+    """ADV is a LIQUIDITY ceiling. A very liquid name does not earn a bigger position --
+    that would turn a risk control into a conviction signal."""
+    from fundamentals.screens.l5_sizing import compute_position_size
+
+    illiquid = compute_position_size(target_capital_rs=100000, adv_value_rs=200000)
+    assert illiquid["recommended_size_rs"] == 20000.0
+    assert illiquid["binding_constraint"] == "adv_liquidity_cap"
+
+    liquid = compute_position_size(target_capital_rs=100000, adv_value_rs=900_000_000)
+    assert liquid["recommended_size_rs"] == 100000.0   # NOT scaled up
+
+    # Unknown liquidity is neither infinite nor zero: fall back to the flat allocation
+    # and say so, rather than silently uncapping or zeroing the position.
+    unknown = compute_position_size(target_capital_rs=100000, adv_value_rs=None)
+    assert unknown["recommended_size_rs"] == 100000.0
+    assert unknown["binding_constraint"] == "flat_allocation_no_adv_data"
+    assert unknown["adv_cap_rs"] is None
+
+
+def test_sizing_refuses_a_company_with_no_open_position(monkeypatch):
+    import fundamentals.screens.l5_sizing as sizing
+
+    monkeypatch.setattr(sizing, "load_open_thesis", lambda cid: None)
+    assert sizing.get_position_size_recommendation("nse:X") is None
+
+
+def test_full_book_turns_candidates_away_by_name_rather_than_silently(monkeypatch):
+    """MAX_POSITIONS is a CAPITAL constraint (100 x Rs 1L = Rs 1cr), not a diversification
+    heuristic, and that decides how it is enforced. "The book was full" and "the rule
+    found nothing" look identical in a position count and mean opposite things -- so the
+    turned-away names are recorded, and the candidate list is never silently truncated."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: {f"HELD{i}" for i in range(100)})
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "MAX_POSITIONS", 100)
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 2,
+        "candidates": [_pf_candidate("NEWNAME"), _pf_candidate("VETOME")]})
+    monkeypatch.setattr(runner, "adjudicate_entry", lambda c: {
+        "decision": "reject" if c["ticker"] == "VETOME" else "accept",
+        "reason": "r", "model": "m", "prompt_version": 3})
+    opened = []
+    monkeypatch.setattr(runner, "_open_position",
+                        lambda c, v, *, kind, dry_run: opened.append((c["ticker"], kind)))
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+
+    out = runner.run_portfolio()
+    assert out["turned_away_book_full"] == ["NEWNAME"]
+    assert out["entered"] == 0
+    # A VETOED name commits no capital, so a full book must not stop it being recorded --
+    # losing it would break the accepted-vs-vetoed comparison exactly when the book is
+    # most active.
+    assert ("VETOME", "shadow") in opened
+
+
+def test_entry_sizing_is_frozen_on_the_position(monkeypatch):
+    """Sizing is stored at entry, not recomputed on read. Recomputing would restate
+    history every time ADV moved; the question a review asks is "what did we commit"."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    monkeypatch.setattr(runner, "_latest_price", lambda t: 100.0)
+    monkeypatch.setattr(runner, "_size_for", lambda c: {
+        "recommended_size_rs": 100000.0, "adv_cap_rs": 250000.0,
+        "binding_constraint": "flat_allocation"})
+    row = runner._open_position(_pf_candidate("X"), {"decision": "accept", "reason": "r"},
+                                kind="shadow", dry_run=True)
+    assert row["position_size_rs"] == 100000.0
+    assert row["adv_cap_rs"] == 250000.0
+    assert row["sizing_basis"] == "flat_allocation"
+
+
+def test_api_sizing_defaults_to_the_operator_set_allocation(monkeypatch):
+    """This route used to 422 without total_capital_rs/target_position_count, because the
+    API had no business guessing the operator's sleeve. It is not guessing now: Rs 1L per
+    position is a figure the operator set, so the default is a recorded decision rather
+    than a silent assumption -- and an override is still accepted."""
+    seen = {}
+
+    def fake(cmid, *, capital_per_position_rs):
+        seen["value"] = capital_per_position_rs
+        return {"company_master_id": cmid, "recommended_size_rs": 100000.0,
+                "binding_constraint": "flat_allocation"}
+
+    monkeypatch.setattr(fundamentals_api_queries, "get_position_sizing", fake)
+    client = TestClient(fundamentals_api_app)
+
+    assert client.get("/api/watchlist/nse:X/sizing").status_code == 200
+    assert seen["value"] is None          # -> l5_sizing applies CAPITAL_PER_POSITION_RS
+
+    client.get("/api/watchlist/nse:X/sizing?capital_per_position_rs=250000")
+    assert seen["value"] == 250000.0
+
+
+# ---------------------------------------------------------------------------
+# Review findings, 2026-09-04. All four were live bugs found by reviewing the
+# finished build against real data, none by reading the code.
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_never_resolves_against_data_that_predates_it(monkeypatch):
+    """THE worst bug in the build. Resolution reads the LATEST L2 row, and L2 refreshes on
+    the screener's cadence -- on the 2026-09-04 book every L2 row predated its forecast by
+    ~15 days, so forecasts would have been graded against the very data the adjudicator
+    read when writing them.
+
+    Not merely circular: systematically wrong in ONE direction. These forecasts predict a
+    CHANGE ("net debt keeps falling"), so the pre-forecast snapshot marks them wrong before
+    the company has reported anything. BALPHARMA returned False on a +9 reading the
+    adjudicator had already seen and was predicting would reverse. The mechanical hit rate
+    -- trusted precisely because no model can influence it -- would have converged on zero
+    and looked like evidence.
+    """
+    import fundamentals.screens.portfolio_resolution as pr
+
+    row = {"company_master_id": "nse:X", "opened_at": pd.Timestamp("2026-09-04", tz="UTC"),
+           "metric_name": "debt_to_ebitda", "metric_operator": "<", "metric_threshold": 2.0}
+
+    monkeypatch.setattr(pr, "build_l1_ticker_by_company_master_id", lambda: {"nse:X": "X"})
+
+    def state_at(run_date):
+        return lambda *a, **k: pd.DataFrame([{"run_date": pd.Timestamp(run_date),
+                                              "debt_to_ebitda": 1.0}])
+
+    # State older than the forecast -> refuses, even though the metric would evaluate True.
+    monkeypatch.setattr(pr, "sql_to_df", state_at("2026-08-20"))
+    fresh, why = pr.l2_is_newer_than_forecast(row)
+    assert fresh is False and "has not refreshed" in why
+    assert pr.check_structured_prediction(row) is None
+
+    # Same-day state is the same reporting period -- still refused.
+    monkeypatch.setattr(pr, "sql_to_df", state_at("2026-09-04"))
+    assert pr.l2_is_newer_than_forecast(row)[0] is False
+
+    # Genuinely newer state -> resolves normally.
+    monkeypatch.setattr(pr, "sql_to_df", state_at("2026-12-01"))
+    assert pr.l2_is_newer_than_forecast(row)[0] is True
+    assert pr.check_structured_prediction(row) is True
+
+
+def test_stale_state_skips_the_resolver_call_entirely(monkeypatch):
+    """If the state hasn't moved, NEITHER path can honestly settle the forecast -- so the
+    judged path must not be asked either. Cheapest guard first, and it saves the call."""
+    import fundamentals.screens.portfolio_resolution as pr
+
+    asked = []
+    monkeypatch.setattr(pr, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(pr, "load_due_forecasts", lambda **k: pd.DataFrame([_pf_resolved()]))
+    monkeypatch.setattr(pr, "l2_is_newer_than_forecast", lambda row: (False, "stale"))
+    monkeypatch.setattr(pr, "_judge_prediction", lambda *a, **k: asked.append(a) or {})
+    out = pr.resolve_due_forecasts()
+    assert asked == []
+    assert out["resolved"] == 0 and out["left_open"] == 1
+
+
+def test_metric_validation_fails_closed_when_the_column_list_is_empty():
+    """This read `if allowed and name not in allowed`, so an EMPTY allow-list -- what a
+    failed or empty information_schema read returns -- disabled validation entirely. A
+    stored metric naming nothing real looks machine-checkable and then silently never
+    resolves, which is worse than having no metric."""
+    from fundamentals.screens.portfolio_adjudicator import _validate_metric
+
+    out = _validate_metric({"metric_name": "invented_column", "metric_operator": "<",
+                            "metric_threshold": 1}, [])
+    assert out["metric_name"] is None
+    assert "refusing to trust" in out["metric_rejected_reason"]
+
+
+def test_a_veto_is_not_a_permanent_ban(monkeypatch):
+    """A vetoed shadow position never closes on its own, and the re-entry guard used to
+    read ALL open positions -- so one day's veto silently became a lifetime exclusion and
+    the name could never be reconsidered however much its evidence improved. Nobody
+    decided that."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    opened = []
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_latest_price", lambda t: 100.0)
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+    monkeypatch.setattr(runner, "_open_position",
+                        lambda c, v, *, kind, dry_run: opened.append((c["ticker"], kind)))
+    # Vetoed earlier, and the confluence score has since been re-run -- new evidence is
+    # what makes reconsideration meaningful (see test_a_veto_stands_until_the_evidence_moves).
+    reconsidered = _pf_candidate("ONCEVETOED")
+    reconsidered["scored_on"] = pd.Timestamp("2026-10-01").date()
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1, "candidates": [reconsidered]})
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "_open_vetoed_tickers",
+                        lambda: {"ONCEVETOED": pd.Timestamp("2026-09-04", tz="UTC")})
+
+    # The adjudicator changed its mind: the name must be enterable.
+    monkeypatch.setattr(runner, "adjudicate_entry",
+                        lambda c: {"decision": "accept", "reason": "evidence improved"})
+    out = runner.run_portfolio(live=True)
+    assert out["entered"] == 1 and ("ONCEVETOED", "real") in opened
+
+    # Vetoed again -> decision recorded (above), but no SECOND identical shadow, which
+    # would inflate the vetoed arm with duplicates of one company.
+    opened.clear()
+    monkeypatch.setattr(runner, "adjudicate_entry",
+                        lambda c: {"decision": "reject", "reason": "still no"})
+    out = runner.run_portfolio()
+    assert opened == []
+    assert out["re_vetoed_no_duplicate"] == ["ONCEVETOED"]
+
+
+def test_a_turned_away_candidate_still_has_its_reasoning_recorded(monkeypatch):
+    """The adjudication happened and cost a call. Discarding the verdict because the book
+    happened to be full loses the only record of what was decided about that name."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    recorded = []
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: {f"H{i}" for i in range(100)})
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "MAX_POSITIONS", 100)
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1, "candidates": [_pf_candidate("NEW")]})
+    monkeypatch.setattr(runner, "adjudicate_entry",
+                        lambda c: {"decision": "accept", "reason": "good"})
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: recorded.append(k))
+    monkeypatch.setattr(runner, "_open_position", lambda *a, **k: None)
+
+    out = runner.run_portfolio()
+    assert out["turned_away_book_full"] == ["NEW"]
+    assert len(recorded) == 1 and recorded[0]["decision"] == "accept"
+
+
+def test_price_reads_are_date_bounded_on_the_hypertable():
+    """advisory_adjusted_ohlcv_daily is a VIEW over a TimescaleDB hypertable. Without a
+    date bound, "latest close per symbol" visits EVERY chunk to find each symbol's max
+    date -- measured 2026-09-04: 689 chunks and 2.4s for 100 symbols vs 0.2s bounded, and
+    the unbounded cost grows with history while the bounded one does not. These run
+    nightly over the whole book, which is the exact shape of the unbounded-hypertable
+    scan that caused this session's OOM incident.
+    """
+    import ast
+    from pathlib import Path
+
+    # Scan SQL STRING LITERALS via ast, not raw text. A plain substring scan matches the
+    # explanatory comment above the query and the prose in docstrings -- and a guard that
+    # trips on correct code gets deleted rather than fixed.
+    checked = 0
+    for module in ("portfolio_exit.py", "portfolio_runner.py",
+                   "portfolio_resolution.py", "portfolio_ruleset.py"):
+        tree = ast.parse(Path(f"fundamentals/screens/{module}").read_text())
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            sql = node.value
+            if "advisory_adjusted_ohlcv_daily" not in sql or "FROM" not in sql:
+                continue
+            checked += 1
+            assert "interval" in sql, (
+                f"{module}:{node.lineno} reads advisory_adjusted_ohlcv_daily "
+                f"without a date bound"
+            )
+    assert checked >= 4, f"expected to find the known price queries, saw {checked}"
+
+
+def test_a_position_with_no_recent_price_is_reported_not_skipped(monkeypatch):
+    """A position with no trade inside the lookback cannot have its stop evaluated. A stop
+    nobody is checking must never be silently assumed safe -- "no silent fallback"."""
+    import fundamentals.screens.portfolio_exit as px
+
+    px_env = _pf_exit_env(monkeypatch, positions=_pf_position(), price=None)
+    out = px_env.evaluate_exit_triggers()
+    assert out["unpriced"] == ["X"]
+    assert out["triggers"] == []     # still no spurious exit
+
+
+def test_a_veto_stands_until_the_evidence_moves(monkeypatch):
+    """The counterpart to test_a_veto_is_not_a_permanent_ban, and the two must both hold.
+
+    Fixing the permanent ban created the opposite failure: the adjudicator is a sampled
+    model, so re-asking it the same question about the same evidence eventually yields an
+    accept. Observed live within one hour -- RANEHOLDIN was vetoed at 18:42 and accepted
+    at 19:32 on an identical scorecard. That makes the rule "accept if the model EVER says
+    yes", which is not a filter, and it favours whichever names get re-asked most often.
+    """
+    import fundamentals.screens.portfolio_runner as runner
+
+    asked = []
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_latest_price", lambda t: 100.0)
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+    monkeypatch.setattr(runner, "_open_position", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "adjudicate_entry",
+                        lambda c: asked.append(c["ticker"]) or {"decision": "accept", "reason": "r"})
+
+    vetoed_on = pd.Timestamp("2026-09-04", tz="UTC")
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {"X": vetoed_on})
+
+    # Same evidence date as the veto -> not re-asked at all (which also saves the call).
+    stale = _pf_candidate("X"); stale["scored_on"] = pd.Timestamp("2026-09-04").date()
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1, "candidates": [stale]})
+    out = runner.run_portfolio()
+    assert out["veto_stands_no_new_evidence"] == ["X"]
+    assert asked == [], "a vetoed name was re-adjudicated on unchanged evidence"
+
+    # Evidence genuinely refreshed -> the name is reconsidered.
+    fresh = _pf_candidate("X"); fresh["scored_on"] = pd.Timestamp("2026-10-01").date()
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1, "candidates": [fresh]})
+    out = runner.run_portfolio()
+    assert out["entered"] == 1 and asked == ["X"]
+
+    # Missing evidence date cannot demonstrate a change -> the veto stands.
+    asked.clear()
+    unknown = _pf_candidate("X"); unknown["scored_on"] = None
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1, "candidates": [unknown]})
+    assert runner.run_portfolio()["veto_stands_no_new_evidence"] == ["X"]
+    assert asked == []
+
+
+def test_a_stale_stage_read_is_discarded_like_a_missing_one(monkeypatch):
+    """The entry rule was fail-closed on a MISSING stage read but had no protection
+    against a STALE one -- and stale is the more dangerous case precisely because it looks
+    healthy. systrader's cmd/api is kept alive by its own cron; if that dies the endpoint
+    keeps serving last week's stages forever, with no error, silently turning a daily price
+    read into a constant. This repo has been bitten by that exact shape twice (go-crond
+    dead 5 days; Dhan collection dead 5 days with every freshness check green).
+
+    Found live 2026-09-05: 14 real reads were being trusted despite being stale.
+    """
+    import json as _json
+    import fundamentals.screens.portfolio_ruleset as pr
+
+    today = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5, minutes=30)).normalize()
+    payload = {"rows": [
+        {"ticker": "FRESH", "stage": 2, "as_of": str((today - pd.Timedelta(days=1)).date())},
+        {"ticker": "STALE", "stage": 2, "as_of": str((today - pd.Timedelta(days=40)).date())},
+        {"ticker": "JUNKDATE", "stage": 2, "as_of": "not-a-date"},
+        {"ticker": "NOASOF", "stage": 2},
+    ]}
+
+    class FakeResp:
+        def read(self): return _json.dumps(payload).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(pr.urllib.request, "urlopen", lambda *a, **k: FakeResp())
+    stages = pr.load_stage_reads()
+
+    assert stages.get("FRESH") == 2
+    assert "STALE" not in stages, "a stale stage read was trusted as current"
+    assert "JUNKDATE" not in stages, "an unparseable as_of must not be trusted"
+    # A row with no as_of at all predates the field; it is accepted rather than dropping
+    # the whole universe on a contract change, and the endpoint's own health is a
+    # separate check.
+    assert stages.get("NOASOF") == 2
+
+
+def test_stale_stage_reads_block_entry_rather_than_passing_silently(monkeypatch):
+    """The consequence that matters: if every read is stale, the ruleset must report the
+    stage API as unavailable so portfolio_runner BLOCKS the run -- not record a day of
+    zero entries that later reads as "the rule found nothing"."""
+    import fundamentals.screens.portfolio_ruleset as pr
+
+    monkeypatch.setattr(pr, "load_stage_reads", lambda: {})
+    monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame([{
+        "company_master_id": "nse:X", "narrative_text": "", "first_seen_price": 1.0,
+        "first_seen_at": None, "confluence_count": 3, "contradicting_count": 0,
+        "evaluable_count": 3, "axis_fundamentals_trajectory": True,
+        "axis_event_corroboration": True, "axis_sector_cycle": True,
+        "axis_ownership": None, "axis_valuation": None, "scored_on": None,
+    }]))
+    monkeypatch.setattr("fundamentals.screens.confluence_score._ensure_confluence_score_table", lambda: None)
+    out = pr.evaluate_entry_candidates()
+    assert out["stage_api_available"] is False and out["candidates"] == []
+
+
+# ---------------------------------------------------------------------------
+# Dhan consent rationing -- incident 2026-09-04/05 (CONSENT_LIMIT_EXCEED).
+# Every Dhan-backed job minted its own consent when it found no token: 22 attempts
+# across five jobs exhausted Dhan's quota and stopped ALL collection, which then made
+# every job retry. Two independent guards, because either alone is insufficient.
+# ---------------------------------------------------------------------------
+
+
+def test_the_login_lock_alone_cannot_prevent_a_consent_storm():
+    """Documents WHY a second guard was needed. _dhan_login_lock serialises callers so
+    they do not fight over the browser -- it was never a rate limit, and serialising N
+    callers still mints N consents. Reaching for the existing lock here would have looked
+    like a fix and changed nothing."""
+    import inspect
+    from data.dhanlive import auth as a
+
+    doc = inspect.getdoc(a._dhan_login_lock) or ""
+    assert "Serialize" in doc or "serialize" in doc
+    # The real cap lives elsewhere, and is not the lock.
+    assert a.MAX_CONSENTS_PER_DAY >= 1
+    assert "budget" in inspect.getsource(a.generate_consent_app_id)
+
+
+def test_only_the_designated_owner_may_mint_a_consent(monkeypatch):
+    from data.dhanlive import auth as a
+
+    monkeypatch.delenv(a.CONSENT_OWNER_ENV, raising=False)
+    monkeypatch.setattr(a, "_record_dhan_auth_fallback", lambda **k: None)
+    assert a.is_consent_owner() is False
+    with pytest.raises(a.DhanAuthError):
+        a._require_consent_owner("dhan_intraday_sync")
+
+    a.claim_consent_owner()          # what auth_cli --auto-login does
+    assert a.is_consent_owner() is True
+    a._require_consent_owner("auth_cli")     # must not raise
+
+
+def test_a_refused_collector_records_telemetry_rather_than_failing_silently(monkeypatch):
+    """The outage was invisible: no Dhan collector was marked not-OK and no auth failure
+    was recorded as a fallback event, so Friday's collapse to 4 tickers raised nothing."""
+    from data.dhanlive import auth as a
+
+    events = []
+    monkeypatch.delenv(a.CONSENT_OWNER_ENV, raising=False)
+    monkeypatch.setattr(a, "_record_dhan_auth_fallback", lambda **k: events.append(k))
+    with pytest.raises(a.DhanAuthError):
+        a._require_consent_owner("data_readiness")
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "dhan_consent_generation_refused_not_owner"
+    assert events[0]["metadata"]["caller"] == "data_readiness"
+
+
+def test_the_daily_budget_is_charged_before_the_network_call(tmp_path, monkeypatch):
+    """Charged before, not after. A request that reaches Dhan has already cost quota
+    whatever it answers, so counting only successes lets a FAILING loop mint consents
+    forever -- which is exactly how the quota was exhausted."""
+    from data.dhanlive import auth as a
+
+    monkeypatch.setattr(a, "CONSENT_BUDGET_PATH", tmp_path / "budget.json")
+    monkeypatch.setattr(a, "MAX_CONSENTS_PER_DAY", 2)
+    a._spend_consent_budget()
+    a._spend_consent_budget()
+    assert a.consent_budget_remaining() == 0
+    with pytest.raises(a.DhanAuthError) as excinfo:
+        a._spend_consent_budget()
+    assert "budget exhausted" in str(excinfo.value)
+
+
+def test_the_budget_is_shared_across_processes_and_resets_by_ist_day(tmp_path, monkeypatch):
+    """A per-process counter would not have helped: the 22 attempts came from five
+    SEPARATE processes. The budget is on disk and keyed by the IST calendar day."""
+    from data.dhanlive import auth as a
+
+    budget = tmp_path / "budget.json"
+    monkeypatch.setattr(a, "CONSENT_BUDGET_PATH", budget)
+    monkeypatch.setattr(a, "MAX_CONSENTS_PER_DAY", 1)
+    a._spend_consent_budget()
+    assert a.consent_budget_remaining() == 0          # a fresh process reads the same file
+    assert json.loads(budget.read_text())["date"] == a._ist_today_str()
+
+    budget.write_text(json.dumps({"date": "2020-01-01", "count": 99}))
+    assert a.consent_budget_remaining() == 1          # yesterday's spend does not carry over
+
+
+def test_an_unwritable_budget_refuses_rather_than_running_unmetered(tmp_path, monkeypatch):
+    """An unenforceable cap is the state that caused the outage, so it fails closed."""
+    from data.dhanlive import auth as a
+
+    monkeypatch.setattr(a, "CONSENT_BUDGET_PATH", tmp_path / "nodir" / "budget.json")
+    monkeypatch.setattr(a, "MAX_CONSENTS_PER_DAY", 5)
+
+    def boom(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(pathlib.Path, "write_text", boom)
+    with pytest.raises(a.DhanAuthError) as excinfo:
+        a._spend_consent_budget()
+    assert "Cannot record Dhan consent budget" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio in the daily digest (operator request, 2026-09-06).
+# ---------------------------------------------------------------------------
+
+
+def _digest_position(**over):
+    row = {"ticker": "ACME", "company_master_id": "nse:ACME", "entry_decision": "accept",
+           "kind": "shadow", "opened_at": pd.Timestamp("2026-09-04", tz="UTC"),
+           "entry_price": 100.0, "stop_pct": 10.0, "target_date": date(2027, 1, 4),
+           "prediction_text": "Net debt keeps falling", "adjudicator_reason": "consistent",
+           "position_size_rs": 100000.0, "metric_name": "debt_to_ebitda",
+           "metric_operator": "<", "metric_threshold": 1.5, "current_price": 97.0}
+    row.update(over)
+    return row
+
+
+def test_digest_states_plainly_that_no_money_is_committed():
+    """An emailed list of holdings reads as REAL unless it says otherwise, and every row
+    is currently kind='shadow'. Getting this wrong would misrepresent a paper book as a
+    live one to four recipients."""
+    from fundamentals.screens.notifications import build_portfolio_section
+
+    html_body, text = build_portfolio_section([_digest_position()])
+    assert "RECORD-ONLY" in text[0] and "no money committed" in text[0]
+    assert "RECORD-ONLY" in html_body
+
+    live_html, live_text = build_portfolio_section([_digest_position(kind="real")])
+    assert "LIVE" in live_text[0] and "RECORD-ONLY" not in live_html
+
+
+def test_digest_shows_vetoed_names_not_just_the_taken_ones():
+    """The vetoed names are the control arm. A digest showing only what was taken hides
+    the half of the record that says whether the veto is worth anything."""
+    from fundamentals.screens.notifications import build_portfolio_section
+
+    html_body, text = build_portfolio_section([
+        _digest_position(ticker="TAKEN"),
+        _digest_position(ticker="VETOED", entry_decision="reject",
+                         adjudicator_reason="CWIP rising again"),
+    ])
+    assert "VETOED" in html_body and "CWIP rising again" in html_body
+    assert "1 vetoed" in html_body
+    # ...and the vetoed name must NOT be counted as committed capital.
+    assert "Rs 100,000 notional" in html_body
+
+
+def test_room_to_stop_is_never_guessed():
+    from fundamentals.screens.notifications import _room_to_stop_pct
+
+    assert _room_to_stop_pct(100, 10, 100) == 100.0      # just entered
+    assert _room_to_stop_pct(100, 10, 90) == 0.0         # at the stop
+    assert _room_to_stop_pct(100, 10, 95) == 50.0
+    assert _room_to_stop_pct(100, 10, 80) == 0.0         # past it, clamped
+    # Missing inputs give None, never a reassuring 100.
+    assert _room_to_stop_pct(100, 10, None) is None
+    assert _room_to_stop_pct(None, 10, 95) is None
+    assert _room_to_stop_pct(100, 0, 95) is None
+
+
+def test_an_unreadable_portfolio_does_not_lose_the_watchlist_email(monkeypatch):
+    """The digest has arrived daily for weeks. A portfolio that cannot be read must
+    degrade to "no portfolio section", not take the whole email down with it."""
+    import fundamentals.screens.notifications as n
+
+    recorded = []
+    monkeypatch.setattr(n, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(n, "_record_fallback", lambda *a, **k: recorded.append(a))
+    assert n.load_portfolio_positions() == []
+    assert recorded, "a swallowed failure must still be recorded"
+
+    subject, text, html_body = n.build_daily_digest_content(
+        [{"ticker": "X", "company_master_id": "nse:X", "first_seen_at": None,
+          "current_price": None, "first_seen_price": None, "alert_count": 0,
+          "narrative_text": "why", "suggested_watch_until": None, "company_name": "X Ltd"}],
+        [],
+    )
+    assert "Watchlist Digest" in html_body
+    assert "Portfolio" not in html_body
+
+
+def test_portfolio_survives_an_empty_watchlist():
+    """Positions stay open after a name leaves the watchlist, so an empty watchlist must
+    not swallow the book."""
+    from fundamentals.screens.notifications import build_daily_digest_content
+
+    subject, text, html_body = build_daily_digest_content([], [_digest_position()])
+    assert "ACME" in html_body and "PORTFOLIO" in text
+
+
+def test_digest_subject_names_the_position_count():
+    from fundamentals.screens.notifications import build_daily_digest_content
+
+    wl = [{"ticker": "X", "company_master_id": "nse:X", "first_seen_at": None,
+           "current_price": None, "first_seen_price": None, "alert_count": 0,
+           "narrative_text": "why", "suggested_watch_until": None, "company_name": "X Ltd"}]
+    subject, _, _ = build_daily_digest_content(wl, [_digest_position()])
+    assert "1 positions" in subject or "1 position" in subject
+    subject_no_pf, _, _ = build_daily_digest_content(wl, [])
+    assert "position" not in subject_no_pf
+
+
+def test_fetch_daily_compensates_for_dhans_exclusive_todate():
+    """BUG FOUND LIVE 2026-09-06. Dhan's /charts/historical toDate is EXCLUSIVE: asking
+    for toDate=D returns sessions only through D-1. Measured on BSE (security_id 19585),
+    toDate=2026-09-04 gave 09-01..09-03 while toDate=2026-09-05 gave 09-01..09-04, with
+    the 09-04 close (3409.8) matching NSE's bhavcopy exactly.
+
+    Every caller passes an INCLUSIVE to_date, so the most recent session's bar was never
+    fetched by the run that asked for it -- dhan_ohlcv_daily sat permanently one trading
+    day behind and data_completeness's dhan_daily check failed every night for a chronic
+    reason. A gate that fails nightly is a gate people stop reading, which is exactly how
+    the August outage stayed invisible for five days.
+    """
+    from datetime import datetime as _dt
+
+    from data.dhanlive import client as dhan_client_module
+
+    captured = {}
+
+    class FakeClient(dhan_client_module.DhanHistoricalClient):
+        def __init__(self):  # bypass auth/session setup
+            pass
+
+        def _request(self, method, url, **kwargs):
+            captured.update(kwargs.get("json") or {})
+            return {}
+
+    FakeClient().fetch_daily(
+        security_id=1, exchange_segment="NSE_EQ", instrument="EQUITY",
+        from_date=_dt(2026, 9, 1), to_date=_dt(2026, 9, 4),
+    )
+    assert captured["fromDate"] == "2026-09-01"
+    assert captured["toDate"] == "2026-09-05", (
+        "to_date must be sent as the day AFTER the caller's inclusive date, or the "
+        "most recent session is silently dropped"
+    )
+
+
+def test_fetch_intraday_does_not_need_the_same_compensation():
+    """The contrast that localises the bug: fetch_intraday sends a full timestamp clamped
+    to market close, so the session's own candles already fall inside the window. Adding a
+    day there would pull in the NEXT session."""
+    from datetime import datetime as _dt
+
+    from data.dhanlive import client as dhan_client_module
+
+    captured = {}
+
+    class FakeClient(dhan_client_module.DhanHistoricalClient):
+        def __init__(self):
+            pass
+
+        def _request(self, method, url, **kwargs):
+            captured.update(kwargs.get("json") or {})
+            return {}
+
+    FakeClient().fetch_intraday(
+        security_id=1, exchange_segment="NSE_EQ", instrument="EQUITY",
+        interval_minutes=1, from_datetime=_dt(2026, 9, 4, 9, 15),
+        to_datetime=_dt(2026, 9, 4, 15, 30),
+    )
+    assert captured["toDate"] == "2026-09-04 15:30:00"
+
+
+def test_a_renamed_purpose_orphans_its_row_instead_of_showing_red_forever(monkeypatch):
+    """BUG FOUND LIVE 2026-09-06. advisory_sync_state is keyed by (source_name,
+    scope_key) where scope_key is the step's PURPOSE, but the reconcile matched on module
+    name alone. Renaming a step's purpose therefore froze its old row at whatever status
+    it last held, and nothing could ever update it again.
+
+    data.nseindia.offmarket moved from purpose 'market_wide' to 'fundamentals_deal_flow'
+    on 2026-08-14. Its market_wide row froze at 'error' and was the ONE "failing"
+    collector on the Data Health page for three weeks while the module ran green every
+    day. A permanently-red row for a healthy collector is exactly the alert fatigue this
+    view exists to prevent.
+    """
+    import fundamentals.api.queries as q
+
+    rows = pd.DataFrame([
+        # live module, CURRENT scope, genuinely broken -> must stay visible as failing
+        {"source_name": "download_runner:data.nseindia.offmarket", "scope_key": "fundamentals_deal_flow",
+         "status": "error", "error_text": "real failure", "last_success_at": None,
+         "last_item_ts": None, "updated_at": pd.Timestamp("2026-09-06", tz="UTC")},
+        # live module, RETIRED scope, stale error -> orphaned, not failing
+        {"source_name": "download_runner:data.nseindia.offmarket", "scope_key": "market_wide",
+         "status": "error", "error_text": "source_unavailable", "last_success_at": None,
+         "last_item_ts": None, "updated_at": pd.Timestamp("2026-08-14", tz="UTC")},
+    ])
+    monkeypatch.setattr(q, "sql_to_df", lambda *a, **k: rows)
+    monkeypatch.setattr(q, "_live_registry_modules", lambda: {"data.nseindia.offmarket"})
+    monkeypatch.setattr(q, "_live_registry_scopes",
+                        lambda: {("data.nseindia.offmarket", "fundamentals_deal_flow")})
+
+    out = q.get_collectors()
+    by_scope = {r["scope_key"]: r["classification"] for r in out["collectors"]}
+    assert by_scope["fundamentals_deal_flow"] == "failing", "a real failure was hidden"
+    assert by_scope["market_wide"] == "orphaned", "a retired scope still shows as failing"
+    assert out["counts"].get("failing", 0) == 1
+
+
+def test_a_healthy_row_under_a_retired_scope_is_left_alone(monkeypatch):
+    """Only NON-ok rows are demoted. Demoting a healthy row would hide nothing and would
+    make the orphaned bucket meaningless."""
+    import fundamentals.api.queries as q
+
+    rows = pd.DataFrame([
+        {"source_name": "download_runner:data.nseindia.offmarket_parser", "scope_key": "market_wide",
+         "status": "ok", "error_text": None, "last_success_at": None,
+         "last_item_ts": None, "updated_at": pd.Timestamp("2026-08-14", tz="UTC")},
+    ])
+    monkeypatch.setattr(q, "sql_to_df", lambda *a, **k: rows)
+    monkeypatch.setattr(q, "_live_registry_modules", lambda: {"data.nseindia.offmarket_parser"})
+    monkeypatch.setattr(q, "_live_registry_scopes",
+                        lambda: {("data.nseindia.offmarket_parser", "fundamentals_deal_flow")})
+    assert q.get_collectors()["collectors"][0]["classification"] == "ok"
+
+
+def test_morning_catch_up_runs_on_saturday():
+    """BUG FOUND LIVE 2026-09-06: every recovery job was weekday-only, so a FRIDAY-evening
+    miss had no catch-up until Monday. That is what happened on 2026-09-04 -- NSE had not
+    published when the 19:15 run asked, and Friday's bhavcopy sat missing all weekend, a
+    whole-weekend hole in the chain that is supposed to be "the guarantee"."""
+    from pathlib import Path
+
+    template = Path("config/stockey.crontab.template").read_text()
+    morning = [("40 01", "complete_data.sh"), ("00 02", "all_data_readiness.sh"),
+               ("10 02", "all_ohlcv_reconcile.sh"), ("15 02", "all_price_adjustment.sh"),
+               ("30 02", "all_data_completeness.sh")]
+    for hhmm, script in morning:
+        line = next((l for l in template.splitlines()
+                     if l.startswith(hhmm) and script in l), None)
+        assert line is not None, f"{script} at {hhmm} UTC not found"
+        assert "* * 1-6 " in line, f"{script} still weekday-only: {line[:60]}"
+
+    # The EVENING chain must stay weekday-only: Saturday is not a trading day, so there
+    # is no Saturday session to collect and running it would just hammer NSE for nothing.
+    evening = next(l for l in template.splitlines()
+                   if l.startswith("45 13") and "complete_data.sh" in l)
+    assert "* * 1-5 " in evening
+
+
+def test_a_lone_row_under_an_unknown_scope_stays_visible_as_failing(monkeypatch):
+    """The narrowing that keeps the orphaned-by-scope demotion safe.
+
+    8 scope_key values in advisory_sync_state are not registry purposes at all -- they are
+    written by the fundamentals and continuous_watch paths ('default', 'events', 'news',
+    'mcap', ...). Demoting on "scope not in registry" alone would hide a GENUINE failure
+    from any of those, which is strictly worse than the stale-red row the demotion exists
+    to remove. So a row is only demoted when the module ALSO has a row under a scope the
+    registry still runs -- the actual signature of a renamed purpose.
+    """
+    import fundamentals.api.queries as q
+
+    rows = pd.DataFrame([
+        {"source_name": "download_runner:data.some.collector", "scope_key": "default",
+         "status": "error", "error_text": "genuinely broken", "last_success_at": None,
+         "last_item_ts": None, "updated_at": pd.Timestamp("2026-09-06", tz="UTC")},
+    ])
+    monkeypatch.setattr(q, "sql_to_df", lambda *a, **k: rows)
+    monkeypatch.setattr(q, "_live_registry_modules", lambda: {"data.some.collector"})
+    # The registry runs this module under 'market_wide'; the row says 'default'. With no
+    # second row proving a rename, this must stay FAILING.
+    monkeypatch.setattr(q, "_live_registry_scopes",
+                        lambda: {("data.some.collector", "market_wide")})
+
+    out = q.get_collectors()
+    assert out["collectors"][0]["classification"] == "failing", (
+        "a lone unrecognised-scope failure was hidden"
+    )
+
+
+def test_claude_md_cron_table_matches_the_actual_crontab():
+    """The cron list in CLAUDE.md is a convenience copy of the crontab, and convenience
+    copies drift. This one did: after the collection times were retimed mid-session,
+    BOTH CLAUDE.md and docs/DATA_INVENTORY.md still showed the old schedule and were
+    wrong by hours on nearly every job while claiming to be authoritative (found
+    2026-09-06). docs/DATA_INVENTORY.md's duplicate was deleted; this test keeps the
+    remaining copy honest instead of trusting anyone to remember.
+    """
+    import re
+    from pathlib import Path
+
+    cron_lines = [
+        l for l in Path("config/stockey.generated.crontab").read_text().splitlines()
+        if l and not l.lstrip().startswith("#")
+    ]
+    # findall, not search: every cron line begins with scripts/with_lock.sh, so taking
+    # only the first match per line yields nothing but the wrapper.
+    scheduled = {name for l in cron_lines
+                 for name in re.findall(r'(?:\./|scripts/)([a-z_]+\.sh)', l)}
+    # with_lock.sh wraps every job and rotate_logs is invoked through it
+    scheduled -= {"with_lock.sh", "run_with_markers.sh", "resolve_python.sh"}
+
+    doc = Path("CLAUDE.md").read_text()
+    table = doc[doc.index("| IST | days | job |"):doc.index("Ordering is load-bearing")]
+    documented = {m.rsplit("/", 1)[-1] for m in re.findall(r'`([a-z_/]+\.sh)`', table)}
+
+    missing = scheduled - documented
+    assert not missing, f"scheduled but undocumented in CLAUDE.md: {sorted(missing)}"
+    phantom = documented - scheduled
+    assert not phantom, f"documented in CLAUDE.md but not scheduled: {sorted(phantom)}"
+
+
+def test_data_inventory_does_not_reintroduce_a_duplicate_cron_list():
+    """Deleted 2026-09-06 after it drifted. Re-adding a second copy of the schedule
+    recreates the exact failure: two lists, one stale, both claiming authority."""
+    from pathlib import Path
+
+    inventory = Path("docs/DATA_INVENTORY.md").read_text()
+    assert "all_ohlcv_reconcile.sh` (" not in inventory, (
+        "DATA_INVENTORY has regrown a cron list; the template + CLAUDE.md are the "
+        "single source"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Portfolio ACTION email (operator 2026-09-07: entries and exits only).
+# ---------------------------------------------------------------------------
+
+
+def _action_entry(**over):
+    row = {"ticker": "ACME", "entry_price": 100.0, "stop_pct": 10.0,
+           "position_size_rs": 100000.0, "target_date": date(2027, 1, 4),
+           "prediction_text": "Net debt keeps falling", "metric_name": "debt_to_ebitda",
+           "metric_operator": "<", "metric_threshold": 1.5, "confluence_count": 2,
+           "evaluable_count": 2, "stage_at_entry": 2, "kind": "shadow",
+           "adjudicator_reason": "consistent"}
+    row.update(over)
+    return row
+
+
+def _action_exit(**over):
+    row = {"ticker": "ZETA", "entry_price": 100.0, "exit_price": 88.0,
+           "close_reason": "stop_loss", "stop_pct": 10.0, "kind": "shadow",
+           "opened_at": pd.Timestamp("2026-06-01", tz="UTC"),
+           "closed_at": pd.Timestamp("2026-09-07", tz="UTC"),
+           "prediction_text": "thesis"}
+    row.update(over)
+    return row
+
+
+def _book(**over):
+    b = {"open_count": 8, "committed_rs": 800000.0, "is_live": False}
+    b.update(over)
+    return b
+
+
+def test_action_email_is_sent_even_when_there_is_nothing_to_do():
+    """THE design point. An email that only arrives when something happened makes "quiet
+    day" and "pipeline broken" identical from the inbox. This repo has been bitten by that
+    twice -- go-crond dead 5 days, Dhan collection dead 5 days behind green checks."""
+    from fundamentals.screens.portfolio_notify import build_action_email
+
+    subject, text, html_body = build_action_email(
+        {"day": "2026-09-07", "entered": [], "exited": [], "deferred": []}, _book())
+    assert subject == "[Portfolio] No action -- 2026-09-07"
+    assert "No entries or exits today." in text
+    assert "No action today" in html_body
+    # the book summary still goes out, so the mail is never contentless
+    assert "8 open" in text
+
+
+def test_action_email_names_what_to_buy_and_how_much():
+    from fundamentals.screens.portfolio_notify import build_action_email
+
+    subject, text, html_body = build_action_email(
+        {"day": "2026-09-07", "entered": [_action_entry()], "exited": [], "deferred": []},
+        _book())
+    assert "1 enter" in subject
+    assert "Rs 100,000" in text and "ACME" in text
+    assert "stop 10.0% (90.00)" in text        # the stop LEVEL, not just the percentage
+    assert "debt_to_ebitda < 1.5" in text      # what will resolve it
+    assert "Net debt keeps falling" in text
+
+
+def test_action_email_shows_why_a_position_was_closed_and_what_it_cost():
+    from fundamentals.screens.portfolio_notify import build_action_email
+
+    subject, text, html_body = build_action_email(
+        {"day": "2026-09-07", "entered": [], "exited": [_action_exit()], "deferred": []},
+        _book())
+    assert "1 exit" in subject
+    assert "STOP HIT" in text                  # plain language, not the enum
+    assert "-12.0%" in text
+    assert "98d held" in text
+
+
+def test_action_email_states_that_no_money_is_committed():
+    """An emailed instruction to buy reads as REAL unless it says otherwise."""
+    from fundamentals.screens.portfolio_notify import build_action_email
+
+    _, text, html_body = build_action_email(
+        {"day": "2026-09-07", "entered": [_action_entry()], "exited": [], "deferred": []},
+        _book())
+    assert "RECORD-ONLY" in text and "RECORD-ONLY" in html_body
+
+    _, live_text, live_html = build_action_email(
+        {"day": "2026-09-07", "entered": [_action_entry(kind="real")], "exited": [], "deferred": []},
+        _book(is_live=True))
+    assert "RECORD-ONLY" not in live_html
+
+
+def test_action_email_excludes_the_watchlist_entirely():
+    """The whole point of the change: this is an action list, not a status digest."""
+    from fundamentals.screens.portfolio_notify import build_action_email
+
+    _, text, html_body = build_action_email(
+        {"day": "2026-09-07", "entered": [_action_entry()], "exited": [], "deferred": []},
+        _book())
+    for banned in ("Watchlist Digest", "Why this is on the watchlist", "Candidate Notes",
+                   "watching since"):
+        assert banned not in html_body
+    # and it must stay small enough that Gmail (~102KB) never clips it
+    assert len(html_body.encode()) < 60_000
+
+
+def test_a_failed_build_does_not_raise_into_the_nightly_chain(monkeypatch):
+    """The email is the LAST step of the portfolio chain. It must not be able to fail the
+    run whose results it is reporting."""
+    import fundamentals.screens.portfolio_notify as pn
+
+    recorded = []
+    monkeypatch.setattr(pn, "load_actions", lambda **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(pn, "_record_fallback", lambda *a, **k: recorded.append(a))
+    out = pn.send_portfolio_actions()
+    assert out["status"] == "error" and out["sent"] == 0
+    assert recorded, "a swallowed failure must still be recorded"
+
+
+def test_the_watchlist_digest_is_no_longer_sent_by_the_nightly_pipeline():
+    """Retired 2026-09-07. send_daily_digest() is KEPT and still tested so it can be
+    revived or sent by hand -- but the nightly pipeline must not call it, or the operator
+    gets both emails."""
+    import inspect
+
+    from fundamentals.screens import notifications as n
+
+    src = inspect.getsource(n.run_watchlist_notification_pipeline)
+    body = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert "send_daily_digest()" not in body
+    assert callable(n.send_daily_digest)      # kept, not deleted
+
+
+def test_the_action_email_runs_after_the_decisions_it_reports():
+    """Ordering is the reason this module exists separately. The screener sends at 21:00
+    IST; entries and exits are not decided until the portfolio job at 22:00. An action
+    email in the screener pipeline would report yesterday's actions every single night."""
+    from pathlib import Path
+
+    chain = Path("all_portfolio_ruleset.sh").read_text()
+    for step in ("portfolio_exit", "portfolio_ruleset", "portfolio_resolution", "portfolio_notify"):
+        assert step in chain, f"{step} missing from the portfolio chain"
+    assert chain.index("portfolio_notify") > chain.index("portfolio_resolution")
+    assert chain.index("portfolio_notify") > chain.index("portfolio_exit")
+    # and it must NOT have been wired into the screener pipeline
+    assert "portfolio_notify" not in Path("all_fundamentals_screener.sh").read_text()
 
 
 def test_bhavcopy_parser_mto_dat_delivery(monkeypatch, tmp_path):

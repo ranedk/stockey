@@ -577,6 +577,15 @@ def sync_daily_ohlcv(
         DAILY_TABLE,
         unique_keys=["exchange", "security_id", "date"],
         timescaledb_column="date",
+        # update_if_changed, NOT "nothing" -- deliberately different from the intraday
+        # write below. choose_daily_refresh_end clamps to the last trading day, which
+        # during a live session is TODAY, so a sync running in market hours (the
+        # 12:30 IST downloader queue does) stores a PARTIAL bar for today. The
+        # post-close reconcile then has to overwrite it with the settled one. Under
+        # DO NOTHING that correction is silently dropped and the partial bar is
+        # permanent. The predicate still skips the no-op rewrite in the normal case,
+        # where a re-fetched settled bar carries values identical to what is stored.
+        on_conflict="update_if_changed",
     )
     return df
 
@@ -668,6 +677,15 @@ def sync_intraday_ohlcv(
         INTRADAY_TABLE,
         unique_keys=["exchange", "security_id", "interval_minutes", "timestamp"],
         timescaledb_column="timestamp",
+        # A one-minute bar is immutable once its minute has passed, and the key
+        # includes the timestamp -- so a partial session is simply FEWER ROWS, never a
+        # wrong row, and the missing minutes insert later as new keys. There is no
+        # correction to preserve here, unlike the daily write above. DO NOTHING skips
+        # the conflicting rows outright; a DO UPDATE against a COMPRESSED chunk forces
+        # decompress -> update -> recompress, all WAL-logged -- the mechanism behind
+        # the ~1.6 TB/day WAL and the 2026-08-31 OOM on this 525M-row table. To
+        # genuinely rewrite a stored bar, delete it first.
+        on_conflict="nothing",
     )
     return df
 

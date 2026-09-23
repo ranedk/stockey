@@ -224,7 +224,14 @@ def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
     }
     if not dry_run:
         ensure_factors_table()
-        upsert_to_db(out, ADJUSTMENT_FACTORS_TABLE, unique_keys=["scrip_code", "date"])
+        # See data/nseindia/price_adjustment.py -- same full-history nightly rebuild,
+        # same load_ts-driven whole-table rewrite without this.
+        upsert_to_db(
+            out,
+            ADJUSTMENT_FACTORS_TABLE,
+            unique_keys=["scrip_code", "date"],
+            on_conflict="update_if_changed",
+        )
         ensure_view()
     return summary
 

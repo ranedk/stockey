@@ -17,7 +17,7 @@ judgment call about how long the CURRENT situation stays relevant (a rating acti
 signal plays out over quarters; a single insider trade's signal value fades faster) --
 it is advisory framing for a human, never an auto-expiry or auto-removal trigger (the
 user's own decision in conversation 2026-08-11: entry/exit stays fully manual via
-fundamentals_l4_thesis's add/remove-from-portfolio actions).
+the machine portfolio's own entry/exit decisions).
 
 Regeneration is gated on real new information, not a fixed schedule: a company is only
 re-summarized when fundamentals_watchlist.last_alert_at is newer than its own

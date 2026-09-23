@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import threading
+from contextlib import contextmanager
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -14,6 +15,7 @@ from environs import Env
 
 from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import force_refresh_access_token, get_access_token
+from utils.exchange_rate_limiter import exchange_request_gate
 
 env = Env()
 
@@ -24,11 +26,14 @@ env = Env()
 # treated as a hard failure with no retry at all (only 401/expired-token
 # responses were ever retried). Confirmed live: symbols 4 and 5 of a
 # 2,876-symbol backfill run failed outright on the very first burst.
-# Per-process pacing only (module-level, in-process) -- NOT a cross-process
-# rate limiter like utils/nse_rate_limiter.py's nse_goto/nse_request_gate.
-# Sufficient for today's single-process usage; if multiple stockey processes
-# ever call Dhan concurrently, this needs the same cross-process treatment
-# NSE already has.
+# CROSS-PROCESS as of 2026-09-02. This used to be per-process only, with a note that
+# it "needs the same cross-process treatment NSE already has" if two stockey processes
+# ever hit Dhan at once. The retimed schedule makes that concrete: ohlcv_reconcile now
+# runs 1500 symbols from 23:15 IST (~32 min at the observed ~1.3s/symbol) and
+# dhan_intraday_sync starts at 23:40, so they overlap by several minutes -- two
+# processes each pacing at ~4.5 req/sec is ~9 req/sec against a documented 5/sec cap,
+# which is how a 429 storm starts. The in-process lock below still paces THIS process's
+# calls; the shared gate serializes across processes so the combined rate is capped too.
 _DHAN_RATE_LIMIT_LOCK = threading.Lock()
 _dhan_last_request_at = 0.0
 DHAN_MIN_REQUEST_INTERVAL_SECONDS = 0.22  # ~4.5 req/sec, safely under the 5/sec cap
@@ -36,7 +41,15 @@ DHAN_RATE_LIMIT_MAX_RETRIES = 5
 DHAN_RATE_LIMIT_BACKOFF_SECONDS = 3.0  # multiplied by attempt number
 
 
-def _pace_dhan_request() -> None:
+@contextmanager
+def _pace_dhan_request():
+    """Hold the cross-process Dhan gate for one request, after in-process pacing.
+
+    Both layers matter: the in-process lock keeps a single busy process under the cap
+    without paying filesystem-lock cost on every call, and the shared gate stops two
+    concurrent stockey processes from summing to twice the rate. Same mechanism NSE
+    uses (utils/nse_rate_limiter), via the generic exchange_request_gate.
+    """
     global _dhan_last_request_at
     with _DHAN_RATE_LIMIT_LOCK:
         now = time.monotonic()
@@ -44,6 +57,10 @@ def _pace_dhan_request() -> None:
         if wait > 0:
             time.sleep(wait)
         _dhan_last_request_at = time.monotonic()
+    with exchange_request_gate(
+        domain="dhan", min_interval_seconds=DHAN_MIN_REQUEST_INTERVAL_SECONDS
+    ):
+        yield
 env.read_env()
 
 
@@ -112,6 +129,22 @@ class DhanHistoricalClient:
         oi: bool = False,
         expiry_code: int = 0,
     ) -> dict[str, Any]:
+        # BUG FOUND LIVE 2026-09-06: Dhan's /charts/historical toDate is EXCLUSIVE, so
+        # asking for toDate=D returns sessions only through D-1. Measured on BSE
+        # (security_id 19585): toDate=2026-09-04 -> sessions 09-01..09-03; toDate=2026-09-05
+        # -> 09-01..09-04, with the 09-04 close (3409.8) matching NSE's bhavcopy exactly.
+        #
+        # Every caller passes an INCLUSIVE to_date (choose_daily_refresh_end clamps to the
+        # last trading day and means "fetch up to and including that session"), so the most
+        # recent session's bar was never fetched by the run that asked for it -- it only
+        # arrived a run later, leaving dhan_ohlcv_daily permanently one trading day behind
+        # and data_completeness's dhan_daily_freshness check failing every single day. A
+        # gate that fails nightly for a chronic reason is a gate people stop reading.
+        #
+        # Fixed HERE rather than in the callers so all three (ohlcv.py x2, ohlcv_pull.py)
+        # are covered and this method's own contract becomes the intuitive one: to_date is
+        # inclusive. fetch_intraday never had this problem -- it sends a full timestamp
+        # clamped to market close, so the session's own candles fall inside the window.
         payload = {
             "securityId": str(security_id),
             "exchangeSegment": exchange_segment,
@@ -119,7 +152,7 @@ class DhanHistoricalClient:
             "expiryCode": expiry_code,
             "oi": oi,
             "fromDate": from_date.strftime("%Y-%m-%d"),
-            "toDate": to_date.strftime("%Y-%m-%d"),
+            "toDate": (to_date + timedelta(days=1)).strftime("%Y-%m-%d"),
         }
         return self._request("POST", f"{self.BASE_URL}/charts/historical", json=payload)
 
@@ -148,8 +181,10 @@ class DhanHistoricalClient:
     def _request_with_rate_limit_retry(self, method: str, url: str, **kwargs) -> requests.Response:
         response: requests.Response | None = None
         for rate_attempt in range(1, DHAN_RATE_LIMIT_MAX_RETRIES + 1):
-            _pace_dhan_request()
-            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            # The gate is held for the duration of the request itself, so the enforced
+            # gap is measured between actual hits to Dhan, not between loop iterations.
+            with _pace_dhan_request():
+                response = self.session.request(method, url, timeout=self.timeout, **kwargs)
             if response.status_code != 429:
                 return response
             if rate_attempt >= DHAN_RATE_LIMIT_MAX_RETRIES:

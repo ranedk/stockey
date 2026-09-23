@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 
 from utils.sync_state import persist_sync_state
 from data.dhanlive.dhan_db import get_nse_equity
@@ -102,7 +103,7 @@ def sync_earnings_events(symbols: List[str], from_date: datetime | None = None, 
 
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+            browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.nseindia.earnings_events")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.new_page()
 

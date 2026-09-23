@@ -13,8 +13,8 @@ assume local execution with a .env holding real credentials). Do not put this be
 public endpoint without adding real auth first.
 
 Write surface is deliberately narrow: the only mutations exposed are portfolio
-create/resolve (wrapping fundamentals/screens/l4_thesis.py's create_thesis/
-resolve_thesis, the ONE deliberate human act in this whole pipeline, per
+the machine portfolio (fundamentals/screens/portfolio_runner.py opens positions,
+portfolio_resolution.py resolves their forecasts -- no human act remains, per
 fundamental_basic_goal.md sec 1). Nothing here can create an alert, a watchlist entry,
 or a narrative -- those stay batch-job-only (fundamentals/screens/notifications.py's
 pipeline), never a live HTTP write, so there's no path for the frontend to inject a
@@ -23,7 +23,7 @@ fabricated signal into the screener's own data.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +31,6 @@ from pydantic import BaseModel
 
 from fundamentals.api import queries
 from fundamentals.screens.investor_classification import INVESTOR_TIERS
-from fundamentals.screens.l4_thesis import ORIGIN_TAGS, ThesisValidationError
 
 app = FastAPI(title="Stockey Fundamentals Screener API")
 
@@ -43,27 +42,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-
-class PortfolioCreateRequest(BaseModel):
-    company_master_id: str
-    prediction_text: str
-    target_date: date
-    invalidation_criteria: str
-    origin_tag: str
-    signal_definition_version: str | None = None
-    source_alert_source: str | None = None
-    source_alert_news_id: str | None = None
-    source_alert_trigger_type: str | None = None
-    metric_name: str | None = None
-    metric_operator: str | None = None
-    metric_threshold: float | None = None
-
-
-class PortfolioResolveRequest(BaseModel):
-    resolved_true: bool
-    resolution_notes: str | None = None
-    failure_attribution: str | None = None
 
 
 class InvestorOverrideRequest(BaseModel):
@@ -111,20 +89,20 @@ def watchlist_detail(company_master_id: str) -> dict:
 
 
 @app.get("/api/watchlist/{company_master_id}/sizing")
-def watchlist_sizing(company_master_id: str, total_capital_rs: float, target_position_count: int) -> dict:
+def watchlist_sizing(company_master_id: str, capital_per_position_rs: float | None = None) -> dict:
     # PRD §12 todo #8 -- a CALCULATOR, not a decision: 404s if this company has no
-    # OPEN L4 thesis (a human hasn't committed to it yet), same "no capital act
-    # without the one deliberate human gate" boundary as portfolio create/resolve
-    # below. total_capital_rs/target_position_count are REQUIRED query params (no
-    # server-side default) -- FastAPI 422s a request that omits either rather than
-    # this API silently assuming a sleeve size or position count on the caller's
-    # behalf.
+    # OPEN, ACCEPTED position in the machine portfolio.
+    # capital_per_position_rs is OPTIONAL and defaults to the operator-set
+    # PORTFOLIO_CAPITAL_PER_POSITION_RS (Rs 1,00,000, 2026-09-04). It used to be a
+    # required total_capital/position_count pair with no default, because this API had
+    # no business guessing the operator's sleeve. It is not guessing now -- that figure
+    # is a recorded decision, and an override is still accepted.
     try:
-        result = queries.get_position_sizing(company_master_id, total_capital_rs=total_capital_rs, target_position_count=target_position_count)
-    except ValueError as exc:  # target_position_count <= 0 -- same translation pattern as ThesisValidationError below
+        result = queries.get_position_sizing(company_master_id, capital_per_position_rs=capital_per_position_rs)
+    except ValueError as exc:  # capital_per_position_rs <= 0
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result is None:
-        raise HTTPException(status_code=404, detail=f"{company_master_id} has no open L4 thesis to size a position for")
+        raise HTTPException(status_code=404, detail=f"{company_master_id} has no open accepted position to size")
     return result
 
 
@@ -143,41 +121,18 @@ def sectors() -> list[dict]:
 
 @app.get("/api/portfolio")
 def portfolio() -> list[dict]:
+    """The machine portfolio (fundamentals_portfolio_position).
+
+    The POST create/resolve endpoints that used to sit here were deleted 2026-09-04: the
+    operator removed the human forecast entirely, so there is no human act left for this
+    API to accept. Positions are opened by portfolio_runner and resolved by
+    portfolio_resolution, both unattended."""
     return queries.get_portfolio()
 
 
 @app.get("/api/portfolio/scoring")
 def portfolio_scoring() -> dict:
     return queries.get_portfolio_scoring()
-
-
-@app.post("/api/portfolio")
-def create_portfolio(payload: PortfolioCreateRequest) -> dict:
-    if payload.origin_tag not in ORIGIN_TAGS:
-        raise HTTPException(status_code=400, detail=f"origin_tag must be one of {ORIGIN_TAGS}")
-
-    source_alert = None
-    if payload.source_alert_source:
-        source_alert = {
-            "source": payload.source_alert_source,
-            "news_id": payload.source_alert_news_id,
-            "trigger_type": payload.source_alert_trigger_type,
-        }
-
-    fields = payload.model_dump(exclude={"source_alert_source", "source_alert_news_id", "source_alert_trigger_type"})
-    try:
-        return queries.create_portfolio_entry({**fields, "source_alert": source_alert})
-    except ThesisValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/portfolio/{thesis_id}/resolve")
-def resolve_portfolio(thesis_id: str, payload: PortfolioResolveRequest) -> dict:
-    try:
-        queries.resolve_portfolio_entry(thesis_id, payload.model_dump())
-    except ThesisValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "resolved", "thesis_id": thesis_id}
 
 
 @app.get("/api/investors")
@@ -209,3 +164,111 @@ def strategy_detail(trigger_type: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail=f"{trigger_type} has never alerted")
     return result
+
+
+# --- Data-platform health ---------------------------------------------------
+# Deliberately NOT a fundamentals concern, but this is stockey's only HTTP surface
+# and the screener frontend already talks to it. It reports on the data platform's
+# own completeness -- monitoring, not research/signals/LLM -- so it sits inside the
+# pure-TA boundary (docs/DATA_INVENTORY.md) rather than crossing it.
+#
+# Cached: the intraday checks scan a 30-day window of a 528M-row compressed
+# hypertable and take ~20s, which is far too slow to run on every page load. A short
+# TTL keeps the dashboard responsive while staying fresh enough to be useful; the
+# authoritative gate is still the nightly all_data_completeness.sh cron job.
+_HEALTH_CACHE: dict[str, object] = {"at": 0.0, "payload": None, "window_days": None}
+_HEALTH_TTL_SECONDS = 300
+
+
+@app.get("/api/data-health")
+def data_health(window_days: int = 30, refresh: bool = False) -> dict:
+    """Data-platform completeness: is the data actually THERE, across the universe?
+
+    Same implementation as the nightly cron gate (scripts/data_completeness.py's
+    run_all_checks) -- one definition of "complete", so the dashboard and the gate
+    cannot drift apart.
+    """
+    import time
+
+    from scripts.data_completeness import ERROR, WARN, run_all_checks
+
+    now = time.time()
+    fresh_enough = (
+        not refresh
+        and _HEALTH_CACHE["payload"] is not None
+        and _HEALTH_CACHE["window_days"] == window_days
+        and now - float(_HEALTH_CACHE["at"]) < _HEALTH_TTL_SECONDS
+    )
+    if fresh_enough:
+        payload = dict(_HEALTH_CACHE["payload"])  # type: ignore[arg-type]
+        payload["cached"] = True
+        payload["age_seconds"] = round(now - float(_HEALTH_CACHE["at"]))
+        return payload
+
+    try:
+        findings = run_all_checks(window_days=window_days)
+    except Exception as exc:  # noqa: BLE001 -- surface the failure, never a blank green page
+        raise HTTPException(
+            status_code=503,
+            detail=f"data-health checks could not run: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    errors = [f for f in findings.items if f["level"] == ERROR]
+    warnings = [f for f in findings.items if f["level"] == WARN]
+    payload = {
+        "status": "error" if errors else ("warn" if warnings else "ok"),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "window_days": window_days,
+        "error_count": len(errors),
+        "warn_count": len(warnings),
+        "findings": findings.items,
+    }
+    _HEALTH_CACHE.update({"at": now, "payload": payload, "window_days": window_days})
+    return {**payload, "cached": False, "age_seconds": 0}
+
+
+@app.get("/api/collectors")
+def collectors() -> dict:
+    """Per-collector status from advisory_sync_state, reconciled against the live
+    registry so a deleted/renamed module's frozen error row is not reported as a live
+    failure. See queries.get_collectors for why that reconciliation is the point."""
+    return queries.get_collectors()
+
+
+@app.get("/api/scheduler-health")
+def scheduler_health() -> dict:
+    """go-crond alive AND firing, stale locks, crontab drift, watchdog, Chrome CDP.
+
+    Backed by scripts/is_cron_running.sh --json so the browser and the operator's shell
+    answer the same question with one implementation. Note the inherent limit: an API
+    served by a process the scheduler manages cannot fully report on that scheduler --
+    this improves visibility, it does not replace the OS-crontab watchdog.
+    """
+    try:
+        return queries.get_scheduler_health()
+    except Exception as exc:  # noqa: BLE001 -- surface it, never a blank green panel
+        raise HTTPException(
+            status_code=503,
+            detail=f"scheduler health check could not run: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@app.get("/api/platform-issues")
+def platform_issues(hours: int = 24, limit: int = 100) -> dict:
+    """Open identity issues + a fallback-telemetry rollup. Read-only: unlike
+    issue_digest's nightly pass this never rechecks or closes anything."""
+    return queries.get_platform_issues(hours=hours, limit=limit)
+
+
+@app.get("/api/coverage-report")
+def coverage_report(history_days: int = 30) -> dict:
+    """Per-table coverage/staleness from the nightly data_coverage_report, plus a short
+    staleness trend -- a degrading feed shows up here before it fails outright."""
+    return queries.get_coverage_report(history_days=history_days)
+
+
+@app.get("/api/ruleset-portfolio")
+def ruleset_portfolio() -> dict:
+    """Positions from the mechanical ruleset + LLM adjudicator. Shadow (rejected-but-
+    tracked) rows are included and labelled -- they are the adjudicator's own scorecard."""
+    return queries.get_ruleset_positions()

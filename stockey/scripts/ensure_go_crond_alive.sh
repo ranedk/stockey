@@ -16,8 +16,24 @@ set -euo pipefail
 # Follows the same idiom already established for other long-running services in this repo
 # (see all_fundamentals_api.sh / the stockey-service-management convention): a cheap liveness
 # check first (exit 0 immediately if healthy, so this can run frequently and quietly), restart
-# routed through with_lock.sh so a watchdog tick racing a human's own manual restart (this
-# happened live on 2026-08-19 -- see start_cron.sh's own docstring) can't double-start it.
+# routed through a lock shared with start_cron.sh itself.
+#
+# CORRECTION 2026-09-02: this block used to claim the with_lock call meant "a concurrent
+# manual restart wins cleanly". It did not, and the gap was reproduced live. The lock was
+# only ever held by OTHER watchdog ticks -- a human running ./start_cron.sh took no lock at
+# all -- and because start_cron.sh runs data_readiness --fix and a full ohlcv_reconcile
+# BEFORE it execs go-crond, there is a long window (minutes, now ~30 with the raised
+# reconcile cap) where go-crond is legitimately not yet running. A watchdog tick landing in
+# that window saw "not running", declared the scheduler dead, and launched a SECOND
+# start_cron.sh -- two concurrent Dhan reconciles competing for the same rate limit.
+# Both sides now take CRON_START_LOCK, so whichever starts first wins and the other exits.
+#
+# MAINTENANCE MODE: a watchdog that always restarts makes a deliberate stop impossible --
+# ./stop_cron.sh would be undone within the tick interval, which cost real time during the
+# 2026-08-31 repair when cron had to be held down while data was being rebuilt. If
+# CRON_MAINTENANCE_SENTINEL exists, this exits without restarting. It lives in /tmp on
+# purpose: maintenance must not survive a reboot, or a forgotten sentinel would silently
+# keep the scheduler off forever -- the exact failure this watchdog exists to prevent.
 #
 # No push-alert channel (email/Slack) is wired up here -- this repo has no general-purpose ops
 # alerting config, only the fundamentals screener's own scoped SES pipeline (WATCHLIST_ALERT_
@@ -33,9 +49,16 @@ LOG_FILE="${SCRIPT_DIR}/logs/cron/go_crond_watchdog.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
 
 GO_CROND_BIN="${SCRIPT_DIR}/go-crond"
+CRON_START_LOCK="/tmp/stockey_cron_start.lock"
+CRON_MAINTENANCE_SENTINEL="/tmp/stockey_cron_maintenance"
 
-if pgrep -f "^${GO_CROND_BIN} " >/dev/null 2>&1; then
+if pgrep -x go-crond >/dev/null 2>&1; then
   exit 0  # alive -- stay quiet, this may run every few minutes
+fi
+
+if [ -e "${CRON_MAINTENANCE_SENTINEL}" ]; then
+  echo "[go_crond_watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) go-crond is down but ${CRON_MAINTENANCE_SENTINEL} exists -- maintenance mode, NOT restarting. Remove the file (or run ./start_cron.sh) to resume." | tee -a "${LOG_FILE}" >&2
+  exit 0
 fi
 
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -59,6 +82,6 @@ record_local_fallback_event(
 )
 " >> "${LOG_FILE}" 2>&1 || echo "[go_crond_watchdog] ${TIMESTAMP} WARNING: fallback telemetry write itself failed -- see above" | tee -a "${LOG_FILE}" >&2
 
-"${SCRIPT_DIR}/scripts/with_lock.sh" /tmp/stockey_go_crond_watchdog_restart.lock "${SCRIPT_DIR}/start_cron.sh" >> "${LOG_FILE}" 2>&1 &
+"${SCRIPT_DIR}/scripts/with_lock.sh" "${CRON_START_LOCK}" "${SCRIPT_DIR}/start_cron.sh" >> "${LOG_FILE}" 2>&1 &
 disown
-echo "[go_crond_watchdog] ${TIMESTAMP} restart attempted in the background (with_lock-protected, so a concurrent manual restart wins cleanly) -- see ${LOG_FILE} for start_cron.sh's own output" | tee -a "${LOG_FILE}" >&2
+echo "[go_crond_watchdog] ${TIMESTAMP} restart attempted in the background (holding ${CRON_START_LOCK}, which start_cron.sh also takes -- so a manual start already in progress wins and this exits) -- see ${LOG_FILE} for start_cron.sh's own output" | tee -a "${LOG_FILE}" >&2

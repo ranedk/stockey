@@ -26,6 +26,7 @@ from environs import Env
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
@@ -174,7 +175,7 @@ def download_currency_rates(playwright, from_date: date, to_date: date, *, dry_r
     browser = None
     page = None
     try:
-        browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+        browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="data.rbi.download_currency_rates")
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
 

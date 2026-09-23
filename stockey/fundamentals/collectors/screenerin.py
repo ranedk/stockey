@@ -33,6 +33,7 @@ from bs4 import BeautifulSoup
 from environs import Env
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
@@ -109,7 +110,7 @@ def build_authenticated_session() -> requests.Session:
         raise RuntimeError("CDP_ENDPOINT is required for screener.in login")
     with exchange_request_gate(domain="screenerin"):
         with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+            browser = connect_over_cdp_guarded(playwright, CDP_ENDPOINT, caller="fundamentals.collectors.screenerin")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.new_page()
             try:

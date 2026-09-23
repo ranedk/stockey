@@ -68,10 +68,19 @@ became unmaintainable, not incidental complexity:
    tied to the four L3 triggers (rating actions, PIT/SAST, shareholding
    deltas, results). Not the firehose. This alone removes most of what made
    the old announcement pipeline expensive and unreliable.
-3. **No LLM makes a capital decision.** See §4 below — the LLM's role is
-   bounded to extraction and triage, never sizing or execution. L4 (a human
-   committing to a falsifiable, dated prediction) is the only gate capital
-   passes through.
+3. **No LLM makes a capital decision.** ⚠️ **SUPERSEDED 2026-09-04 — see §11's
+   note and `docs/PORTFOLIO_RULESET_PRD.md` before relying on this.** As
+   originally written: the LLM's role is bounded to extraction and triage,
+   never sizing or execution, and L4 (a human committing to a falsifiable,
+   dated prediction) is the only gate capital passes through.
+
+   What actually holds now: an LLM authors versioned rules and may VETO an
+   action those rules propose, but can never select a position the ruleset did
+   not pass. The human L4 register was **deleted** — machine forecasts are
+   written by the entry adjudicator and resolved unattended by
+   `portfolio_resolution.py`. The narrower objection this clause was really
+   protecting (a per-position LLM buy call is unauditable) is respected, not
+   overturned.
 4. **Append-only, versioned state, always.** Already in the source PRD §4.
    The old system's mutable state was part of why it couldn't be audited or
    reasoned about after the fact. Every L2 snapshot, every L3 alert, every
@@ -149,7 +158,11 @@ fundamentals/
     l1_universe.py           # quarterly universe filter + rejection log (append-only)
     l2_state.py               # per-company state vector, versioned/append-only
     l3_triggers.py             # daily rule-based triggers + LLM triage (see §3.2), one batch ~8am
-    l4_thesis.py                # thesis register CRUD + quarterly forecast scoring
+    portfolio_ruleset.py        # mechanical entry rule (v1)
+    portfolio_adjudicator.py    # LLM entry/exit adjudication + thesis authoring
+    portfolio_exit.py           # mechanical exit triggers
+    portfolio_resolution.py     # machine forecast resolution + scoring
+    portfolio_runner.py         # nightly entry orchestration
 ```
 
 Reused as-is from existing stockey infrastructure — this is the entire
@@ -255,7 +268,9 @@ Storage split (per your instruction):
 - `fundamentals_l3_alerts` — `origin` (`rule` | `llm_triage`), trigger type,
   the L2 state snapshot it fired against, and for `llm_triage` rows: model,
   prompt_version, evidence bundle reference.
-- `fundamentals_l4_thesis` — falsifiable prediction text, target date,
+- `fundamentals_portfolio_position` (was `fundamentals_l4_thesis`, deleted
+  2026-09-04 with the human forecast — see `docs/PORTFOLIO_RULESET_PRD.md`)
+  — falsifiable prediction text, target date,
   invalidation criteria, `origin_tag` (`systematic_screen` | `ad_hoc`),
   signal_definition_version, resolution status + resolved-true/false +
   resolution date (feeds the quarterly forecast-calibration scoring in §5
@@ -360,6 +375,18 @@ scanning):
 One item still genuinely open: whether extraction should use `gpt-5.4-mini`
 or something else — flagged in §3.1, not blocking.
 
+## 13. Portfolio ruleset (2026-09-04) — see docs/PORTFOLIO_RULESET_PRD.md
+
+§12 built a mechanical confluence score and stopped deliberately at "a richer READ for
+the human who still writes the L4 thesis by hand". The operator has since decided
+stockey should build and run the fundamental portfolio itself
+(`docs/PORTFOLIO_RULESET_PRD.md`, and the boundary revision in `CLAUDE.md`).
+
+That PRD reverses §1/§3.3's "no LLM makes a capital decision", narrowly and on purpose:
+an LLM authors versioned rules and may VETO an action the rules propose, but can never
+select a position the ruleset did not pass. §12's objection to holistic LLM buy calls is
+respected, not overturned — read that PRD's opening section before touching either.
+
 ## 12. Confluence scoring & disciplined promotion (2026-08-29 addition)
 
 **Why**: the operator wants "more signals, better decision, better
@@ -449,6 +476,14 @@ against the real DB and the live API/frontend, not just unit-tested:
    sizes off `min(capital / target_position_count, ADV_pct_cap)` using
    `avg_vol_1mth`/`cmp_rs` already sitting in L1's own `metrics_json` — no new
    data source needed.
+
+**Frontend follow-up (2026-08-31)**: items 7 and 8 were backend-scoped by design and
+never claimed a UI — and none was built. `/api/watchlist/{id}/sizing` has zero
+frontend consumers, and `portfolio.vue` drops all three `hit_rate_by_*` breakdowns, so
+the operator can filter the watchlist by confluence but cannot see whether confluence
+predicts anything, and the funnel stops one call short of "how much to buy". Both are
+planned in `docs/FRONTEND_COMPLETION_PLAN.md` (Part A), which is blocked on there
+being at least one open L4 thesis to verify against (`total_theses` is currently 0).
 
 Not built (deliberately, see each item's own reasoning): a "results_on_time"
 reassurance trigger to pair with `results_delayed` (no such event exists in

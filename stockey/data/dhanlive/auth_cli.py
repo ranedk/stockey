@@ -14,6 +14,7 @@ from data.dhanlive.auth import (
     begin_browser_consent,
     clear_cached_access_token,
     consume_consent_token,
+    claim_consent_owner,
     get_token_id_from_auto_login,
     is_auto_login_configured,
     load_cached_access_token_payload,
@@ -129,6 +130,11 @@ def refresh_token(token_input: str | None = None, *, auto_login: bool = False) -
         # already-have-a-token fast paths outside the lock.
         with _dhan_login_lock():
             if auto_login or is_auto_login_configured():
+                # This command IS the designated consent owner (all_dhan_auth_ensure.sh
+                # runs it). Claiming it here rather than in the shell script means the
+                # right cannot be lost by someone invoking the CLI directly, and cannot be
+                # accidentally inherited by a collector that merely imports auth.py.
+                claim_consent_owner()
                 normalized = get_token_id_from_auto_login()
             else:
                 consent_url = begin_browser_consent()
