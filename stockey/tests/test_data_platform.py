@@ -341,6 +341,31 @@ def test_get_equity_universe_empty_on_db_error(monkeypatch):
     assert universe_mod.get_equity_universe() == []
 
 
+def test_ohlcv_reconcile_retries_transient_failures_once(monkeypatch):
+    # Dhan's daily endpoint fails in bulk and serves the same symbol minutes later
+    # (measured 2026-09-21: 289/1500 at 07:40 IST, 177/200 at 12:00). One retry of just
+    # the failures recovers most of them; a symbol that fails twice is a real failure.
+    from data.dhanlive import ohlcv_reconcile as orc
+
+    monkeypatch.setattr(orc, "expected_complete_trading_day", lambda now=None: pd.Timestamp("2026-07-03", tz="UTC"))
+    monkeypatch.setattr(orc, "get_equity_universe", lambda: ["A", "B", "C"])
+    monkeypatch.setattr(orc, "find_stale_symbols", lambda universe, expected: ["A", "B", "C"])
+    calls: list[list[str]] = []
+
+    def fake_sync(tickers, **_kwargs):
+        calls.append(list(tickers))
+        first_pass = len(calls) == 1
+        return [{"ticker": t, "error": "DH-905" if (first_pass and t in {"B", "C"}) else None} for t in tickers]
+
+    monkeypatch.setattr(orc, "sync_many_daily", fake_sync)
+    summary = orc.run_reconcile()
+
+    assert calls == [["A", "B", "C"], ["B", "C"]]  # only the failures are retried
+    assert summary["sync_attempted"] == 3
+    assert summary["sync_succeeded"] == 3 and summary["sync_failed"] == 0
+    assert summary["sync_retried"] == 2 and summary["sync_recovered_on_retry"] == 2
+
+
 def test_ohlcv_reconcile_find_stale_symbols(monkeypatch):
     from data.dhanlive import ohlcv_reconcile as orc
 
@@ -373,9 +398,11 @@ def test_ohlcv_reconcile_run_caps_symbols_and_counts_results(monkeypatch):
 
     monkeypatch.setattr(orc, "sync_many_daily", fake_sync)
     summary = orc.run_reconcile(max_symbols=2)
-    assert synced == [["A", "B"]]  # capped at 2, cap logged
+    # capped at 2, then B's failure retried once (2026-09-23) and still failing
+    assert synced == [["A", "B"], ["B"]]
     assert summary["stale_symbols"] == 3 and summary["skipped_over_cap"] == 1
     assert summary["sync_attempted"] == 2 and summary["sync_succeeded"] == 1 and summary["sync_failed"] == 1
+    assert summary["sync_retried"] == 1 and summary["sync_recovered_on_retry"] == 0
     # dry run never syncs
     synced.clear()
     dry = orc.run_reconcile(dry_run=True)

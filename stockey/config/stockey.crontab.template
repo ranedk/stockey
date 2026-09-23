@@ -70,7 +70,55 @@ LOG_DIR={{LOG_DIR}}
 # Daily broad raw download + parse safety net before market open on weekdays.
 # A second end-of-day complete_data.sh run below repairs anything intraday jobs missed.
 # 01:40 UTC = 07:10 IST
-40 01 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
+40 01 * * 1-6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
+
+# --- Morning catch-up: the previous session's data is not final until this runs ---
+# WHY THIS EXISTS (2026-09-01, caught by the completeness gate on its FIRST night):
+# NSE publishes the daily bhavcopy around 18:00-19:00 IST, but the EOD complete_data
+# run fires at 17:30 IST -- BEFORE it exists. The 18:45 reconcile and 18:50 price
+# adjustment then process whatever is in the DB at that moment, which on a slow
+# publishing day is still yesterday's data. Confirmed live for 2026-08-31: EOD ran
+# clean at 17:42 IST, reconcile and adjustment both ran on stale input, and the
+# session's bhavcopy only landed on the 07:10 IST morning run the next day -- leaving
+# 2,879 EQ/BE bars with no adjustment factor, silently absent from systrader's PRIMARY
+# series, exactly the failure of 2026-08-26..31.
+#
+# The evening pass is kept (when NSE is prompt it works, and earlier data is better).
+# These two re-runs are the guarantee. Both are cheap when there is nothing to do:
+# price_adjustment now writes ZERO rows on a no-change run (on_conflict=
+# update_if_changed), and ohlcv_reconcile only targets symbols that are actually stale.
+# Dhan token refresh -- MUST precede the morning Dhan work. Tokens expire ~20:35 UTC
+# (02:05 IST) and the catch-up reconcile below runs at 02:10 UTC, five minutes later.
+# Confirmed live 2026-09-04: the evening chain (17:45/18:10 UTC) sits inside the token's
+# life and succeeded on ~1412 symbols; the morning pass ran on a dead token and failed
+# ~950 of 1500, because an expired token on the daily endpoint returns
+# 400 "Missing required fields..." which the client's auth-error predicate does not
+# match, so it never refreshed. See all_dhan_auth_ensure.sh for why the predicate was
+# not loosened instead.
+# 02:05 UTC = 07:35 IST
+05 02 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dhan_auth_ensure.lock ./all_dhan_auth_ensure.sh >> "$LOG_DIR/dhan_auth_ensure.log" 2>&1
+
+# 06:30 UTC = 12:00 IST -- MOVED from 02:10 UTC (07:40 IST) on 2026-09-23. Dhan's daily
+# endpoint is unreliable in the 07:40 IST window: measured the same day, the same bulk
+# code completed 289/1500 symbols at 07:40, 177/200 at 12:00 and ~1410/1500 at 23:15,
+# and symbols that failed at 07:40 returned their bars on a manual retry hours later.
+# The backlog that built up behind those failures is why daily coverage sat at ~900 of
+# ~2,900 symbols. Midday costs a partial bar for the live session, which the 23:05 IST
+# pass overwrites (sync_daily_ohlcv writes update_if_changed for exactly this reason).
+30 06 * * 1-6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
+
+# 02:15 UTC = 07:45 IST -- after the morning complete_data has landed the bhavcopy (the
+# reconcile that used to sit at 02:10 moved to 06:30 UTC; price adjustment does not
+# depend on it, only on the bhavcopy)
+15 02 * * 1-6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+
+# Completeness gate -- MOVED here from 22:50 IST on 2026-09-01. It has to run after the
+# catch-up above, not before: at 22:50 the previous session's bhavcopy legitimately may
+# not have been published yet, so the gate failed on its first night for data that was
+# merely late rather than lost. A gate that fails most nights for a benign reason
+# teaches the operator to ignore it, which is the one thing it must never do.
+# 02:30 UTC = 08:00 IST
+30 02 * * 1-6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_completeness.lock ./all_data_completeness.sh >> "$LOG_DIR/data_completeness.log" 2>&1
 
 # Queue single-client downloader work and drain it without parallel NSE/Dhan/Screener sessions.
 # The direct complete_data.sh path remains the broad catch-up/backfill safety net.

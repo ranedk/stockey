@@ -37,7 +37,24 @@ from utils.universe import get_equity_universe
 
 env = Env()
 
-DEFAULT_MAX_SYMBOLS = env.int("OHLCV_RECONCILE_MAX_SYMBOLS", default=400)
+# Raised 400 -> 1500 on 2026-09-02. The cap is a runtime bound, not a correctness knob,
+# and 400 was too small to be one: with ~2,880 universe symbols a single run could close
+# at most ~377, so recovering a fully-stale universe took EIGHT nightly runs. That only
+# stayed invisible because the 18:45 IST schedule meant the job was reading Dhan before
+# it had published anything (every logged run reported current=0), so the backlog was
+# being hand-repaired rather than drained by cron.
+#
+# With the corrected 23:05 IST slot a healthy night has almost nothing to reconcile, so
+# this ceiling only binds during recovery -- and two runs a day (23:05 + the 07:40
+# morning catch-up) now drain a completely stale universe within a single day instead of
+# a working week. At roughly 1.3s per symbol a full 1500 is about 30 minutes, which fits
+# the overnight window comfortably.
+# Raised 1500 -> 3000 on 2026-09-23. 1500 was sized for "a healthy night reconciles almost
+# nothing", but Dhan's daily endpoint fails most requests in the 07:40 IST window (measured
+# 2026-09-21: 289/1500 at 07:40 vs 177/200 at 12:00 and ~1410/1500 at 23:15), so the backlog
+# outgrew the cap and never drained: coverage sat at 664-910 of ~2,900 symbols. A full pass
+# at ~1.3s per symbol is about an hour, which both slots have.
+DEFAULT_MAX_SYMBOLS = env.int("OHLCV_RECONCILE_MAX_SYMBOLS", default=3000)
 # After this hour (IST) on a trading day, today's EOD bars are expected to exist, so the
 # pre-advisory reconcile (18:45) pulls TODAY's bars instead of stopping at yesterday.
 TODAY_COMPLETE_AFTER_HOUR_IST = env.int("OHLCV_RECONCILE_TODAY_COMPLETE_AFTER_HOUR_IST", default=18)
@@ -124,6 +141,27 @@ def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now:
         summary["stale_sample"] = to_sync[:20]
         return summary
     results = sync_many_daily(to_sync)
+    # Dhan's daily endpoint fails transiently in bulk -- the same symbol that returns
+    # DH-905 in one pass returns its bars minutes later (measured 2026-09-21). One retry
+    # of just the failures, at the end of the run, costs a fraction of the run and
+    # recovers most of them. Only one: a symbol that fails twice is a real failure.
+    failed_rows = [row for row in results if row.get("error")]
+    retried = [str(row.get("ticker")) for row in failed_rows if row.get("ticker")]
+    recovered = 0
+    if retried:
+        print(f"[ohlcv_reconcile] retrying {len(retried)} failed symbols once", file=sys.stderr)
+        retry_results = sync_many_daily(retried)
+        by_ticker = {str(row.get("ticker")): row for row in retry_results}
+        merged = []
+        for row in results:
+            ticker = str(row.get("ticker"))
+            replacement = by_ticker.get(ticker)
+            if row.get("error") and replacement is not None and not replacement.get("error"):
+                recovered += 1
+                merged.append(replacement)
+            else:
+                merged.append(replacement if row.get("error") and replacement is not None else row)
+        results = merged
     succeeded = sum(1 for row in results if not row.get("error"))
     failure_classes = sorted(
         {str(row.get("classification") or "failed") for row in results if row.get("error")}
@@ -131,6 +169,8 @@ def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now:
     summary["sync_attempted"] = len(results)
     summary["sync_succeeded"] = succeeded
     summary["sync_failed"] = len(results) - succeeded
+    summary["sync_retried"] = len(retried)
+    summary["sync_recovered_on_retry"] = recovered
     summary["failure_classifications"] = failure_classes
     return summary
 
