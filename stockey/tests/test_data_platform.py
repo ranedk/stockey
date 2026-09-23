@@ -22621,3 +22621,81 @@ def test_dhan_web_login_does_not_retry_when_the_mobile_field_is_gone(monkeypatch
     assert "dhan_web_login_mobile_step_retried" not in [e["fallback_type"] for e in events]
     mobile_fills = [a for a in page.actions if a[0] == "fill" and a[1].startswith("mobile")]
     assert len(mobile_fills) == 1
+
+
+def test_a_stopped_out_name_is_not_re_entered_inside_the_cooldown(monkeypatch):
+    """CHEMBOND was stopped out 2026-09-21 at 187.04 and re-accepted the same day at
+    187.04; LAMBODHARA the same on 09-22 at 116.08. The re-entry guard reads only OPEN
+    positions, and the stop had just closed the row -- so a stop could be undone within
+    the hour. Skipping happens BEFORE adjudication, so it also saves the call, and the
+    name is reported rather than silently dropped."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    adjudicated = []
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "_recently_stopped_tickers",
+                        lambda: {"STOPPED": pd.Timestamp("2026-09-21", tz="UTC")})
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 2,
+        "candidates": [_pf_candidate("STOPPED"), _pf_candidate("FRESH")]})
+
+    def spy_adjudicate(candidate):
+        adjudicated.append(candidate["ticker"])
+        return {"decision": "accept", "reason": "r", "model": "m", "prompt_version": 3}
+
+    monkeypatch.setattr(runner, "adjudicate_entry", spy_adjudicate)
+    opened = []
+    monkeypatch.setattr(runner, "_open_position",
+                        lambda c, v, *, kind, dry_run: opened.append(c["ticker"]))
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+
+    out = runner.run_portfolio()
+
+    assert out["stopped_recently_skipped"] == ["STOPPED"]
+    assert opened == ["FRESH"], "a name stopped out today was bought back the same day"
+    assert adjudicated == ["FRESH"], "the skipped name still cost an adjudicator call"
+
+
+def test_a_stopped_out_name_returns_once_the_cooldown_has_passed(monkeypatch):
+    """The cooldown is a wait, not a ban -- _recently_stopped_tickers only reports stops
+    inside STOP_COOLDOWN_DAYS, so an older stop leaves the name eligible again."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "_recently_stopped_tickers", lambda: {})
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1,
+        "candidates": [_pf_candidate("STOPPED")]})
+    monkeypatch.setattr(runner, "adjudicate_entry", lambda c: {
+        "decision": "accept", "reason": "r", "model": "m", "prompt_version": 3})
+    opened = []
+    monkeypatch.setattr(runner, "_open_position",
+                        lambda c, v, *, kind, dry_run: opened.append(c["ticker"]))
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+
+    out = runner.run_portfolio()
+
+    assert opened == ["STOPPED"] and out["stopped_recently_skipped"] == []
+
+
+def test_stop_cooldown_query_targets_only_stop_loss_exits(monkeypatch):
+    """A thesis_invalidation exit is a statement about the company and carries no
+    cooldown; only a stop does. Asserted on the SQL because the distinction lives there."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    seen = {}
+
+    def fake_sql(sql, params=None):
+        seen["sql"] = " ".join(sql.split())
+        seen["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(runner, "sql_to_df", fake_sql)
+    assert runner._recently_stopped_tickers() == {}
+    assert "close_reason = 'stop_loss'" in seen["sql"]
+    assert "status = 'closed'" in seen["sql"]
+    assert seen["params"] == (runner.STOP_COOLDOWN_DAYS,)
