@@ -253,7 +253,8 @@ def _ensure_tables() -> None:
             """
         )
         # The table predates these four columns (first positions written 2026-09-04).
-        for column, coltype in (("entry_decision", "text"), ("prediction_text", "text"),
+        for column, coltype in (("bucket", "text"), ("bucket_capital_rs", "double precision"),
+                                ("entry_decision", "text"), ("prediction_text", "text"),
                                 ("position_size_rs", "double precision"),
                                 ("adv_cap_rs", "double precision"), ("sizing_basis", "text"),
                                 ("metric_name", "text"), ("metric_operator", "text"),

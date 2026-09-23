@@ -22699,3 +22699,60 @@ def test_stop_cooldown_query_targets_only_stop_loss_exits(monkeypatch):
     assert "close_reason = 'stop_loss'" in seen["sql"]
     assert "status = 'closed'" in seen["sql"]
     assert seen["params"] == (runner.STOP_COOLDOWN_DAYS,)
+
+
+def test_a_position_records_which_bucket_paid_for_it(monkeypatch):
+    """A bucket is a capital envelope, and which envelope a position spent has to be
+    readable off the position -- otherwise "what did the swing book do" can only be
+    reconstructed from dates and tickers, which stops being possible the moment two
+    engines buy the same name."""
+    import fundamentals.screens.portfolio_runner as runner
+    from fundamentals.screens import portfolio_buckets
+
+    monkeypatch.setattr(runner, "_latest_price", lambda t: 100.0)
+    row = runner._open_position(_pf_candidate("X"), {"decision": "accept", "reason": "r"},
+                                kind="shadow", dry_run=True)
+    assert row["bucket"] == portfolio_buckets.DEFAULT_BUCKET == "longterm"
+    assert row["bucket_capital_rs"] == 10_000_000.0
+
+
+def test_position_size_is_the_buckets_share_not_a_flat_figure(monkeypatch):
+    """Rs 1 crore across 25 longterm positions is Rs 4 lakh each. The ADV cap still binds
+    on top -- a thinly traded name gets less, never more."""
+    import fundamentals.screens.l5_sizing as sizing
+    import fundamentals.screens.portfolio_runner as runner
+    from fundamentals.screens import portfolio_buckets
+
+    assert portfolio_buckets.capital_per_position_rs("longterm") == 400000.0
+    seen = {}
+
+    def fake_compute(*, target_capital_rs, adv_value_rs, max_pct_of_adv=0.10):
+        seen["target"] = target_capital_rs
+        return {"recommended_size_rs": target_capital_rs, "adv_cap_rs": None,
+                "binding_constraint": "flat_allocation"}
+
+    monkeypatch.setattr(sizing, "compute_position_size", fake_compute)
+    monkeypatch.setattr(sizing, "load_adv_inputs", lambda cid: None)
+    runner._size_for(_pf_candidate("X"), "longterm")
+    assert seen["target"] == 400000.0, "sizing ignored the bucket's envelope"
+
+
+def test_the_book_fills_at_the_buckets_position_count(monkeypatch):
+    """The cap has to come from the bucket. 100 x the old flat Rs 1 lakh was a crore by
+    coincidence; 100 x Rs 4 lakh would be four."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: {f"HELD{i}" for i in range(25)})
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(runner, "_recently_stopped_tickers", lambda: {})
+    monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {
+        "stage_api_available": True, "evaluated": 1, "candidates": [_pf_candidate("NEWNAME")]})
+    monkeypatch.setattr(runner, "adjudicate_entry", lambda c: {
+        "decision": "accept", "reason": "r", "model": "m", "prompt_version": 3})
+    monkeypatch.setattr(runner, "_open_position", lambda c, v, *, kind, dry_run: None)
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+
+    out = runner.run_portfolio()
+    assert out["book_capacity"] == 25 and out["bucket"] == "longterm"
+    assert out["turned_away_book_full"] == ["NEWNAME"] and out["entered"] == 0

@@ -46,6 +46,11 @@ from fundamentals.screens.l5_sizing import (
     MAX_POSITIONS,
     get_position_size_recommendation,
 )
+from fundamentals.screens.portfolio_buckets import (
+    DEFAULT_BUCKET,
+    bucket_config,
+    capital_per_position_rs,
+)
 from fundamentals.screens.portfolio_exit import PRICE_LOOKBACK_DAYS
 from fundamentals.screens.portfolio_ruleset import RULESET_VERSION, evaluate_entry_candidates
 from utils.db import db_session, sql_to_df
@@ -140,21 +145,30 @@ def _size_for(candidate: dict) -> dict:
 
     adv = load_adv_inputs(candidate["company_master_id"])
     return compute_position_size(
-        target_capital_rs=CAPITAL_PER_POSITION_RS,
+        # The bucket's own share, not the flat per-position figure: a sleeve is a capital
+        # envelope, so what one position may take is that envelope divided by how many
+        # positions the sleeve is meant to hold.
+        target_capital_rs=capital_per_position_rs(bucket),
         adv_value_rs=adv["adv_value_rs"] if adv else None,
     )
 
 
-def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool) -> dict:
+def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
+                   bucket: str = DEFAULT_BUCKET) -> dict:
     price = _latest_price(candidate["ticker"])
     stop = candidate.get("stop") or {}
-    sizing = _size_for(candidate)
+    sizing = _size_for(candidate, bucket)
     row = {
         "position_id": f"pos:{uuid.uuid4().hex[:16]}",
         "company_master_id": candidate["company_master_id"],
         "ticker": candidate["ticker"],
         "ruleset_version": RULESET_VERSION,
         "kind": kind,
+        # Which sleeve's capital this position spends. Recorded per position rather than
+        # inferred from the engine that opened it, so a later review can ask "what did the
+        # swing book do" without reconstructing it from dates and tickers.
+        "bucket": bucket,
+        "bucket_capital_rs": bucket_config(bucket)["capital_rs"],
         "status": "open",
         "entry_price": price,
         "stop_pct": stop.get("stop_pct"),
@@ -222,8 +236,12 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     entered, rejected, skipped, turned_away, re_vetoed, veto_stands = [], [], [], [], [], []
     stopped_out = []
 
-    # Only accepted positions consume capital, so only they fill the book.
+    # Only accepted positions consume capital, so only they fill the book, and the book
+    # is the BUCKET's, not a global one: 100 x the old flat Rs 1 lakh happened to equal a
+    # crore, but 25 x Rs 4 lakh is the same crore held in fewer, larger positions. Capping
+    # on the old global count would let a bucket deploy four times its envelope.
     book_used = len(already_accepted)
+    book_capacity = bucket_config(DEFAULT_BUCKET)["target_positions"] or MAX_POSITIONS
 
     for candidate in evaluation["candidates"]:
         if candidate["ticker"] in already_accepted:
@@ -255,7 +273,7 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 payload=candidate,
             )
         if verdict["decision"] == "accept":
-            if book_used >= MAX_POSITIONS:
+            if book_used >= book_capacity:
                 # Named, not silent. "The book was full" and "the rule found nothing" look
                 # identical in a position count and mean opposite things.
                 turned_away.append(candidate["ticker"])
@@ -290,7 +308,8 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         "rejected_tickers": rejected,
         "capital_per_position_rs": CAPITAL_PER_POSITION_RS,
         "book_used": book_used,
-        "book_capacity": MAX_POSITIONS,
+        "book_capacity": book_capacity,
+        "bucket": DEFAULT_BUCKET,
         "turned_away_book_full": turned_away,
         "re_vetoed_no_duplicate": re_vetoed,
         # Vetoed previously and NOT re-asked, because no new evidence has arrived.
