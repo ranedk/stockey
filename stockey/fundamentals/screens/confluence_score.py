@@ -16,7 +16,8 @@ Five axes, each independently True (supportive) / False (contradicting) / None
 (insufficient data to call either way -- never silently coerced to a side):
 
 1. fundamentals_trajectory -- debt or CWIP-ratio improving (fundamentals_l2_state),
-   with neither one worsening.
+   with neither one worsening. Read in l2_state.compute_trend_direction's own
+   numeric-series vocabulary (see WORSENING/IMPROVING_TREND_DIRECTIONS below).
 2. event_corroboration -- does this company's recent alert history (fundamentals_
    l3_alerts) lean toward the corroborating trigger_types or the contradicting
    ones (same classification watchlist_exit.py's own INVALIDATING_TRIGGER_TYPES
@@ -43,10 +44,19 @@ import pandas as pd
 from fundamentals.screens.l2_state import ensure_l2_pledge_trend_columns
 from utils.company_master import build_l1_ticker_by_company_master_id
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.ops_alert import send_ops_alert
 
 RESULTS_TABLE = "fundamentals_confluence_score"
 SYNC_SOURCE_NAME = "fundamentals.screens.confluence_score"
-SCORE_VERSION = 1
+# v2 (2026-09-23): fundamentals_trajectory was DEAD in every v1 row. v1 tested
+# net_debt/cwip_ratio_trend_direction for "increasing"/"decreasing", but those two
+# fields come from l2_state.compute_trend_direction, which only ever emits
+# accelerating/decelerating/steady_{increase,decline}, flat or reversal -- so the
+# axis returned None for 0 of 137 names on every run back to at least 2026-09-15,
+# and every v1 score was a count out of four axes, not five. The ownership fields
+# (promoter/institutional/pledge) DO use "increasing"/"decreasing" and were fine.
+# Readers pick the newest version on a run_date tie, so v1 rows stay as history.
+SCORE_VERSION = 2
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 # BUG FOUND LIVE 2026-08-29 (same class as fundamentals/api/queries.py's
@@ -111,16 +121,23 @@ VALUATION_CHEAP_THRESHOLD = 0.9
 VALUATION_EXPENSIVE_THRESHOLD = 1.1
 
 
+# l2_state.compute_trend_direction's vocabulary. A decelerating increase is still an
+# increase -- debt that is growing more slowly is growing. "flat" and "reversal" (the
+# sign flipped between the two latest deltas) are in neither set: no settled trend.
+WORSENING_TREND_DIRECTIONS = frozenset({"accelerating_increase", "decelerating_increase", "steady_increase"})
+IMPROVING_TREND_DIRECTIONS = frozenset({"accelerating_decline", "decelerating_decline", "steady_decline"})
+
+
 def compute_fundamentals_trajectory_axis(l2_row: dict) -> bool | None:
     debt_dir = l2_row.get("net_debt_trend_direction")
     cwip_dir = l2_row.get("cwip_ratio_trend_direction")
     if debt_dir is None and cwip_dir is None:
         return None
-    if debt_dir == "increasing" or cwip_dir == "increasing":
+    if debt_dir in WORSENING_TREND_DIRECTIONS or cwip_dir in WORSENING_TREND_DIRECTIONS:
         return False
-    if debt_dir == "decreasing" or cwip_dir == "decreasing":
+    if debt_dir in IMPROVING_TREND_DIRECTIONS or cwip_dir in IMPROVING_TREND_DIRECTIONS:
         return True
-    return None  # both flat/unknown -- no clear trend either way
+    return None  # both flat/reversal/unknown -- no clear trend either way
 
 
 def compute_ownership_axis(l2_row: dict, recent_trigger_types: set[str]) -> bool | None:
@@ -182,6 +199,82 @@ def compute_confluence_row(l2_row: dict, phase: str | None, recent_trigger_types
         "contradicting_count": sum(1 for v in axes.values() if v is False),
         "evaluable_count": sum(1 for v in axes.values() if v is not None),
     }
+
+
+AXIS_COLUMNS = (
+    "axis_fundamentals_trajectory",
+    "axis_event_corroboration",
+    "axis_sector_cycle",
+    "axis_ownership",
+    "axis_valuation",
+)
+
+# TODO.md C3 (2026-09-23): v1's trajectory axis scored 0 names for at least a week in
+# a live decision path and nothing noticed. Every run now records what share of names
+# each axis actually scored, and alarms on two DISTINCT classes -- kept separate so a
+# noisy alarm is fixed by reclassifying it, never by loosening a threshold until it
+# goes quiet:
+#   dead    -- the axis scored 0 of N names. Never legitimate for a whole watchlist.
+#   dropped -- the share fell below half of the previous same-version run's share.
+#              Only checked when that previous share was >= AXIS_DROP_MIN_PRIOR_SHARE,
+#              so an axis that was always thin cannot "drop" on noise.
+AXIS_DROP_MIN_PRIOR_SHARE = 0.10
+AXIS_DROP_RATIO = 0.5
+
+
+def compute_axis_coverage(rows: list[dict[str, object]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    return {axis: sum(1 for r in rows if r.get(axis) is not None) / len(rows) for axis in AXIS_COLUMNS}
+
+
+def load_previous_axis_coverage(run_date: pd.Timestamp) -> dict[str, float]:
+    """Axis coverage of the latest earlier run at THIS score_version -- a version bump
+    changes what an axis can score, so comparing across versions would alarm on the
+    fix itself."""
+    counts = ", ".join(f"count({axis}) AS {axis}" for axis in AXIS_COLUMNS)
+    df = sql_to_df(
+        f"""
+        SELECT run_date, count(*) AS n, {counts}
+          FROM {RESULTS_TABLE}
+         WHERE score_version = %s AND run_date < %s
+         GROUP BY run_date
+         ORDER BY run_date DESC
+         LIMIT 1
+        """,  # noqa: S608 -- column and table names are module constants
+        params=(SCORE_VERSION, run_date),
+    )
+    if df.empty or not df.iloc[0]["n"]:
+        return {}
+    row = df.iloc[0]
+    return {axis: float(row[axis]) / float(row["n"]) for axis in AXIS_COLUMNS}
+
+
+def classify_axis_coverage(current: dict[str, float], previous: dict[str, float]) -> list[dict[str, object]]:
+    problems: list[dict[str, object]] = []
+    for axis, share in current.items():
+        if share == 0:
+            problems.append({"axis": axis, "class": "dead", "share": share, "previous_share": previous.get(axis)})
+            continue
+        prior = previous.get(axis)
+        if prior is not None and prior >= AXIS_DROP_MIN_PRIOR_SHARE and share < prior * AXIS_DROP_RATIO:
+            problems.append({"axis": axis, "class": "dropped", "share": share, "previous_share": prior})
+    return problems
+
+
+def _alert_axis_coverage(problems: list[dict[str, object]], coverage: dict[str, float], names: int) -> None:
+    lines = [f"{p['axis']}: {p['class']} -- scored {p['share']:.0%} of {names} names"
+             + (f" (previous run {p['previous_share']:.0%})" if p["previous_share"] is not None else "")
+             for p in problems]
+    body = (
+        "fundamentals_confluence_score: an axis stopped scoring.\n\n"
+        + "\n".join(lines)
+        + "\n\nAll axes this run:\n"
+        + "\n".join(f"  {axis}: {share:.0%}" for axis, share in coverage.items())
+        + f"\n\nscore_version={SCORE_VERSION}. The confluence count feeds the portfolio ruleset,"
+        " so a dead axis silently changes entries and exits. See confluence_score.py's C3 note."
+    )
+    send_ops_alert(f"confluence axis coverage: {', '.join(sorted({p['class'] for p in problems}))}", body)
 
 
 def load_active_watchlist_company_ids() -> list[str]:
@@ -301,9 +394,13 @@ def run_confluence_score_refresh() -> dict[str, object]:
         row["score_version"] = SCORE_VERSION
         rows.append(row)
 
+    coverage = compute_axis_coverage(rows)
+    problems = classify_axis_coverage(coverage, load_previous_axis_coverage(run_date)) if rows else []
     if rows:
         upsert_to_db(pd.DataFrame(rows), RESULTS_TABLE, unique_keys=["company_master_id", "run_date", "score_version"])
-    return {"rows": len(rows), "companies_no_l2_state": no_l2_state}
+    if problems:
+        _alert_axis_coverage(problems, coverage, len(rows))
+    return {"rows": len(rows), "companies_no_l2_state": no_l2_state, "axis_coverage": coverage, "axis_coverage_problems": problems}
 
 
 def main() -> int:
@@ -314,6 +411,8 @@ def main() -> int:
         "rows": result["rows"],
         "rows_written": result["rows"],
         "companies_no_l2_state": result["companies_no_l2_state"],
+        "axis_coverage": result.get("axis_coverage", {}),
+        "axis_coverage_problems": result.get("axis_coverage_problems", []),
         "fallback_used": result["companies_no_l2_state"] > 0,
         "state_advanced": result["rows"] > 0,
         "status": "ok",

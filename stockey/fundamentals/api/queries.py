@@ -142,7 +142,7 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
             SELECT confluence_count, contradicting_count, evaluable_count
             FROM fundamentals_confluence_score
             WHERE company_master_id = w.company_master_id
-            ORDER BY run_date DESC LIMIT 1
+            ORDER BY run_date DESC, score_version DESC LIMIT 1
         ) conf ON TRUE
         {where_clause}
         ORDER BY w.last_alert_at DESC NULLS LAST
@@ -315,7 +315,7 @@ def load_confluence_for_company(company_master_id: str) -> dict | None:
                confluence_count, contradicting_count, evaluable_count
           FROM fundamentals_confluence_score
          WHERE company_master_id = %s
-         ORDER BY run_date DESC
+         ORDER BY run_date DESC, score_version DESC
          LIMIT 1
         """,
         params=(company_master_id,),

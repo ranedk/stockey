@@ -100,7 +100,7 @@ def _current_scores(company_ids: list[str]) -> dict[str, dict]:
                company_master_id, contradicting_count, evaluable_count, run_date
           FROM fundamentals_confluence_score
          WHERE company_master_id = ANY(%s)
-         ORDER BY company_master_id, run_date DESC
+         ORDER BY company_master_id, run_date DESC, score_version DESC
         """,
         params=(list(company_ids),),
     )

@@ -17352,20 +17352,48 @@ def test_compute_fundamentals_trajectory_axis_no_data_is_none():
     assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({}) is None
 
 
-def test_compute_fundamentals_trajectory_axis_decreasing_is_true():
-    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": "decreasing"}) is True
-    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"cwip_ratio_trend_direction": "decreasing"}) is True
+def test_compute_fundamentals_trajectory_axis_decline_is_true():
+    for direction in ("accelerating_decline", "decelerating_decline", "steady_decline"):
+        assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": direction}) is True
+        assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"cwip_ratio_trend_direction": direction}) is True
 
 
-def test_compute_fundamentals_trajectory_axis_increasing_is_false():
-    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": "increasing"}) is False
+def test_compute_fundamentals_trajectory_axis_increase_is_false():
+    # A decelerating increase is still an increase.
+    for direction in ("accelerating_increase", "decelerating_increase", "steady_increase"):
+        assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": direction}) is False
+
+
+def test_compute_fundamentals_trajectory_axis_reads_l2_states_real_vocabulary():
+    # Regression (score v1): the axis tested "increasing"/"decreasing", which
+    # compute_trend_direction never emits, so it scored 0 names for weeks while its own
+    # tests -- written in the same wrong vocabulary -- passed. Feed it what L2 actually
+    # writes: every directional label must land on a side, and every label the axis
+    # names must be one L2 can produce.
+    import itertools
+    emitted = set()
+    for a, b, c in itertools.product([10.0, 20.0, 25.0, 40.0], repeat=3):
+        emitted.add(fundamentals_l2_state.compute_trend_direction([a, b, c])["trend_direction"])
+    emitted.discard(None)
+    sided = fundamentals_confluence_score.WORSENING_TREND_DIRECTIONS | fundamentals_confluence_score.IMPROVING_TREND_DIRECTIONS
+    assert sided <= emitted
+    for direction in emitted - sided:
+        assert direction in {"flat", "reversal"}
+        assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": direction}) is None
+    for direction in sided:
+        assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis({"net_debt_trend_direction": direction}) is not None
 
 
 def test_compute_fundamentals_trajectory_axis_contradiction_prefers_false():
     # debt worsening while CWIP improves -- a real contradiction must not resolve to
     # a claimed "True" just because one sub-signal happens to be positive.
-    row = {"net_debt_trend_direction": "increasing", "cwip_ratio_trend_direction": "decreasing"}
+    row = {"net_debt_trend_direction": "steady_increase", "cwip_ratio_trend_direction": "accelerating_decline"}
     assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis(row) is False
+
+
+def test_compute_fundamentals_trajectory_axis_reversal_is_none():
+    row = {"net_debt_trend_direction": "reversal", "cwip_ratio_trend_direction": "flat"}
+    assert fundamentals_confluence_score.compute_fundamentals_trajectory_axis(row) is None
 
 
 def test_compute_fundamentals_trajectory_axis_both_flat_is_none():
@@ -17432,7 +17460,7 @@ def test_compute_valuation_axis():
 
 def test_compute_confluence_row_counts_true_false_and_evaluable():
     l2_row = {
-        "net_debt_trend_direction": "decreasing",  # True
+        "net_debt_trend_direction": "steady_decline",  # True
         "institutional_stake_direction": "increasing",  # ownership True
         "promoter_stake_direction": "flat",
         "valuation_vs_own_history_ratio": 1.5,  # False
@@ -17554,10 +17582,16 @@ def test_run_confluence_score_refresh_degrades_gracefully_when_no_l2_state(monke
     monkeypatch.setattr(fundamentals_confluence_score, "load_recent_trigger_types_by_company_id", lambda ids: {})
     upserts = []
     monkeypatch.setattr(fundamentals_confluence_score, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_confluence_score, "load_previous_axis_coverage", lambda run_date: {})
+    alerts = []
+    monkeypatch.setattr(fundamentals_confluence_score, "send_ops_alert", lambda subject, body: alerts.append(subject))
 
     result = fundamentals_confluence_score.run_confluence_score_refresh()
 
-    assert result == {"rows": 1, "companies_no_l2_state": 1}
+    assert result["rows"] == 1 and result["companies_no_l2_state"] == 1
+    # every axis None for the whole (one-name) watchlist -- all five are dead, one email
+    assert {p["class"] for p in result["axis_coverage_problems"]} == {"dead"}
+    assert len(alerts) == 1
     df, table, kwargs = upserts[0]
     assert table == fundamentals_confluence_score.RESULTS_TABLE
     assert kwargs["unique_keys"] == ["company_master_id", "run_date", "score_version"]
@@ -17571,22 +17605,45 @@ def test_run_confluence_score_refresh_writes_full_row(monkeypatch):
     monkeypatch.setattr(
         fundamentals_confluence_score,
         "load_l2_state_by_ticker",
-        lambda tickers: {"A": {"net_debt_trend_direction": "decreasing", "institutional_stake_direction": "increasing", "promoter_stake_direction": "flat"}},
+        lambda tickers: {"A": {"net_debt_trend_direction": "accelerating_decline", "institutional_stake_direction": "increasing",
+                               "promoter_stake_direction": "flat", "valuation_vs_own_history_ratio": 0.5}},
     )
     monkeypatch.setattr(fundamentals_confluence_score, "load_sector_phase_by_company_id", lambda ids: {"nse:A": "capacity_discipline"})
     monkeypatch.setattr(fundamentals_confluence_score, "load_recent_trigger_types_by_company_id", lambda ids: {"nse:A": {"insider_buy"}})
     upserts = []
     monkeypatch.setattr(fundamentals_confluence_score, "upsert_to_db", lambda df, table, **k: upserts.append((df, table, k)))
+    monkeypatch.setattr(fundamentals_confluence_score, "load_previous_axis_coverage", lambda run_date: {})
+    monkeypatch.setattr(fundamentals_confluence_score, "send_ops_alert",
+                        lambda subject, body: (_ for _ in ()).throw(AssertionError("no axis is dead")))
 
     result = fundamentals_confluence_score.run_confluence_score_refresh()
 
-    assert result == {"rows": 1, "companies_no_l2_state": 0}
+    assert result["rows"] == 1 and result["companies_no_l2_state"] == 0
+    assert result["axis_coverage"] == {axis: 1.0 for axis in fundamentals_confluence_score.AXIS_COLUMNS}
+    assert result["axis_coverage_problems"] == []
     df, _, _ = upserts[0]
     row = df.iloc[0]
     assert row["company_master_id"] == "nse:A"
     assert row["score_version"] == fundamentals_confluence_score.SCORE_VERSION
-    assert row["confluence_count"] == 4  # trajectory, ownership, sector, event_corroboration all True
+    assert row["confluence_count"] == 5  # all five axes True
     assert row["contradicting_count"] == 0
+
+
+def test_classify_axis_coverage_dead_and_dropped_are_distinct():
+    classify = fundamentals_confluence_score.classify_axis_coverage
+    problems = classify({"a": 0.0, "b": 0.2, "c": 0.5, "d": 0.04}, {"a": 0.5, "b": 0.6, "c": 0.55, "d": 0.09})
+    assert {(p["axis"], p["class"]) for p in problems} == {("a", "dead"), ("b", "dropped")}
+    # d fell by more than half but was always thin (< 10%): not a drop
+    # no previous run (first run at a new version): only a dead axis alarms
+    assert [(p["axis"], p["class"]) for p in classify({"a": 0.0, "b": 0.01}, {})] == [("a", "dead")]
+
+
+def test_compute_axis_coverage_counts_non_none_share():
+    rows = [{"axis_valuation": True, "axis_ownership": None}, {"axis_valuation": False, "axis_ownership": None}]
+    coverage = fundamentals_confluence_score.compute_axis_coverage(rows)
+    assert coverage["axis_valuation"] == 1.0
+    assert coverage["axis_ownership"] == 0.0
+    assert fundamentals_confluence_score.compute_axis_coverage([]) == {}
 
 
 def test_confluence_score_main_exports_run_state(monkeypatch, capsys):

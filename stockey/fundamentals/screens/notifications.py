@@ -182,7 +182,7 @@ def load_full_watchlist() -> list[dict]:
             SELECT confluence_count, contradicting_count, evaluable_count
             FROM fundamentals_confluence_score
             WHERE company_master_id = w.company_master_id
-            ORDER BY run_date DESC LIMIT 1
+            ORDER BY run_date DESC, score_version DESC LIMIT 1
         ) conf ON TRUE
         WHERE w.status = 'active'
         ORDER BY w.last_alert_at DESC NULLS LAST

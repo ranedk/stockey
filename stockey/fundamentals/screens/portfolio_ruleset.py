@@ -183,7 +183,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
                  axis_ownership, axis_valuation,
                  confluence_count, contradicting_count, evaluable_count
             FROM fundamentals_confluence_score
-           ORDER BY company_master_id, run_date DESC
+           ORDER BY company_master_id, run_date DESC, score_version DESC
         )
         SELECT w.company_master_id, w.narrative_text, w.first_seen_price, w.first_seen_at,
                l.confluence_count, l.contradicting_count, l.evaluable_count,
