@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
 
 // QuantileDimension buckets the day's cross-section by rank on a continuous
@@ -176,4 +177,65 @@ func BinDimension(name string, value func(Obs) float64, edges []float64, labels 
 			return out
 		},
 	}
+}
+
+// CrossDimension crosses two dimensions into one grid: a cell is a name that
+// sits in a bucket of BOTH, on the same day. It exists to answer the question
+// one trait at a time cannot — whether an effect that looks like "small names"
+// is really "small AND volatile names", with the two traits confounded in
+// every single-trait cut.
+//
+// A grid multiplies buckets, and the best of many buckets is what noise looks
+// like, so the rule this tool is built under is that the PAIRS ARE NAMED IN
+// ADVANCE (README, step 2 of the slicer). Nothing here stops a caller crossing
+// everything with everything; the caller has to be the one that refuses.
+//
+// A name either dimension leaves out is left out of the grid: the cell must
+// mean "both traits said this", never "one trait said this and the other had
+// no opinion". Cells too thin on a day are dropped by the same guard every
+// bucket-day passes through, so a grid fine enough to empty its corners loses
+// those days rather than scoring five names as a cross-section.
+//
+// The result is day-level only if BOTH parents are: a market regime crossed
+// with a stock trait still picks out stocks, and must be controlled against
+// same-size random groups of stocks rather than against other days.
+func CrossDimension(a, b Dimension) Dimension {
+	var order []string
+	if a.Order != nil && b.Order != nil {
+		for _, la := range a.Order {
+			for _, lb := range b.Order {
+				order = append(order, crossLabel(la, lb))
+			}
+		}
+	}
+	return Dimension{
+		Name:  a.Name + " x " + b.Name,
+		Order: order,
+		Daily: a.Daily && b.Daily,
+		Assign: func(d Day) []string {
+			la, lb := a.Assign(d), b.Assign(d)
+			out := make([]string, len(d.Obs))
+			for i := range out {
+				if i >= len(la) || i >= len(lb) || la[i] == "" || lb[i] == "" {
+					continue
+				}
+				out[i] = crossLabel(la[i], lb[i])
+			}
+			return out
+		},
+	}
+}
+
+// crossLabel keeps a grid cell short enough to read in a table: the quantile
+// hints ("lowest", "highest") are dropped because the grid's own header says
+// which trait comes first and that Q1 is the low end.
+func crossLabel(a, b string) string { return compactLabel(a) + " | " + compactLabel(b) }
+
+func compactLabel(s string) string {
+	for _, suffix := range []string{" (lowest)", " (highest)"} {
+		if strings.HasSuffix(s, suffix) {
+			return strings.TrimSuffix(s, suffix)
+		}
+	}
+	return s
 }

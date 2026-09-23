@@ -1,6 +1,7 @@
 // Command slice asks where and when a rule worked, and what it costs to trade.
 //
 //	slice explore -rule ewmac32_128 -horizon 20
+//	slice explore -rule ewmac32_128 -pairs "liquidity x own volatility"  (two-trait grids)
 //	slice cost     -rule ewmac32_128
 //	slice family   (row 18's configurations, judged with internal/evidence)
 //	slice speeds   (speed-blend construction: costs and correlations only)
@@ -108,6 +109,8 @@ func main() {
 	to := flag.String("to", "2021-12-31", "last decision date — exploration stops before the confirmation years (see -include-confirmation-years)")
 	minTurnover := flag.Float64("min-turnover", 1e7, "minimum 60-bar median traded value in INR")
 	quantiles := flag.Int("quantiles", 5, "buckets per continuous dimension")
+	pairs := flag.String("pairs", "", "two-trait grids instead of single-trait slices: comma-separated pairs, each \"trait x trait\" (e.g. \"liquidity x own volatility\"). The pairs must be named BEFORE the run")
+	gridQuantiles := flag.Int("grid-quantiles", 3, "buckets per continuous dimension INSIDE a grid — coarser than -quantiles because a grid cuts twice")
 	costBps := flag.Float64("cost-bps", 50, "round-trip cost charged on each bucket's churn")
 	reps := flag.Int("reps", 1000, "block-bootstrap resamples for each bucket's 'vs ctl' score (0 = skip)")
 	readConfirm := flag.Bool("include-confirmation-years", false, "let -to reach 2022 onward, the years kept unread for confirmation")
@@ -141,6 +144,9 @@ func main() {
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
 
 	dims := universalDims(*quantiles)
+	if *pairs != "" {
+		dims = gridDims(*pairs, *gridQuantiles)
+	}
 
 	res := explore.Run(days, dims, rule.Name(), *horizon)
 	printResult(res, deviations(res, *horizon, *reps), *costBps, mcaps, sectors, false)
@@ -267,6 +273,54 @@ func universalDims(q int) []explore.Dimension {
 		explore.DayDimension("market breadth", explore.BreadthLabel, explore.BreadthOrder),
 		explore.DayDimension("year", func(d explore.Day) string { return fmt.Sprintf("%d", d.Date.Year()) }, nil),
 	}
+}
+
+// gridDims builds the two-trait grids named on the command line — step 2's
+// last piece, and the one with the sharpest teeth. Crossing two traits
+// multiplies buckets, and the best of many buckets is what noise looks like,
+// so the discipline is that the pairs are NAMED IN ADVANCE and the grid
+// REPLACES the single-trait slices rather than joining them: the family-wise
+// threshold is then computed over the grid's own buckets, which is the family
+// that was actually searched.
+//
+// Grids are cut coarsely (terciles by default). A quintile grid is 25 cells,
+// and at the tradable universe's size that leaves a handful of names per cell
+// — a "top fifth" of six names is a coin flip, and the bucket-day guard
+// throws those days away rather than scoring them.
+func gridDims(spec string, q int) []explore.Dimension {
+	byName := map[string]explore.Dimension{}
+	var known []string
+	for _, d := range universalDims(q) {
+		byName[d.Name] = d
+		known = append(known, d.Name)
+	}
+	var out []explore.Dimension
+	for _, p := range strings.Split(spec, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		parts := strings.SplitN(p, " x ", 2)
+		if len(parts) != 2 {
+			fatal(fmt.Errorf("pair %q is not \"trait x trait\" — known traits: %s", p, strings.Join(known, ", ")))
+		}
+		a, ok := byName[strings.TrimSpace(parts[0])]
+		if !ok {
+			fatal(fmt.Errorf("unknown trait %q — known traits: %s", strings.TrimSpace(parts[0]), strings.Join(known, ", ")))
+		}
+		b, ok := byName[strings.TrimSpace(parts[1])]
+		if !ok {
+			fatal(fmt.Errorf("unknown trait %q — known traits: %s", strings.TrimSpace(parts[1]), strings.Join(known, ", ")))
+		}
+		if a.Name == b.Name {
+			fatal(fmt.Errorf("pair %q crosses a trait with itself", p))
+		}
+		out = append(out, explore.CrossDimension(a, b))
+	}
+	if len(out) == 0 {
+		fatal(fmt.Errorf("-pairs was given but names no pair"))
+	}
+	return out
 }
 
 // confirmationStart is where exploration stops by default. Explore freely,

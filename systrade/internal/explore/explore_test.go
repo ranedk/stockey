@@ -401,3 +401,151 @@ func TestSparseBucketsGetNoScoreAndLeaveTheThresholdAlone(t *testing.T) {
 		t.Fatalf("threshold %v: a sparse bucket leaked into the family", dev.Threshold)
 	}
 }
+
+// gridDays builds a universe with two independent traits, each taking three
+// values in equal proportion, and plants an effect in exactly ONE cell of the
+// nine — low liquidity AND high volatility. Neither single-trait cut can see
+// it cleanly: each spreads the live cell across two dead ones.
+func gridDays(nDays, perCell int, edge float64) []Day {
+	rng := newRng(99)
+	start := time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC)
+	var days []Day
+	for d := 0; d < nDays; d++ {
+		day := Day{Date: start.AddDate(0, 0, d)}
+		marketMove := 0.01 * rng.normal()
+		for liq := 0; liq < 3; liq++ {
+			for vol := 0; vol < 3; vol++ {
+				for i := 0; i < perCell; i++ {
+					f := rng.normal()
+					r := marketMove + 0.02*rng.normal()
+					if liq == 0 && vol == 2 {
+						r += edge * f
+					}
+					day.Obs = append(day.Obs, Obs{
+						Sym:      int32((liq*3+vol)*perCell + i),
+						Forecast: f,
+						FwdRet:   r,
+						Sector:   "A",
+						Turnover: float64(liq + 1),
+						Vol:      float64(vol + 1),
+						Price:    100,
+					})
+				}
+			}
+		}
+		days = append(days, day)
+	}
+	return days
+}
+
+func TestCrossDimensionFindsAnEffectNeitherTraitAloneShows(t *testing.T) {
+	days := gridDays(400, 15, 0.012)
+	liq := QuantileDimension("liquidity", 3, func(o Obs) float64 { return o.Turnover })
+	vol := QuantileDimension("own volatility", 3, func(o Obs) float64 { return o.Vol })
+	res := Run(days, []Dimension{liq, vol, CrossDimension(liq, vol)}, "synthetic", 20)
+
+	byKey := map[string]Bucket{}
+	for _, b := range res.Buckets {
+		byKey[b.Dimension+"/"+b.Label] = b
+	}
+	live := byKey["liquidity x own volatility/Q1 | Q3"]
+	if live.Days == 0 {
+		t.Fatalf("the planted cell has no days; buckets seen: %d", len(res.Buckets))
+	}
+	if live.Edge < 0.006 {
+		t.Errorf("planted cell edge %.4f, expected clearly positive", live.Edge)
+	}
+	// Every other cell of the grid must be quiet.
+	for _, b := range res.Buckets {
+		if b.Dimension != "liquidity x own volatility" || b.Label == "Q1 | Q3" {
+			continue
+		}
+		if math.Abs(b.Edge) > live.Edge/3 {
+			t.Errorf("cell %s shows edge %.4f against the planted cell's %.4f — the effect leaked",
+				b.Label, b.Edge, live.Edge)
+		}
+	}
+	// And the point of the tool: each single-trait bucket containing the live
+	// cell is diluted, because two thirds of it is dead.
+	for _, k := range []string{"liquidity/Q1 (lowest)", "own volatility/Q3 (highest)"} {
+		b, ok := byKey[k]
+		if !ok {
+			t.Fatalf("missing single-trait bucket %q", k)
+		}
+		if b.Edge >= live.Edge {
+			t.Errorf("single-trait bucket %s shows %.4f, not diluted against the cell's %.4f", k, b.Edge, live.Edge)
+		}
+	}
+}
+
+func TestCrossDimensionDropsWhatEitherParentDrops(t *testing.T) {
+	day := Day{Date: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
+	for i := 0; i < 60; i++ {
+		o := Obs{Sym: int32(i), Forecast: float64(i % 7), FwdRet: 0.01, Turnover: float64(i%3 + 1), Vol: 1, Price: 100}
+		if i < 10 {
+			o.Vol = math.NaN() // the second trait has no opinion on these
+		}
+		day.Obs = append(day.Obs, o)
+	}
+	liq := QuantileDimension("liquidity", 3, func(o Obs) float64 { return o.Turnover })
+	vol := QuantileDimension("own volatility", 3, func(o Obs) float64 { return o.Vol })
+	labels := CrossDimension(liq, vol).Assign(day)
+	for i := 0; i < 10; i++ {
+		if labels[i] != "" {
+			t.Fatalf("name %d has no volatility but landed in cell %q — a cell must mean BOTH traits agreed", i, labels[i])
+		}
+	}
+	var placed int
+	for _, l := range labels {
+		if l != "" {
+			placed++
+		}
+	}
+	if placed == 0 {
+		t.Fatal("the grid placed nothing at all")
+	}
+}
+
+func TestCrossDimensionIsDayLevelOnlyWhenBothParentsAre(t *testing.T) {
+	stock := QuantileDimension("liquidity", 3, func(o Obs) float64 { return o.Turnover })
+	breadth := DayDimension("market breadth", BreadthLabel, BreadthOrder)
+	year := DayDimension("year", func(d Day) string { return "2015" }, nil)
+	if CrossDimension(breadth, stock).Daily {
+		t.Error("a regime crossed with a stock trait still picks stocks: its control must be random stocks, not other days")
+	}
+	if !CrossDimension(breadth, year).Daily {
+		t.Error("two whole-day labels crossed are still a whole-day label")
+	}
+}
+
+func TestCrossDimensionLabelsAreTheCrossProduct(t *testing.T) {
+	a := QuantileDimension("liquidity", 3, func(o Obs) float64 { return o.Turnover })
+	b := QuantileDimension("own volatility", 3, func(o Obs) float64 { return o.Vol })
+	c := CrossDimension(a, b)
+	if c.Name != "liquidity x own volatility" {
+		t.Errorf("name %q", c.Name)
+	}
+	want := []string{"Q1 | Q1", "Q1 | Q2", "Q1 | Q3", "Q2 | Q1", "Q2 | Q2", "Q2 | Q3", "Q3 | Q1", "Q3 | Q2", "Q3 | Q3"}
+	if len(c.Order) != len(want) {
+		t.Fatalf("order has %d labels, want %d: %v", len(c.Order), len(want), c.Order)
+	}
+	for i := range want {
+		if c.Order[i] != want[i] {
+			t.Fatalf("order[%d] = %q, want %q", i, c.Order[i], want[i])
+		}
+	}
+}
+
+// A grid fine enough to empty its cells must lose those days, not score five
+// names as if they were a cross-section.
+func TestCrossDimensionCellsTooThinAreSkipped(t *testing.T) {
+	days := gridDays(50, 6, 0.01) // 54 names a day: a 5x5 grid leaves 2 per cell
+	liq := QuantileDimension("liquidity", 5, func(o Obs) float64 { return o.Turnover })
+	vol := QuantileDimension("own volatility", 5, func(o Obs) float64 { return o.Vol })
+	res := Run(days, []Dimension{CrossDimension(liq, vol)}, "synthetic", 20)
+	for _, b := range res.Buckets {
+		if b.Names < minNamesPerBucket {
+			t.Errorf("cell %s scored %v names a day, below the %d-name floor", b.Label, b.Names, minNamesPerBucket)
+		}
+	}
+}
