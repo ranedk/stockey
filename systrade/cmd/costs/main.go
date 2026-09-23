@@ -6,6 +6,8 @@
 // assumed.
 //
 //	costs            the full report (2023-06 .. 2026-08, every 5th trading day)
+//	costs speed      the speed limit: what a book costs to run at each holding
+//	                 period (arithmetic only — no market data read)
 //
 // A measurement, not a hypothesis test: LEDGER trials=0.
 package main
@@ -60,6 +62,10 @@ type tierAcc struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "speed" {
+		runSpeed(os.Args[2:])
+		return
+	}
 	from := flag.String("from", "2023-06-01", "first sampled day")
 	to := flag.String("to", "2026-08-31", "last sampled day")
 	every := flag.Int("every", 5, "sample every Nth trading day")

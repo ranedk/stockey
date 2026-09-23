@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ranedk/systrader/internal/bars"
+	"github.com/ranedk/systrader/internal/costs"
 )
 
 // synthBars builds one-minute bars from trades that bounce between a bid and
@@ -57,5 +58,34 @@ func TestVwapGapIsMeasuredFromTheAuctionPrice(t *testing.T) {
 	// typical prices 100 and 102, weights 10 and 30 -> 101.5; against 100 -> +1.5%
 	if !ok || math.Abs(g-0.015) > 1e-12 {
 		t.Errorf("gap = %v, want 0.015", g)
+	}
+}
+
+func TestSpeedLimitIsRoundTripsTimesCost(t *testing.T) {
+	// A book replaced every 21 days trades twelve times a year; at 40 bps a
+	// round trip that is 4.8% a year, whatever the signal does.
+	if got := annualCost(21, 1, 0.0040); math.Abs(got-0.048) > 1e-12 {
+		t.Fatalf("got %.6f, want 0.048", got)
+	}
+	// Churn scales it linearly: replacing two thirds costs two thirds.
+	if got := annualCost(21, 2.0/3, 0.0040); math.Abs(got-0.032) > 1e-12 {
+		t.Fatalf("got %.6f, want 0.032", got)
+	}
+	// Halving the holding period doubles the bill — the whole point of the table.
+	fast, slow := annualCost(5, 1, 0.0040), annualCost(10, 1, 0.0040)
+	if math.Abs(fast-2*slow) > 1e-12 {
+		t.Fatalf("5-day %.6f is not twice the 10-day %.6f", fast, slow)
+	}
+	if !math.IsNaN(annualCost(0, 1, 0.004)) {
+		t.Fatal("a zero holding period should be NaN, not a division by zero")
+	}
+}
+
+// The DP charge is flat rupees, so it is the small positions it eats.
+func TestDPChargeHurtsSmallSlicesMost(t *testing.T) {
+	small := costs.DPFraction(6000)
+	large := costs.DPFraction(300000)
+	if !(small > 10*large) {
+		t.Fatalf("DP charge is %.5f of a Rs 6,000 position and %.5f of a Rs 3 lakh one", small, large)
 	}
 }
