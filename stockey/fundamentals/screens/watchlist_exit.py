@@ -49,6 +49,7 @@ import pandas as pd
 
 from fundamentals.screens.technicals import STALE_PRICE_THRESHOLD_DAYS
 from fundamentals.screens.watchlist import _ensure_watchlist_table, load_price_near
+from fundamentals.screens.watchlist import NEGATIVE_TRIGGER_TYPES
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -327,6 +328,9 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
     _price_data_is_effectively_stale) -- surfaced so the batch caller can record
     fallback telemetry for a condition that used to be entirely silent (re-audit
     2026-08-18)."""
+    if trigger_history and all(t.get("trigger_type") in NEGATIVE_TRIGGER_TYPES for t in trigger_history):
+        # Only evidence against, nothing that makes it worth watching (2026-09-24).
+        return "no_thesis", "only negative alerts -- no positive signal ever justified watching it", False
     invalidated_reason = _check_invalidated(trigger_history)
     if invalidated_reason:
         return "invalidated", invalidated_reason, False
@@ -361,7 +365,7 @@ def run_watchlist_exit_evaluation() -> dict[str, object]:
     load_ts = pd.Timestamp.now(tz="UTC")
 
     rows = []
-    counts = {"active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0}
+    counts = {"active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "no_thesis": 0}
     price_data_stale_skips: list[str] = []
     for _, row in watchlist.iterrows():
         row_dict = row.to_dict()

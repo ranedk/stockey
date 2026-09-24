@@ -450,7 +450,28 @@ def adjudicate_entry(candidate: dict, *, model: str = DEFAULT_MODEL) -> dict:
         target, basis = _clamp_target_date(result.get("target_date"))
         result["target_date"] = target.date().isoformat()
         result["target_date_basis"] = basis
+    else:
+        # A vetoed candidate gets a MECHANICAL horizon (2026-09-24, operator decision): it
+        # carries no forecast, so without a target date it never took the target-date exit
+        # and never resolved, and the accepted-vs-vetoed comparison -- the only test of
+        # whether the veto adds value -- could only ever contain accepts. The midpoint of
+        # the accept window, so both arms are compared on price over a like horizon.
+        result["target_date"] = vetoed_horizon().date().isoformat()
+        result["target_date_basis"] = VETO_HORIZON_BASIS
     return result
+
+
+VETO_HORIZON_DAYS = (MIN_HOLD_DAYS + MAX_HOLD_DAYS) // 2
+VETO_HORIZON_BASIS = (f"mechanical horizon for a vetoed candidate: {VETO_HORIZON_DAYS} days, the midpoint "
+                      f"of the {MIN_HOLD_DAYS}-{MAX_HOLD_DAYS} day accept window; price comparison only, no forecast")
+
+
+def vetoed_horizon(opened=None) -> pd.Timestamp:
+    base = pd.Timestamp(opened) if opened is not None else pd.Timestamp.now(tz="UTC")
+    if base.tzinfo is None:
+        base = base.tz_localize("UTC")
+    ist_day = (base + pd.Timedelta(hours=5, minutes=30)).normalize().tz_localize(None)
+    return ist_day + pd.Timedelta(days=VETO_HORIZON_DAYS)
 
 
 def adjudicate_exit(position: dict, exit_reason: str, *, model: str = DEFAULT_MODEL) -> dict:

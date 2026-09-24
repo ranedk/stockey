@@ -17249,6 +17249,41 @@ def test_unit_tests_cannot_open_a_live_database_connection():
         db._engine.raw_connection()
 
 
+def test_vetoed_candidates_get_a_mechanical_horizon_and_a_price_score(monkeypatch):
+    """Vetoed rows had no target date: never resolved, never exited on target, so the
+    accepted-vs-vetoed comparison could only contain accepts (2026-09-24 decision)."""
+    import fundamentals.screens.portfolio_adjudicator as adj
+    import fundamentals.screens.portfolio_resolution as pr
+
+    horizon = adj.vetoed_horizon(pd.Timestamp("2026-09-24 16:30", tz="UTC"))
+    assert horizon == pd.Timestamp("2026-09-24") + pd.Timedelta(days=adj.VETO_HORIZON_DAYS)
+    rows = pd.DataFrame([
+        {"entry_decision": "accept", "entry_price": 100.0, "exit_price": 110.0},
+        {"entry_decision": "accept", "entry_price": 100.0, "exit_price": 90.0},
+        {"entry_decision": "reject", "entry_price": 100.0, "exit_price": 130.0},
+    ])
+    monkeypatch.setattr(pr, "sql_to_df", lambda q, params=None: rows)
+    monkeypatch.setattr(pr, "MIN_SAMPLE_SIZE_FOR_BREAKDOWN", 1)
+    out = pr.paired_price_comparison()
+    assert out["accept"]["closed"] == 2 and out["accept"]["mean_return_pct"] == 0.0
+    assert out["reject"]["mean_return_pct"] == 30.0
+
+
+def test_negative_only_names_are_not_watched():
+    """2026-09-24 decision: a lone results_decline / bulk_deal_sell used to add a name, and
+    nothing could ever invalidate it."""
+    from fundamentals.screens import watchlist_exit as we
+
+    today = pd.Timestamp("2026-09-24").date()
+    row = {"first_seen_price": None, "current_price": None, "price_data_stale": None,
+           "technicals_as_of_date": None, "suggested_watch_until": None,
+           "latest_alert_load_ts": None, "narrative_generated_at": None}
+    status, reason, _ = we.evaluate_exit_status(row, [{"trigger_type": "results_decline"}, {"trigger_type": "bulk_deal_sell"}], today=today)
+    assert status == "no_thesis"
+    status, _, _ = we.evaluate_exit_status(row, [{"trigger_type": "results_decline"}, {"trigger_type": "insider_buy"}], today=today)
+    assert status != "no_thesis"
+
+
 def test_india_ratings_affirms_is_a_reaffirmation():
     from fundamentals.collectors.rating_agencies import classify_rating_action_type
 
@@ -19348,7 +19383,7 @@ def test_sync_watchlist_from_alerts_returns_early_on_no_alerts(monkeypatch):
 def test_sync_watchlist_from_alerts_new_company_looks_up_first_seen_price(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-03"), "alert_count": 2}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-03"), "positive_alerts": 1, "alert_count": 2}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: pd.DataFrame())
@@ -19485,7 +19520,7 @@ def test_sync_watchlist_from_alerts_leaves_first_seen_at_alone_when_unchanged(mo
 def test_sync_watchlist_from_alerts_flags_missing_price_without_failing(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist, "_ensure_watchlist_table", lambda: None)
     alert_summary = pd.DataFrame(
-        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-01"), "alert_count": 1}]
+        [{"company_master_id": "nse:FOO", "first_detected_date": pd.Timestamp("2026-08-01"), "last_detected_date": pd.Timestamp("2026-08-01"), "positive_alerts": 1, "alert_count": 1}]
     )
     monkeypatch.setattr(fundamentals_watchlist, "load_l3_alert_summary_by_company", lambda: alert_summary)
     monkeypatch.setattr(fundamentals_watchlist, "load_existing_watchlist", lambda: pd.DataFrame())
@@ -23865,6 +23900,7 @@ def test_hit_rate_is_always_split_by_resolution_method(monkeypatch):
     """THE anti-self-grading control. A single blended hit rate lets judged resolutions
     (a model grading its own prose) flatter the mechanical ones (data deciding). The gap
     between the two is the bias estimate, so it must never be averaged away."""
+    monkeypatch.setattr(__import__("fundamentals.screens.portfolio_resolution", fromlist=["x"]), "paired_price_comparison", lambda: {})
     import fundamentals.screens.portfolio_resolution as pr
 
     rows = ([_pf_resolved(resolution_method="mechanical", resolved_true=(i < 2)) for i in range(5)]
@@ -23878,6 +23914,7 @@ def test_hit_rate_is_always_split_by_resolution_method(monkeypatch):
 def test_scoring_pairs_accepted_against_vetoed(monkeypatch):
     """The PRD's whole reason for recording vetoed names. Without this split the veto
     layer absorbs every result and can never be shown to be wrong."""
+    monkeypatch.setattr(__import__("fundamentals.screens.portfolio_resolution", fromlist=["x"]), "paired_price_comparison", lambda: {})
     import fundamentals.screens.portfolio_resolution as pr
 
     rows = ([_pf_resolved(entry_decision="accept", resolved_true=True) for _ in range(5)]
@@ -23892,6 +23929,7 @@ def test_thin_groups_report_none_rather_than_a_number(monkeypatch):
     """A hit rate off two samples is noise wearing a percentage sign. It reports None but
     still shows n, so a thin sample is visibly thin rather than absent -- absence reads as
     'nothing collected', thinness reads as 'not enough yet'."""
+    monkeypatch.setattr(__import__("fundamentals.screens.portfolio_resolution", fromlist=["x"]), "paired_price_comparison", lambda: {})
     import fundamentals.screens.portfolio_resolution as pr
 
     rows = [_pf_resolved(entry_decision="accept") for _ in range(2)]

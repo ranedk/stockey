@@ -99,6 +99,17 @@ def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = 
     )
 
 
+# Alerts that are only ever evidence AGAINST a company (2026-09-24, operator decision:
+# only positive alerts add a name). Before, a lone results_decline or bulk_deal_sell
+# added the name, and invalidation only fires when a POSITIVE original story is later
+# contradicted -- so negative-only names sat 'active' forever. They still count against
+# a name already on the list.
+NEGATIVE_TRIGGER_TYPES = frozenset({
+    "rating_downgrade", "results_decline", "insider_sell_surprise", "pledge_increase",
+    "bulk_deal_sell", "auditor_change", "related_party_transaction", "results_delayed",
+})
+
+
 def load_l3_alert_summary_by_company() -> pd.DataFrame:
     """first/last DETECTED date -- MIN/MAX(load_ts), not alert_date. alert_date is
     the underlying disclosed event's own date and can predate detection by months
@@ -107,6 +118,7 @@ def load_l3_alert_summary_by_company() -> pd.DataFrame:
     return sql_to_df(
         """
         SELECT company_master_id,
+               count(*) FILTER (WHERE trigger_type <> ALL(%s)) AS positive_alerts,
                (MIN(load_ts))::date AS first_detected_date,
                (MAX(load_ts))::date AS last_detected_date,
                COUNT(*) AS alert_count
@@ -114,7 +126,8 @@ def load_l3_alert_summary_by_company() -> pd.DataFrame:
         WHERE company_master_id IS NOT NULL
           AND status NOT LIKE 'superseded%%'   -- round-trip deals are not evidence (2026-09-23)
         GROUP BY company_master_id
-        """
+        """,
+        params=(sorted(NEGATIVE_TRIGGER_TYPES),),
     )
 
 
@@ -277,6 +290,8 @@ def sync_watchlist_from_alerts() -> dict[str, object]:
                 first_seen_at = stored_first_seen_at
                 first_seen_price = existing.loc[company_master_id, "first_seen_price"]
         else:
+            if int(alert_row.get("positive_alerts") or 0) == 0:
+                continue  # negative-only: evidence against, never a reason to start watching
             first_seen_at = true_first_detected_date
             first_seen_price = load_price_near(company_master_id, first_seen_at)
             new_candidates.append(company_master_id)

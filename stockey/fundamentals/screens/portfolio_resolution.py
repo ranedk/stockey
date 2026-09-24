@@ -321,6 +321,9 @@ def load_due_forecasts(*, as_of_date=None) -> pd.DataFrame:
          WHERE target_date IS NOT NULL
            AND target_date <= %s
            AND resolution_date IS NULL
+           -- a vetoed row has a mechanical horizon but NO forecast to grade; it is
+           -- scored on price in compute_portfolio_scoring (2026-09-24)
+           AND entry_decision IS DISTINCT FROM 'reject'
          ORDER BY target_date ASC
         """,
         params=(as_of_date,),
@@ -402,6 +405,33 @@ def resolve_due_forecasts(*, as_of_date=None, dry_run: bool = False) -> dict[str
     }
 
 
+def paired_price_comparison() -> dict[str, dict[str, object]]:
+    """Accepted vs vetoed, on PRICE, over CLOSED positions -- the PRD's test of whether
+    the veto adds value (2026-09-24). Both arms now take the same exits (stop, thesis
+    invalidation, target date -- vetoed rows via a mechanical horizon), so a closed
+    position's exit_price/entry_price is comparable across arms. A thin arm reports its
+    count with mean None, never hidden."""
+    df = sql_to_df(
+        "SELECT entry_decision, entry_price, exit_price FROM fundamentals_portfolio_position "
+        " WHERE status = 'closed' AND entry_price > 0 AND exit_price IS NOT NULL "
+        "   AND close_reason IS DISTINCT FROM 'superseded_by_accept'"
+    )
+    out: dict[str, dict[str, object]] = {}
+    if df.empty:
+        return out
+    df["ret"] = df["exit_price"].astype(float) / df["entry_price"].astype(float) - 1
+    for decision, group in df.groupby(df["entry_decision"].fillna("none")):
+        n = int(len(group))
+        thin = n < MIN_SAMPLE_SIZE_FOR_BREAKDOWN
+        out[str(decision)] = {
+            "closed": n,
+            "mean_return_pct": None if thin else round(float(group["ret"].mean()) * 100, 2),
+            "median_return_pct": None if thin else round(float(group["ret"].median()) * 100, 2),
+            "share_positive_pct": None if thin else round(float((group["ret"] > 0).mean()) * 100, 1),
+        }
+    return out
+
+
 def _split_by_method(resolved: pd.DataFrame, column: str) -> dict[str, dict[str, dict[str, object]]]:
     """{resolution_method: {group: {count, hit_rate}}} -- the breakdown the design asks for."""
     if resolved.empty or "resolution_method" not in resolved.columns:
@@ -448,6 +478,7 @@ def compute_portfolio_scoring(*, as_of_date=None) -> dict[str, object]:
     that can say whether the veto layer adds value or destroys it.
     """
     as_of_date = as_of_date or _ist_today()
+    price_arms = paired_price_comparison()
     positions = sql_to_df("SELECT * FROM fundamentals_portfolio_position "
                           " WHERE prediction_text IS NOT NULL OR target_date IS NOT NULL")
     empty = {
@@ -455,6 +486,7 @@ def compute_portfolio_scoring(*, as_of_date=None) -> dict[str, object]:
         "hit_rate": None, "hit_rate_by_resolution_method": {},
         "hit_rate_by_entry_decision": {}, "hit_rate_by_confluence_count": {},
         "failure_attribution_breakdown": {}, "time_to_confirmation_days": {},
+        "price_return_by_entry_decision": price_arms,
     }
     if positions.empty:
         return empty
@@ -492,6 +524,7 @@ def compute_portfolio_scoring(*, as_of_date=None) -> dict[str, object]:
         "hit_rate_by_confluence_count_and_method": _split_by_method(scored, "confluence_count"),
         "failure_attribution_breakdown": failure_breakdown,
         "time_to_confirmation_days": time_to_confirmation,
+        "price_return_by_entry_decision": price_arms,
     }
 
 
