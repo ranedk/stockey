@@ -7,7 +7,8 @@
 //
 //	costs            the full report (2023-06 .. 2026-08, every 5th trading day)
 //	costs speed      the speed limit: what a book costs to run at each holding
-//	                 period (arithmetic only — no market data read)
+//	                 period, before and after Indian equity tax (arithmetic only —
+//	                 no market data read)
 //
 // A measurement, not a hypothesis test: LEDGER trials=0.
 package main

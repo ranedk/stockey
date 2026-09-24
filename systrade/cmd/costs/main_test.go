@@ -89,3 +89,23 @@ func TestDPChargeHurtsSmallSlicesMost(t *testing.T) {
 		t.Fatalf("DP charge is %.5f of a Rs 6,000 position and %.5f of a Rs 3 lakh one", small, large)
 	}
 }
+
+func TestAfterTaxIsPreTaxLessTheTaxOnWhatIsLeft(t *testing.T) {
+	// Churn 1 monthly: nothing survives a year, so the whole net gain pays 20%.
+	r := afterTax(21, 1, 0.004, 0.16, 1e7)
+	if math.Abs(r.cost-0.048) > 1e-12 || math.Abs(r.preTax-0.112) > 1e-12 {
+		t.Fatalf("cost %.4f pre-tax %.4f", r.cost, r.preTax)
+	}
+	if r.longTerm != 0 || math.Abs(r.tax-0.2*0.112) > 1e-12 || math.Abs(r.afterTax-0.8*0.112) > 1e-12 {
+		t.Fatalf("long-term %.4f tax %.4f after %.4f", r.longTerm, r.tax, r.afterTax)
+	}
+	// A losing year pays no tax.
+	if l := afterTax(1, 1, 0.004, 0.16, 1e7); l.tax != 0 || l.afterTax != l.preTax {
+		t.Fatalf("losing year taxed: %+v", l)
+	}
+	// Lower churn at the same clock moves gains long-term and cuts the tax rate.
+	lo := afterTax(21, 0.1, 0.004, 0.16, 1e7)
+	if !(lo.longTerm > 0.5 && lo.tax/lo.preTax < 0.2) {
+		t.Fatalf("churn 0.1: long-term %.3f, effective rate %.3f", lo.longTerm, lo.tax/lo.preTax)
+	}
+}
