@@ -45,7 +45,12 @@ from fundamentals.screens.portfolio_adjudicator import (
     _record_decision,
     adjudicate_exit,
 )
-from fundamentals.screens.portfolio_ruleset import ENTRY_STAGE, RULESET_VERSION, load_stage_reads
+from fundamentals.screens.portfolio_ruleset import (
+    CONFLUENCE_MAX_AGE_DAYS,
+    ENTRY_STAGE,
+    RULESET_VERSION,
+    load_stage_reads,
+)
 from utils.db import db_session, sql_to_df
 
 SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_exit"
@@ -67,7 +72,9 @@ def _open_positions() -> pd.DataFrame:
         """
         SELECT position_id, company_master_id, ticker, kind, entry_price, stop_pct,
                opened_at, deferral_count, confluence_count, contradicting_count,
-               evaluable_count, stage_at_entry, target_date, prediction_text
+               evaluable_count, stage_at_entry, target_date, prediction_text,
+               invalidation_criteria, score_version, baseline_score_version,
+               baseline_contradicting_count
           FROM fundamentals_portfolio_position
          WHERE status = 'open'
         """
@@ -97,7 +104,9 @@ def _current_scores(company_ids: list[str]) -> dict[str, dict]:
     df = sql_to_df(
         """
         SELECT DISTINCT ON (company_master_id)
-               company_master_id, contradicting_count, evaluable_count, run_date
+               company_master_id, contradicting_count, evaluable_count, run_date, score_version,
+               axis_fundamentals_trajectory, axis_event_corroboration, axis_sector_cycle,
+               axis_ownership, axis_valuation
           FROM fundamentals_confluence_score
          WHERE company_master_id = ANY(%s)
          ORDER BY company_master_id, run_date DESC, score_version DESC
@@ -106,8 +115,42 @@ def _current_scores(company_ids: list[str]) -> dict[str, dict]:
     )
     return {str(r.company_master_id): {"contradicting_count": r.contradicting_count,
                                        "evaluable_count": r.evaluable_count,
-                                       "run_date": r.run_date}
+                                       "run_date": r.run_date,
+                                       "score_version": int(r.score_version),
+                                       "axes": {"fundamentals_trajectory": r.axis_fundamentals_trajectory,
+                                                "event_corroboration": r.axis_event_corroboration,
+                                                "sector_cycle": r.axis_sector_cycle,
+                                                "ownership": r.axis_ownership,
+                                                "valuation": r.axis_valuation}}
             for r in df.itertuples()}
+
+
+# Every position opened before the 2026-09-23 audit was entered on confluence v1.
+LEGACY_SCORE_VERSION = 1
+
+
+def _baseline(position) -> tuple[int, int]:
+    """(scorer version, contradicting count) the exit compares against. Pre-audit rows have
+    no baseline columns: their entry counts are the baseline, on v1."""
+    version = getattr(position, "baseline_score_version", None)
+    count = getattr(position, "baseline_contradicting_count", None)
+    if version is None or pd.isna(version):
+        version = getattr(position, "score_version", None)
+    if version is None or pd.isna(version):
+        version = LEGACY_SCORE_VERSION
+    if count is None or pd.isna(count):
+        count = position.contradicting_count or 0
+    return int(version), int(count)
+
+
+def _rebaseline(position_id: str, score_version: int, contradicting: int) -> None:
+    with db_session() as (_conn, cur):
+        cur.execute(
+            "UPDATE fundamentals_portfolio_position "
+            "   SET baseline_score_version = %s, baseline_contradicting_count = %s "
+            " WHERE position_id = %s AND status = 'open'",
+            (score_version, contradicting, position_id),
+        )
 
 
 def evaluate_exit_triggers() -> dict[str, object]:
@@ -127,8 +170,9 @@ def evaluate_exit_triggers() -> dict[str, object]:
     # depending only on when cron happened to run.
     today = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5, minutes=30)).normalize().tz_localize(None)
 
+    score_cutoff = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=CONFLUENCE_MAX_AGE_DAYS)
     triggers = []
-    unpriced = []
+    unpriced, stop_unchecked, stale_scores, rebaselines = [], [], [], []
     for p in positions.itertuples():
         price = prices.get(str(p.ticker))
         if price is None:
@@ -139,6 +183,10 @@ def evaluate_exit_triggers() -> dict[str, object]:
         stop_level = None
         if p.entry_price and p.stop_pct:
             stop_level = float(p.entry_price) * (1 - float(p.stop_pct) / 100.0)
+        else:
+            # No entry price or no stop: the stop can NEVER fire for this position. Used
+            # to be silent unless today's price was also missing.
+            stop_unchecked.append(str(p.ticker))
 
         # 1. Stop. Requires a real price -- a missing quote is not a breach.
         if price is not None and stop_level is not None and price <= stop_level:
@@ -149,17 +197,36 @@ def evaluate_exit_triggers() -> dict[str, object]:
 
         # 2. Thesis invalidation. POSITIVE evidence only: a contradicting axis that is
         #    actually present, or a stage read that exists and is no longer advancing.
+        #
+        #    Compared WITHIN one scorer version (2026-09-23 audit). The check used to be
+        #    "any contradicting axis on the newest score", so shipping confluence v2 -- which
+        #    revived a dead axis -- closed ASHIANA as "a contradicting axis appeared since
+        #    entry" when only the scorer had changed. A version change now RE-BASELINES the
+        #    position (named in the run output); only a rise above the baseline on the same
+        #    version is evidence about the company. A stale score is reported, never used.
         score = scores.get(str(p.company_master_id)) or {}
         contradicting = score.get("contradicting_count")
-        if contradicting is not None and int(contradicting) > 0:
-            triggers.append(_trigger(p, "thesis_invalidation", price,
-                                     f"{int(contradicting)} contradicting axis/axes appeared "
-                                     f"since entry (was {p.contradicting_count} at entry)"))
-            continue
+        if contradicting is not None and score.get("run_date") is not None \
+                and pd.Timestamp(score["run_date"]) < score_cutoff:
+            stale_scores.append(str(p.ticker))
+            contradicting = None
+        if contradicting is not None:
+            base_version, base_count = _baseline(p)
+            if (score.get("score_version") or LEGACY_SCORE_VERSION) != base_version:
+                rebaselines.append({"position_id": p.position_id, "ticker": str(p.ticker),
+                                    "from_version": base_version, "to_version": score.get("score_version"),
+                                    "contradicting_count": int(contradicting)})
+            elif int(contradicting) > base_count:
+                triggers.append(_trigger(p, "thesis_invalidation", price,
+                                         f"{int(contradicting)} contradicting axis/axes on score "
+                                         f"v{base_version}, up from {base_count} at baseline",
+                                         score=score, stage_now=stages.get(str(p.ticker))))
+                continue
         stage_now = stages.get(str(p.ticker))
         if stage_now is not None and int(stage_now) != ENTRY_STAGE:
             triggers.append(_trigger(p, "thesis_invalidation", price,
-                                     f"Weinstein stage left {ENTRY_STAGE} (now {int(stage_now)})"))
+                                     f"Weinstein stage left {ENTRY_STAGE} (now {int(stage_now)})",
+                                     score=score, stage_now=stage_now))
             continue
 
         # 3. Target date reached -- the date the adjudicator committed to at entry.
@@ -167,20 +234,25 @@ def evaluate_exit_triggers() -> dict[str, object]:
         if target is not None and pd.notna(target) and pd.Timestamp(target).normalize() <= today:
             triggers.append(_trigger(p, "target_date", price,
                                      f"target date {pd.Timestamp(target).date()} has passed "
-                                     f"without the thesis resolving"))
+                                     f"without the thesis resolving",
+                                     score=score, stage_now=stage_now))
 
     return {
         "ruleset_version": RULESET_VERSION,
         "open": int(len(positions)),
         "priced": len(prices),
         "unpriced": unpriced,
+        "stop_unchecked": stop_unchecked,
+        "stale_confluence": stale_scores,
+        "rebaselines": rebaselines,
         "stage_reads": len(stages),
         "stage_api_available": bool(stages),
         "triggers": triggers,
     }
 
 
-def _trigger(position, reason: str, price: float | None, detail: str) -> dict:
+def _trigger(position, reason: str, price: float | None, detail: str, *,
+             score: dict | None = None, stage_now: int | None = None) -> dict:
     return {
         "position_id": position.position_id,
         "company_master_id": position.company_master_id,
@@ -199,6 +271,10 @@ def _trigger(position, reason: str, price: float | None, detail: str) -> dict:
         "stage_at_entry": position.stage_at_entry,
         "target_date": getattr(position, "target_date", None),
         "prediction_text": getattr(position, "prediction_text", None),
+        "invalidation_criteria": getattr(position, "invalidation_criteria", None),
+        "score_version_at_entry": getattr(position, "score_version", None),
+        "current_score": score or None,
+        "stage_now": stage_now,
     }
 
 
@@ -226,6 +302,9 @@ def run_exits(*, dry_run: bool = False) -> dict[str, object]:
     _ensure_tables()
     evaluation = evaluate_exit_triggers()
     closed, deferred = [], []
+    if not dry_run:
+        for rb in evaluation.get("rebaselines", []):
+            _rebaseline(rb["position_id"], rb["to_version"], rb["contradicting_count"])
 
     for trigger in evaluation["triggers"]:
         reason = trigger["exit_reason"]
@@ -265,6 +344,9 @@ def run_exits(*, dry_run: bool = False) -> dict[str, object]:
         # Positions whose stop could not be checked at all. Non-empty here is a real
         # finding, not noise.
         "unpriced": evaluation.get("unpriced", []),
+        "stop_unchecked": evaluation.get("stop_unchecked", []),
+        "stale_confluence": evaluation.get("stale_confluence", []),
+        "rebaselined": evaluation.get("rebaselines", []),
         "closed": len(closed),
         "deferred": len(deferred),
         "closed_detail": closed,

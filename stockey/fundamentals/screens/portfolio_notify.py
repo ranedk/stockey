@@ -95,6 +95,9 @@ def load_actions(*, as_of=None) -> dict[str, list[dict]]:
                opened_at, closed_at, prediction_text
           FROM fundamentals_portfolio_position
          WHERE status = 'closed'
+           -- Vetoed names were never bought; closing their shadow is not a SELL
+           -- (2026-09-23 audit: two vetoed shadows had closed as thesis_invalidation).
+           AND entry_decision = 'accept'
            AND (closed_at AT TIME ZONE 'Asia/Kolkata')::date = %s
          ORDER BY ticker
         """,
@@ -105,6 +108,7 @@ def load_actions(*, as_of=None) -> dict[str, list[dict]]:
         SELECT ticker, deferral_count, entry_price, stop_pct, prediction_text
           FROM fundamentals_portfolio_position
          WHERE status = 'open'
+           AND entry_decision = 'accept'
            AND (last_deferred_at AT TIME ZONE 'Asia/Kolkata')::date = %s
          ORDER BY ticker
         """,

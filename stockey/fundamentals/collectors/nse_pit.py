@@ -82,6 +82,7 @@ from utils.cdp import connect_over_cdp as connect_over_cdp_guarded
 from fundamentals.collectors.events_store import resolve_isin, upsert_events_with_dedup
 from fundamentals.collectors.screenerin import to_number
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
+from utils.db import sql_to_df
 from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.nse_rate_limiter import nse_goto, nse_request_gate
@@ -273,7 +274,11 @@ def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app
     # DateOfFiling when broadcast_datetime isn't parseable. The more precise
     # DateOfIntimationToCompany is NOT lost -- it's still in raw_json's own
     # disclosure dict below for anyone who needs the finer distinction.
-    disclosure_date = (announcement_timestamp.date() if announcement_timestamp is not None else None) or filing_date
+    # IST calendar date (2026-09-23 audit): .date() on the UTC value dated 00:00-05:30 IST
+    # filings a day early, and BSE's copy of the same filing then failed to dedup.
+    disclosure_date = (announcement_timestamp.tz_convert("Asia/Kolkata").date()
+                       if announcement_timestamp is not None and announcement_timestamp.tzinfo is not None
+                       else (announcement_timestamp.date() if announcement_timestamp is not None else None)) or filing_date
     rows = []
     for idx, disclosure in enumerate(disclosures, start=1):
         insider_name = disclosure.get("NameOfThePerson")
@@ -322,6 +327,19 @@ def build_pit_rows(*, symbol: str, company_master_id: str, isin: str | None, app
     return rows
 
 
+def load_nse_symbols(company_master_ids: list) -> dict:
+    """company_master_id -> recorded NSE symbol, for the ids that have one."""
+    ids = [c for c in company_master_ids if c is not None and not (isinstance(c, float) and pd.isna(c))]
+    if not ids:
+        return {}
+    df = sql_to_df(
+        "SELECT company_master_id, nse_ticker FROM company_master "
+        " WHERE company_master_id = ANY(%s) AND nse_ticker IS NOT NULL",
+        params=(ids,),
+    )
+    return {} if df.empty else dict(zip(df["company_master_id"], df["nse_ticker"]))
+
+
 def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None = None) -> dict[str, object]:
     universe = load_l1_universe_tickers()
     if limit:
@@ -339,6 +357,12 @@ def run_nse_pit_detection(*, limit: int | None = None, lookback_days: int | None
         str(ticker).upper(): (company_master_id, isin if pd.notna(isin) else None)
         for ticker, company_master_id, isin in zip(universe["ticker"], universe["company_master_id"], universe["isin"])
     }
+    # NSE files under the NSE SYMBOL, but an L1 slug can be a BSE code for a company that
+    # is NSE-listed (ALUFLUOR = 524634) -- those filings never matched (2026-09-23 audit).
+    # Key every company by its recorded nse_ticker as well.
+    by_cmid = {value[0]: value for value in universe_by_symbol.values()}
+    for cmid, symbol in load_nse_symbols(list(by_cmid)).items():
+        universe_by_symbol.setdefault(str(symbol).upper(), by_cmid[cmid])
 
     to_date = datetime.now(timezone.utc)
     from_date = to_date - timedelta(days=lookback_days if lookback_days is not None else LOOKBACK_DAYS)

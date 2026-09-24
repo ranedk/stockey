@@ -68,6 +68,12 @@ ENTRY_STAGE = 2  # Weinstein stage 2 = advancing
 # 5 calendar days spans a long weekend plus a holiday without tripping.
 STAGE_MAX_AGE_DAYS = int(os.getenv("PORTFOLIO_STAGE_MAX_AGE_DAYS", "5"))
 
+# The same guard for the confluence score (2026-09-23 data audit). The candidate query
+# takes each company's LATEST score whatever its age, so a confluence step that fails for
+# a week lets week-old scores pass silently. 4 calendar days covers a Friday score read
+# on Monday plus one holiday. Fail-closed at entry: an unscored day is not a quiet day.
+CONFLUENCE_MAX_AGE_DAYS = int(os.getenv("PORTFOLIO_CONFLUENCE_MAX_AGE_DAYS", "4"))
+
 
 def load_stage_reads() -> dict[str, int]:
     """Weinstein stage per ticker from systrader's API.
@@ -90,14 +96,16 @@ def load_stage_reads() -> dict[str, int]:
 
     cutoff = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5, minutes=30)).normalize() \
         - pd.Timedelta(days=STAGE_MAX_AGE_DAYS)
-    out, stale = {}, 0
+    out, stale, newest = {}, 0, None
     for row in payload.get("rows", []):
         if row.get("ticker") is None or row.get("stage") is None:
             continue
         as_of = row.get("as_of")
         if as_of is not None:
             try:
-                if pd.Timestamp(as_of).tz_localize(None) < cutoff.tz_localize(None):
+                as_of_ts = pd.Timestamp(as_of).tz_localize(None)
+                newest = as_of_ts if newest is None or as_of_ts > newest else newest
+                if as_of_ts < cutoff.tz_localize(None):
                     stale += 1
                     continue
             except (ValueError, TypeError):
@@ -106,10 +114,16 @@ def load_stage_reads() -> dict[str, int]:
         out[str(row["ticker"])] = int(row["stage"])
     if stale:
         # Never silent: a stale stage API is an infrastructure outage wearing the costume
-        # of a normal quiet day (CLAUDE.md, "no silent fallback").
-        print(f"[{SYNC_SOURCE_NAME}] discarded {stale} stage read(s) older than "
-              f"{STAGE_MAX_AGE_DAYS} days -- systrader's stage API may be frozen",
-              flush=True)
+        # of a normal quiet day (CLAUDE.md, "no silent fallback"). But CLASSIFY it: every
+        # run since at least 2026-09-15 printed "may be frozen" for ~25 suspended/illiquid
+        # tickers while 2,135 rows were current -- an alarm that cries wolf daily is how
+        # the real outage gets ignored. Frozen means the NEWEST read is stale.
+        if newest is None or newest < cutoff.tz_localize(None):
+            print(f"[{SYNC_SOURCE_NAME}] STAGE API FROZEN: newest read {newest} is older than "
+                  f"{STAGE_MAX_AGE_DAYS} days; discarded {stale} read(s)", flush=True)
+        else:
+            print(f"[{SYNC_SOURCE_NAME}] discarded {stale} individually stale stage read(s) "
+                  f"(suspended/illiquid tickers; API current as of {newest.date()})", flush=True)
     return out
 
 
@@ -158,9 +172,12 @@ def compute_stop_pct(symbols: list[str]) -> dict[str, dict]:
         out[symbol] = {
             "stop_pct": round(clamped, 2),
             "daily_vol_pct": round(daily_vol * 100, 2),
+            # States the raw product and whether the clamp BOUND. "(4.8%), clamped to 5-15%"
+            # used to describe a 7.2% stop that no clamp touched (2026-09-23 audit).
             "basis": (
-                f"{STOP_VOL_MULTIPLE}x the 10-day 1-sigma move "
-                f"({ten_day_sigma_pct:.1f}%), clamped to {STOP_PCT_MIN:g}-{STOP_PCT_MAX:g}%"
+                f"{STOP_VOL_MULTIPLE}x the 10-day 1-sigma move ({ten_day_sigma_pct:.1f}%) = {raw:.1f}%"
+                + (f", clamped to {clamped:g}% (band {STOP_PCT_MIN:g}-{STOP_PCT_MAX:g}%)" if clamped != raw
+                   else f", inside the {STOP_PCT_MIN:g}-{STOP_PCT_MAX:g}% band")
             ),
         }
     return out
@@ -189,7 +206,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
                l.confluence_count, l.contradicting_count, l.evaluable_count,
                l.axis_fundamentals_trajectory, l.axis_event_corroboration,
                l.axis_sector_cycle, l.axis_ownership, l.axis_valuation,
-               l.run_date AS scored_on
+               l.run_date AS scored_on, l.score_version
           FROM fundamentals_watchlist w
           JOIN latest l USING (company_master_id)
          WHERE w.status = 'active'
@@ -199,8 +216,13 @@ def evaluate_entry_candidates() -> dict[str, object]:
         return {"ruleset_version": RULESET_VERSION, "evaluated": 0, "candidates": [], "stage_reads": 0}
 
     stages = load_stage_reads()
+    score_cutoff = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=CONFLUENCE_MAX_AGE_DAYS)
+    stale_scores: list[str] = []
     candidates = []
     for r in rows.itertuples():
+        if r.scored_on is None or pd.Timestamp(r.scored_on) < score_cutoff:
+            stale_scores.append(str(r.company_master_id))
+            continue
         ticker = str(r.company_master_id).replace("nse:", "")
         stage = stages.get(ticker)
         # Each condition recorded individually so a rejection is explainable, not just
@@ -231,6 +253,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
                 "first_seen_price": r.first_seen_price,
                 "first_seen_at": r.first_seen_at,
                 "scored_on": r.scored_on,
+                "score_version": int(r.score_version),
                 "checks": checks,
             }
         )
@@ -250,5 +273,8 @@ def evaluate_entry_candidates() -> dict[str, object]:
         # Surfaced, not swallowed: zero stage reads means systrader's API is down and
         # EVERY candidate was rejected for a reason that has nothing to do with the data.
         "stage_api_available": bool(stages),
+        # Named, not silent: these were never evaluated because their latest confluence
+        # score is older than CONFLUENCE_MAX_AGE_DAYS.
+        "stale_confluence_skipped": stale_scores,
         "candidates": candidates,
     }

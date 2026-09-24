@@ -112,6 +112,7 @@ def load_l3_alert_summary_by_company() -> pd.DataFrame:
                COUNT(*) AS alert_count
         FROM fundamentals_l3_alerts
         WHERE company_master_id IS NOT NULL
+          AND status NOT LIKE 'superseded%%'   -- round-trip deals are not evidence (2026-09-23)
         GROUP BY company_master_id
         """
     )
@@ -163,6 +164,12 @@ def _record_first_seen_corrected_fallback(company_master_id: str, *, old_first_s
     )
 
 
+# Every read below is date-bounded (2026-09-23 audit): these are views over hypertables,
+# called once per watchlist row per run, and an unbounded "latest on or before" walks
+# every chunk. A name with no trade in this window has no honest "price near" anyway.
+PRICE_NEAR_MAX_GAP_DAYS = 30
+
+
 def load_price_near(company_master_id: str, as_of_date) -> float | None:
     """Close price on or before as_of_date -- adjusted series preferred, raw
     nseindia_ohlcv as fallback, None if neither has anything that early (never
@@ -170,10 +177,17 @@ def load_price_near(company_master_id: str, as_of_date) -> float | None:
     ticker = str(company_master_id or "").removeprefix("nse:")
     if not ticker or as_of_date is None:
         return None
+    # The id's suffix is not always the NSE symbol ("nse:543531-BOM" is BSE-only); use
+    # company_master's recorded nse_ticker when there is one.
+    recorded = sql_to_df("SELECT nse_ticker FROM company_master WHERE company_master_id = %s",
+                         params=(company_master_id,))
+    if not recorded.empty and pd.notna(recorded.iloc[0]["nse_ticker"]):
+        ticker = str(recorded.iloc[0]["nse_ticker"])
 
     adjusted = sql_to_df(
-        "SELECT adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s AND series = 'EQ' AND date <= %s ORDER BY date DESC LIMIT 1",
-        params=(ticker, as_of_date),
+        "SELECT adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s AND series = 'EQ' AND date <= %s "
+        "  AND date >= %s::date - %s ORDER BY date DESC LIMIT 1",
+        params=(ticker, as_of_date, as_of_date, PRICE_NEAR_MAX_GAP_DAYS),
     )
     if not adjusted.empty:
         return float(adjusted.iloc[0]["adj_close"])
@@ -183,8 +197,9 @@ def load_price_near(company_master_id: str, as_of_date) -> float | None:
     # covers -- same fix as technicals.py's load_adjusted_price_history, see its own
     # comment for the live-confirmed VHLTD example (531 real BE-series rows, zero EQ).
     adjusted_be = sql_to_df(
-        "SELECT adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s AND series = 'BE' AND date <= %s ORDER BY date DESC LIMIT 1",
-        params=(ticker, as_of_date),
+        "SELECT adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s AND series = 'BE' AND date <= %s "
+        "  AND date >= %s::date - %s ORDER BY date DESC LIMIT 1",
+        params=(ticker, as_of_date, as_of_date, PRICE_NEAR_MAX_GAP_DAYS),
     )
     if not adjusted_be.empty:
         return float(adjusted_be.iloc[0]["adj_close"])
@@ -203,15 +218,17 @@ def load_price_near(company_master_id: str, as_of_date) -> float | None:
     )
     if not scrip.empty and pd.notna(scrip.iloc[0]["bse_scrip_code"]):
         bse = sql_to_df(
-            "SELECT adj_close FROM bse_advisory_adjusted_ohlcv_daily WHERE scrip_code = %s AND date <= %s ORDER BY date DESC LIMIT 1",
-            params=(str(scrip.iloc[0]["bse_scrip_code"]), as_of_date),
+            "SELECT adj_close FROM bse_advisory_adjusted_ohlcv_daily WHERE scrip_code = %s AND date <= %s "
+            "  AND date >= %s::date - %s ORDER BY date DESC LIMIT 1",
+            params=(str(scrip.iloc[0]["bse_scrip_code"]), as_of_date, as_of_date, PRICE_NEAR_MAX_GAP_DAYS),
         )
         if not bse.empty:
             return float(bse.iloc[0]["adj_close"])
 
     raw = sql_to_df(
-        "SELECT close FROM nseindia_ohlcv WHERE company_master_id = %s AND date <= %s ORDER BY date DESC LIMIT 1",
-        params=(company_master_id, as_of_date),
+        "SELECT close FROM nseindia_ohlcv WHERE company_master_id = %s AND date <= %s "
+        "  AND date >= %s::date - %s ORDER BY date DESC LIMIT 1",
+        params=(company_master_id, as_of_date, as_of_date, PRICE_NEAR_MAX_GAP_DAYS),
     )
     if not raw.empty:
         return float(raw.iloc[0]["close"])

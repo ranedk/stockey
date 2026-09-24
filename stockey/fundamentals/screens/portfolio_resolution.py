@@ -96,7 +96,7 @@ RESOLVER_SCHEMA = {
 
 def _latest_l2_state(company_master_id: str):
     """Latest L2 row for a company, with its run_date. None if there is none."""
-    ticker = build_l1_ticker_by_company_master_id().get(company_master_id)
+    ticker = build_l1_ticker_by_company_master_id(include_history=True).get(company_master_id)
     if ticker is None:
         return None
     df = sql_to_df(
@@ -139,6 +139,41 @@ def l2_is_newer_than_forecast(row: dict) -> tuple[bool, str]:
     return True, f"L2 state {run_d} postdates the forecast {open_d}"
 
 
+# Which reporting period a metric is read from. Metrics absent here (pledge, PE,
+# valuation ratios) are market snapshots with no period; a newer run_date is enough.
+SHAREHOLDING_METRICS = frozenset({"promoter_pct", "institutional_pct"})
+SNAPSHOT_METRICS = frozenset({"pledge_pct", "pledge_pct_prior", "pledge_pct_delta_pp", "pe",
+                              "valuation_vs_own_history_ratio", "valuation_sector_percentile"})
+
+
+def period_end(label) -> pd.Timestamp | None:
+    """'Mar 2026' -> 2026-03-31. None for anything that is not a 'Mon YYYY' label."""
+    try:
+        return pd.Timestamp(f"1 {str(label).strip()}") + pd.offsets.MonthEnd(0)
+    except (ValueError, TypeError):
+        return None
+
+
+def reported_period_postdates_forecast(row: dict, state) -> tuple[bool, str]:
+    """A forecast predicts what the company will REPORT, so it can only be graded on a
+    reporting period that ENDED after the forecast was made (2026-09-23 audit). The
+    run_date check alone let a 75-day re-crawl of the same Mar-2026 accounts count as
+    "new", and 18 of 20 forecasts are on balance-sheet metrics. A missing or
+    unparseable label cannot show the period moved, so it never resolves."""
+    metric = row.get("metric_name")
+    if metric in SNAPSHOT_METRICS:
+        return True, "snapshot metric -- no reporting period"
+    column = "shareholding_period" if metric in SHAREHOLDING_METRICS else "balance_sheet_period"
+    label = state.get(column) if hasattr(state, "get") else None
+    end = period_end(label)
+    opened = pd.Timestamp(row.get("opened_at")).tz_localize(None) if row.get("opened_at") is not None else None
+    if end is None or opened is None:
+        return False, f"no parseable {column} ({label!r}) to show a newer reporting period"
+    if end <= opened.normalize():
+        return False, f"latest {column} {label} ended before the forecast ({opened.date()}) -- not yet reported"
+    return True, f"{column} {label} postdates the forecast"
+
+
 def check_structured_prediction(row: dict) -> bool | None:
     """Evaluate a structured (metric_name, metric_operator, metric_threshold) forecast
     against current L2 state. None means "cannot be evaluated", never False.
@@ -148,7 +183,7 @@ def check_structured_prediction(row: dict) -> bool | None:
 
     - BUG (2026-08-18): naive removeprefix("nse:") only recovers the right
       fundamentals_l2_state.ticker when the company IS its own NSE symbol -- wrong for the
-      ~22% BSE-only cohort. Use build_l1_ticker_by_company_master_id().
+      ~22% BSE-only cohort. Use build_l1_ticker_by_company_master_id(include_history=True).
     - BUG (2026-08-17): metric_name named a NON-NUMERIC L2 column (trend_direction,
       company_name, ...) and `value < threshold` raised an uncaught str-vs-number
       TypeError instead of the graceful None every other branch returns.
@@ -172,6 +207,8 @@ def check_structured_prediction(row: dict) -> bool | None:
         return None
     state = _latest_l2_state(row.get("company_master_id"))
     if state is None or metric_name not in state.index:
+        return None
+    if "opened_at" in row and not reported_period_postdates_forecast(row, state)[0]:
         return None
     value = state[metric_name]
     if value is None or pd.isna(value):
@@ -202,7 +239,7 @@ def _judge_prediction(row: dict, *, model: str = DEFAULT_MODEL) -> dict:
     Never raises: an unreachable resolver must leave the forecast OPEN for the next run,
     not silently mark it false. A failed grading is missing data, not a failed forecast.
     """
-    ticker = build_l1_ticker_by_company_master_id().get(row.get("company_master_id"))
+    ticker = build_l1_ticker_by_company_master_id(include_history=True).get(row.get("company_master_id"))
     state = {}
     if ticker:
         df = sql_to_df(
@@ -313,6 +350,14 @@ def resolve_due_forecasts(*, as_of_date=None, dry_run: bool = False) -> dict[str
         if not fresh:
             unresolved.append({"ticker": row["ticker"], "why": freshness_note})
             continue
+        # ...and a newer CRAWL is not a newer REPORT. Checked here, before either path:
+        # were it only inside check_structured_prediction, a None there would fall
+        # through to the judged path, which would grade against the same stale figures.
+        state = _latest_l2_state(row.get("company_master_id"))
+        reported, period_note = reported_period_postdates_forecast(row, state) if state is not None else (False, "no L2 state")
+        if not reported:
+            unresolved.append({"ticker": row["ticker"], "why": period_note})
+            continue
 
         mechanical = check_structured_prediction(row)
         if mechanical is not None:
@@ -336,11 +381,14 @@ def resolve_due_forecasts(*, as_of_date=None, dry_run: bool = False) -> dict[str
         attribution = _attribute_failure(bool(outcome), price_return)
         if not dry_run:
             _write_resolution(row["position_id"], bool(outcome), method, notes, attribution)
+            judged_by_model = method != "mechanical"
             _record_decision(
-                phase="exit", company_master_id=row["company_master_id"],
+                phase="resolution", company_master_id=row["company_master_id"],
                 ruleset_version=row["ruleset_version"],
                 decision=f"forecast_{'true' if outcome else 'false'}",
-                reason=f"[{method}] {notes}", model=None,
+                reason=f"[{method}] {notes}",
+                model=DEFAULT_MODEL if judged_by_model else None,
+                prompt_version=RESOLVER_PROMPT_VERSION if judged_by_model else None,
                 payload={"position_id": row["position_id"], "price_return": price_return,
                          "failure_attribution": attribution},
             )
@@ -352,6 +400,14 @@ def resolve_due_forecasts(*, as_of_date=None, dry_run: bool = False) -> dict[str
         "due": int(len(due)), "resolved": len(resolved), "left_open": len(unresolved),
         "resolved_detail": resolved, "unresolved_detail": unresolved,
     }
+
+
+def _split_by_method(resolved: pd.DataFrame, column: str) -> dict[str, dict[str, dict[str, object]]]:
+    """{resolution_method: {group: {count, hit_rate}}} -- the breakdown the design asks for."""
+    if resolved.empty or "resolution_method" not in resolved.columns:
+        return {}
+    return {str(method): _hit_rate_breakdown(group, column)
+            for method, group in resolved.fillna({"resolution_method": "none"}).groupby("resolution_method")}
 
 
 def _hit_rate_breakdown(resolved: pd.DataFrame, column: str) -> dict[str, dict[str, object]]:
@@ -378,17 +434,22 @@ def _hit_rate_breakdown(resolved: pd.DataFrame, column: str) -> dict[str, dict[s
 def compute_portfolio_scoring(*, as_of_date=None) -> dict[str, object]:
     """Forecast accuracy, not returns -- the primary outcome measure.
 
-    Every breakdown is reported SPLIT BY resolution_method. A single blended hit rate
-    would let judged resolutions (where the model grades prose) flatter the mechanical
-    ones (where data decides), and the whole point of separating the two paths is that the
-    gap between them is visible.
+    A single blended hit rate would let judged resolutions (where the model grades prose)
+    flatter the mechanical ones (where data decides). This docstring used to claim every
+    breakdown was split by resolution_method; only one was (2026-09-23 audit). The
+    *_and_method breakdowns are the split ones -- read those; the plain ones are kept for
+    the page that already renders them.
+
+    Only rows that CARRY a forecast are counted: a vetoed shadow has none, so counting it
+    showed "26 open" forecasts on a book that had 20.
 
     hit_rate_by_entry_decision is the PRD's paired comparison: accepted names versus the
     ones the adjudicator vetoed, under one ruleset over one period. It is the only thing
     that can say whether the veto layer adds value or destroys it.
     """
     as_of_date = as_of_date or _ist_today()
-    positions = sql_to_df("SELECT * FROM fundamentals_portfolio_position")
+    positions = sql_to_df("SELECT * FROM fundamentals_portfolio_position "
+                          " WHERE prediction_text IS NOT NULL OR target_date IS NOT NULL")
     empty = {
         "as_of_date": str(as_of_date), "total_forecasts": 0, "open": 0, "resolved": 0,
         "hit_rate": None, "hit_rate_by_resolution_method": {},
@@ -427,6 +488,8 @@ def compute_portfolio_scoring(*, as_of_date=None) -> dict[str, object]:
         "hit_rate_by_resolution_method": _hit_rate_breakdown(scored, "resolution_method"),
         "hit_rate_by_entry_decision": _hit_rate_breakdown(scored, "entry_decision"),
         "hit_rate_by_confluence_count": _hit_rate_breakdown(scored, "confluence_count"),
+        "hit_rate_by_entry_decision_and_method": _split_by_method(scored, "entry_decision"),
+        "hit_rate_by_confluence_count_and_method": _split_by_method(scored, "confluence_count"),
         "failure_attribution_breakdown": failure_breakdown,
         "time_to_confirmation_days": time_to_confirmation,
     }

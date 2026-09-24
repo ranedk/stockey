@@ -124,6 +124,7 @@ def check_bse_price_pipeline_freshness(run_date) -> bool:
         """
         SELECT date, COUNT(*) AS n
         FROM bse_advisory_adjusted_ohlcv_daily
+        WHERE date >= CURRENT_DATE - 30   -- bounded: a whole-view GROUP BY walks every chunk
         GROUP BY date
         ORDER BY date DESC
         LIMIT 1
@@ -204,7 +205,9 @@ def load_watchlist_only_tickers(covered_company_master_ids) -> pd.DataFrame:
                    COALESCE(cm.nse_ticker, cm.bse_scrip_code) AS ticker
             FROM fundamentals_watchlist w
             JOIN company_master cm ON cm.company_master_id = w.company_master_id
-            WHERE w.status = 'active'
+            -- Every watchlist status, not only 'active' (2026-09-23 audit): a flagged name
+            -- stopped being priced, its price went stale, and the exit check read the
+            -- stale price as "cannot judge" -> active -> priced -> flagged, every ~8 days.
             """
         )
     except Exception as exc:  # noqa: BLE001 -- a missing table/column (first-ever pipeline run) must not crash the whole technicals step
@@ -222,38 +225,36 @@ def load_watchlist_only_tickers(covered_company_master_ids) -> pd.DataFrame:
 
 
 def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.DataFrame:
+    # 2026-09-23 data audit, three fixes in one read:
+    #  * DATE-BOUNDED. The view sits on a hypertable; "ORDER BY date DESC LIMIT n" with no
+    #    bound walks every chunk, per ticker, every run. 2x the row count in calendar days
+    #    comfortably holds `lookback_days` trading sessions.
+    #  * FRESHEST SERIES WINS. EQ used to win whenever it had ANY rows, so a name moved to
+    #    BE (trade-to-trade) was priced off a frozen EQ tail.
+    #  * NSE SYMBOL FIRST. An L1 slug can be a BSE code for an NSE-listed company
+    #    (ALUFLUOR = 524634), which priced it off the BSE series while first_seen_price
+    #    came from NSE -- the price_flagged move then compared two exchanges.
+    symbol = ticker
+    if str(ticker).isdigit():
+        nse = sql_to_df("SELECT nse_ticker FROM company_master WHERE bse_scrip_code = %s AND nse_ticker IS NOT NULL LIMIT 1",
+                        params=(str(ticker),))
+        if not nse.empty:
+            symbol = str(nse.iloc[0]["nse_ticker"])
     nse_history = sql_to_df(
         """
-        SELECT date, adj_close
+        SELECT date, adj_close, series
         FROM advisory_adjusted_ohlcv_daily
-        WHERE symbol = %s AND series = 'EQ'
+        WHERE symbol = %s AND series IN ('EQ', 'BE')
+          AND date >= CURRENT_DATE - %s
         ORDER BY date DESC
-        LIMIT %s
         """,
-        params=(ticker, lookback_days),
+        params=(symbol, lookback_days * 2),
     )
     if not nse_history.empty:
-        return nse_history.sort_values("date").reset_index(drop=True)
-
-    # BUG FOUND LIVE 2026-08-18 (re-audit): series='EQ' hardcode drops BE-series
-    # (trade-to-trade / restricted-segment) companies the adjusted view actually
-    # covers -- confirmed live, VHLTD has 531 real BE-series rows spanning 2 years
-    # and zero EQ rows, yet showed close=NULL, a misleading insufficient-history
-    # event, and a permanently-inert exit price check purely because of this filter
-    # (10 of 192 latest technicals rows had NULL close, all traced to this). Same
-    # NSE-primary/next-source fallback chain shape as the BSE fallback below.
-    nse_be_history = sql_to_df(
-        """
-        SELECT date, adj_close
-        FROM advisory_adjusted_ohlcv_daily
-        WHERE symbol = %s AND series = 'BE'
-        ORDER BY date DESC
-        LIMIT %s
-        """,
-        params=(ticker, lookback_days),
-    )
-    if not nse_be_history.empty:
-        return nse_be_history.sort_values("date").reset_index(drop=True)
+        latest_by_series = nse_history.groupby("series")["date"].max()
+        best = "EQ" if latest_by_series.get("EQ") is not None and latest_by_series.get("EQ") >= latest_by_series.max() else latest_by_series.idxmax()
+        chosen = nse_history[nse_history["series"] == best].head(lookback_days)
+        return chosen[["date", "adj_close"]].sort_values("date").reset_index(drop=True)
 
     # BSE-only-company fallback -- see module docstring. `ticker` here is USUALLY
     # already the BSE scrip code for BSE-only L1 companies (matching bse_advisory_
@@ -282,11 +283,11 @@ def load_adjusted_price_history(ticker: str, *, lookback_days: int = 300) -> pd.
         """
         SELECT date, adj_close
         FROM bse_advisory_adjusted_ohlcv_daily
-        WHERE scrip_code = %s
+        WHERE scrip_code = %s AND date >= CURRENT_DATE - %s
         ORDER BY date DESC
         LIMIT %s
         """,
-        params=(str(scrip.iloc[0]["bse_scrip_code"]), lookback_days),
+        params=(str(scrip.iloc[0]["bse_scrip_code"]), lookback_days * 2, lookback_days),
     )
     return bse_history.sort_values("date").reset_index(drop=True)
 

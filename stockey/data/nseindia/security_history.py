@@ -495,5 +495,22 @@ def run() -> None:
     sync_security_history()
 
 
-if __name__ == "__main__":
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
     run()
+    counts = sql_to_df("SELECT count(*) AS n, max(effective_to) AS latest FROM dim_security_history")
+    STOCKEY_RUN_STATE = {
+        "source": "data.nseindia.security_history",
+        "rows": int(counts.iloc[0]["n"]),
+        "latest_observed": str(counts.iloc[0]["latest"]),
+        "state_advanced": True,
+        "status": "ok",
+    }
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

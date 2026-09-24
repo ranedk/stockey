@@ -188,9 +188,14 @@ screener/watchlist/narrative/portfolio — not technicals/trading;
    (LLM, may only REJECT) and mechanical exit evaluator → exit adjudicator (LLM, may
    only DEFER, never a stop). **Exits run before entries** inside the script: a name
    can satisfy both on the same day, and entering first would leave a one-day round
-   trip in the record that never happened. Scheduled an hour after the screener
-   because it reads that run's `fundamentals_confluence_score`, plus systrader's
-   stage API for the price read. **Record-only** — the crontab deliberately does not
+   trip in the record that never happened. It reads that run's
+   `fundamentals_confluence_score`, plus systrader's stage API for the price read --
+   and the screener runs 65-109 minutes, so "an hour later" was NOT enough: on 5 of 6
+   days before 2026-09-23 this job decided on half-refreshed data. The script now waits
+   on the screener's cron lock (`scripts/wait_for_locks.sh`, 3h timeout -> no run), and
+   the ruleset refuses a confluence score older than `PORTFOLIO_CONFLUENCE_MAX_AGE_DAYS`.
+   Exits compare contradicting axes WITHIN one scorer version: a `SCORE_VERSION` bump
+   re-baselines open positions instead of closing them. **Record-only** — the crontab deliberately does not
    pass `--live`, so no real money is committed (rollout phase 1).
    The script then runs `portfolio_resolution.py`, which grades every forecast whose
    target date has passed. That step is not optional: with the human register gone
@@ -369,6 +374,15 @@ made, diagnosed, and fixed live -- they are cheap to avoid and expensive to redi
   Strip comments first, or -- better -- walk the AST and inspect only the string literals
   or calls you actually mean. A guard that trips on correct code gets deleted rather than
   fixed, so it is worse than no guard.
+- **A self-referencing DELETE on a compressed hypertable can silently delete nothing.**
+  On `dhan_ohlcv_intraday` (TimescaleDB 2.21), `DELETE ... USING dhan_ohlcv_intraday` and
+  `WHERE ts IN (SELECT ts FROM dhan_ohlcv_intraday ...)` both returned rowcount 0 while
+  the equivalent SELECT matched 69,682 rows (2026-09-24). Select the keys first, then
+  delete with a literal `= ANY(%s)` array, and always check `rowcount`.
+- **`sql_to_df` retries a query after `pg_cancel_backend`.** Cancelling a runaway read
+  server-side just restarts it under a new pid (2026-09-24). Kill the CLIENT process
+  first, then cancel the backend -- and bound exploratory reads with
+  `SET LOCAL statement_timeout` so there is nothing to cancel.
 - **`pgrep -f` / `pkill -f` match the invoking command's own argv.** Use `pgrep -x`, an
   exact pattern, or kill by PID.
 
@@ -382,6 +396,13 @@ made, diagnosed, and fixed live -- they are cheap to avoid and expensive to redi
 - **`builder.py` (no flags) rewrites the crontab and silently stops a LIVE go-crond from
   scheduling anything.** Use `--check-crontab` to test for drift; if you do regenerate,
   restart go-crond afterwards regardless of whether the diff was empty.
+- **Do not edit fundamentals code while the screener is running** (lock
+  `/tmp/stockey_fundamentals_screener.lock.d` present). `run_pipeline.run_step`
+  re-imports only the STEP module; its dependencies (`utils/`, other screens) stay as
+  loaded at 15:30 UTC. On 2026-09-23 a signature change in `utils/company_master.py`
+  mid-run failed l3_triggers, confluence_score and llm_triage with TypeError while every
+  test passed. If it happens, re-run those steps in a fresh process:
+  `scripts/with_lock.sh /tmp/stockey_fundamentals_screener.lock python -m fundamentals.run_pipeline --steps ...`.
 - **The fundamentals API does not hot-reload.** After changing anything under
   `fundamentals/api/`, kill the listener (`ss -tlnp | grep :8000`) and relaunch.
 
@@ -444,12 +465,22 @@ python scripts/docs_state_audit.py --strict
   prediction against the data that produced it is not merely circular, it marks
   change-predictions wrong before the company has reported (review finding,
   2026-09-04). `portfolio_resolution.l2_is_newer_than_forecast()` guards both paths.
+  A newer run_date is still not enough: a 75-day re-crawl re-reads the SAME annual
+  accounts. `reported_period_postdates_forecast()` requires the metric's reporting
+  period (`balance_sheet_period` / `shareholding_period`, stored on L2 since
+  2026-09-23) to END after the forecast, and it runs before BOTH paths -- if it sat
+  only in the mechanical check, a None there would fall through to the LLM judge.
 - Do not let a veto become permanent, and do not let it be re-asked on unchanged
   evidence. These are a MATCHED PAIR and a change to either must preserve both: a
   vetoed shadow never closes, so reading all open positions bans the name forever;
   but re-adjudicating nightly lets a sampled model eventually accept anything
   (observed: veto->accept in one hour on an identical scorecard). A veto stands
-  until the confluence score's `run_date` moves.
+  until the EVIDENCE CONTENT moves -- `portfolio_runner.evidence_fingerprint` (scorer
+  version, five axes, three counts, stage). It used to be "until the confluence
+  `run_date` moves", which is true every night because confluence re-scores daily, so
+  the guard did nothing: SHREEPUSHK was re-asked 14 times in 14 sessions (fixed
+  2026-09-23). A later accept closes the vetoed shadow (`superseded_by_accept`) so one
+  company never sits in both arms.
 - The ONLY outbound email is `fundamentals/screens/portfolio_notify.py` (entries and
   exits), sent at the END of the portfolio chain. It cannot move into the 21:00
   screener pipeline: entry/exit decisions are not made until the 22:00 portfolio job,

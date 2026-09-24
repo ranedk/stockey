@@ -35,6 +35,7 @@ from environs import Env
 from openai import OpenAI
 
 from utils.db import db_session, sql_to_df
+from utils.schema_migrations import apply_schema_migration
 
 env = Env()
 env.read_env()
@@ -264,7 +265,19 @@ def _ensure_tables() -> None:
                                 ("resolution_method", "text"), ("resolution_notes", "text"),
                                 ("failure_attribution", "text"), ("target_date", "date"),
                                 ("invalidation_criteria", "text"),
-                                ("target_date_basis", "text")):
+                                ("target_date_basis", "text"),
+                                # 2026-09-23 data audit. score_version: which confluence
+                                # scorer produced the entry counts -- without it a scorer fix
+                                # reads as "a contradiction appeared since entry" (ASHIANA
+                                # was closed exactly that way the day v2 shipped).
+                                # baseline_*: the counts the exit compares against, re-set
+                                # when the scorer version changes (entry counts stay frozen).
+                                # entry_price_date: the bar entry_price came from; without it
+                                # a stale entry close (seen 2026-09-04..15) is undetectable.
+                                ("score_version", "integer"),
+                                ("baseline_score_version", "integer"),
+                                ("baseline_contradicting_count", "integer"),
+                                ("entry_price_date", "date")):
             cur.execute(
                 "ALTER TABLE fundamentals_portfolio_position "
                 "ADD COLUMN IF NOT EXISTS " + column + " " + coltype
@@ -274,7 +287,7 @@ def _ensure_tables() -> None:
             CREATE TABLE IF NOT EXISTS fundamentals_portfolio_decision (
                 decision_id     bigserial PRIMARY KEY,
                 decided_at      timestamptz NOT NULL DEFAULT now(),
-                phase           text NOT NULL CHECK (phase IN ('entry','exit')),
+                phase           text NOT NULL CHECK (phase IN ('entry','exit','resolution')),
                 company_master_id text NOT NULL,
                 ruleset_version integer NOT NULL,
                 decision        text NOT NULL,
@@ -285,9 +298,32 @@ def _ensure_tables() -> None:
             )
             """
         )
+    # Forecast resolutions were written as phase='exit' (decision forecast_true/false),
+    # polluting the exit vocabulary; they get their own phase (2026-09-23 audit).
+    apply_schema_migration(
+        migration_id="20260923_portfolio_decision_resolution_phase",
+        description="fundamentals_portfolio_decision.phase: allow 'resolution'.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": ["fundamentals_portfolio_decision"]},
+        statements=[
+            "ALTER TABLE fundamentals_portfolio_decision DROP CONSTRAINT IF EXISTS fundamentals_portfolio_decision_phase_check",
+            "ALTER TABLE fundamentals_portfolio_decision ADD CONSTRAINT fundamentals_portfolio_decision_phase_check "
+            "CHECK (phase IN ('entry','exit','resolution'))",
+        ],
+    )
 
 
-def _record_decision(*, phase, company_master_id, ruleset_version, decision, reason, model, payload) -> None:
+_PROMPT_VERSION_FROM_MODEL = object()
+
+
+def _record_decision(*, phase, company_master_id, ruleset_version, decision, reason, model, payload,
+                     prompt_version=_PROMPT_VERSION_FROM_MODEL) -> None:
+    # The entry prompt's version used to be written on EVERY row -- stop-loss exits and
+    # forecast resolutions included, where no model (or a different prompt) ran
+    # (2026-09-23 audit). Default: this module's prompt version when a model decided,
+    # NULL when none did; callers with their own prompt pass it explicitly.
+    if prompt_version is _PROMPT_VERSION_FROM_MODEL:
+        prompt_version = PROMPT_VERSION if model else None
     with db_session() as (_conn, cur):
         cur.execute(
             """
@@ -296,7 +332,7 @@ def _record_decision(*, phase, company_master_id, ruleset_version, decision, rea
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (phase, company_master_id, ruleset_version, decision, reason, model,
-             PROMPT_VERSION, json.dumps(payload, default=str)),
+             prompt_version, json.dumps(payload, default=str)),
         )
 
 
@@ -402,9 +438,13 @@ def adjudicate_entry(candidate: dict, *, model: str = DEFAULT_MODEL) -> dict:
             "decision": "accept",
             "reason": f"adjudicator unavailable ({type(exc).__name__}); mechanical rule stands",
             "concern_axis": None,
+            "_no_model": True,
         }
-    result["model"] = model
-    result["prompt_version"] = PROMPT_VERSION
+    # A default accept is not a model's accept: recording the model name on it made an
+    # outage look like adjudication in the paired comparison (2026-09-23 audit).
+    no_model = result.pop("_no_model", False)
+    result["model"] = None if no_model else model
+    result["prompt_version"] = None if no_model else PROMPT_VERSION
     if result["decision"] == "accept":
         result.update(_validate_metric(result, payload["available_l2_metrics"]))
         target, basis = _clamp_target_date(result.get("target_date"))
@@ -436,9 +476,15 @@ def adjudicate_exit(position: dict, exit_reason: str, *, model: str = DEFAULT_MO
             "prompt_version": PROMPT_VERSION,
         }
 
+    # 2026-09-23 data audit: the model used to see only entry-time counts and the reason
+    # NAME -- not the trigger's detail, today's axes, today's stage or the thesis it was
+    # meant to weigh the trigger against. Told "when in doubt, EXIT" with nothing to
+    # doubt, it deferred 0 of 10 exits. It now gets the evidence the trigger fired on.
     payload = {k: position.get(k) for k in
                ("ticker", "opened_at", "entry_price", "stop_pct", "confluence_count",
-                "contradicting_count", "evaluable_count", "stage_at_entry", "deferral_count")}
+                "contradicting_count", "evaluable_count", "stage_at_entry", "deferral_count",
+                "detail", "price", "score_version_at_entry", "current_score",
+                "stage_now", "prediction_text", "invalidation_criteria", "target_date")}
     payload["exit_reason"] = exit_reason
     try:
         client = OpenAI(api_key=env("OPENAI_API_KEY"))
@@ -457,7 +503,9 @@ def adjudicate_exit(position: dict, exit_reason: str, *, model: str = DEFAULT_MO
     except Exception as exc:  # noqa: BLE001
         # Unavailable adjudicator defaults to EXIT here, the opposite of the entry
         # default. Both defaults fail towards LESS exposure, which is the safe direction.
-        result = {"decision": "exit", "reason": f"adjudicator unavailable ({type(exc).__name__}); mechanical exit stands"}
+        # model=None: no model decided this, and the decision log must not say one did.
+        return {"decision": "exit", "reason": f"adjudicator unavailable ({type(exc).__name__}); mechanical exit stands",
+                "model": None, "prompt_version": None}
     result["model"] = model
     result["prompt_version"] = PROMPT_VERSION
     return result

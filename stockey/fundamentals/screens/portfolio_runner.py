@@ -30,6 +30,7 @@ instead of selection.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import uuid
@@ -92,14 +93,83 @@ def _evidence_moved_since(candidate: dict, vetoed_at) -> bool:
     rule into "accept if the model EVER says yes", which is not a filter at all, and it
     quietly favours whichever names get re-asked most often.
 
-    So a veto stands until the EVIDENCE moves. The confluence score's run_date is the
-    evidence date: it is what the adjudicator was given and what would have to change for
-    a different answer to mean anything.
+    So a veto stands until the EVIDENCE moves.
+
+    BUG FOUND IN THE 2026-09-23 DATA AUDIT: this used to compare the confluence run_date
+    with the veto date. confluence_score writes a fresh row for every active name EVERY
+    night, so from the day after any veto the date check always said "moved" -- the guard
+    was a no-op. SHREEPUSHK was re-asked and re-vetoed 14 times in 14 sessions, and
+    SAHYADRI/KAMDHENU/RANEHOLDIN were vetoed and later accepted on unchanged scorecards.
+    Evidence now means CONTENT: the fingerprint of what the rule and the adjudicator
+    actually weigh (scorer version, five axes, three counts, stage), compared with the
+    fingerprint recorded on the last entry decision for the company.
     """
-    scored_on = candidate.get("scored_on")
-    if scored_on is None or vetoed_at is None:
+    if vetoed_at is None:
         return False        # cannot show anything changed -> the veto stands
-    return pd.Timestamp(scored_on).date() > pd.Timestamp(vetoed_at).date()
+    previous = candidate.get("_previous_fingerprint")
+    if previous is None:
+        return False        # no recorded evidence to compare with -> the veto stands
+    return evidence_fingerprint(candidate) != previous
+
+
+EVIDENCE_KEYS = ("score_version", "confluence_count", "contradicting_count", "evaluable_count", "stage")
+
+
+def evidence_fingerprint(candidate: dict) -> str | None:
+    """Stable hash of the evidence a veto was given. None when the payload predates the
+    fields (a pre-audit decision row), which the caller treats as "cannot show a change"."""
+    if any(candidate.get(k) is None for k in ("confluence_count", "contradicting_count", "evaluable_count")):
+        return None
+    axes = candidate.get("axes") or {}
+    material = {k: _as_int(candidate.get(k)) for k in EVIDENCE_KEYS}
+    material["axes"] = {k: _as_tristate(axes.get(k)) for k in sorted(axes)}
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _as_tristate(value) -> bool | None:
+    """True/False/None from whatever form an axis arrives in: a Python or numpy bool from
+    pandas, NaN for SQL NULL, or -- in decision payloads written with default=str -- the
+    STRINGS "True"/"False". Hashing those raw would make identical evidence differ, and
+    the veto guard would silently stop guarding."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {"true": True, "false": False}.get(value.strip().lower())
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
+
+
+def _as_int(value) -> int | None:
+    try:
+        return None if value is None or pd.isna(value) else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_entry_fingerprints() -> dict[str, str]:
+    """Fingerprint recorded on each company's most recent entry decision. Rows written
+    before 2026-09-23 carry no fingerprint; it is recomputed from their payload, which
+    holds the same fields (score_version is absent there and reads as None -- so the first
+    v2 comparison differs and re-asks once, which is correct: the scorer changed)."""
+    df = sql_to_df(
+        "SELECT DISTINCT ON (company_master_id) company_master_id, payload_json "
+        "  FROM fundamentals_portfolio_decision WHERE phase = 'entry' "
+        " ORDER BY company_master_id, decided_at DESC"
+    )
+    out: dict[str, str] = {}
+    for r in df.itertuples():
+        try:
+            payload = json.loads(r.payload_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        fp = payload.get("evidence_fingerprint") or evidence_fingerprint(payload)
+        if fp is not None:
+            out[str(r.company_master_id)] = fp
+    return out
 
 
 def _open_accepted_tickers() -> set[str]:
@@ -123,14 +193,19 @@ def _recently_stopped_tickers() -> dict:
     return {} if df.empty else dict(zip(df["ticker"], df["stopped_at"]))
 
 
-def _latest_price(ticker: str) -> float | None:
+def _latest_price(ticker: str) -> tuple[float | None, object]:
+    """(adj_close, bar date). The date is stored with the entry: positions opened
+    2026-09-04..15 carry the PREVIOUS session's close (HESTERBIO entered at 2201.70, the
+    09-03 close, on 09-04 when 09-04 closed at 2405.40) and nothing recorded that."""
     df = sql_to_df(
-        "SELECT adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s "
+        "SELECT adj_close, date FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s "
         "  AND date >= now() - make_interval(days => %s) "
         "ORDER BY date DESC LIMIT 1",
         params=(ticker, PRICE_LOOKBACK_DAYS),
     )
-    return float(df.iloc[0]["adj_close"]) if not df.empty else None
+    if df.empty:
+        return None, None
+    return float(df.iloc[0]["adj_close"]), pd.Timestamp(df.iloc[0]["date"]).date()
 
 
 def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET) -> dict:
@@ -155,7 +230,7 @@ def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET) -> dict:
 
 def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
                    bucket: str = DEFAULT_BUCKET) -> dict:
-    price = _latest_price(candidate["ticker"])
+    price, price_date = _latest_price(candidate["ticker"])
     stop = candidate.get("stop") or {}
     sizing = _size_for(candidate, bucket)
     row = {
@@ -171,11 +246,17 @@ def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
         "bucket_capital_rs": bucket_config(bucket)["capital_rs"],
         "status": "open",
         "entry_price": price,
+        "entry_price_date": price_date,
         "stop_pct": stop.get("stop_pct"),
         "stop_basis": stop.get("basis"),
         "confluence_count": candidate["confluence_count"],
         "contradicting_count": candidate["contradicting_count"],
         "evaluable_count": candidate["evaluable_count"],
+        "score_version": candidate.get("score_version"),
+        # The exit compares against the baseline, never the frozen entry counts directly,
+        # so a scorer-version change can re-baseline without restating what entry saw.
+        "baseline_score_version": candidate.get("score_version"),
+        "baseline_contradicting_count": candidate["contradicting_count"],
         "stage_at_entry": candidate["stage"],
         "adjudicator_model": verdict.get("model"),
         "adjudicator_prompt_version": verdict.get("prompt_version"),
@@ -206,6 +287,19 @@ def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
     return row
 
 
+def _close_superseded_veto(ticker: str, *, dry_run: bool) -> None:
+    price, _ = _latest_price(ticker)
+    if dry_run:
+        return
+    with db_session() as (_conn, cur):
+        cur.execute(
+            "UPDATE fundamentals_portfolio_position SET status = 'closed', closed_at = now(), "
+            "       close_reason = 'superseded_by_accept', exit_price = %s "
+            " WHERE ticker = %s AND status = 'open' AND entry_decision = 'reject'",
+            (price, ticker),
+        )
+
+
 def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, object]:
     _ensure_tables()
     evaluation = evaluate_entry_candidates()
@@ -232,9 +326,11 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     already_accepted = _open_accepted_tickers()
     vetoed_at_by_ticker = _open_vetoed_tickers()
     stopped_recently = _recently_stopped_tickers()
+    # Only needed to judge a veto, so only read when some name carries one.
+    fingerprints = _last_entry_fingerprints() if vetoed_at_by_ticker else {}
     kind = "real" if live else "shadow"
     entered, rejected, skipped, turned_away, re_vetoed, veto_stands = [], [], [], [], [], []
-    stopped_out = []
+    stopped_out, superseded, below_liquidity_floor = [], [], []
 
     # Only accepted positions consume capital, so only they fill the book, and the book
     # is the BUCKET's, not a global one: 100 x the old flat Rs 1 lakh happened to equal a
@@ -253,7 +349,19 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
             # and "we were not allowed to buy it yet" mean different things.
             stopped_out.append(candidate["ticker"])
             continue
+        min_adv = bucket_config(DEFAULT_BUCKET).get("min_adv_rs")
+        if min_adv:
+            # The bucket's liquidity floor was configured but never applied (2026-09-23
+            # audit). Checked before adjudication, like the other skips, and named.
+            from fundamentals.screens.l5_sizing import load_adv_inputs
+
+            adv = load_adv_inputs(candidate["company_master_id"])
+            if adv is None or adv["adv_value_rs"] < min_adv:
+                below_liquidity_floor.append(candidate["ticker"])
+                continue
         vetoed_at = vetoed_at_by_ticker.get(candidate["ticker"])
+        candidate["_previous_fingerprint"] = fingerprints.get(str(candidate["company_master_id"]))
+        candidate["evidence_fingerprint"] = evidence_fingerprint(candidate)
         if vetoed_at is not None and not _evidence_moved_since(candidate, vetoed_at):
             # Vetoed, and nothing new has arrived. Do not re-ask -- see
             # _evidence_moved_since. Skipping BEFORE adjudication also saves the call.
@@ -270,7 +378,7 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 decision=verdict["decision"],
                 reason=verdict.get("reason"),
                 model=verdict.get("model"),
-                payload=candidate,
+                payload={k: v for k, v in candidate.items() if k != "_previous_fingerprint"},
             )
         if verdict["decision"] == "accept":
             if book_used >= book_capacity:
@@ -278,6 +386,13 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 # identical in a position count and mean opposite things.
                 turned_away.append(candidate["ticker"])
                 continue
+            if candidate["ticker"] in vetoed_at_by_ticker:
+                # The same company must not sit in BOTH arms of the paired comparison
+                # (SAHYADRI and KAMDHENU did, 2026-09). The vetoed shadow is closed at
+                # today's price under its own reason, so its outcome up to now is kept
+                # and it stops accruing the accepted arm's future.
+                _close_superseded_veto(candidate["ticker"], dry_run=dry_run)
+                superseded.append(candidate["ticker"])
             _open_position(candidate, verdict, kind=kind, dry_run=dry_run)
             entered.append(candidate["ticker"])
             book_used += 1
@@ -306,7 +421,9 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         "already_open_skipped": len(skipped),
         "entered_tickers": entered,
         "rejected_tickers": rejected,
-        "capital_per_position_rs": CAPITAL_PER_POSITION_RS,
+        # The bucket's figure -- what _size_for actually used. CAPITAL_PER_POSITION_RS is
+        # the pre-bucket flat Rs 1 lakh and reported the wrong number since 2026-09-23.
+        "capital_per_position_rs": capital_per_position_rs(DEFAULT_BUCKET),
         "book_used": book_used,
         "book_capacity": book_capacity,
         "bucket": DEFAULT_BUCKET,
@@ -316,6 +433,9 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         "veto_stands_no_new_evidence": veto_stands,
         # Stopped out within STOP_COOLDOWN_DAYS, so not re-entered at the stop price.
         "stopped_recently_skipped": stopped_out,
+        "vetoed_shadow_superseded_by_accept": superseded,
+        "below_bucket_liquidity_floor": below_liquidity_floor,
+        "stale_confluence_skipped": evaluation.get("stale_confluence_skipped", []),
     }
 
 

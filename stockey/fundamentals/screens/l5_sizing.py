@@ -119,19 +119,26 @@ def load_open_thesis(company_master_id: str) -> dict | None:
     return df.iloc[0].to_dict()
 
 
+ADV_MAX_AGE_DAYS = 10
+
+
 def load_adv_inputs(company_master_id: str) -> dict | None:
     """avg_vol_1mth x cmp_rs from the LATEST fundamentals_l1_universe row for this
     company -- both already collected at L1 admission (l1_universe.py's own
     metrics_json), no new data source needed. None if this company has no L1 row
     (e.g. an ad_hoc thesis on a name that never passed L1 screening) or the metrics
     are missing/non-numeric -- never a guessed/defaulted ADV."""
-    ticker_by_cmid = build_l1_ticker_by_company_master_id()
+    ticker_by_cmid = build_l1_ticker_by_company_master_id(include_history=True)
     ticker = ticker_by_cmid.get(company_master_id)
     if ticker is None:
         return None
+    # Age-bounded (2026-09-23 audit): "latest L1 row" had no age limit, so a name that
+    # left L1 months ago was sized on its old liquidity. Stale ADV is unknown ADV, which
+    # sizing already reports visibly (flat_allocation_no_adv_data).
     df = sql_to_df(
-        "SELECT metrics_json FROM fundamentals_l1_universe WHERE ticker = %s ORDER BY run_date DESC LIMIT 1",
-        params=(ticker,),
+        "SELECT metrics_json FROM fundamentals_l1_universe WHERE ticker = %s "
+        "  AND run_date >= now() - make_interval(days => %s) ORDER BY run_date DESC LIMIT 1",
+        params=(ticker, ADV_MAX_AGE_DAYS),
     )
     if df.empty or not df.iloc[0]["metrics_json"]:
         return None

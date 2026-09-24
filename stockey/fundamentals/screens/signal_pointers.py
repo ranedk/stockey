@@ -81,8 +81,8 @@ def load_l2_signals_for_company(company_master_id: str) -> dict | None:
     # -- wrong for the ~22% BSE-only cohort. Live-confirmed: get_stock_signal_
     # pointers() returned [] for a real BSE-only company's canonical id and real
     # data for its L1 ticker. Same recurring mistake fixed elsewhere via
-    # build_l1_ticker_by_company_master_id() (see its own docstring).
-    ticker = build_l1_ticker_by_company_master_id().get(company_master_id)
+    # build_l1_ticker_by_company_master_id(include_history=True) (see its own docstring).
+    ticker = build_l1_ticker_by_company_master_id(include_history=True).get(company_master_id)
     if ticker is None:
         return None
     df = sql_to_df(
@@ -105,7 +105,7 @@ def load_latest_rating_event_for_company(company_master_id: str) -> dict | None:
         SELECT rating_agency, rating_action_type, structured_extraction_json, disclosure_date, load_ts
         FROM fundamentals_events
         WHERE company_master_id = %s AND filing_type = 'rating_action'
-        ORDER BY load_ts DESC
+        ORDER BY disclosure_date DESC NULLS LAST, load_ts DESC  -- event recency, not crawl recency (2026-09-23)
         LIMIT 1
         """,
         params=(company_master_id,),
@@ -138,7 +138,7 @@ def load_latest_insider_transaction_for_company(company_master_id: str) -> dict 
         SELECT insider_name, quantity, transaction_type, disclosure_date, load_ts, structured_extraction_json
         FROM fundamentals_events
         WHERE company_master_id = %s AND filing_type = 'pit_sast'
-        ORDER BY load_ts DESC
+        ORDER BY disclosure_date DESC NULLS LAST, load_ts DESC  -- event recency, not crawl recency (2026-09-23)
         LIMIT 20
         """,
         params=(company_master_id,),
@@ -193,7 +193,7 @@ def load_latest_confirmed_auditor_change_for_company(company_master_id: str) -> 
         FROM fundamentals_events
         WHERE company_master_id = %s AND filing_type = 'auditor_change'
           AND structured_extraction_status = 'done' AND structured_extraction_json IS NOT NULL
-        ORDER BY load_ts DESC
+        ORDER BY disclosure_date DESC NULLS LAST, load_ts DESC  -- event recency, not crawl recency (2026-09-23)
         """,
         params=(company_master_id,),
     )
@@ -221,7 +221,7 @@ def load_latest_material_rpt_for_company(company_master_id: str) -> dict | None:
         FROM fundamentals_events
         WHERE company_master_id = %s AND filing_type = 'related_party_transaction'
           AND structured_extraction_status = 'done' AND structured_extraction_json IS NOT NULL
-        ORDER BY load_ts DESC
+        ORDER BY disclosure_date DESC NULLS LAST, load_ts DESC  -- event recency, not crawl recency (2026-09-23)
         """,
         params=(company_master_id,),
     )

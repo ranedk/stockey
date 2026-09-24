@@ -288,6 +288,9 @@ _ACTION_PATTERNS = (
     ("suspended", re.compile(r"suspend", re.IGNORECASE)),
     ("placed_on_watch", re.compile(r"watch|credit\s*watch", re.IGNORECASE)),
     ("reaffirmed", re.compile(r"reaffirm", re.IGNORECASE)),
+    # India Ratings titles say "Affirms", which "reaffirm" never matched -- those rows
+    # were classified 'other' and could never confirm deleveraging (2026-09-23 audit).
+    ("reaffirmed", re.compile(r"\baffirm", re.IGNORECASE)),
     ("assigned", re.compile(r"assign", re.IGNORECASE)),
 )
 
@@ -522,6 +525,23 @@ AGENCY_PLUGINS = {
 }
 
 
+def _agency_for_row(row) -> str | None:
+    """Headline keywords first; else the agency the extracted filing itself names. A BSE
+    headline like "Announcement under Regulation 30 (LODR) - Credit Rating." names no
+    agency, and those rows were parked as 'unsupported' although the PDF says ICRA."""
+    agency = detect_agency(row.get("headline"), row.get("subcategory"))
+    if agency is not None:
+        return agency
+    raw = row.get("structured_extraction_json")
+    if not raw:
+        return None
+    try:
+        named = (json.loads(raw) or {}).get("rating_agency")
+    except (TypeError, ValueError):
+        return None
+    return detect_agency(str(named), None) if named else None
+
+
 def load_pending_rating_actions(limit: int | None = None) -> pd.DataFrame:
     """Fresh 'pending' rows, PLUS 'no_match'/'failed' rows whose last attempt is at
     least RETRY_AFTER old -- see that constant's docstring for the bug this fixes.
@@ -529,13 +549,17 @@ def load_pending_rating_actions(limit: int | None = None) -> pd.DataFrame:
     prioritizes never-yet-tried detections over a retry of one that already missed
     once."""
     query = """
-        SELECT source, news_id, company_master_id, headline, subcategory, disclosure_date, enrichment_status
+        SELECT source, news_id, company_master_id, headline, subcategory, disclosure_date, enrichment_status,
+               structured_extraction_json
         FROM fundamentals_events
         WHERE filing_type = 'rating_action'
           AND (
             enrichment_status = 'pending'
             OR (
-              enrichment_status IN ('no_match', 'failed')
+              -- unsupported_agency is retried too (2026-09-23 audit): it used to be a
+              -- dead end, so rows parked before a plugin shipped (CARE, 2026-08-13)
+              -- never came back, and 50 of 70 rating rows could never be enriched.
+              enrichment_status IN ('no_match', 'failed', 'unsupported_agency')
               AND (enrichment_attempted_at IS NULL OR enrichment_attempted_at < %s)
             )
           )
@@ -582,7 +606,7 @@ def run_rating_agency_enrichment(*, limit: int | None = None) -> dict[str, objec
         return {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0, "blocked": False, "time_budget_exceeded": False}
 
     pending = pending.copy()
-    pending["_agency"] = pending.apply(lambda row: detect_agency(row["headline"], row["subcategory"]), axis=1)
+    pending["_agency"] = pending.apply(_agency_for_row, axis=1)
 
     counts = {"matched": 0, "no_match": 0, "unsupported_agency": 0, "failed": 0}
     any_blocked = False

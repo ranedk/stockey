@@ -513,6 +513,39 @@ def _set_extraction_result(*, source: str, news_id: str, status: str, fields: di
     execute_db_operation(_update, operation_name="fundamentals_events:extraction_update")
 
 
+def promote_pit_fields_to_columns() -> int:
+    """Copy extracted PIT trade fields into the flat columns where those are still NULL.
+
+    2026-09-23 data audit: insider_name/transaction_type/quantity lived ONLY in
+    structured_extraction_json for BSE rows -- 96% of insider_name and 82% of quantity
+    were NULL, and every reader of the flat columns (llm_triage's evidence bundle,
+    anything new) saw no trade at all. Fill-only: an NSE-merged value always wins. The
+    quantity cast is guarded so one malformed value cannot fail the whole statement."""
+    count = 0
+
+    def _update() -> None:
+        nonlocal count
+        with db_session() as (_, cur):
+            cur.execute(
+                r"""
+                UPDATE fundamentals_events SET
+                    transaction_type = COALESCE(transaction_type, structured_extraction_json::jsonb->>'transaction_type'),
+                    insider_name = COALESCE(insider_name, structured_extraction_json::jsonb->>'insider_name'),
+                    quantity = COALESCE(quantity, CASE
+                        WHEN structured_extraction_json::jsonb->>'quantity_shares' ~ '^[0-9]+(\.[0-9]+)?$'
+                        THEN (structured_extraction_json::jsonb->>'quantity_shares')::double precision END)
+                 WHERE filing_type = 'pit_sast' AND structured_extraction_status = 'done'
+                   AND structured_extraction_json IS NOT NULL
+                   AND structured_extraction_json::jsonb->>'transaction_type' IS NOT NULL
+                   AND (transaction_type IS NULL OR insider_name IS NULL OR quantity IS NULL)
+                """
+            )
+            count = cur.rowcount
+
+    execute_db_operation(_update, operation_name="fundamentals_events:promote_pit_fields")
+    return count
+
+
 def run_structured_extraction(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> dict[str, object]:
     _ensure_events_schema()
     _bootstrap_extraction_columns()
@@ -608,6 +641,7 @@ def run_structured_extraction(*, limit: int | None = None, model: str = DEFAULT_
 def main() -> int:
     global STOCKEY_RUN_STATE
     result = run_structured_extraction()
+    result["pit_fields_promoted"] = promote_pit_fields_to_columns()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "extracted": result["extracted"],
@@ -615,6 +649,7 @@ def main() -> int:
         "failed": result["failed"],
         "unsupported_filing_type": result["unsupported_filing_type"],
         "routine_pit_sast_skipped": result["routine_pit_sast_skipped"],
+        "pit_fields_promoted": result["pit_fields_promoted"],
         "blocked": result["blocked"],
         "fallback_used": bool(result["failed"] or result["blocked"]),
         "state_advanced": result["extracted"] > 0 or result["routine_pit_sast_skipped"] > 0,

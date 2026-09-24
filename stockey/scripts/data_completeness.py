@@ -307,9 +307,13 @@ def check_universe_coverage(f: Findings, window_days: int) -> None:
     n = _scalar(
         """
         SELECT count(*) FROM (
-          SELECT DISTINCT symbol FROM nseindia_ohlcv
-           WHERE series IN ('EQ','BE')
-             AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
+          -- A renamed NSE symbol (TMPV) is collected under its company's canonical ticker
+          -- (TATAMOTORS); without this mapping ~50 fully-collected names read as missing
+          -- (2026-09-24).
+          SELECT DISTINCT COALESCE(a.canonical_nse_ticker, o.symbol) FROM nseindia_ohlcv o
+            LEFT JOIN company_master_nse_alias a ON a.alias_ticker = o.symbol
+           WHERE o.series IN ('EQ','BE')
+             AND o.date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
           EXCEPT
           SELECT DISTINCT ticker FROM dhan_ohlcv_intraday
            WHERE timestamp >= now() - make_interval(days => %s)

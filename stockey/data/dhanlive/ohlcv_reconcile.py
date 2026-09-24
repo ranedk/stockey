@@ -90,11 +90,15 @@ def find_stale_symbols(universe: list[str], expected_date: pd.Timestamp) -> list
     """Symbols whose latest daily bar predates the expected date (or that have no bars)."""
     if not universe:
         return []
+    # A renamed NSE symbol (TMPV) is stored under its company's canonical ticker
+    # (TATAMOTORS), so look each symbol up by that ticker (2026-09-24: ~50 renamed names
+    # were fetched successfully every run and still reported stale forever).
+    canonical = _canonical_tickers(universe)
     try:
         frame = sql_to_df(
             f"SELECT UPPER(TRIM(ticker)) AS symbol, MAX(date)::date AS max_date "
             f"FROM {DAILY_TABLE} WHERE UPPER(TRIM(ticker)) = ANY(%s) GROUP BY 1",
-            params=(list(universe),),
+            params=(sorted(set(canonical.values())),),
         )
     except Exception as exc:
         print(f"[ohlcv_reconcile] coverage lookup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -106,7 +110,22 @@ def find_stale_symbols(universe: list[str], expected_date: pd.Timestamp) -> list
         for symbol, max_date in zip(frame["symbol"].tolist(), max_dates):
             if not pd.isna(max_date) and pd.Timestamp(max_date).date() >= expected:
                 current.add(str(symbol))
-    return [symbol for symbol in universe if symbol not in current]
+    return [symbol for symbol in universe if canonical.get(symbol, symbol) not in current]
+
+
+def _canonical_tickers(universe: list[str]) -> dict[str, str]:
+    mapping = {str(s): str(s) for s in universe}
+    try:
+        aliases = sql_to_df(
+            "SELECT alias_ticker, canonical_nse_ticker FROM company_master_nse_alias WHERE alias_ticker = ANY(%s)",
+            params=(list(universe),),
+        )
+    except Exception:  # noqa: BLE001 -- no alias table yet: symbols are their own tickers
+        return mapping
+    for alias, canonical in zip(aliases.get("alias_ticker", []), aliases.get("canonical_nse_ticker", [])):
+        if canonical:
+            mapping[str(alias)] = str(canonical).upper()
+    return mapping
 
 
 def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now: Any | None = None) -> dict[str, Any]:
@@ -172,6 +191,15 @@ def run_reconcile(*, max_symbols: int | None = None, dry_run: bool = False, now:
     summary["sync_retried"] = len(retried)
     summary["sync_recovered_on_retry"] = recovered
     summary["failure_classifications"] = failure_classes
+    # "Succeeded" only means the API call did not error. Dhan publishes daily bars in stages
+    # through the evening, so a call can succeed and still return no bar for the expected
+    # day: on 2026-09-23 the evening pass reported 2,742 succeeded while the gate found
+    # 1,406 symbols with a 09-23 bar. Re-measure after syncing so the log says what is in
+    # the table, not what the API answered (2026-09-24 audit).
+    still_stale = find_stale_symbols(universe, expected)
+    summary["still_stale_after_sync"] = len(still_stale)
+    summary["succeeded_without_expected_bar"] = len(set(still_stale) & {
+        str(row.get("ticker")) for row in results if not row.get("error")})
     return summary
 
 
@@ -191,7 +219,9 @@ def main(argv: list[str] | None = None) -> int:
             f"universe={summary['universe_symbols']} current={summary['current_symbols']} "
             f"stale={summary['stale_symbols']} attempted={summary['sync_attempted']} "
             f"succeeded={summary['sync_succeeded']} failed={summary['sync_failed']} "
-            f"skipped_over_cap={summary['skipped_over_cap']} dry_run={summary['dry_run']}"
+            f"skipped_over_cap={summary['skipped_over_cap']} dry_run={summary['dry_run']} "
+            f"still_stale_after_sync={summary.get('still_stale_after_sync', 'n/a')} "
+            f"succeeded_without_expected_bar={summary.get('succeeded_without_expected_bar', 'n/a')}"
         )
     # Systemic failure exits non-zero so cron logs/script markers surface it: either the
     # Dhan token is dead (auth_unavailable) or a broad sweep produced zero successes.

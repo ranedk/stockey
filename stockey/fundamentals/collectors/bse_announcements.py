@@ -488,9 +488,20 @@ def _parse_bse_timestamp(value: str | None):
     if not value:
         return None
     try:
-        return pd.Timestamp(value, tz="Asia/Kolkata").tz_convert("UTC") if "T" in value else pd.Timestamp(value)
+        # Both formats are IST wall clock; the non-"T" branch used to come back naive,
+        # so its date was IST while the "T" branch's was UTC (2026-09-23 audit).
+        return pd.Timestamp(value, tz="Asia/Kolkata").tz_convert("UTC")
     except (ValueError, TypeError):
         return None
+
+
+def ist_disclosure_date(ts):
+    """The IST calendar date of a disclosure. `.date()` on the UTC timestamp dated every
+    filing disseminated 00:00-05:30 IST (late-night results) a day early -- 204 stored
+    BSE rows, and a date mismatch against NSE's copy broke the cross-exchange dedup."""
+    if ts is None:
+        return None
+    return ts.tz_convert("Asia/Kolkata").date() if ts.tzinfo is not None else ts.date()
 
 
 def build_announcement_row(scrip_code: str, company_master_id: str, isin: str | None, raw: dict) -> dict | None:
@@ -507,7 +518,7 @@ def build_announcement_row(scrip_code: str, company_master_id: str, isin: str | 
         "filing_type": filing_type,
         "headline": raw.get("HEADLINE") or raw.get("NEWSSUB"),
         "subcategory": raw.get("SUBCATNAME"),
-        "disclosure_date": disclosure_ts.date() if disclosure_ts is not None else None,
+        "disclosure_date": ist_disclosure_date(disclosure_ts),
         "announcement_timestamp": disclosure_ts,
         # BSE's announcement text never carries structured PIT fields (see
         # fundamentals/collectors/events_store.py) -- left NULL here so a later NSE
@@ -518,7 +529,9 @@ def build_announcement_row(scrip_code: str, company_master_id: str, isin: str | 
         "attachment_name": raw.get("ATTACHMENTNAME"),
         "detail_url": raw.get("NSURL"),
         "detection_source": "bse_announcements",
-        "enrichment_status": "pending",
+        # Only rating rows are ever enriched; 'pending' on every other type never advanced
+        # and read as a backlog that did not exist (2026-09-23 audit).
+        "enrichment_status": "pending" if filing_type == "rating_action" else "not_applicable",
         "sources": "bse",
         "raw_json": json.dumps(raw, ensure_ascii=False, default=str),
         "load_ts": pd.Timestamp.now(tz="UTC"),
@@ -550,7 +563,7 @@ def build_result_calendar_row(scrip_code: str, company_master_id: str, isin: str
         "attachment_name": None,
         "detail_url": raw.get("URL"),
         "detection_source": "bse_result_calendar",
-        "enrichment_status": "pending",
+        "enrichment_status": "not_applicable",
         "sources": "bse",
         "raw_json": json.dumps(raw, ensure_ascii=False, default=str),
         "load_ts": pd.Timestamp.now(tz="UTC"),

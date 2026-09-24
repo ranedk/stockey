@@ -164,7 +164,14 @@ def load_full_watchlist() -> list[dict]:
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
-            WHERE ticker = REPLACE(w.company_master_id, 'nse:', '')
+            WHERE ticker IN (
+                -- Through company_master, not string surgery (2026-09-23 audit): the id's
+                -- suffix is not the L1 slug for BSE-only names ('nse:543531-BOM' vs
+                -- '543531') or NSE names whose slug is a BSE code (ALUFLUOR = 524634),
+                -- so ~22 percent of the watchlist showed no company name.
+                SELECT cm.nse_ticker FROM company_master cm WHERE cm.company_master_id = w.company_master_id
+                UNION SELECT cm.bse_scrip_code FROM company_master cm WHERE cm.company_master_id = w.company_master_id
+                UNION SELECT REPLACE(w.company_master_id, 'nse:', ''))
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
@@ -486,6 +493,10 @@ STRATEGY_LABELS = {
     "results_delayed": "Results delayed",
     "auditor_change": "Auditor change",
     "related_party_transaction": "Related-party transaction",
+    # Added 2026-09-23 (data audit) -- fired but rendered as raw names.
+    "pledge_increase": "Promoter pledge increase",
+    "bulk_deal_buy": "Bulk/block deal buy (net)",
+    "bulk_deal_sell": "Bulk/block deal sell (net)",
 }
 
 

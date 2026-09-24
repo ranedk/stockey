@@ -56,7 +56,11 @@ SYNC_SOURCE_NAME = "fundamentals.screens.confluence_score"
 # and every v1 score was a count out of four axes, not five. The ownership fields
 # (promoter/institutional/pledge) DO use "increasing"/"decreasing" and were fine.
 # Readers pick the newest version on a run_date tie, so v1 rows stay as history.
-SCORE_VERSION = 2
+# v3 (2026-09-23, same audit): trajectory reads the split reversal labels; sector_cycle
+# returns None on a low-confidence (thin-sample) phase; ownership reads only L2
+# shareholding state -- insider/bulk-deal alerts count once, in event_corroboration,
+# instead of in both axes; superseded (round-trip) alerts are not counted at all.
+SCORE_VERSION = 3
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 # BUG FOUND LIVE 2026-08-29 (same class as fundamentals/api/queries.py's
@@ -124,8 +128,10 @@ VALUATION_EXPENSIVE_THRESHOLD = 1.1
 # l2_state.compute_trend_direction's vocabulary. A decelerating increase is still an
 # increase -- debt that is growing more slowly is growing. "flat" and "reversal" (the
 # sign flipped between the two latest deltas) are in neither set: no settled trend.
-WORSENING_TREND_DIRECTIONS = frozenset({"accelerating_increase", "decelerating_increase", "steady_increase"})
-IMPROVING_TREND_DIRECTIONS = frozenset({"accelerating_decline", "decelerating_decline", "steady_decline"})
+WORSENING_TREND_DIRECTIONS = frozenset({"accelerating_increase", "decelerating_increase", "steady_increase",
+                                        "reversal_to_increase", "new_increase"})
+IMPROVING_TREND_DIRECTIONS = frozenset({"accelerating_decline", "decelerating_decline", "steady_decline",
+                                        "reversal_to_decline", "new_decline"})
 
 
 def compute_fundamentals_trajectory_axis(l2_row: dict) -> bool | None:
@@ -148,8 +154,8 @@ def compute_ownership_axis(l2_row: dict, recent_trigger_types: set[str]) -> bool
         return False
     if pledge_dir == "increasing":
         return False
-    if "insider_sell_surprise" in recent_trigger_types or "bulk_deal_sell" in recent_trigger_types:
-        return False
+    # insider_sell_surprise / bulk_deal_sell used to ALSO count here, so one sell alert
+    # was two contradicting axes (v3: each alert counts once, in event_corroboration).
     if institutional_dir == "increasing":
         return True
     if institutional_dir is None and promoter_dir is None:
@@ -168,6 +174,8 @@ def compute_event_corroboration_axis(recent_trigger_types: set[str]) -> bool | N
 
 
 def compute_sector_cycle_axis(phase: str | None) -> bool | None:
+    # A 'low'-confidence phase (thin sample, often one company) arrives here as None --
+    # load_sector_phase_by_company_id drops it (v3).
     if phase == "capacity_discipline":
         return True
     if phase == "capacity_expansion":
@@ -278,8 +286,26 @@ def _alert_axis_coverage(problems: list[dict[str, object]], coverage: dict[str, 
 
 
 def load_active_watchlist_company_ids() -> list[str]:
-    df = sql_to_df("SELECT company_master_id FROM fundamentals_watchlist WHERE status = 'active'")
-    return [] if df.empty else df["company_master_id"].dropna().tolist()
+    """Active watchlist names PLUS every company with an open portfolio position.
+
+    2026-09-23 data audit: scoring only status='active' froze the score of any held name
+    whose watchlist row turned price_flagged (a +50% winner) or invalidated -- after
+    that no later contradiction could reach portfolio_exit's invalidation check. A held
+    position is scored for as long as it is held, whatever its watchlist status."""
+    # Defensive DDL first: on a fresh DB the position table does not exist until the
+    # portfolio job's first write, and this query runs earlier in the day (same class
+    # as this module's own _ensure_confluence_score_table note).
+    from fundamentals.screens.portfolio_adjudicator import _ensure_tables as _ensure_portfolio_tables
+
+    _ensure_portfolio_tables()
+    df = sql_to_df(
+        """
+        SELECT company_master_id FROM fundamentals_watchlist WHERE status = 'active'
+        UNION
+        SELECT company_master_id FROM fundamentals_portfolio_position WHERE status = 'open'
+        """
+    )
+    return [] if df.empty else sorted(df["company_master_id"].dropna().unique().tolist())
 
 
 def load_l2_state_by_ticker(tickers: list[str]) -> dict[str, dict]:
@@ -312,7 +338,36 @@ def load_l2_state_by_ticker(tickers: list[str]) -> dict[str, dict]:
     )
     if df.empty:
         return {}
-    return {row["ticker"]: row for row in df.to_dict("records")}
+    out = {row["ticker"]: row for row in df.to_dict("records")}
+    # Pledge trend and valuation come from the DAILY market snapshot when one exists
+    # (2026-09-23 audit): on the L2 detail row they are as old as the last 75-day crawl.
+    # A snapshot older than SNAPSHOT_MAX_AGE_DAYS is not used, and a failed fetch is
+    # stored as NULL there, so it degrades to "no call", never to a stale value.
+    for ticker, snap in load_latest_market_snapshot(list(out)).items():
+        out[ticker]["pledge_pct_trend_direction"] = snap.get("pledge_pct_trend_direction")
+        out[ticker]["valuation_vs_own_history_ratio"] = snap.get("valuation_vs_own_history_ratio")
+    return out
+
+
+SNAPSHOT_MAX_AGE_DAYS = 4
+
+
+def load_latest_market_snapshot(tickers: list[str]) -> dict[str, dict]:
+    if not tickers:
+        return {}
+    from fundamentals.screens.l2_state import MARKET_SNAPSHOT_TABLE, ensure_market_snapshot_table
+
+    ensure_market_snapshot_table()
+    df = sql_to_df(
+        f"""
+        SELECT DISTINCT ON (ticker) ticker, pledge_pct_trend_direction, valuation_vs_own_history_ratio
+          FROM {MARKET_SNAPSHOT_TABLE}
+         WHERE ticker = ANY(%s) AND run_date >= now() - make_interval(days => %s)
+         ORDER BY ticker, run_date DESC
+        """,  # noqa: S608 -- fixed internal table name
+        params=(tickers, SNAPSHOT_MAX_AGE_DAYS),
+    )
+    return {} if df.empty else {r["ticker"]: r for r in df.to_dict("records")}
 
 
 def load_sector_phase_by_company_id(company_master_ids: list[str]) -> dict[str, str]:
@@ -331,13 +386,18 @@ def load_sector_phase_by_company_id(company_master_ids: list[str]) -> dict[str, 
         return {}
     phase_df = sql_to_df(
         """
-        SELECT sector_code, phase FROM fundamentals_sector_cycle
+        SELECT sector_code, phase, sample_size_confidence FROM fundamentals_sector_cycle
         WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_sector_cycle)
         """
     )
     if phase_df.empty:
         return {}
-    phase_by_sector = dict(zip(phase_df["sector_code"], phase_df["phase"]))
+    # A 'low' confidence phase (thin sample, often one company) is read as no phase (v3).
+    phase_by_sector = {
+        code: (None if conf == "low" else phase)
+        for code, phase, conf in zip(phase_df["sector_code"], phase_df["phase"],
+                                     phase_df.get("sample_size_confidence", [None] * len(phase_df)))
+    }
     return {
         row["company_master_id"]: phase_by_sector[row["sector_code"]]
         for row in sector_df.to_dict("records")
@@ -351,7 +411,14 @@ def load_recent_trigger_types_by_company_id(company_master_ids: list[str]) -> di
     df = sql_to_df(
         f"""
         SELECT company_master_id, trigger_type FROM fundamentals_l3_alerts
-        WHERE company_master_id = ANY(%s) AND alert_date >= CURRENT_DATE - INTERVAL '{int(ALERT_LOOKBACK_DAYS)} days'
+        WHERE company_master_id = ANY(%s)
+          -- superseded alerts (same-day round-trip deals, 2026-09-23) are kept, not counted
+          AND status NOT LIKE 'superseded%%'
+          -- The window runs from when WE LEARNED of it, not only the disclosure date: alerts
+          -- lag disclosure by a median ~15 days, so a backfilled contradiction whose filing
+          -- was >90 days old never counted (2026-09-23 audit). IST calendar, not DB clock.
+          AND GREATEST(alert_date, (load_ts AT TIME ZONE 'Asia/Kolkata')::date)
+              >= (now() AT TIME ZONE 'Asia/Kolkata')::date - {int(ALERT_LOOKBACK_DAYS)}
         """,  # noqa: S608 -- ALERT_LOOKBACK_DAYS is a fixed internal constant, not user input; company list is parameterized
         params=(company_master_ids,),
     )
@@ -369,7 +436,7 @@ def run_confluence_score_refresh() -> dict[str, object]:
     if not company_ids:
         return {"rows": 0, "companies_no_l2_state": 0}
 
-    ticker_by_cmid = build_l1_ticker_by_company_master_id()
+    ticker_by_cmid = build_l1_ticker_by_company_master_id(include_history=True)
     tickers = [ticker_by_cmid[cmid] for cmid in company_ids if cmid in ticker_by_cmid]
     l2_by_ticker = load_l2_state_by_ticker(tickers)
     phase_by_cmid = load_sector_phase_by_company_id(company_ids)

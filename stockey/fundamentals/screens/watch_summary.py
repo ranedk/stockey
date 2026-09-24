@@ -209,7 +209,7 @@ def load_latest_l2_state_for_company(company_master_id: str) -> dict | None:
     # function's evidence bundle silently missing L2 state for that cohort's
     # watchlisted companies, exactly the gap signal_pointers.py was built to
     # close for other fields.
-    ticker = build_l1_ticker_by_company_master_id().get(company_master_id)
+    ticker = build_l1_ticker_by_company_master_id(include_history=True).get(company_master_id)
     if ticker is None:
         return None
     df = sql_to_df(

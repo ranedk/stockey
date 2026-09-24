@@ -17,3 +17,19 @@ def _isolate_local_telemetry_files(monkeypatch, tmp_path):
 
     monkeypatch.setattr(fallback_telemetry, "LOCAL_FALLBACK_TELEMETRY_FILE", tmp_path / "local_fallback_events.jsonl")
     monkeypatch.setattr(db, "DB_RETRY_TELEMETRY_FILE", tmp_path / "db_retry_events.jsonl")
+
+
+@pytest.fixture(autouse=True)
+def _schema_migrations_never_run_from_tests(monkeypatch):
+    """A test must never ALTER the live database. apply_schema_migration is called from
+    many module ensure_* helpers; unstubbed, a test run applied real migrations (found in
+    the 2026-09-23 data audit, when 37 tests were measured reaching the live DB). Every
+    migration reads as already applied; tests of the migration machinery itself override
+    these with their own monkeypatch.setattr, which runs after this and wins."""
+    from utils import schema_migrations
+
+    # Guarded at the module's DB boundary, not by replacing its functions, so tests of the
+    # functions themselves still run them (and override these with their own stubs).
+    monkeypatch.setattr(schema_migrations, "execute_db_operation", lambda *a, **k: None)
+    monkeypatch.setattr(schema_migrations, "load_schema_migration",
+                        lambda _migration_id: {"status": "applied", "checksum": ""})

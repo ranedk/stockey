@@ -30,7 +30,9 @@ from fundamentals.collectors.rating_agencies import get_unsupported_rating_agenc
 from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
 from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
-from fundamentals.screens.l5_sizing import CAPITAL_PER_POSITION_RS, MAX_POSITIONS
+from fundamentals.screens.l5_sizing import MAX_POSITIONS
+from fundamentals.screens.portfolio_buckets import DEFAULT_BUCKET, bucket_config, capital_per_position_rs
+from fundamentals.screens.portfolio_exit import PRICE_LOOKBACK_DAYS
 from fundamentals.screens.portfolio_resolution import compute_portfolio_scoring
 from fundamentals.screens.l4_thesis_draft import _ensure_draft_table
 from fundamentals.screens.l5_sizing import get_position_size_recommendation as _get_position_size_recommendation
@@ -41,6 +43,7 @@ from fundamentals.screens.watch_summary import (
     load_sector_context_for_company,
 )
 from utils.db import sql_to_df
+from utils.json_safe import loads_lenient
 
 _UNIVERSE_METRIC_KEYS = ("cmp_rs", "p_e", "mar_cap_rscr", "div_yld_pct", "roce_pct", "qtr_sales_var_pct", "avg_vol_1mth")
 
@@ -125,7 +128,14 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
-            WHERE ticker = REPLACE(w.company_master_id, 'nse:', '')
+            WHERE ticker IN (
+                -- Through company_master, not string surgery (2026-09-23 audit): the id's
+                -- suffix is not the L1 slug for BSE-only names ('nse:543531-BOM' vs
+                -- '543531') or NSE names whose slug is a BSE code (ALUFLUOR = 524634),
+                -- so ~22 percent of the watchlist showed no company name.
+                SELECT cm.nse_ticker FROM company_master cm WHERE cm.company_master_id = w.company_master_id
+                UNION SELECT cm.bse_scrip_code FROM company_master cm WHERE cm.company_master_id = w.company_master_id
+                UNION SELECT REPLACE(w.company_master_id, 'nse:', ''))
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
@@ -359,7 +369,7 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
     alerts = []
     for alert in _clean_records(alerts_df):
         raw_bundle = alert.pop("evidence_bundle_json", None)
-        alert["evidence_bundle"] = json.loads(raw_bundle) if raw_bundle else None
+        alert["evidence_bundle"] = loads_lenient(raw_bundle)  # pre-2026-09-23 rows may hold a bare NaN
         alerts.append(alert)
 
     thesis_df = sql_to_df(
@@ -508,7 +518,14 @@ def get_strategy_detail(trigger_type: str) -> dict | None:
         FROM fundamentals_l3_alerts a
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
-            WHERE ticker = REPLACE(a.company_master_id, 'nse:', '')
+            WHERE ticker IN (
+                -- Through company_master, not string surgery (2026-09-23 audit): the id's
+                -- suffix is not the L1 slug for BSE-only names ('nse:543531-BOM' vs
+                -- '543531') or NSE names whose slug is a BSE code (ALUFLUOR = 524634),
+                -- so ~22 percent of the watchlist showed no company name.
+                SELECT cm.nse_ticker FROM company_master cm WHERE cm.company_master_id = a.company_master_id
+                UNION SELECT cm.bse_scrip_code FROM company_master cm WHERE cm.company_master_id = a.company_master_id
+                UNION SELECT REPLACE(a.company_master_id, 'nse:', ''))
             ORDER BY run_date DESC LIMIT 1
         ) l1 ON TRUE
         LEFT JOIN LATERAL (
@@ -806,11 +823,17 @@ def get_ruleset_positions() -> dict:
                -- The live distance to the stop, computed here rather than in the client
                -- so the page and the exit evaluator cannot disagree about what "close to
                -- the stop" means.
+               -- Date-bounded: the view sits on a hypertable, and an unbounded "latest
+               -- per symbol" per row is the shape behind this workspace's OOM incident.
                (SELECT adj_close FROM advisory_adjusted_ohlcv_daily a
-                 WHERE a.symbol = p.ticker ORDER BY a.date DESC LIMIT 1) AS last_price
+                 WHERE a.symbol = p.ticker
+                   AND a.date >= now() - make_interval(days => %s)
+                 ORDER BY a.date DESC LIMIT 1) AS last_price,
+               entry_price_date, score_version
           FROM fundamentals_portfolio_position p
          ORDER BY (status = 'open') DESC, opened_at DESC
-        """
+        """,
+        params=(PRICE_LOOKBACK_DAYS,),
     )
     rows = _clean_records(df)
     real = [r for r in rows if r["kind"] == "real"]
@@ -828,9 +851,11 @@ def get_ruleset_positions() -> dict:
         # Only ACCEPTED positions consume capital -- vetoed ones are counterfactuals.
         "capital_committed_rs": sum(r["position_size_rs"] or 0 for r in accepted
                                     if r["status"] == "open"),
-        "capital_per_position_rs": CAPITAL_PER_POSITION_RS,
+        # The bucket's figures -- what the runner sizes and caps with. The flat Rs 1 lakh /
+        # 100-name constants predate buckets and were shown here after they stopped applying.
+        "capital_per_position_rs": capital_per_position_rs(DEFAULT_BUCKET),
         "book_used": sum(1 for r in accepted if r["status"] == "open"),
-        "book_capacity": MAX_POSITIONS,
+        "book_capacity": bucket_config(DEFAULT_BUCKET)["target_positions"] or MAX_POSITIONS,
         # record-only until at least one real position exists
         "mode": "live" if real else "record-only",
         "positions": rows,

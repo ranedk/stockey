@@ -1,5 +1,6 @@
 import pandas as pd
 
+from utils.company_master import map_company_master_ids
 from utils.db import sql_to_df, upsert_to_db
 
 
@@ -82,6 +83,33 @@ def build_dim_security() -> pd.DataFrame:
     df = latest.merge(summary, on="security_id", how="left")
     df = df.merge(dhan, on=["symbol", "series"], how="left")
     df = df.merge(company_master, on="symbol", how="left")
+    # NSE renames (TATAMOTORS -> TMPV) leave the new symbol matching no company_master
+    # row by ticker; map_company_master_ids falls back to the ISIN-derived alias table, so
+    # the dimension carries the existing company id -- and its sector -- for the renamed
+    # symbol instead of NULL (2026-09-24: 52 active EQ symbols).
+    missing = df["company_master_id"].isna() & df["series"].isin(["EQ", "BE"])
+    if missing.any():
+        df.loc[missing, "company_master_id"] = map_company_master_ids(df.loc[missing, "symbol"], exchange="NSE")
+        by_id = company_master.drop_duplicates(subset=["company_master_id"]).set_index("company_master_id")
+        for column in ("company_name", "sector_code", "bse_ticker"):
+            if column in df.columns and column in by_id.columns:
+                fill = df.loc[missing, "company_master_id"].map(by_id[column])
+                df.loc[missing, column] = df.loc[missing, column].fillna(fill)
+    # Sector by ISIN where the symbol join found none: Sharpely's symbol can differ from
+    # NSE's (renames, conventions) while the ISIN agrees -- 123 of 482 active EQ names
+    # had a Sharpely sector reachable only this way (2026-09-24). ISIN was not stored
+    # from the Sharpely feed before that date.
+    if "sector_code" in df.columns and "isin" in df.columns and df["sector_code"].isna().any():
+        try:
+            by_isin = sql_to_df(
+                "SELECT DISTINCT ON (isin) isin, sector_code FROM master_sharpely_equity "
+                " WHERE isin IS NOT NULL AND sector_code IS NOT NULL ORDER BY isin"
+            )
+        except Exception:  # noqa: BLE001 -- pre-2026-09-24 table has no isin column
+            by_isin = pd.DataFrame(columns=["isin", "sector_code"])
+        if not by_isin.empty:
+            no_sector = df["sector_code"].isna()
+            df.loc[no_sector, "sector_code"] = df.loc[no_sector, "isin"].map(by_isin.set_index("isin")["sector_code"])
     df["is_active_recent"] = df["last_trade_date"] >= (pd.Timestamp.utcnow() - pd.Timedelta(days=31))
     df = df.sort_values(["security_id", "last_trade_date"]).drop_duplicates(subset=["security_id"], keep="last")
     return df
@@ -94,5 +122,22 @@ def run():
     upsert_to_db(df, "dim_security", unique_keys=["security_id"])
 
 
-if __name__ == "__main__":
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
     run()
+    counts = sql_to_df("SELECT count(*) AS n, max(effective_to) AS latest FROM dim_security")
+    STOCKEY_RUN_STATE = {
+        "source": "data.nseindia.security_dimension",
+        "rows": int(counts.iloc[0]["n"]),
+        "latest_observed": str(counts.iloc[0]["latest"]),
+        "state_advanced": True,
+        "status": "ok",
+    }
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

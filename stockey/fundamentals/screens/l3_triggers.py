@@ -58,6 +58,7 @@ from psycopg2 import sql as psycopg2_sql
 from fundamentals.screens.investor_classification import effective_tier, normalize_investor_key
 from fundamentals.screens.l1_universe import RPT_PCT_OF_REVENUE_THRESHOLD, rpt_is_material
 from utils.company_master import build_l1_ticker_by_company_master_id
+from utils.json_safe import dumps_strict
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -150,17 +151,32 @@ def load_candidate_events(limit: int | None = None) -> pd.DataFrame:
     query = f"""
         SELECT source, news_id, company_master_id, filing_type, headline,
                rating_action_type, rating_agency, transaction_type, insider_name, quantity,
-               disclosure_date, structured_extraction_json
+               disclosure_date, structured_extraction_json, subcategory,
+               CASE WHEN source = 'nse' AND filing_type = 'pit_sast' THEN raw_json END AS nse_pit_raw_json
         FROM fundamentals_events
         WHERE filing_type IN ({placeholders})
           AND (rule_trigger_status IS NULL OR rule_trigger_status = 'pending')
           AND (
-                (filing_type = 'rating_action' AND rating_action_type IS NOT NULL)
-             OR (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
-             OR filing_type IN ('capital_raise', 'institutional_entry')
+                -- rating_action no longer short-circuits on its flat action type
+                -- (2026-09-23 audit): that label comes from the agency LISTING headline,
+                -- so a downgrade on one instrument behind a "reaffirmed" headline was
+                -- judged before extraction could see it, and closed for good.
+                -- rating_downgrade had never fired. Ratings now wait for the document
+                -- like every other filing type.
+                (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
+             -- capital_raise no longer skips the document (2026-09-23 audit): it alerts
+             -- unconditionally, but was judged before extraction had named the
+             -- investors, so the investor-tier note never reached its reasoning.
+             -- institutional_entry is synthetic (no document) and passes below.
              OR (attachment_name IS NULL AND rationale_pdf_url IS NULL)
-             OR (ocr_status IN ('done', 'failed', 'no_document')
-                 AND (structured_extraction_status IS NULL OR structured_extraction_status != 'pending'))
+             -- OCR'd rows wait for extraction to FINISH (2026-09-23 audit): "IS NULL"
+             -- used to count as finished, so a row OCR'd but not yet extracted was
+             -- judged with no JSON and closed for good. Extraction sets a status on
+             -- every OCR'd row (done / failed / unsupported_filing_type), so this
+             -- cannot strand one. A failed or document-less row has nothing to wait for.
+             OR (ocr_status = 'done' AND structured_extraction_status IS NOT NULL
+                 AND structured_extraction_status != 'pending')
+             OR ocr_status IN ('failed', 'no_document', 'timeout_exhausted')
           )
         ORDER BY load_ts ASC NULLS LAST
     """  # noqa: S608 -- placeholders built from SUPPORTED_FILING_TYPES, a fixed internal constant, never user input
@@ -321,6 +337,39 @@ def _resolve_pit_disclosure_fields(event: dict) -> tuple[str | None, str | None]
     return extracted.get("disclosure_type"), extracted.get("insider_category")
 
 
+# NSE's structured feed names who traded (CategoryOfPerson, stored in `subcategory`) and
+# how (ModeOfAcquisitionOrDisposal, only in raw_json). Neither was read (2026-09-23
+# audit): every NSE "Buy" alerted as an insider buy whatever the person or the mode --
+# an employee's ESOP allotment, a relative's gift and an inter-se transfer all counted
+# as conviction. Only MARKET trades by promoter/director/KMP carry that signal.
+MARKET_MODES = ("market purchase", "market sale")
+
+
+def _nse_category(subcategory: str | None) -> str | None:
+    text = (subcategory or "").lower()
+    if "promoter" in text:
+        return "promoter"
+    if "director" in text:
+        return "director"
+    if "kmp" in text or "key managerial" in text:
+        return "kmp"
+    if "designated" in text or "employee" in text:
+        return "employee"
+    return None
+
+
+def _nse_mode(event: dict) -> str | None:
+    raw = event.get("nse_pit_raw_json")
+    if not raw:
+        return None
+    try:
+        disclosure = (json.loads(raw) or {}).get("disclosure") or {}
+    except (TypeError, ValueError):
+        return None
+    mode = disclosure.get("ModeOfAcquisitionOrDisposal")
+    return str(mode).strip().lower() if mode else None
+
+
 def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
     # BUG FOUND LIVE 2026-08-18 (re-audit): this used to ignore insider_category and
     # disclosure_type entirely, both already extracted by PIT_SAST_SCHEMA -- alerting
@@ -337,6 +386,13 @@ def evaluate_pit_sast_trigger(event: dict, l2_row: dict | None) -> dict | None:
     disclosure_type, insider_category = _resolve_pit_disclosure_fields(event)
     if disclosure_type == "trading_window_notice":
         return None
+    if event.get("source") == "nse":
+        insider_category = insider_category or _nse_category(event.get("subcategory"))
+        mode = _nse_mode(event)
+        if mode is not None and mode not in MARKET_MODES:
+            return None  # ESOP / gift / inter-se / off-market: not a conviction trade
+    if insider_category == "employee":
+        return None  # an employee's trade is not the promoter/KMP signal this trigger reads
     transaction_type_raw, insider_name = _resolve_pit_transaction_fields(event)
     transaction_type = (transaction_type_raw or "").lower()
     if not transaction_type:
@@ -470,21 +526,43 @@ def load_prior_same_period_results_event(company_master_id: str, *, period_type:
     return None
 
 
-def load_latest_results_calendar_event(company_master_id: str) -> dict | None:
-    """Most recent results_calendar (BSE's own forward results-calendar, already
-    collected by fundamentals/collectors/bse_announcements.py's fetch_result_
-    calendar) event for this company -- corroborating-only baseline, see
-    compute_timing_delay_days' own docstring for why own-history is preferred."""
-    df = sql_to_df(
-        """
-        SELECT disclosure_date
-        FROM fundamentals_events
-        WHERE company_master_id = %s AND filing_type = 'results_calendar'
-        ORDER BY load_ts DESC
-        LIMIT 1
-        """,
-        params=(company_master_id,),
-    )
+CALENDAR_MATCH_WINDOW_DAYS = 60
+
+
+def load_latest_results_calendar_event(company_master_id: str, *, near_date=None) -> dict | None:
+    """The results_calendar (BSE's own forward results-calendar, already collected by
+    fundamentals/collectors/bse_announcements.py's fetch_result_calendar) entry for the
+    SAME results cycle -- corroborating-only baseline, see compute_timing_delay_days'
+    own docstring for why own-history is preferred.
+
+    2026-09-23 audit: this took the row with the newest load_ts whatever its period, and
+    load_ts is when a crawler last touched the row -- so the "expected date" was often
+    next quarter's, and the delay came out negative. With near_date, the entry whose
+    scheduled date is closest to the filing (within CALENDAR_MATCH_WINDOW_DAYS) is used;
+    none in the window means no calendar baseline, not a wrong one."""
+    if near_date is not None:
+        df = sql_to_df(
+            """
+            SELECT disclosure_date
+            FROM fundamentals_events
+            WHERE company_master_id = %s AND filing_type = 'results_calendar'
+              AND abs(disclosure_date::date - %s::date) <= %s
+            ORDER BY abs(disclosure_date::date - %s::date), disclosure_date DESC
+            LIMIT 1
+            """,
+            params=(company_master_id, str(near_date), CALENDAR_MATCH_WINDOW_DAYS, str(near_date)),
+        )
+    else:
+        df = sql_to_df(
+            """
+            SELECT disclosure_date
+            FROM fundamentals_events
+            WHERE company_master_id = %s AND filing_type = 'results_calendar'
+            ORDER BY disclosure_date DESC
+            LIMIT 1
+            """,
+            params=(company_master_id,),
+        )
     return df.iloc[0].to_dict() if not df.empty else None
 
 
@@ -585,7 +663,8 @@ def evaluate_results_trigger(event: dict, l2_row: dict | None) -> dict | None:
         if company_master_id and disclosure_date
         else None
     )
-    calendar_event = load_latest_results_calendar_event(company_master_id) if company_master_id else None
+    calendar_event = (load_latest_results_calendar_event(company_master_id, near_date=disclosure_date)
+                      if company_master_id else None)
     delay = compute_timing_delay_days(
         disclosure_date,
         prior_same_period_disclosure_date=prior_event.get("disclosure_date") if prior_event else None,
@@ -899,7 +978,7 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
     # turnaround, insider-sell-surprise) could never evaluate its L2 gate for
     # them. Built once per run (not per event) since it's the same reverse map
     # for every event in this batch.
-    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id()
+    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id(include_history=True)
 
     tiers_df = load_investor_tiers()
     tiers_by_key = {row["investor_key"]: row for row in tiers_df.to_dict("records")} if not tiers_df.empty else {}
@@ -942,7 +1021,7 @@ def run_l3_rule_triggers(*, limit: int | None = None) -> dict[str, object]:
                 "alert_date": event_dict.get("disclosure_date"),
                 "reasoning": result["reasoning"],
                 "l2_run_date": str(l2_row.get("run_date")) if l2_row is not None else None,
-                "l2_state_snapshot_json": json.dumps(l2_row, ensure_ascii=False, default=str) if l2_row is not None else None,
+                "l2_state_snapshot_json": dumps_strict(l2_row) if l2_row is not None else None,
                 # LOW FINDING (re-audit 2026-08-18): "status" is write-only -- always
                 # "new", no reader or updater anywhere in this repo, shipped to the
                 # frontend where it will always read "new" regardless of real review

@@ -153,6 +153,7 @@ def load_watchlist_for_exit_evaluation() -> pd.DataFrame:
         """
         SELECT w.company_master_id, w.first_seen_price, w.first_seen_at, w.last_alert_at,
                w.suggested_watch_until, w.narrative_generated_at,
+               w.status AS previous_status, w.status_reason AS previous_status_reason,
                tech.close AS current_price, tech.price_data_stale, tech.as_of_date AS technicals_as_of_date,
                a.latest_alert_load_ts
         FROM fundamentals_watchlist w
@@ -181,6 +182,7 @@ def load_trigger_type_history_by_company() -> dict[str, list[dict]]:
         SELECT company_master_id, trigger_type, alert_date
         FROM fundamentals_l3_alerts
         WHERE company_master_id IS NOT NULL
+          AND status NOT LIKE 'superseded%%'   -- round-trip deals are not evidence (2026-09-23)
         ORDER BY company_master_id, alert_date ASC NULLS LAST
         """
     )
@@ -333,6 +335,12 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
     price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"), price_data_stale=price_data_stale)
     if price_reason:
         return "price_flagged", price_reason, False
+    if price_data_stale and row.get("previous_status") == "price_flagged":
+        # A stale price cannot UN-flag a name (2026-09-23 audit): skipping the check used
+        # to fall through to 'active', so a flagged name flipped active for a day on
+        # frozen data -- where the portfolio ruleset could enter it -- and flagged again
+        # once prices refreshed. No fresh price, no change.
+        return "price_flagged", row.get("previous_status_reason"), True
 
     stale_reason = _check_stale(row.get("suggested_watch_until"), row.get("latest_alert_load_ts"), row.get("narrative_generated_at"), today=today)
     if stale_reason:

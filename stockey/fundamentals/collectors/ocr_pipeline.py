@@ -54,6 +54,7 @@ from fundamentals.collectors.events_store import RESULTS_TABLE, _ensure_events_s
 from fundamentals.collectors.security_master import UA
 from utils.blob_store import metadata_to_row, put_text_blob
 from utils.db import db_session, execute_db_operation, sql_to_df
+from utils.schema_migrations import apply_schema_migration
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.ocr.llm_ocr import ocr_page_with_local, render_pdf_pages
@@ -260,6 +261,75 @@ def fetch_document_bytes(url: str, *, domain: str) -> bytes:
     return response.content
 
 
+BSE_ARCHIVE_URL_PREFIX = "https://www.bseindia.com/xml-data/corpfiling/AttachHis/"
+BSE_LIVE_URL_PREFIX = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+
+
+def fetch_document_bytes_with_archive_fallback(url: str, *, domain: str) -> bytes:
+    """BSE moves older filings from AttachLive/ to AttachHis/. Only AttachLive was ever
+    tried, so every older PDF 404'd and was marked failed PERMANENTLY -- 995 of the
+    3-year backfill in its first week (2026-09-23 audit; confirmed by hand: a
+    2024-12-30 filing 404s on AttachLive and returns a 982 KB PDF from AttachHis)."""
+    try:
+        return fetch_document_bytes(url, domain=domain)
+    except DocumentFetchError as exc:
+        if domain != "bse" or "HTTP 404" not in str(exc) or not url.startswith(BSE_LIVE_URL_PREFIX):
+            raise
+        return fetch_document_bytes(BSE_ARCHIVE_URL_PREFIX + url[len(BSE_LIVE_URL_PREFIX):], domain=domain)
+
+
+MAX_OCR_TIMEOUTS = env.int("FUNDAMENTALS_OCR_MAX_TIMEOUTS", 3)
+
+
+def ensure_ocr_timeout_column() -> None:
+    apply_schema_migration(
+        migration_id="20260923_fundamentals_events_ocr_timeouts",
+        description="fundamentals_events: ocr_timeouts counter.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": ["fundamentals_events"]},
+        statements=["ALTER TABLE fundamentals_events ADD COLUMN IF NOT EXISTS ocr_timeouts INTEGER"],
+    )
+
+
+def _record_ocr_timeout(*, source: str, news_id: str) -> None:
+    """Count a timeout; after MAX_OCR_TIMEOUTS the row stops retrying as
+    'timeout_exhausted' -- visible, and treated like a failure downstream."""
+    def _update() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                "UPDATE fundamentals_events SET ocr_timeouts = COALESCE(ocr_timeouts, 0) + 1, "
+                "  ocr_status = CASE WHEN COALESCE(ocr_timeouts, 0) + 1 >= %s THEN 'timeout_exhausted' ELSE ocr_status END "
+                " WHERE source = %s AND news_id = %s",
+                (MAX_OCR_TIMEOUTS, source, news_id),
+            )
+
+    execute_db_operation(_update, operation_name="fundamentals_events:ocr_timeout")
+
+
+def readmit_bse_attachlive_failures() -> None:
+    """One-time: put BSE rows that failed before the AttachHis fallback existed back in
+    the queue. The backlog drains under this module's own per-run limit and time budget,
+    newest filings first, so this cannot turn one run into a thousand fetches.
+
+    ~414 rows: results, ratings, auditor changes, capital raises, RPTs. The 584 failed
+    pit_sast rows are deliberately NOT re-admitted: they are mostly routine trading-window
+    notices, NSE's structured feed already carries recent insider trades, and at ~30
+    OCR'd documents a day they would hold OCR at its 3-hour ceiling for weeks. Re-admit
+    them separately if insider history before the NSE feed is ever needed."""
+    apply_schema_migration(
+        migration_id="20260923_fundamentals_events_readmit_bse_attachlive_ocr_failures",
+        description="fundamentals_events: BSE ocr_status=failed -> NULL, retried with the AttachHis fallback.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": ["fundamentals_events"]},
+        statements=[
+            "UPDATE fundamentals_events SET ocr_status = NULL "
+            " WHERE source = 'bse' AND ocr_status = 'failed' AND attachment_name IS NOT NULL"
+            "   AND filing_type IN ('results', 'rating_action', 'auditor_change', 'capital_raise',"
+            "                       'related_party_transaction')",
+        ],
+    )
+
+
 def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
     # BUG FOUND LIVE 2026-08-17: plain load_ts ASC processes strictly oldest-inserted-
     # first, with no regard for how old the FILING itself is. bse_announcements.py's
@@ -278,7 +348,10 @@ def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
         FROM fundamentals_events
         WHERE (ocr_status IS NULL OR ocr_status = 'pending')
           AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
-        ORDER BY disclosure_date DESC NULLS LAST, load_ts ASC NULLS LAST
+        -- Documents that already timed out go to the BACK (2026-09-23 audit): they used
+        -- to lead every run in the same order, tripping the timeout breaker before any
+        -- fresh filing was reached.
+        ORDER BY COALESCE(ocr_timeouts, 0) ASC, disclosure_date DESC NULLS LAST, load_ts ASC NULLS LAST
     """
     if limit:
         query += f" LIMIT {int(limit)}"
@@ -436,11 +509,12 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
             continue
 
         try:
-            pdf_bytes = fetch_document_bytes(url, domain=domain)
+            pdf_bytes = fetch_document_bytes_with_archive_fallback(url, domain=domain)
             ocr_text = ocr_pdf_bytes(pdf_bytes)
         except OcrTimeoutError as exc:
             consecutive_timeouts_by_domain[domain] = consecutive_timeouts_by_domain.get(domain, 0) + 1
             counts["failed"] += 1
+            _record_ocr_timeout(source=row["source"], news_id=row["news_id"])
             # Deliberately NOT _set_ocr_result(status="failed") here -- see
             # OcrTimeoutError's own docstring for why a timeout stays retryable
             # (ocr_status untouched, so load_pending_ocr_targets re-selects it on
@@ -523,6 +597,8 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
 
 def main() -> int:
     global STOCKEY_RUN_STATE
+    ensure_ocr_timeout_column()
+    readmit_bse_attachlive_failures()
     result = run_ocr_pipeline()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,

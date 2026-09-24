@@ -181,6 +181,49 @@ def _build_deal_flow_event_row(deal: dict, *, load_ts: pd.Timestamp) -> dict[str
     }
 
 
+# Same-day round trips are not a position change (2026-09-23 data audit). Over 120 days,
+# 79% of market-wide bulk-deal SELLS had a same-day BUY by the same client and 59% were
+# within 10% of it -- intraday churn. Each still became a bulk_deal_sell alert, which
+# made the confluence ownership AND event axes contradict (blocking entry for 90 days)
+# and fired thesis_invalidation exits. Deals are now netted per (day, company, client);
+# a client whose buys and sells cancel to within ROUND_TRIP_TOLERANCE of the larger side
+# produces no event at all.
+ROUND_TRIP_TOLERANCE = 0.10
+
+
+def net_deals_by_client_day(deals: pd.DataFrame) -> tuple[list[dict], int]:
+    """(one netted deal per day/company/client, number of round trips dropped)."""
+    if deals.empty:
+        return [], 0
+    work = deals.copy()
+    work["_client"] = work["client_name"].fillna("").astype(str).str.strip().str.upper()
+    work["_day"] = pd.to_datetime(work["date"], utc=True, errors="coerce").dt.normalize()
+    work["_side"] = work["buysell"].fillna("").astype(str).str.strip().str.upper().str[:1]
+    work = work[work["_side"].isin(["B", "S"])]
+    netted, round_trips = [], 0
+    for (_day, _cmid, _client), g in work.groupby(["_day", "company_master_id", "_client"], dropna=False, sort=True):
+        buys, sells = g[g["_side"] == "B"], g[g["_side"] == "S"]
+        bought, sold = float(buys["quantity"].sum()), float(sells["quantity"].sum())
+        net = bought - sold
+        if bought and sold and abs(net) <= ROUND_TRIP_TOLERANCE * max(bought, sold):
+            round_trips += 1
+            continue
+        side = buys if net > 0 else sells
+        qty = side["quantity"].astype(float)
+        price = float((side["price"].astype(float) * qty).sum() / qty.sum()) if qty.sum() else None
+        first = side.iloc[0].to_dict()
+        netted.append({
+            **{k: v for k, v in first.items() if not str(k).startswith("_")},
+            "buysell": "BUY" if net > 0 else "SELL",
+            # the NET quantity: a client that bought 100k and sold 60k added 40k
+            "quantity": int(abs(net)) if float(abs(net)).is_integer() else abs(net),
+            "price": round(price, 4) if price is not None else None,
+            "gross_bought": bought,
+            "gross_sold": sold,
+        })
+    return netted, round_trips
+
+
 def run_deal_flow_detection() -> dict[str, object]:
     company_master_ids = load_l1_company_master_ids()
     if not company_master_ids:
@@ -192,9 +235,11 @@ def run_deal_flow_detection() -> dict[str, object]:
         return {"deals_seen": 0, "events_written": 0, "buy_events": 0, "sell_events": 0}
 
     load_ts = pd.Timestamp.now(tz="UTC")
-    events = [row for row in (_build_deal_flow_event_row(d, load_ts=load_ts) for d in deals.to_dict("records")) if row is not None]
+    netted, round_trips = net_deals_by_client_day(deals)
+    events = [row for row in (_build_deal_flow_event_row(d, load_ts=load_ts) for d in netted) if row is not None]
     if not events:
-        return {"deals_seen": int(len(deals)), "events_written": 0, "buy_events": 0, "sell_events": 0}
+        return {"deals_seen": int(len(deals)), "events_written": 0, "buy_events": 0, "sell_events": 0,
+                "round_trips_dropped": round_trips}
 
     _ensure_events_schema()
     upsert_to_db(pd.DataFrame(events), EVENTS_TABLE, unique_keys=["source", "news_id"])
@@ -204,6 +249,7 @@ def run_deal_flow_detection() -> dict[str, object]:
         "events_written": len(events),
         "buy_events": buy_events,
         "sell_events": len(events) - buy_events,
+        "round_trips_dropped": round_trips,
     }
 
 

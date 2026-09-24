@@ -15,6 +15,7 @@ import redis
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.company_master import attach_company_master_id
 from utils.db import db_session, execute_db_operation, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.ingestion_state import get_processed_keys, mark_failed, mark_processed
 from utils import store
 from utils.sync import get_redis_client
@@ -33,6 +34,19 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 
 rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
+
+
+def _ensure_date_column_is_timestamptz(table: str) -> None:
+    """bulk/block deals' `date` was created TEXT (short_selling's is TIMESTAMPTZ), so every
+    reader had to cast and a lexical comparison would silently misorder (2026-09-23 data
+    audit). One format, no post-cast duplicates, so the cast is lossless."""
+    apply_schema_migration(
+        migration_id=f"20260923_{table}_date_to_timestamptz",
+        description=f"{table}.date: TEXT -> TIMESTAMPTZ.",
+        owner="data.nseindia.offmarket_parser",
+        metadata={"tables": [table]},
+        statements=[f"ALTER TABLE {table} ALTER COLUMN date TYPE TIMESTAMPTZ USING date::timestamptz"],
+    )
 
 def ensure_unique_constraint(
     table_name: str,
@@ -206,6 +220,8 @@ def process_csv(file_name, csv_path):
         drop_constraints=drop_constraints,
         drop_indexes=drop_indexes,
     )
+    if dtype in ("bulk_deals", "block_deals"):
+        _ensure_date_column_is_timestamptz(f"nseindia_{dtype}")
     upsert_to_db(df, f"nseindia_{dtype}", unique_keys=unique_keys)
     state_status = EMPTY_VALID_STATUS if df.empty else "processed"
     mark_processed(SOURCE_PREFIX, file_name, status=state_status)

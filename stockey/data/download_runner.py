@@ -74,6 +74,19 @@ PARSER_STEPS = [
     # holidays downloader has refreshed nseindia_holidays, which is what extends the
     # runway into future years.
     {"module": "data.nseindia.calendar_creator", "args": [], "purpose": "trading_calendar"},
+    # SCHEDULED 2026-09-24. dim_security / dim_security_history had NO scheduled producer:
+    # the table was last built by hand ~2026-08-10, so every listing and every NSE rename
+    # since then had no ISIN, no sector code and no company id there -- read by the event
+    # dedupe (ISIN), NSE PIT's issuer lookup, L2's sector percentiles and the confluence
+    # sector axis. Both derive from nseindia_ohlcv, so they follow bhavcopy_parser; the
+    # dimension reads the history, so history first. Non-critical: a failure here must
+    # not fail the market-data path.
+    {"module": "data.nseindia.security_history", "args": [], "purpose": "identity_dimension"},
+    {"module": "data.nseindia.security_dimension", "args": [], "purpose": "identity_dimension"},
+    # Fills company_master_id left NULL at parse time -- chiefly the first day of an NSE
+    # symbol rename, before the ISIN alias can exist (it needs the bhavcopy to show the new
+    # symbol). Cheap: only NULL rows are touched.
+    {"module": "data.backfill_company_master_ids", "args": [], "purpose": "identity_dimension"},
     # No dependency on anything after it -- placed before benchmark_sync only to
     # preserve benchmark_sync as the literal last parser step (it depends on the
     # rest of the chain having already run; offmarket_parser depends on nothing

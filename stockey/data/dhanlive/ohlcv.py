@@ -12,7 +12,7 @@ from data.dhanlive.auth import DhanAuthError
 from data.dhanlive.client import DhanAPIError, DhanHistoricalClient, candles_to_df
 from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.fallback_telemetry import record_local_fallback_event
-from utils.db import sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, normalize_date_window, parse_datetime_arg
 
@@ -179,11 +179,15 @@ def latest_daily_snapshot(identifier: str, exchange: str, asset_type: str) -> di
             MAX(date) AS max_date,
             MAX(load_ts) AS max_load_ts
         FROM {DAILY_TABLE}
-        WHERE security_id = %s
+        WHERE ticker = %s
           AND exchange = %s
           AND asset_type = %s
         """,
-        params=(identity["security_id"], exchange.upper(), asset_type.lower()),
+        # By the company's ticker, not the security_id (2026-09-24): a stock moving between
+        # EQ and BE switches Dhan ids, the new id had no bars, and every switch re-fetched 5
+        # years that Dhan serves identically under either id -- 47,376 duplicated
+        # company-days across 258 tickers.
+        params=(str(identity["ticker"]), str(identity["exchange"]).upper(), asset_type.lower()),
     )
     if df.empty:
         return {"min_date": None, "max_date": None, "max_load_ts": None}
@@ -508,6 +512,47 @@ def normalize_intraday_frame(
     )
 
 
+def alternate_nse_equity_security_ids(identity: dict) -> list[int]:
+    """Other ACTIVE Dhan EQUITY ids for the same NSE symbol (the EQ/BE pair)."""
+    if str(identity.get("exchange")) != "NSE" or identity.get("asset_type") != "stock":
+        return []
+    df = sql_to_df(
+        """
+        SELECT security_id FROM master_dhan_instruments
+         WHERE exch_id = 'NSE' AND segment = 'E' AND instrument = 'EQUITY' AND valid_to IS NULL
+           AND underlying_symbol = %s AND security_id <> %s
+         ORDER BY (series = 'BE') DESC, load_ts DESC
+        """,
+        params=(str(identity.get("ticker")), int(identity["security_id"])),
+    )
+    return [] if df.empty else [int(v) for v in df["security_id"].tolist()]
+
+
+def _fetch_daily_with_alternate_id(api_client, identity: dict, first_error: Exception, *,
+                                   from_date, to_date, ticker: str):
+    """A stock moved from EQ to BE keeps two active Dhan ids. company_master stores the EQ
+    id because Dhan serves INTRADAY under it, but its DAILY endpoint answers 400 "Missing
+    required fields" for that id and serves the BE one (measured 2026-09-24; 115 of the
+    178 symbols the 2026-09-23 evening reconcile could not fetch). On such an error, try
+    the symbol's other active id once; bars are stored under the id that served them."""
+    for alternate in alternate_nse_equity_security_ids(identity):
+        try:
+            payload = api_client.fetch_daily(
+                security_id=alternate,
+                exchange_segment=str(identity["exchange_segment"]),
+                instrument=str(identity["instrument"]),
+                from_date=from_date,
+                to_date=to_date,
+            )
+        except DhanAPIError:
+            continue
+        print({"mode": "daily", "ticker": ticker, "warning": "dhan_daily_served_by_alternate_id",
+               "primary_security_id": identity["security_id"], "alternate_security_id": alternate},
+              file=sys.stderr, flush=True)
+        return payload, {**identity, "security_id": alternate}
+    raise first_error
+
+
 def sync_daily_ohlcv(
     ticker: str,
     *,
@@ -530,13 +575,19 @@ def sync_daily_ohlcv(
 
     api_client = client or DhanHistoricalClient()
     try:
-        payload = api_client.fetch_daily(
-            security_id=identity["security_id"],
-            exchange_segment=str(identity["exchange_segment"]),
-            instrument=str(identity["instrument"]),
-            from_date=effective_from_date,
-            to_date=effective_to_date,
-        )
+        try:
+            payload = api_client.fetch_daily(
+                security_id=identity["security_id"],
+                exchange_segment=str(identity["exchange_segment"]),
+                instrument=str(identity["instrument"]),
+                from_date=effective_from_date,
+                to_date=effective_to_date,
+            )
+        except DhanAPIError as exc:
+            if is_no_data_error(exc) or classify_symbol_sync_error(exc) == "auth_unavailable":
+                raise
+            payload, identity = _fetch_daily_with_alternate_id(
+                api_client, identity, exc, from_date=effective_from_date, to_date=effective_to_date, ticker=ticker)
     except DhanAPIError as exc:
         if not is_no_data_error(exc):
             raise
@@ -587,7 +638,30 @@ def sync_daily_ohlcv(
         # where a re-fetched settled bar carries values identical to what is stored.
         on_conflict="update_if_changed",
     )
+    _drop_same_day_bars_under_other_ids(df, identity)
     return df
+
+
+def _drop_same_day_bars_under_other_ids(df: pd.DataFrame, identity: dict) -> None:
+    """One bar per company per day: the id that just served it wins. The unique key is
+    per security_id, so a company whose Dhan id changed (EQ <-> BE) would otherwise keep
+    the overlap days twice -- Dhan serves identical bars under both (2026-09-24)."""
+    if df.empty or "date" not in df.columns:
+        return
+    dates = sorted({pd.Timestamp(d) for d in df["date"].dropna()})
+    if not dates:
+        return
+
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"DELETE FROM {DAILY_TABLE} WHERE exchange = %s AND ticker = %s AND security_id <> %s "
+                "  AND date >= %s AND date <= %s AND date = ANY(%s)",
+                (str(identity["exchange"]).upper(), str(identity["ticker"]), int(identity["security_id"]),
+                 dates[0], dates[-1], [d.to_pydatetime() for d in dates]),
+            )
+
+    execute_db_operation(_op, operation_name=f"{DAILY_TABLE}:drop_other_id_duplicates")
 
 
 def _intraday_windows(from_date: datetime, to_date: datetime) -> Iterable[tuple[datetime, datetime]]:

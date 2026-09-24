@@ -37,6 +37,7 @@ import pandas as pd
 from psycopg2 import sql
 
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 RESULTS_TABLE = "fundamentals_events"
 
@@ -85,6 +86,30 @@ def _ensure_events_schema() -> None:
                 )
 
     execute_db_operation(_op, operation_name="fundamentals_events:ensure_schema")
+    _ensure_event_date_types()
+
+
+def _ensure_event_date_types() -> None:
+    """2026-09-23 data audit. announcement_timestamp was TEXT in four formats (Postgres
+    '+00', isoformat 'T...+00:00', naive IST) -- lexical order between ' ' and 'T' is
+    wrong, and the cross-exchange merge picks the "earliest". disclosure_date stays TEXT
+    (the API serialises it verbatim) but must be 'YYYY-MM-DD': deal_flow wrote
+    '2026-07-24 00:00:00+00' for 234 rows, which never equals a date key. The CHECK
+    makes a malformed date fail loudly at write time instead of silently mismatching."""
+    apply_schema_migration(
+        migration_id="20260923_fundamentals_events_date_types",
+        description="fundamentals_events: announcement_timestamp -> TIMESTAMPTZ; disclosure_date ISO + CHECK.",
+        owner="fundamentals.collectors.events_store",
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"UPDATE {RESULTS_TABLE} SET disclosure_date = left(disclosure_date, 10) "
+            r" WHERE disclosure_date !~ '^\d{4}-\d{2}-\d{2}$' AND disclosure_date ~ '^\d{4}-\d{2}-\d{2}'",
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN announcement_timestamp TYPE TIMESTAMPTZ "
+            "USING announcement_timestamp::timestamptz",
+            f"ALTER TABLE {RESULTS_TABLE} ADD CONSTRAINT fundamentals_events_disclosure_date_iso "
+            r"CHECK (disclosure_date IS NULL OR disclosure_date ~ '^\d{4}-\d{2}-\d{2}$')",
+        ],
+    )
 
 
 def resolve_isin(company_master_ids: pd.Series) -> pd.Series:
@@ -123,7 +148,8 @@ def resolve_issuer_names(company_master_ids: pd.Series) -> pd.Series:
     return company_master_ids.map(name_by_company_master_id)
 
 
-def find_dedup_candidate(isin: str | None, filing_type: str | None, disclosure_date) -> dict | None:
+def find_dedup_candidate(isin: str | None, filing_type: str | None, disclosure_date, *,
+                         other_than_source: str | None = None) -> dict | None:
     """The earliest-loaded existing row (if any) for this (isin, filing_type,
     disclosure_date) -- the merge target for an incoming row that turns out to be the
     same underlying disclosure from a different exchange.
@@ -146,10 +172,11 @@ def find_dedup_candidate(isin: str | None, filing_type: str | None, disclosure_d
                announcement_timestamp, sources
         FROM fundamentals_events
         WHERE isin = %s AND filing_type = %s AND disclosure_date = %s
+          AND (%s::text IS NULL OR source <> %s::text)
         ORDER BY load_ts ASC
         LIMIT 1
         """,
-        params=(isin, filing_type, str(disclosure_date)),
+        params=(isin, filing_type, str(disclosure_date), other_than_source, other_than_source),
     )
     return None if df.empty else df.iloc[0].to_dict()
 
@@ -224,6 +251,50 @@ def _dedup_key(row: dict) -> tuple | None:
     return (isin, filing_type, str(disclosure_date))
 
 
+def _same_disclosure(existing: dict, incoming: dict) -> bool:
+    """Is `incoming` the SAME disclosure as `existing`, seen on the other exchange?
+
+    2026-09-23 data audit: the key (isin, filing_type, disclosure_date) alone merged
+    genuinely different filings -- two insiders trading on one day, standalone and
+    consolidated results, NSE's Disclosure1..N persons -- and the losers were never
+    stored. The repo's own dedupe audit had found 54 of 73 colliding groups were
+    distinct real filings. Now: only rows from DIFFERENT sources can merge, and two
+    rows that both name an insider must name the same one."""
+    if existing.get("source") == incoming.get("source"):
+        return False
+    a = str(existing.get("insider_name") or "").strip().lower()
+    b = str(incoming.get("insider_name") or "").strip().lower()
+    return not (a and b and a != b)
+
+
+# Filled on an existing row only where it is still NULL (a PDF BSE attaches later).
+# Everything else on an existing row -- processing status, NSE-merged insider fields,
+# enrichment -- belongs to the pipeline stages that set it, not to the next re-crawl.
+_FILL_IF_NULL_COLUMNS = ("attachment_name", "detail_url", "isin", "subcategory", "scrip_code")
+
+
+def _existing_event_keys(rows: list[dict]) -> set[tuple[str, str]]:
+    news_ids = sorted({str(r["news_id"]) for r in rows})
+    if not news_ids:
+        return set()
+    df = sql_to_df("SELECT source, news_id FROM fundamentals_events WHERE news_id = ANY(%s)", params=(news_ids,))
+    return set() if df.empty else set(zip(df["source"], df["news_id"]))
+
+
+def _fill_nulls_on_existing(rows: list[dict]) -> None:
+    def _update() -> None:
+        with db_session() as (_, cur):
+            for row in rows:
+                present = [c for c in _FILL_IF_NULL_COLUMNS if row.get(c) is not None and not (isinstance(row.get(c), float) and pd.isna(row.get(c)))]
+                if not present:
+                    continue
+                sets = ", ".join(f"{c} = COALESCE({c}, %s)" for c in present)
+                cur.execute(f"UPDATE fundamentals_events SET {sets} WHERE source = %s AND news_id = %s",  # noqa: S608 -- fixed column names
+                            (*[row[c] for c in present], row["source"], row["news_id"]))
+
+    execute_db_operation(_update, operation_name="fundamentals_events:fill_nulls_on_existing")
+
+
 def upsert_events_with_dedup(rows: list[dict]) -> dict[str, int]:
     """Insert new fundamentals_events rows, merging into an existing cross-source match
     instead of inserting a duplicate -- see module docstring. Rows without an isin
@@ -243,33 +314,48 @@ def upsert_events_with_dedup(rows: list[dict]) -> dict[str, int]:
 
     _ensure_events_schema()
 
+    # RE-CRAWLS DO NOT OVERWRITE (2026-09-23 data audit). The BSE crawl looks back 7 days,
+    # so each filing came through here ~7 times, and each time upsert's DO UPDATE reset
+    # every column in the frame: NSE-merged insider fields back to NULL, sources back to
+    # 'bse', enrichment_status back to 'pending' (re-searching ratings daily),
+    # announcement_timestamp back to BSE's, load_ts to now. An already-stored row now
+    # only has its still-NULL identity/attachment fields filled.
+    existing = _existing_event_keys(rows)
+    already_stored = [r for r in rows if (r["source"], str(r["news_id"])) in existing]
+    rows = [r for r in rows if (r["source"], str(r["news_id"])) not in existing]
+    if already_stored:
+        _fill_nulls_on_existing(already_stored)
+
     to_insert: list[dict] = []
-    staged_by_key: dict[tuple, int] = {}
+    staged_by_key: dict[tuple, list[int]] = {}
     merged = 0
 
     for row in rows:
-        candidate = find_dedup_candidate(row.get("isin"), row.get("filing_type"), row.get("disclosure_date"))
-        if candidate is not None and (candidate["source"], candidate["news_id"]) != (row["source"], row["news_id"]):
+        candidate = find_dedup_candidate(row.get("isin"), row.get("filing_type"), row.get("disclosure_date"),
+                                         other_than_source=row.get("source"))
+        if candidate is not None and _same_disclosure(candidate, row):
             merged_fields = _merge_row_fields(candidate, row)
             _apply_merge(source=candidate["source"], news_id=candidate["news_id"], merged_fields=merged_fields)
             merged += 1
             continue
 
         key = _dedup_key(row)
-        staged_idx = staged_by_key.get(key) if key is not None else None
-        if staged_idx is not None:
-            staged_row = to_insert[staged_idx]
-            if (staged_row["source"], staged_row["news_id"]) != (row["source"], row["news_id"]):
-                merged_fields = _merge_row_fields(staged_row, row)
-                to_insert[staged_idx] = {**staged_row, **merged_fields}
-                merged += 1
-                continue
+        staged_match = next(
+            (i for i in (staged_by_key.get(key, []) if key is not None else [])
+             if _same_disclosure(to_insert[i], row)),
+            None,
+        )
+        if staged_match is not None:
+            merged_fields = _merge_row_fields(to_insert[staged_match], row)
+            to_insert[staged_match] = {**to_insert[staged_match], **merged_fields}
+            merged += 1
+            continue
 
         to_insert.append(row)
         if key is not None:
-            staged_by_key[key] = len(to_insert) - 1
+            staged_by_key.setdefault(key, []).append(len(to_insert) - 1)
 
     if to_insert:
-        upsert_to_db(pd.DataFrame(to_insert), RESULTS_TABLE, unique_keys=["source", "news_id"])
+        upsert_to_db(pd.DataFrame(to_insert), RESULTS_TABLE, unique_keys=["source", "news_id"], on_conflict="nothing")
 
-    return {"inserted": len(to_insert), "merged": merged}
+    return {"inserted": len(to_insert), "merged": merged, "already_stored": len(already_stored)}

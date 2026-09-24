@@ -7,7 +7,7 @@ import pandas as pd
 from utils.fallback_telemetry import record_local_fallback_event
 from utils.schema_migrations import apply_schema_migration
 
-from .db import sql_to_df, upsert_to_db
+from .db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 
 
 COMPANY_MASTER_TABLE = "company_master"
@@ -120,6 +120,14 @@ def sync_company_master() -> pd.DataFrame:
             security_id AS dhan_nse_id,
             COALESCE(NULLIF(display_name, ''), NULLIF(symbol_name, '')) AS dhan_nse_name
         FROM master_dhan_instruments
+        LEFT JOIN (
+            -- The series each symbol traded in on its LATEST bhavcopy day. See ORDER BY.
+            SELECT DISTINCT ON (symbol) symbol AS current_symbol, series AS current_series
+              FROM nseindia_ohlcv
+             WHERE series IN ('EQ', 'BE')
+               AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
+             ORDER BY symbol, date DESC
+        ) current_listing ON current_listing.current_symbol = underlying_symbol
         WHERE valid_to IS NULL
           AND exch_id = 'NSE'
           AND instrument = 'EQUITY'
@@ -162,7 +170,17 @@ def sync_company_master() -> pd.DataFrame:
         --
         -- (series = 'EQ') DESC only breaks ties: a symbol that trades ONLY in BE still
         -- resolves to its BE id, because that is then the sole row.
-        ORDER BY underlying_symbol, (series = 'EQ') DESC, load_ts DESC, valid_from DESC
+        --
+        -- CURRENT SERIES FIRST (measured 2026-09-24). A stock moved between EQ and BE keeps
+        -- BOTH Dhan ids active, and Dhan serves daily AND intraday only under the id of the
+        -- series it trades in THAT day: GATECH/PARSVNATH/VCL (BE throughout) -> 374
+        -- intraday bars on the BE id, 0 on EQ; REPL/RSWM/VALIANTORG (back to EQ on 09-21)
+        -- -> 374 on EQ, 0 on BE. EMPOWER (above) is the same rule: it traded EQ. So the
+        -- latest bhavcopy day's series decides; EQ breaks ties when there is no row. The
+        -- daily sync still retries the other active id on a 400, for the day a stock
+        -- switches series before this sync has seen the new bhavcopy.
+        ORDER BY underlying_symbol, (series = current_series) DESC NULLS LAST,
+                 (series = 'EQ') DESC, load_ts DESC, valid_from DESC
         """,
         operation="sync_dhan_nse",
     )
@@ -284,7 +302,94 @@ def sync_company_master() -> pd.DataFrame:
     company_master = company_master.drop_duplicates(subset=["company_master_id"], keep="last")
 
     upsert_to_db(company_master, COMPANY_MASTER_TABLE, ["company_master_id"])
+    sync_nse_symbol_aliases()
     return company_master
+
+
+# --- NSE symbol renames (2026-09-24) -----------------------------------------------
+# NSE renames symbols (TATAMOTORS -> TMPV, LTIM -> LTM, INFIBEAM -> CCAVENUE, HEG -> HEGAM,
+# AKZOINDIA -> JSWDULUX, SEQUENT -> VIYASH, ...) and neither identity feed follows: Dhan's
+# instrument master keeps the old symbol (same ISIN, same security_id) and Sharpely has no
+# row. So the bhavcopy's NEW symbol resolved to no company at all: its nseindia_ohlcv rows
+# carried company_master_id NULL (TMPV, LTM, CCAVENUE since at least June), and every Dhan
+# job keyed on the bhavcopy symbol skipped the company -- Tata Motors PV's Dhan daily series
+# stopped 2026-07-14. An alias maps the current symbol to the EXISTING company_master_id
+# by ISIN (bhavcopy ISIN -> Dhan security_id -> company_master), so no id changes and no
+# history is orphaned. Rebuilt from scratch on every sync; the bhavcopy is the authority.
+NSE_ALIAS_TABLE = "company_master_nse_alias"
+
+
+def ensure_nse_alias_table() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {NSE_ALIAS_TABLE} (
+                    alias_ticker TEXT PRIMARY KEY,
+                    company_master_id TEXT NOT NULL,
+                    isin TEXT,
+                    canonical_nse_ticker TEXT,
+                    load_ts TIMESTAMPTZ
+                )
+                """
+            )
+
+    execute_db_operation(_op, operation_name=f"{NSE_ALIAS_TABLE}:ensure_table")
+
+
+def sync_nse_symbol_aliases() -> int:
+    ensure_nse_alias_table()
+    aliases = _company_master_sql_to_df(
+        f"""
+        WITH listed AS (
+            SELECT DISTINCT ON (symbol) symbol, isin
+              FROM nseindia_ohlcv
+             WHERE series IN ('EQ', 'BE') AND isin IS NOT NULL
+               AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
+             ORDER BY symbol, date DESC
+        ), unmapped AS (
+            SELECT l.* FROM listed l
+             WHERE NOT EXISTS (SELECT 1 FROM {COMPANY_MASTER_TABLE} cm WHERE cm.nse_ticker = l.symbol)
+        ), dhan AS (
+            SELECT DISTINCT isin, security_id FROM master_dhan_instruments
+             WHERE exch_id = 'NSE' AND instrument = 'EQUITY' AND valid_to IS NULL AND isin IS NOT NULL
+        )
+        SELECT DISTINCT ON (u.symbol) u.symbol AS alias_ticker, cm.company_master_id, u.isin,
+               cm.nse_ticker AS canonical_nse_ticker
+          FROM unmapped u
+          JOIN dhan d ON d.isin = u.isin
+          JOIN {COMPANY_MASTER_TABLE} cm ON cm.dhan_nse_id = d.security_id
+         ORDER BY u.symbol, cm.company_master_id
+        """,
+        operation="sync_nse_aliases",
+    )
+
+    def _replace() -> None:
+        with db_session() as (_, cur):
+            cur.execute(f"DELETE FROM {NSE_ALIAS_TABLE}")
+            for row in aliases.itertuples():
+                cur.execute(
+                    f"INSERT INTO {NSE_ALIAS_TABLE} (alias_ticker, company_master_id, isin, canonical_nse_ticker, load_ts) "
+                    "VALUES (%s, %s, %s, %s, now())",
+                    (row.alias_ticker, row.company_master_id, row.isin, row.canonical_nse_ticker),
+                )
+
+    execute_db_operation(_replace, operation_name=f"{NSE_ALIAS_TABLE}:replace")
+    return int(len(aliases))
+
+
+def _nse_alias_lookup(tickers: list[str]) -> pd.DataFrame:
+    """alias_ticker -> company_master_id; empty (never raises) before the table exists."""
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "company_master_id"])
+    try:
+        return _company_master_sql_to_df(
+            f"SELECT alias_ticker AS ticker, company_master_id FROM {NSE_ALIAS_TABLE} WHERE alias_ticker = ANY(%s)",
+            params=(tickers,),
+            operation="map_nse_aliases",
+        )
+    except Exception:  # noqa: BLE001 -- table absent on a fresh DB: no aliases, direct matches still work
+        return pd.DataFrame(columns=["ticker", "company_master_id"])
 
 
 def attach_company_master_id(
@@ -357,7 +462,7 @@ def map_company_master_ids(tickers: Iterable[object], *, exchange: str) -> pd.Se
         operation=f"map_{exchange_upper.lower()}_ids",
     )
     if lookup.empty:
-        return pd.Series(pd.NA, index=ticker_series.index, dtype="string")
+        lookup = pd.DataFrame(columns=["ticker", "company_master_id"])
 
     # BUG FOUND LIVE 2026-08-17: two company_master rows sharing the same
     # nse_ticker/bse_ticker used to be resolved via drop_duplicates(keep="last") with
@@ -383,7 +488,14 @@ def map_company_master_ids(tickers: Iterable[object], *, exchange: str) -> pd.Se
         )
 
     mapping = lookup.drop_duplicates(subset=["ticker"], keep="last").set_index("ticker")["company_master_id"]
-    return cleaned.map(mapping).astype("string")
+    resolved = cleaned.map(mapping).astype("string")
+    if exchange_upper == "NSE" and resolved.isna().any():
+        unresolved = cleaned[resolved.isna()].dropna().unique().tolist()
+        aliases = _nse_alias_lookup(unresolved)
+        if not aliases.empty:
+            alias_map = aliases.set_index("ticker")["company_master_id"]
+            resolved = resolved.fillna(cleaned.map(alias_map).astype("string"))
+    return resolved
 
 
 def map_company_master_ids_nse_or_bse(tickers: Iterable[object]) -> pd.Series:
@@ -427,7 +539,7 @@ def map_company_master_ids_nse_or_bse(tickers: Iterable[object]) -> pd.Series:
     return resolved
 
 
-def build_l1_ticker_by_company_master_id() -> dict[str, str]:
+def build_l1_ticker_by_company_master_id(*, include_history: bool = False) -> dict[str, str]:
     """Reverse of map_company_master_ids_nse_or_bse: given a company_master_id, what
     fundamentals_l1_universe.ticker (screener.in's own slug -- the NSE symbol for
     most companies, but a raw BSE numeric scrip code for the ~22% BSE-only cohort)
@@ -450,13 +562,27 @@ def build_l1_ticker_by_company_master_id() -> dict[str, str]:
     reverse map by resolving the whole L1 universe forward (same machinery
     map_company_master_ids_nse_or_bse already uses) and inverting it. Cheap
     (L1 universe is ~200 rows) -- call fresh per use, no caller-managed cache."""
-    tickers_df = sql_to_df(
-        """
-        SELECT ticker
-        FROM fundamentals_l1_universe
-        WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
-        """
-    )
+    # include_history (2026-09-23 data audit): the latest-run map made every company that
+    # had LEFT L1 unreachable -- its L2 rows still exist, but 19-22 of 137 watchlist names
+    # scored with every L2 axis None, open positions lost ADV/resolution inputs, and a
+    # thinner name passed "no contradicting axis" more easily. Identity lookups pass True;
+    # callers that mean "today's universe" (deal_flow's scope, L2 crawl scope) keep the
+    # default. Oldest-first so last-wins keeps a company's NEWEST slug (BSE code -> NSE).
+    if include_history:
+        tickers_df = sql_to_df(
+            """
+            SELECT ticker FROM fundamentals_l1_universe
+            GROUP BY ticker ORDER BY max(run_date) ASC
+            """
+        )
+    else:
+        tickers_df = sql_to_df(
+            """
+            SELECT ticker
+            FROM fundamentals_l1_universe
+            WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
+            """
+        )
     if tickers_df.empty:
         return {}
     resolved = map_company_master_ids_nse_or_bse(tickers_df["ticker"])
@@ -483,13 +609,20 @@ def load_company_master_records(ticker: str, exchanges: Optional[Sequence[str]] 
 
     frames: list[pd.DataFrame] = []
     if "NSE" in exchanges_upper:
-        frames.append(
-            _company_master_sql_to_df(
-                f"SELECT * FROM {COMPANY_MASTER_TABLE} WHERE nse_ticker = %s ORDER BY company_master_id",
-                params=(clean_ticker,),
-                operation="load_nse_records",
-            )
+        nse_records = _company_master_sql_to_df(
+            f"SELECT * FROM {COMPANY_MASTER_TABLE} WHERE nse_ticker = %s ORDER BY company_master_id",
+            params=(clean_ticker,),
+            operation="load_nse_records",
         )
+        if nse_records.empty:
+            aliases = _nse_alias_lookup([clean_ticker])
+            if not aliases.empty:
+                nse_records = _company_master_sql_to_df(
+                    f"SELECT * FROM {COMPANY_MASTER_TABLE} WHERE company_master_id = ANY(%s) ORDER BY company_master_id",
+                    params=(aliases["company_master_id"].tolist(),),
+                    operation="load_nse_alias_records",
+                )
+        frames.append(nse_records)
     if "BSE" in exchanges_upper:
         frames.append(
             _company_master_sql_to_df(

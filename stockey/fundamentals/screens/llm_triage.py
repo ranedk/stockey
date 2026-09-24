@@ -36,6 +36,7 @@ from psycopg2 import sql as psycopg2_sql
 
 from fundamentals.screens.l3_triggers import RESULTS_TABLE, _ensure_alerts_table, load_latest_l2_state
 from utils.company_master import build_l1_ticker_by_company_master_id
+from utils.json_safe import dumps_strict
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
@@ -129,11 +130,22 @@ def load_candidate_events_for_triage(limit: int | None = None) -> pd.DataFrame:
         WHERE filing_type IN ('rating_action', 'pit_sast', 'results')
           AND (llm_triage_status IS NULL OR llm_triage_status = 'pending')
           AND (
-                (filing_type = 'rating_action' AND rating_action_type IS NOT NULL)
-             OR (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
+                -- rating_action no longer short-circuits on its flat action type
+                -- (2026-09-23 audit): that label comes from the agency LISTING headline,
+                -- so a downgrade on one instrument behind a "reaffirmed" headline was
+                -- judged before extraction could see it, and closed for good.
+                -- rating_downgrade had never fired. Ratings now wait for the document
+                -- like every other filing type.
+                (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
              OR (attachment_name IS NULL AND rationale_pdf_url IS NULL)
-             OR (ocr_status IN ('done', 'failed', 'no_document')
-                 AND (structured_extraction_status IS NULL OR structured_extraction_status != 'pending'))
+             -- OCR'd rows wait for extraction to FINISH (2026-09-23 audit): "IS NULL"
+             -- used to count as finished, so a row OCR'd but not yet extracted was
+             -- judged with no JSON and closed for good. Extraction sets a status on
+             -- every OCR'd row (done / failed / unsupported_filing_type), so this
+             -- cannot strand one. A failed or document-less row has nothing to wait for.
+             OR (ocr_status = 'done' AND structured_extraction_status IS NOT NULL
+                 AND structured_extraction_status != 'pending')
+             OR ocr_status IN ('failed', 'no_document', 'timeout_exhausted')
           )
         ORDER BY load_ts ASC NULLS LAST
     """
@@ -205,7 +217,7 @@ def triage_event(evidence_bundle: dict, *, model: str = DEFAULT_MODEL) -> dict:
         model=model,
         messages=[
             {"role": "system", "content": TRIAGE_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(evidence_bundle, ensure_ascii=False, default=str)},
+            {"role": "user", "content": dumps_strict(evidence_bundle)},
         ],
         response_format={"type": "json_schema", "json_schema": {"name": "triage_judgment", "schema": TRIAGE_SCHEMA, "strict": True}},
     )
@@ -237,7 +249,7 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
     # l3_triggers.py's sibling loop -- wrong for the ~22% BSE-only cohort whose
     # fundamentals_l2_state.ticker isn't their own company_master_id's symbol.
     # Built once per run, same reverse map every other fixed call site uses.
-    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id()
+    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id(include_history=True)
 
     counts = {"flagged": 0, "not_interesting": 0, "failed": 0}
     consecutive_failures = 0
@@ -292,13 +304,13 @@ def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> d
                 "alert_date": event_dict.get("disclosure_date"),
                 "reasoning": judgment.get("reasoning"),
                 "l2_run_date": str(l2_row.get("run_date")) if l2_row is not None else None,
-                "l2_state_snapshot_json": json.dumps(l2_row, ensure_ascii=False, default=str) if l2_row is not None else None,
+                "l2_state_snapshot_json": dumps_strict(l2_row) if l2_row is not None else None,
                 # LOW FINDING (re-audit 2026-08-18): "status" is write-only -- see
                 # l3_triggers.py's own identical comment on its twin write site.
                 "status": "new",
                 "model": model,
                 "prompt_version": PROMPT_VERSION,
-                "evidence_bundle_json": json.dumps(evidence_bundle, ensure_ascii=False, default=str),
+                "evidence_bundle_json": dumps_strict(evidence_bundle),
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }
         )

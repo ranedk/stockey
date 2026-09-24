@@ -27,6 +27,13 @@ SPECS: tuple[BackfillSpec, ...] = (
     BackfillSpec("nseindia_ohlcv", "symbol", exchange="NSE"),
     BackfillSpec("nseindia_corporate_actions_normalized", "symbol", exchange="NSE"),
     BackfillSpec("dim_security_history", "symbol", exchange="NSE"),
+    # Added 2026-09-24: these carry company_master_id too and had the same NSE-rename gap.
+    BackfillSpec("dim_security", "symbol", exchange="NSE"),
+    BackfillSpec("nseindia_mto", "symbol", exchange="NSE"),
+    BackfillSpec("nseindia_circuit_hit", "symbol", exchange="NSE"),
+    BackfillSpec("nseindia_short_selling", "symbol", exchange="NSE"),
+    BackfillSpec("nseindia_bulk_deals", "symbol", exchange="NSE"),
+    BackfillSpec("nseindia_block_deals", "symbol", exchange="NSE"),
 )
 
 
@@ -118,7 +125,23 @@ def _run_update(cur, spec: BackfillSpec) -> int:
               AND dst.company_master_id IS NULL
         """
     cur.execute(sql)
-    return cur.rowcount
+    updated = cur.rowcount
+    if (spec.exchange or "").upper() == "NSE" and not spec.exchange_column:
+        # NSE renames: the new symbol matches no nse_ticker; company_master_nse_alias maps
+        # it to the existing company by ISIN (utils.company_master, 2026-09-24).
+        cur.execute("SELECT to_regclass('public.company_master_nse_alias') IS NOT NULL")
+        if cur.fetchone()[0]:
+            cur.execute(
+                f"""
+                UPDATE public."{spec.table_name}" AS dst
+                SET company_master_id = a.company_master_id
+                FROM public.company_master_nse_alias AS a
+                WHERE dst."{spec.ticker_column}" = a.alias_ticker
+                  AND dst.company_master_id IS NULL
+                """
+            )
+            updated += cur.rowcount
+    return updated
 def _table_exists(cur, table_name: str) -> bool:
     cur.execute(
         """
@@ -143,19 +166,29 @@ def _column_exists(cur, table_name: str, column_name: str) -> bool:
     return cur.fetchone() is not None
 
 
-def main() -> None:
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def main(argv: list[str] | None = None) -> int:
+    global STOCKEY_RUN_STATE
     parser = argparse.ArgumentParser(description="Backfill company_master_id on historical tables")
     parser.add_argument("--table", action="append", dest="tables", help="Specific table(s) to backfill")
-    args = parser.parse_args()
-
+    args = parser.parse_args(argv if argv is not None else [])
     specs = SPECS
     if args.tables:
         wanted = set(args.tables)
         specs = tuple(spec for spec in SPECS if spec.table_name in wanted)
-
-    for row in backfill_company_master_ids(specs):
+    results = backfill_company_master_ids(specs)
+    for row in results:
         print(row, flush=True)
+    updated = sum(int(r.get("updated", 0)) for r in results)
+    STOCKEY_RUN_STATE = {"source": "data.backfill_company_master_ids", "rows": updated,
+                         "rows_written": updated, "tables": len(results), "status": "ok",
+                         "state_advanced": updated > 0}
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    raise SystemExit(main(sys.argv[1:]))

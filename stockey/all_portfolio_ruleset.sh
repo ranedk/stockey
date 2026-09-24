@@ -16,6 +16,17 @@ PYTHON_BIN="$("${SCRIPT_DIR}/scripts/resolve_python.sh")"
 #
 # Neither half opens real positions unless --live is passed; the default is record-only
 # and the crontab deliberately does NOT pass --live (rollout phase 1, see the PRD).
+#
+# WAIT FOR THE SCREENER FIRST (found 2026-09-23). The screener starts 15:30 UTC and ran
+# 65-109 minutes on the last six weekdays; this job starts 16:30 UTC, so on five of those
+# six days it decided on a half-refreshed mix -- today's L2 beside yesterday's confluence
+# scores and technicals (confluence/technicals are near the END of the pipeline). A lock
+# wait orders the two without touching the crontab. On timeout this exits non-zero and
+# nothing below runs: deciding on stale evidence is worse than deciding a day late.
+# 5h: OCR alone may use FUNDAMENTALS_OCR_MAX_RUNTIME_SECONDS (3h) on a heavy day, on top
+# of ~1h of steps before it and ~15 min after.
+"${SCRIPT_DIR}/scripts/wait_for_locks.sh" --timeout-seconds 18000 --sleep-seconds 60 \
+    /tmp/stockey_fundamentals_screener.lock
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "portfolio_exit" \
     "${PYTHON_BIN}" -m fundamentals.screens.portfolio_exit
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "portfolio_ruleset" \

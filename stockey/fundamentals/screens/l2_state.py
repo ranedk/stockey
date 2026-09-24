@@ -369,8 +369,21 @@ def compute_trend_direction(values: list) -> dict[str, object]:
                 trend_direction = "steady_increase"
         elif latest_delta == 0 and preceding_delta == 0:
             trend_direction = "flat"
+        # "reversal" used to be the catch-all for everything else, discarding the one
+        # fact a reader needs: which way the LATEST period moved. It covered ~48% of rows,
+        # all scored "no call" -- including the turnaround the screener looks for, debt
+        # that rose and has just started falling (2026-09-23 audit). Split by the latest
+        # delta's sign; a zero latest delta is "stalled".
+        elif latest_delta < 0 and preceding_delta > 0:
+            trend_direction = "reversal_to_decline"
+        elif latest_delta > 0 and preceding_delta < 0:
+            trend_direction = "reversal_to_increase"
+        elif latest_delta < 0:
+            trend_direction = "new_decline"      # preceding period was unchanged
+        elif latest_delta > 0:
+            trend_direction = "new_increase"
         else:
-            trend_direction = "reversal"  # sign flipped between the two most recent deltas
+            trend_direction = "stalled"          # latest period unchanged after a move
 
     return {"consecutive_declining_periods": consecutive_declining, "trend_direction": trend_direction}
 
@@ -437,6 +450,31 @@ def compute_debt_trajectory(balance_sheet: dict[str, object], profit_loss: dict[
     }
 
 
+def annual_periods_only(table: dict[str, object]) -> dict[str, object]:
+    """Keep only the columns in the company's fiscal year-end month.
+
+    2026-09-23 audit: some balance sheets end with a half-year column ("Sep 2025" after
+    a run of "Mar YYYY"), so the "annual" net-debt series and its latest delta mixed a
+    six-month change into a year-on-year one, and the P&L lookups at that label found
+    nothing (interest_coverage/debt_to_ebitda None; the l2_bs_pl_period_misaligned
+    fallback). The year-end month is the most common month among the labels. A table
+    whose rows do not line up with its periods is returned unchanged -- no guessing."""
+    periods = list(table.get("periods") or [])
+    months = [str(p).split()[0] if len(str(p).split()) == 2 and str(p).split()[1].isdigit() else None for p in periods]
+    known = [m for m in months if m]
+    if not known:
+        return table
+    year_end = max(set(known), key=known.count)
+    keep = [i for i, m in enumerate(months) if m == year_end]
+    if len(keep) == len(periods):
+        return table
+    rows = table.get("rows") or {}
+    if any(len(v) != len(periods) for v in rows.values()):
+        return table
+    return {"periods": [periods[i] for i in keep],
+            "rows": {k: [v[i] for i in keep] for k, v in rows.items()}}
+
+
 def compute_cwip_ratio(balance_sheet: dict[str, object]) -> dict[str, object]:
     def ratio_at(offset: int):
         cwip = _value_at(balance_sheet, "CWIP", offset=offset)
@@ -500,6 +538,14 @@ def compute_institutional_stake(shareholding: dict[str, object]) -> dict[str, ob
     applies that identical rule here instead of dropping the signal entirely."""
     fii_raw = shareholding.get("rows", {}).get("FIIs") or []
     dii_raw = shareholding.get("rows", {}).get("DIIs") or []
+    promoter_raw = shareholding.get("rows", {}).get("Promoters") or []
+    if not fii_raw and not dii_raw and promoter_raw:
+        # Both classes absent from a table that DID parse (the Promoters row is there):
+        # screener omits a holder class that never held the stock, so this is 0, by the
+        # same rule the one-row padding below applies. It used to return None -- ~12% of
+        # the latest L2 rows, each reading as "no data" to the ownership axis (2026-09-23).
+        fii_raw = [0] * len(promoter_raw)
+        dii_raw = [0] * len(promoter_raw)
     if fii_raw and not dii_raw:
         dii_raw = [0] * len(fii_raw)
     elif dii_raw and not fii_raw:
@@ -846,7 +892,9 @@ def build_l2_state_row(
     pledge_data_available: bool = True,
 ) -> dict[str, object]:
     valuation = valuation_levels.get(company["company_id"])
-    current_pledge_pct = pledge_levels.get(company["company_id"], 0.0)
+    # A failed market-wide pledge fetch stores NULL, not 0.0 (2026-09-23 audit): 0.0 read
+    # as "unpledged" to every reader, and the next good fetch then saw a rise from zero.
+    current_pledge_pct = pledge_levels.get(company["company_id"], 0.0) if pledge_data_available else None
     prior_pledge_pct = (prior_pledge_levels or {}).get(company["company_id"])
     # BUG FOUND LIVE 2026-08-30 (adversarial review, HIGH): fetch_pledge_levels
     # already defaults an absent company to 0.0 ("unpledged, the overwhelmingly
@@ -862,6 +910,7 @@ def build_l2_state_row(
     # thesis invalidations. pledge_pct itself keeps its pre-existing behavior
     # (still defaults to 0.0 on failure, unchanged scope); only the NEW trend
     # fields refuse to trust a fetch that didn't actually happen.
+    annual_balance_sheet = annual_periods_only(detail["balance_sheet"])
     pledge_trend = (
         compute_pledge_trend(current_pledge_pct, prior_pledge_pct)
         if pledge_data_available
@@ -871,12 +920,17 @@ def build_l2_state_row(
         "company_id": company["company_id"],
         "company_name": company["company_name"],
         "ticker": company["ticker"],
-        **compute_debt_trajectory(detail["balance_sheet"], detail["profit_loss"], ticker=company["ticker"]),
-        **compute_cwip_ratio(detail["balance_sheet"]),
+        **compute_debt_trajectory(annual_balance_sheet, detail["profit_loss"], ticker=company["ticker"]),
+        **compute_cwip_ratio(annual_balance_sheet),
         "pledge_pct": current_pledge_pct,
         **pledge_trend,
         **compute_promoter_stake(detail["shareholding"]),
         **compute_institutional_stake(detail["shareholding"]),
+        # The reporting periods these values come from (2026-09-23 audit). Without them a
+        # re-crawl of the SAME annual accounts looked like new data, and forecast
+        # resolution could grade a prediction against the figures that produced it.
+        "balance_sheet_period": (annual_balance_sheet.get("periods") or [None])[-1],
+        "shareholding_period": (detail["shareholding"].get("periods") or [None])[-1],
         "sector_cycle_phase": None,
         # "pe" is the raw driver, same "store the input alongside the derived signal"
         # convention net_debt_rscr/promoter_pct already use -- also read back by
@@ -1036,6 +1090,123 @@ def ensure_l2_pledge_trend_columns() -> None:
     )
 
 
+# --- Daily market-wide snapshot (2026-09-23 data audit) ------------------------------
+# pledge_pct and PE come from two MARKET-WIDE screener queries that already ran every day,
+# but were stored only on fundamentals_l2_state rows -- i.e. only for the 0-6 companies
+# whose 75-day detail crawl fell due. So pledge and valuation were up to 75 days stale,
+# the pledge trend diffed against a crawl ~75 days back (4 of 235 latest rows had one at
+# all; pledge_increase never fired), and the sector percentile ranked a company against
+# the handful crawled the same day. The snapshot stores both for EVERY L1 company EVERY
+# run, with an explicit *_data_available flag so a failed fetch is NULL, never a 0.0
+# that later reads as a rise. The detail crawl keeps its cadence; only these cheap
+# fields move to daily.
+MARKET_SNAPSHOT_TABLE = "fundamentals_l2_market_snapshot"
+_MARKET_SNAPSHOT_STATEMENT = f"""
+    CREATE TABLE IF NOT EXISTS {MARKET_SNAPSHOT_TABLE} (
+        company_id BIGINT NOT NULL,
+        ticker TEXT,
+        run_date TIMESTAMPTZ NOT NULL,
+        pledge_data_available BOOLEAN NOT NULL,
+        pledge_pct DOUBLE PRECISION,
+        pledge_pct_prior DOUBLE PRECISION,
+        pledge_pct_delta_pp DOUBLE PRECISION,
+        pledge_pct_trend_direction TEXT,
+        valuation_data_available BOOLEAN NOT NULL,
+        pe DOUBLE PRECISION,
+        historical_pe_5y DOUBLE PRECISION,
+        valuation_vs_own_history_ratio DOUBLE PRECISION,
+        valuation_sector_percentile DOUBLE PRECISION,
+        load_ts TIMESTAMPTZ,
+        PRIMARY KEY (company_id, run_date)
+    )
+"""
+
+
+def ensure_market_snapshot_table() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(_MARKET_SNAPSHOT_STATEMENT)
+
+    execute_db_operation(_op, operation_name=f"{MARKET_SNAPSHOT_TABLE}:ensure_table")
+
+
+def load_prior_snapshot_pledge(company_ids: list[int], before) -> dict[int, float]:
+    """Latest successfully-fetched pledge_pct per company from an EARLIER snapshot day."""
+    if not company_ids:
+        return {}
+    df = sql_to_df(
+        f"""
+        SELECT DISTINCT ON (company_id) company_id, pledge_pct
+          FROM {MARKET_SNAPSHOT_TABLE}
+         WHERE company_id = ANY(%s) AND run_date < %s
+           AND pledge_data_available AND pledge_pct IS NOT NULL
+         ORDER BY company_id, run_date DESC
+        """,  # noqa: S608 -- fixed internal table name
+        params=(list(company_ids), before),
+    )
+    return {} if df.empty else {int(r.company_id): float(r.pledge_pct) for r in df.itertuples()}
+
+
+def build_market_snapshot_rows(
+    universe: pd.DataFrame,
+    pledge_levels: dict[int, float],
+    pledge_ok: bool,
+    valuation_levels: dict[int, dict[str, float]],
+    valuation_ok: bool,
+    prior_pledge: dict[int, float],
+    sector_codes: dict[str, str],
+    *,
+    run_date,
+    load_ts,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for company in universe.to_dict("records"):
+        company_id = int(company["company_id"])
+        valuation = valuation_levels.get(company_id) if valuation_ok else None
+        pledge = pledge_levels.get(company_id, 0.0) if pledge_ok else None
+        trend = (
+            compute_pledge_trend(pledge, prior_pledge.get(company_id))
+            if pledge_ok
+            else {"pledge_pct_prior": prior_pledge.get(company_id), "pledge_pct_delta_pp": None,
+                  "pledge_pct_trend_direction": None}
+        )
+        rows.append({
+            "company_id": company_id,
+            "ticker": company["ticker"],
+            "company_name": company.get("company_name"),
+            "run_date": run_date,
+            "pledge_data_available": bool(pledge_ok),
+            "pledge_pct": pledge,
+            **trend,
+            "valuation_data_available": bool(valuation_ok),
+            "pe": valuation["pe"] if valuation else None,
+            "historical_pe_5y": valuation["historical_pe_5y"] if valuation else None,
+            "valuation_vs_own_history_ratio": round(valuation["pe"] / valuation["historical_pe_5y"], 2) if valuation else None,
+            "load_ts": load_ts,
+        })
+    # Ranked across the WHOLE universe, not the day's crawled handful.
+    percentiles = compute_valuation_sector_percentiles(rows, sector_codes)
+    for row in rows:
+        row["valuation_sector_percentile"] = percentiles.get(row["company_id"])
+    return rows
+
+
+def ensure_l2_debt_columns_are_double() -> None:
+    """net_debt_rscr/net_debt_yoy_delta_rscr were created BIGINT from an all-integer
+    first write (2026-08-10), and upsert_to_db casts to the column type -- so a -0.4 cr
+    delta was stored as 0 and failed every "< 0" deleveraging check (2026-09-23 audit)."""
+    apply_schema_migration(
+        migration_id="20260923_l2_state_debt_columns_to_double_precision",
+        description=f"{RESULTS_TABLE}.net_debt_rscr/net_debt_yoy_delta_rscr: BIGINT -> DOUBLE PRECISION.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN net_debt_rscr TYPE DOUBLE PRECISION",
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN net_debt_yoy_delta_rscr TYPE DOUBLE PRECISION",
+        ],
+    )
+
+
 def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str, object]:
     """Build one L2 state row per DUE L1-universe company, keyed by (company_id,
     run_date, state_vector_version) -- append-only across refreshes (docs/
@@ -1048,41 +1219,59 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     for N companies gets N genuinely-due ones, not N that might all be skipped."""
     ensure_l2_valuation_columns_are_numeric()
     ensure_l2_pledge_trend_columns()
-    universe = load_l1_universe()
-    if universe.empty:
+    ensure_l2_debt_columns_are_double()
+    ensure_market_snapshot_table()
+    full_universe = load_l1_universe()
+    if full_universe.empty:
         _record_no_universe_fallback()
         return {"rows": 0, "failed_companies": [], "checks_deferred": list(DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0, "companies_due": 0}
 
-    universe = filter_universe_to_due(universe)
-    if limit:
-        universe = universe.head(limit)
-    if universe.empty:
-        return {"rows": 0, "failed_companies": [], "checks_deferred": list(DEFERRED_FIELDS), "companies": [], "institutional_first_entries": 0, "companies_due": 0}
-
+    run_date = pd.Timestamp.now(tz="UTC").normalize()
+    load_ts = pd.Timestamp.now(tz="UTC")
     session = session or build_authenticated_session()
+    pledge_ok = valuation_ok = True
     try:
         pledge_levels = fetch_pledge_levels(session)
     except Exception as exc:  # noqa: BLE001 -- one market-wide query's failure must not sink the whole run
-        pledge_levels = {}
+        pledge_levels, pledge_ok = {}, False
         _record_market_wide_query_fallback("pledge", exc)
     try:
         valuation_levels = fetch_valuation_levels(session)
     except Exception as exc:  # noqa: BLE001 -- see above
-        valuation_levels = {}
+        valuation_levels, valuation_ok = {}, False
         _record_market_wide_query_fallback("valuation", exc)
     try:
-        prior_pledge_levels = load_prior_pledge_levels(universe["company_id"].tolist())
+        prior_pledge_levels = load_prior_snapshot_pledge(full_universe["company_id"].tolist(), run_date)
     except Exception as exc:  # noqa: BLE001 -- a failed prior-snapshot lookup must not sink the whole run;
         # every company just reads back as "no trend claimable" (None prior), same as a company's first-ever row.
         prior_pledge_levels = {}
         _record_market_wide_query_fallback("prior_pledge", exc)
 
-    run_date = pd.Timestamp.now(tz="UTC").normalize()
-    load_ts = pd.Timestamp.now(tz="UTC")
+    snapshot_rows = build_market_snapshot_rows(
+        full_universe, pledge_levels, pledge_ok, valuation_levels, valuation_ok, prior_pledge_levels,
+        load_sector_codes_for_tickers(full_universe["ticker"].dropna().tolist()),
+        run_date=run_date, load_ts=load_ts,
+    )
+    snapshot_by_company = {row["company_id"]: row for row in snapshot_rows}
+    upsert_to_db(
+        pd.DataFrame([{k: v for k, v in r.items() if k != "company_name"} for r in snapshot_rows]),
+        MARKET_SNAPSHOT_TABLE,
+        unique_keys=["company_id", "run_date"],
+    )
+    # pledge_increase is detected on the DAILY snapshot for the whole universe now, not
+    # only for the day's crawled companies against a ~75-day-old crawl.
+    pledge_increase_events = [
+        _build_pledge_increase_event_row(row, run_date=run_date, load_ts=load_ts)
+        for row in snapshot_rows if row.get("pledge_pct_trend_direction") == "increasing"
+    ]
+
+    universe = filter_universe_to_due(full_universe)
+    if limit:
+        universe = universe.head(limit)
+
     rows: list[dict[str, object]] = []
     failed_companies: list[str] = []
     institutional_entry_events: list[dict[str, object]] = []
-    pledge_increase_events: list[dict[str, object]] = []
     crawled: list[tuple] = []
     for _, company in universe.iterrows():
         ticker = company["ticker"]
@@ -1094,7 +1283,14 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             failed_companies.append(ticker)
             _record_company_fetch_fallback(ticker, exc)
             continue
-        row = build_l2_state_row(company, pledge_levels, valuation_levels, detail, prior_pledge_levels)
+        row = build_l2_state_row(company, pledge_levels, valuation_levels, detail, prior_pledge_levels,
+                                 pledge_data_available=pledge_ok)
+        # Market-wide fields on the detail row are the same day's snapshot values, so the
+        # two tables can never disagree about what was known on run_date.
+        snap = snapshot_by_company.get(int(company["company_id"])) or {}
+        for field in ("pledge_pct_prior", "pledge_pct_delta_pp", "pledge_pct_trend_direction",
+                      "valuation_sector_percentile"):
+            row[field] = snap.get(field)
         row["run_date"] = run_date
         row["state_vector_version"] = STATE_VECTOR_VERSION
         row["load_ts"] = load_ts
@@ -1112,23 +1308,8 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             latest_period = periods[-1] if periods else str(run_date.date())
             institutional_entry_events.append(_build_institutional_entry_event_row(row, latest_period=latest_period, load_ts=load_ts))
 
-        # PRD §12 todo #2 (2026-08-29): pledge_pct has no history source of its own
-        # (see load_prior_pledge_levels), so -- same as institutional_first_entry --
-        # this is detected purely inside L2 and synthesized into a fundamentals_events
-        # row so it flows through the SAME l3_triggers evaluation machinery as every
-        # exchange-filed event, rather than needing its own bespoke alert path.
-        if row.get("pledge_pct_trend_direction") == "increasing":
-            pledge_increase_events.append(_build_pledge_increase_event_row(row, run_date=run_date, load_ts=load_ts))
-
-    # Sector-relative valuation percentile needs every company's PE at once (it's a
-    # cross-company rank, unlike every other field above which is purely per-company)
-    # -- computed as a post-pass over the rows just built, not inline in
-    # build_l2_state_row, which only ever sees one company at a time.
-    if rows:
-        sector_codes = load_sector_codes_for_tickers([row["ticker"] for row in rows])
-        sector_percentiles = compute_valuation_sector_percentiles(rows, sector_codes)
-        for row in rows:
-            row["valuation_sector_percentile"] = sector_percentiles.get(row["company_id"])
+    # (pledge_increase events and the sector percentile now come from the daily
+    # market snapshot above -- see MARKET_SNAPSHOT_TABLE.)
 
     if rows:
         upsert_to_db(
@@ -1155,6 +1336,9 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         "institutional_first_entries": len(institutional_entry_events),
         "pledge_increases": len(pledge_increase_events),
         "companies_due": int(len(universe)),
+        "market_snapshot_rows": len(snapshot_rows),
+        "pledge_fetch_ok": pledge_ok,
+        "valuation_fetch_ok": valuation_ok,
     }
 
 
@@ -1170,6 +1354,10 @@ def main() -> int:
         "failed_companies": result["failed_companies"],
         "institutional_first_entries": result.get("institutional_first_entries", 0),
         "companies_due": result.get("companies_due", 0),
+        "market_snapshot_rows": result.get("market_snapshot_rows", 0),
+        "pledge_fetch_ok": result.get("pledge_fetch_ok"),
+        "valuation_fetch_ok": result.get("valuation_fetch_ok"),
+        "pledge_increases": result.get("pledge_increases", 0),
         "fallback_used": True,  # deferred fields + any per-company fetch failures are a standing, visible fallback
         "state_advanced": result["rows"] > 0,
     }
