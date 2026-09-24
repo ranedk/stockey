@@ -42,17 +42,21 @@ UNIVERSE_SOURCE_TABLE = "nseindia_ohlcv"
 # this universe, so no Dhan data was ever collected for ~565 listed companies, several of
 # them on stockey's own fundamentals watchlist.
 UNIVERSE_SERIES = ("EQ", "BE", "SM", "ST")
+# Rights entitlements (CENTEXT-RE, JAYKAY-RE1) trade in BE/ST for a few days each. They are
+# not companies: collecting them wastes Dhan calls and, once they stop trading, reads as a
+# permanent completeness gap. Excluded 2026-09-24.
+RIGHTS_ENTITLEMENT_PATTERN = "-RE[0-9]*$"
 
 
 def get_equity_universe(lookback_days: int | None = None) -> list[str]:
     window = int(DEFAULT_LOOKBACK_DAYS if lookback_days is None else lookback_days)
     query = (
         f"SELECT DISTINCT symbol FROM {UNIVERSE_SOURCE_TABLE} "
-        f"WHERE series = ANY(%s) "
+        f"WHERE series = ANY(%s) AND symbol !~ %s "
         f"AND date >= (SELECT MAX(date) FROM {UNIVERSE_SOURCE_TABLE}) - interval '{window} days'"
     )
     try:
-        frame = sql_to_df(query, params=(list(UNIVERSE_SERIES),))
+        frame = sql_to_df(query, params=(list(UNIVERSE_SERIES), RIGHTS_ENTITLEMENT_PATTERN))
     except Exception as exc:
         print(f"[universe] {UNIVERSE_SOURCE_TABLE} unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
         return []

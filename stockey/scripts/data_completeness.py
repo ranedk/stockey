@@ -313,6 +313,7 @@ def check_universe_coverage(f: Findings, window_days: int) -> None:
           SELECT DISTINCT COALESCE(a.canonical_nse_ticker, o.symbol) FROM nseindia_ohlcv o
             LEFT JOIN company_master_nse_alias a ON a.alias_ticker = o.symbol
            WHERE o.series IN ('EQ','BE','SM','ST')
+             AND o.symbol !~ '-RE[0-9]*$'  -- rights entitlements, see utils/universe.py
              AND o.date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
           EXCEPT
           SELECT DISTINCT ticker FROM dhan_ohlcv_intraday
@@ -324,7 +325,7 @@ def check_universe_coverage(f: Findings, window_days: int) -> None:
     universe = _scalar(
         """
         SELECT count(DISTINCT symbol) FROM nseindia_ohlcv
-         WHERE series IN ('EQ','BE','SM','ST')
+         WHERE series IN ('EQ','BE','SM','ST') AND symbol !~ '-RE[0-9]*$'
            AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
         """
     )

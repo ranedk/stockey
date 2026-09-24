@@ -340,7 +340,20 @@ def test_get_equity_universe_queries_bhavcopy(monkeypatch):
     assert result == ["RELIANCE", "TCS"]
     assert universe_mod.UNIVERSE_SOURCE_TABLE in captured["query"]
     assert "series = ANY(%s)" in captured["query"]
-    assert captured["params"] == (["EQ", "BE", "SM", "ST"],)  # SME included 2026-09-24
+    assert captured["params"] == (["EQ", "BE", "SM", "ST"], universe_mod.RIGHTS_ENTITLEMENT_PATTERN)
+
+
+def test_rights_entitlement_pattern_matches_only_entitlements():
+    # Postgres ~ is POSIX; Python re agrees for this pattern.
+    import re
+
+    from utils.universe import RIGHTS_ENTITLEMENT_PATTERN
+
+    pattern = re.compile(RIGHTS_ENTITLEMENT_PATTERN)
+    for symbol in ("CENTEXT-RE", "JAYKAY-RE1", "MPEL-RE"):
+        assert pattern.search(symbol), symbol
+    for symbol in ("RELIANCE", "SUNREST", "PRE-OWNED", "RE-LTD", "BAJAJ-AUTO"):
+        assert not pattern.search(symbol), symbol
 
 
 def test_get_equity_universe_empty_on_db_error(monkeypatch):
@@ -18677,20 +18690,20 @@ def test_load_l1_companies_with_sector_resolves_bse_numeric_ticker_correctly(mon
 
 
 def test_classify_phase_expansion_when_capacity_outruns_demand():
-    assert fundamentals_sector_cycle.classify_phase(20.0, 5.0) == "capacity_expansion"
+    assert fundamentals_sector_cycle.classify_phase(15.0) == "capacity_expansion"
 
 
 def test_classify_phase_discipline_when_demand_outruns_capacity():
-    assert fundamentals_sector_cycle.classify_phase(2.0, 15.0) == "capacity_discipline"
+    assert fundamentals_sector_cycle.classify_phase(-13.0) == "capacity_discipline"
 
 
 def test_classify_phase_balanced_within_threshold():
-    assert fundamentals_sector_cycle.classify_phase(10.0, 8.0) == "balanced"
+    assert fundamentals_sector_cycle.classify_phase(2.0) == "balanced"
+    assert fundamentals_sector_cycle.classify_phase(-5.0) == "balanced"
 
 
-def test_classify_phase_none_when_either_input_missing():
-    assert fundamentals_sector_cycle.classify_phase(None, 5.0) is None
-    assert fundamentals_sector_cycle.classify_phase(10.0, None) is None
+def test_classify_phase_none_when_gap_missing():
+    assert fundamentals_sector_cycle.classify_phase(None) is None
 
 
 def test_classify_growth_high_at_or_above_threshold():
@@ -18718,81 +18731,108 @@ def test_classify_growth_no_pattern_when_sample_size_low():
     assert fundamentals_sector_cycle.classify_growth(20.0, "low") == "no_pattern"
 
 
+def _gb(current, preceding, sales_growth):
+    return {"gross_block_current_rscr": current, "gross_block_preceding_rscr": preceding, "sales_growth_pct": sales_growth}
+
+
 def test_fetch_gross_block_data_filters_incomplete_rows(monkeypatch):
     companies = [
-        {"company_id": 1, "metrics": {"gross_block_rscr": 120, "gross_block_py_rscr": 100}},
-        {"company_id": 2, "metrics": {"gross_block_rscr": None, "gross_block_py_rscr": 50}},  # incomplete -- excluded
-        {"company_id": 3, "metrics": {}},  # no gross block fields at all -- excluded
+        {"company_id": 1, "metrics": {"gross_block_rscr": 120, "gross_block_py_rscr": 100, "sales_growth_pct": 8.5}},
+        {"company_id": 2, "metrics": {"gross_block_rscr": None, "gross_block_py_rscr": 50, "sales_growth_pct": 3}},
+        {"company_id": 3, "metrics": {"gross_block_rscr": 10, "gross_block_py_rscr": 9, "sales_growth_pct": ""}},  # no sales growth
+        {"company_id": 4, "metrics": {"gross_block_rscr": 10, "gross_block_py_rscr": 0, "sales_growth_pct": 1}},  # zero base
     ]
     monkeypatch.setattr(fundamentals_sector_cycle, "run_query", lambda session, query: ("url", companies))
 
     result = fundamentals_sector_cycle.fetch_gross_block_data(session=object())
 
-    assert result == {1: {"gross_block_current_rscr": 120, "gross_block_preceding_rscr": 100}}
+    assert result == {1: _gb(120, 100, 8.5)}
 
 
-def test_compute_sector_aggregates_computes_capacity_and_demand_growth():
+def test_fetch_gross_block_data_fails_loudly_when_a_column_is_not_revealed(monkeypatch):
+    # screener.in reveals only ~3 queried columns; if sales growth drops out, every company
+    # would silently read as incomplete and the sector table would go empty.
+    companies = [{"company_id": 1, "metrics": {"gross_block_rscr": 120, "gross_block_py_rscr": 100}}]
+    monkeypatch.setattr(fundamentals_sector_cycle, "run_query", lambda session, query: ("url", companies))
+
+    with pytest.raises(RuntimeError, match="sales_growth_pct"):
+        fundamentals_sector_cycle.fetch_gross_block_data(session=object())
+
+
+def test_sector_cycle_query_reveals_gross_block_and_sales_growth_before_the_band():
+    query = fundamentals_sector_cycle.GROSS_BLOCK_QUERY
+    order = [query.index(c) for c in ("Gross block >", "Gross block preceding year", "Sales growth", "Market Capitalization")]
+    assert order == sorted(order)
+
+
+def test_compute_sector_aggregates_pairs_capacity_and_demand_per_company():
     l1 = pd.DataFrame(
         [
-            {"company_id": 1, "company_name": "A", "ticker": "A", "sector_code": "IN0101", "qtr_sales_var_pct": 10.0},
-            {"company_id": 2, "company_name": "B", "ticker": "B", "sector_code": "IN0101", "qtr_sales_var_pct": 20.0},
-            {"company_id": 3, "company_name": "C", "ticker": "C", "sector_code": "IN0201", "qtr_sales_var_pct": 5.0},
+            {"company_id": 1, "company_name": "A", "ticker": "A", "sector_code": "IN0101"},
+            {"company_id": 2, "company_name": "B", "ticker": "B", "sector_code": "IN0101"},
+            {"company_id": 3, "company_name": "C", "ticker": "C", "sector_code": "IN0101"},
+            {"company_id": 4, "company_name": "D", "ticker": "D", "sector_code": "IN0201"},
         ]
     )
     gross_block = {
-        1: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100},
-        2: {"gross_block_current_rscr": 220, "gross_block_preceding_rscr": 200},
-        # company 3 has no gross block data
+        1: _gb(110, 100, 30.0),    # capacity +10, demand +30 -> gap -20
+        2: _gb(120, 100, 10.0),    # capacity +20, demand +10 -> gap +10
+        # A giant whose block halved: under the old SUM it set the whole sector's capacity.
+        3: _gb(5000, 10000, 0.0),  # capacity -50, demand 0 -> gap -50
+        # company 4 has no data
     }
 
     result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
 
     ch = result[result["sector_code"] == "IN0101"].iloc[0]
-    assert ch["n_companies_in_l1"] == 2
-    assert ch["n_companies_with_gross_block"] == 2
-    # (110+220 - 100-200) / (100+200) * 100 = 10.0
-    assert ch["capacity_growth_pct"] == 10.0
-    assert ch["demand_growth_pct"] == 15.0  # median(10, 20)
-
-    # n_companies_with_gross_block=2 < MIN_COMPANIES_FOR_CONFIDENCE -> "no_pattern"
-    # despite a real demand_growth_pct=15.0, same low-sample gate as IN0201 below.
-    assert ch["sample_size_confidence"] == "low"
+    assert ch["n_companies_in_l1"] == 3
+    assert ch["n_companies_with_gross_block"] == 3
+    assert ch["n_companies_with_demand_data"] == 3
+    assert ch["capacity_growth_pct"] == 10.0          # median(10, 20, -50)
+    assert ch["demand_growth_pct"] == 10.0            # median(30, 10, 0) -- same companies
+    assert ch["capacity_minus_demand_pts"] == -20.0   # median(-20, 10, -50)
+    assert ch["phase"] == "capacity_discipline"
+    assert ch["sample_size_confidence"] == "low"      # 3 < MIN_COMPANIES_FOR_CONFIDENCE
     assert ch["growth_classification"] == "no_pattern"
 
     auto = result[result["sector_code"] == "IN0201"].iloc[0]
-    assert auto["n_companies_with_gross_block"] == 0
-    assert pd.isna(auto["capacity_growth_pct"])  # None -> NaN once mixed into a float64 DataFrame column
-    assert auto["demand_growth_pct"] == 5.0
-    # n_companies_with_gross_block=0 < MIN_COMPANIES_FOR_CONFIDENCE -> sample_size_confidence
-    # is "low" here, so growth_classification is "no_pattern" despite a real demand_growth_pct.
-    assert auto["sample_size_confidence"] == "low"
-    assert auto["growth_classification"] == "no_pattern"
+    assert auto["n_companies_with_demand_data"] == 0
+    assert pd.isna(auto["capacity_growth_pct"]) and pd.isna(auto["demand_growth_pct"])
+    assert auto["phase"] is None
+
+
+def test_compute_sector_aggregates_gives_asset_light_sectors_no_phase():
+    l1 = pd.DataFrame(
+        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0501"} for i in range(1, 7)]
+    )
+    gross_block = {i: _gb(200, 100, 5.0) for i in range(1, 7)}  # would read capacity_expansion
+    row = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block).iloc[0]
+    assert row["phase"] is None
+    assert row["growth_classification"] == "medium_growth"
 
 
 def test_compute_sector_aggregates_flags_low_sample_size_confidence():
     # found live 2026-08-11: multiple real sectors had only 1 L1 company contributing
     # gross-block data -- a single company is not a "sector aggregate".
     l1 = pd.DataFrame(
-        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0101", "qtr_sales_var_pct": 10.0} for i in range(1, 7)]
+        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0101"} for i in range(1, 7)]
     )
-    # only 2 of 6 companies have gross-block data -- below MIN_COMPANIES_FOR_CONFIDENCE (5)
-    gross_block = {
-        1: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100},
-        2: {"gross_block_current_rscr": 220, "gross_block_preceding_rscr": 200},
-    }
+    # only 2 of 6 companies have paired data -- below MIN_COMPANIES_FOR_CONFIDENCE (5)
+    gross_block = {1: _gb(110, 100, 10.0), 2: _gb(220, 200, 10.0)}
     result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
     assert result.iloc[0]["sample_size_confidence"] == "low"
 
 
 def test_compute_sector_aggregates_flags_adequate_sample_size_confidence():
     l1 = pd.DataFrame(
-        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0101", "qtr_sales_var_pct": 10.0} for i in range(1, 7)]
+        [{"company_id": i, "company_name": str(i), "ticker": str(i), "sector_code": "IN0101"} for i in range(1, 7)]
     )
-    gross_block = {i: {"gross_block_current_rscr": 110, "gross_block_preceding_rscr": 100} for i in range(1, 6)}  # 5 of 6
+    gross_block = {i: _gb(110, 100, 10.0) for i in range(1, 6)}  # 5 of 6
     result = fundamentals_sector_cycle.compute_sector_aggregates(l1, gross_block)
     row = result.iloc[0]
     assert row["sample_size_confidence"] == "adequate"
     assert row["growth_classification"] == "medium_growth"  # demand_growth_pct=10.0, adequate sample
+    assert row["phase"] == "balanced"                        # gap 0
 
 
 def test_compute_sector_aggregates_excludes_companies_without_sector_code():

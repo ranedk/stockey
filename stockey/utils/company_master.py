@@ -155,6 +155,7 @@ def sync_company_master() -> pd.DataFrame:
                 OR underlying_symbol IN (
                      SELECT DISTINCT symbol FROM nseindia_ohlcv
                       WHERE series IN ('EQ', 'BE', 'SM', 'ST')  -- SME (SM/ST) included 2026-09-24
+                        AND symbol !~ '-RE[0-9]*$'  -- rights entitlements are not companies
                         AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
                    )
           )

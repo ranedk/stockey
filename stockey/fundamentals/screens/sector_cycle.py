@@ -56,6 +56,24 @@ neither silently hidden:
   block growth is not a sector read. `sample_size_confidence` ("low" below
   MIN_COMPANIES_FOR_CONFIDENCE, else "adequate") is stored on every row precisely so
   this isn't silently presented as equally reliable as a 20+ company sector.
+
+REWORKED 2026-09-24 (operator decision: "rework, same company set"). The first cut
+compared two numbers built from DIFFERENT companies over DIFFERENT horizons: capacity was
+the SUM of gross block over companies with gross-block data (annual, balance sheet), demand
+was the median QUARTERLY YoY sales change over every L1 company in the sector. The sum let
+one large company set the whole sector's capacity growth (Chemicals read -10.25 percent on
+2026-09-23), and the quarterly figure is the noisiest growth number screener.in has. Now,
+per company: capacity growth = gross block vs gross block preceding year, demand growth =
+screener.in "Sales growth" (latest ANNUAL YoY, the same fiscal year as the balance sheet --
+verified live: 1778.06 / 896.05 = +98.4 vs its reported 98.43). Both come from ONE query,
+so they are the same companies. The sector's phase reads the MEDIAN per-company gap
+(capacity minus demand, `capacity_minus_demand_pts`); capacity_growth_pct and
+demand_growth_pct are the medians of each side over that same paired set. growth_
+classification therefore also reads annual sales growth now.
+
+Asset-light sectors (ASSET_LIGHT_SECTOR_CODES) get no phase: a lender's or IT firm's gross
+block is offices, not capacity (see the first caveat above). Their growth classification is
+still computed.
 """
 
 from __future__ import annotations
@@ -78,7 +96,22 @@ STOCKEY_RUN_STATE: dict[str, object] = {}
 # (confirmed live: fetching it unbounded pulls in the entire market), not because the
 # band itself is meaningful here; every row gets intersected against L1's actual
 # company_id set regardless.
-GROSS_BLOCK_QUERY = "Market Capitalization > 100 AND Market Capitalization < 5000 AND Gross block > 0 AND Gross block preceding year > 0"
+#
+# 2026-09-24: "Sales growth" (latest annual YoY) added as the third revealed column. ORDER
+# MATTERS -- screener.in reveals only ~3 queried columns, in query order, and the default
+# Mar Cap column already carries the band, so Market Capitalization goes LAST. Verified
+# live: this order returns gross_block_rscr, gross_block_py_rscr and sales_growth_pct.
+GROSS_BLOCK_QUERY = (
+    "Gross block > 0 AND Gross block preceding year > 0 AND Sales growth > -100 AND "
+    "Market Capitalization > 100 AND Market Capitalization < 5000"
+)
+REQUIRED_METRICS = ("gross_block_rscr", "gross_block_py_rscr", "sales_growth_pct")
+
+# Sectors whose gross block is not operating capacity -- no phase (2026-09-24). Financial
+# Services came back "capacity_expansion" in the first live run off office premises.
+# Realty: a developer's capacity is land and inventory, not gross block -- the first reworked
+# run read median block growth 0.00 against 37 percent sales growth ("discipline" off nothing).
+ASSET_LIGHT_SECTOR_CODES = frozenset({"IN0501", "IN0801", "IN0205"})  # Financial Services, IT, Realty
 
 # First-cut, undocumented-in-the-source-PRD threshold -- see module docstring.
 PHASE_THRESHOLD_POINTS = 5.0
@@ -156,26 +189,43 @@ def load_l1_companies_with_sector() -> pd.DataFrame:
 
 
 def fetch_gross_block_data(session=None) -> dict[int, dict[str, float]]:
+    """Per screener.in company_id: gross block this and last year, and annual sales
+    growth -- all three from the same query, so every row is a matched pair."""
     session = session or build_authenticated_session()
     _, companies = run_query(session, GROSS_BLOCK_QUERY)
+    if companies:
+        revealed = set().union(*(c.get("metrics", {}).keys() for c in companies))
+        missing = [m for m in REQUIRED_METRICS if m not in revealed]
+        if missing:
+            # Column-reveal changed under us: fail loudly instead of writing a phase from
+            # nothing (every company would silently drop out as incomplete).
+            raise RuntimeError(f"screener.in did not reveal {missing} for the sector-cycle query")
     result: dict[int, dict[str, float]] = {}
     for company in companies:
         company_id = company.get("company_id")
         metrics = company.get("metrics", {})
         current = metrics.get("gross_block_rscr")
         preceding = metrics.get("gross_block_py_rscr")
-        if company_id is not None and isinstance(current, (int, float)) and isinstance(preceding, (int, float)):
-            result[company_id] = {"gross_block_current_rscr": current, "gross_block_preceding_rscr": preceding}
+        sales_growth = metrics.get("sales_growth_pct")
+        if (company_id is not None and isinstance(current, (int, float))
+                and isinstance(preceding, (int, float)) and preceding > 0
+                and isinstance(sales_growth, (int, float))):
+            result[company_id] = {
+                "gross_block_current_rscr": current,
+                "gross_block_preceding_rscr": preceding,
+                "sales_growth_pct": float(sales_growth),
+            }
     return result
 
 
-def classify_phase(capacity_growth_pct: float | None, demand_growth_pct: float | None) -> str | None:
-    if capacity_growth_pct is None or demand_growth_pct is None:
+def classify_phase(capacity_minus_demand_pts: float | None) -> str | None:
+    """Phase from the sector's median per-company gap (capacity growth minus annual sales
+    growth, in percentage points)."""
+    if capacity_minus_demand_pts is None:
         return None
-    gap = capacity_growth_pct - demand_growth_pct
-    if gap > PHASE_THRESHOLD_POINTS:
+    if capacity_minus_demand_pts > PHASE_THRESHOLD_POINTS:
         return "capacity_expansion"
-    if gap < -PHASE_THRESHOLD_POINTS:
+    if capacity_minus_demand_pts < -PHASE_THRESHOLD_POINTS:
         return "capacity_discipline"
     return "balanced"
 
@@ -195,35 +245,43 @@ def classify_growth(demand_growth_pct: float | None, sample_size_confidence: str
     return "low_growth"
 
 
+def _median(values: pd.Series) -> float | None:
+    values = values.dropna()
+    return round(float(values.median()), 2) if not values.empty else None
+
+
 def compute_sector_aggregates(l1_with_sector: pd.DataFrame, gross_block_data: dict[int, dict[str, float]]) -> pd.DataFrame:
     if l1_with_sector.empty:
         return pd.DataFrame()
 
     df = l1_with_sector.copy()
-    df["gross_block_current_rscr"] = df["company_id"].map(lambda cid: gross_block_data.get(cid, {}).get("gross_block_current_rscr"))
-    df["gross_block_preceding_rscr"] = df["company_id"].map(lambda cid: gross_block_data.get(cid, {}).get("gross_block_preceding_rscr"))
+    for field in ("gross_block_current_rscr", "gross_block_preceding_rscr", "sales_growth_pct"):
+        df[field] = df["company_id"].map(lambda cid, f=field: gross_block_data.get(cid, {}).get(f))
+    df["company_capacity_growth_pct"] = (
+        (df["gross_block_current_rscr"] - df["gross_block_preceding_rscr"]) / df["gross_block_preceding_rscr"] * 100
+    )
 
     with_sector = df[df["sector_code"].notna()]
     rows = []
     for sector_code, group in with_sector.groupby("sector_code"):
-        capacity_rows = group.dropna(subset=["gross_block_current_rscr", "gross_block_preceding_rscr"])
-        current_sum = capacity_rows["gross_block_current_rscr"].sum()
-        preceding_sum = capacity_rows["gross_block_preceding_rscr"].sum()
-        capacity_growth_pct = round((current_sum - preceding_sum) / preceding_sum * 100, 2) if preceding_sum else None
-
-        demand_values = group["qtr_sales_var_pct"].dropna()
-        demand_growth_pct = round(float(demand_values.median()), 2) if not demand_values.empty else None
-        sample_size_confidence = "adequate" if len(capacity_rows) >= MIN_COMPANIES_FOR_CONFIDENCE else "low"
+        # Paired: companies with BOTH sides -- capacity and demand read the same set.
+        paired = group.dropna(subset=["company_capacity_growth_pct", "sales_growth_pct"])
+        capacity_growth_pct = _median(paired["company_capacity_growth_pct"])
+        demand_growth_pct = _median(paired["sales_growth_pct"])
+        gap = _median(paired["company_capacity_growth_pct"] - paired["sales_growth_pct"])
+        sample_size_confidence = "adequate" if len(paired) >= MIN_COMPANIES_FOR_CONFIDENCE else "low"
+        phase = None if sector_code in ASSET_LIGHT_SECTOR_CODES else classify_phase(gap)
 
         rows.append(
             {
                 "sector_code": sector_code,
                 "n_companies_in_l1": int(len(group)),
-                "n_companies_with_gross_block": int(len(capacity_rows)),
-                "n_companies_with_demand_data": int(len(demand_values)),
+                "n_companies_with_gross_block": int(group["company_capacity_growth_pct"].notna().sum()),
+                "n_companies_with_demand_data": int(len(paired)),
                 "capacity_growth_pct": capacity_growth_pct,
                 "demand_growth_pct": demand_growth_pct,
-                "phase": classify_phase(capacity_growth_pct, demand_growth_pct),
+                "capacity_minus_demand_pts": gap,
+                "phase": phase,
                 "growth_classification": classify_growth(demand_growth_pct, sample_size_confidence),
                 "sample_size_confidence": sample_size_confidence,
                 "run_date": pd.Timestamp.now(tz="UTC").normalize(),

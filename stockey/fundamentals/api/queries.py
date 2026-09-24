@@ -412,6 +412,7 @@ def get_sectors() -> list[dict]:
     sector_df = sql_to_df(
         """
         SELECT sc.sector_code, sc.capacity_growth_pct, sc.demand_growth_pct, sc.phase,
+               sc.capacity_minus_demand_pts, sc.n_companies_with_demand_data,
                sc.growth_classification, sc.sample_size_confidence, sc.n_companies_in_l1,
                sr.description AS sector_name
         FROM fundamentals_sector_cycle sc

@@ -60,7 +60,10 @@ SYNC_SOURCE_NAME = "fundamentals.screens.confluence_score"
 # returns None on a low-confidence (thin-sample) phase; ownership reads only L2
 # shareholding state -- insider/bulk-deal alerts count once, in event_corroboration,
 # instead of in both axes; superseded (round-trip) alerts are not counted at all.
-SCORE_VERSION = 3
+# v4 (2026-09-24): the sector phase behind sector_cycle is rebuilt -- per-company gross-
+# block growth against the same company's ANNUAL sales growth, median gap per sector,
+# no phase for asset-light sectors (fundamentals/screens/sector_cycle.py docstring).
+SCORE_VERSION = 4
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 # BUG FOUND LIVE 2026-08-29 (same class as fundamentals/api/queries.py's
