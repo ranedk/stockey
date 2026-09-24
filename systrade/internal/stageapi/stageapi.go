@@ -48,7 +48,7 @@ func nanToNil(v float64) *float64 {
 // human) to see what was excluded and why, rather than a silent partial list.
 type Result struct {
 	Rows          []Row          `json:"rows"`
-	TotalUniverse int            `json:"total_universe"` // symbols with >= MinBars daily bars
+	TotalUniverse int            `json:"total_universe"` // keys tried: NSE equity-series symbols + "BSE:<scrip>" (store.StageKeys)
 	IncludedCount int            `json:"included_count"`
 	ExcludedStale int            `json:"excluded_stale"`  // last daily bar older than MaxStaleDays
 	ExcludedShort int            `json:"excluded_short"`  // not enough weekly history for a first read
@@ -79,14 +79,16 @@ func (o Options) withDefaults() Options {
 }
 
 // List computes the latest stage classification for every symbol in
-// store.AdjustedSymbols (the point-in-time-honest EQ universe), filters out
+// store.StageKeys (NSE symbols in any equity series + BSE-only names), filters out
 // stale/delisted-looking names and names too short for a first classified
 // read, and returns the rest sorted by ticker. now is passed in rather than
 // read internally so callers can hold it fixed for one consistent listing.
 func List(ctx context.Context, st *store.Store, opts Options, now time.Time) (Result, error) {
 	opts = opts.withDefaults()
 
-	symbols, err := st.AdjustedSymbols(ctx, opts.MinBars)
+	// StageKeys, not AdjustedSymbols (2026-09-24): every NSE equity series plus BSE-only
+	// names -- see store.StageKeys. MinBars is applied per key to the merged series.
+	symbols, err := st.StageKeys(ctx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -143,7 +145,7 @@ func List(ctx context.Context, st *store.Store, opts Options, now time.Time) (Re
 // classifyOne never returns an error to the caller -- a single symbol's DB
 // hiccup or thin history degrades that one row to "short", not the whole
 // listing. Errors are swallowed deliberately here for that reason; a widescale
-// DB outage still surfaces since AdjustedSymbols itself would fail first.
+// DB outage still surfaces since StageKeys itself would fail first.
 func classifyOne(ctx context.Context, st *store.Store, symbol string, opts Options, now time.Time) struct {
 	row   Row
 	ok    bool
@@ -157,8 +159,8 @@ func classifyOne(ctx context.Context, st *store.Store, symbol string, opts Optio
 		short bool
 	}
 
-	daily, err := st.AdjustedCloses(ctx, symbol)
-	if err != nil || daily.Len() == 0 {
+	daily, dailyVol, err := st.StageSeries(ctx, symbol)
+	if err != nil || daily.Len() < opts.MinBars {
 		return out{short: true}
 	}
 	lastDaily := daily.Times[daily.Len()-1]
@@ -172,7 +174,7 @@ func classifyOne(ctx context.Context, st *store.Store, symbol string, opts Optio
 	}
 
 	var volPtr *core.Series
-	if dailyVol, err := st.AdjustedVolume(ctx, symbol); err == nil && dailyVol.Len() > 0 {
+	if dailyVol.Len() > 0 {
 		weeklyVol := core.ResampleWeeklySum(dailyVol)
 		volPtr = &weeklyVol
 	}

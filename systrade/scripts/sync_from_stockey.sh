@@ -51,6 +51,8 @@ FULL_TABLES=(
   nseindia_corporate_actions
   nseindia_holidays
   dim_trading_days
+  company_master            # NSE<->BSE identity for the stage API's BSE series (2026-09-24)
+  company_master_nse_alias  # NSE renames: current symbol -> existing company (2026-09-24)
 )
 
 INCR_TABLES=(               # incremental on the "date" column + reconciliation
@@ -60,6 +62,7 @@ INCR_TABLES=(               # incremental on the "date" column + reconciliation
   nseindia_circuit_hit      # price-band hits, 2013+ — trait library, revived 2026-09-11
   nseindia_indices          # index OHLCV + PE/PB/divyield (carry inputs)
   advisory_adjusted_ohlcv_daily  # ADJUSTED closes 2013+, incl. delisted — primary backtest series.
+  bse_advisory_adjusted_ohlcv_daily  # BSE adjusted series (2025-08+) — stage API only: BSE-only names + pre-NSE history (2026-09-24)
                                   # A view on the source side since 2026-08-14 (was a written table);
                                   # now also carries tr_adj_open/high/low/close (total-return-adjusted,
                                   # dividend-reinvested) -- previously only in the removed nseindia_ohlcv_adjusted.
@@ -149,6 +152,7 @@ declare -A RECONCILE_KEY=(
   [nseindia_circuit_hit]=symbol
   [nseindia_indices]=index_name
   [advisory_adjusted_ohlcv_daily]=symbol
+  [bse_advisory_adjusted_ohlcv_daily]=scrip_code
 )
 
 reconcile_by_key() {
@@ -210,6 +214,9 @@ CREATE INDEX IF NOT EXISTS idx_ohlcv_symbol_date ON nseindia_ohlcv (symbol, date
 CREATE INDEX IF NOT EXISTS idx_indices_name_date ON nseindia_indices (index_name, date);
 CREATE INDEX IF NOT EXISTS idx_corpact_symbol ON nseindia_corporate_actions (symbol, date);
 CREATE INDEX IF NOT EXISTS idx_advisory_adj_symbol_date ON advisory_adjusted_ohlcv_daily (symbol, date);
+CREATE INDEX IF NOT EXISTS idx_bse_adv_adj_scrip_date ON bse_advisory_adjusted_ohlcv_daily (scrip_code, date);
+CREATE INDEX IF NOT EXISTS idx_company_master_nse ON company_master (nse_ticker);
+CREATE INDEX IF NOT EXISTS idx_company_master_bse_scrip ON company_master (bse_scrip_code);
 EOF
 
 echo "done. row counts:"
