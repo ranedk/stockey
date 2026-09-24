@@ -6195,6 +6195,7 @@ def test_builder_main_check_crontab_flag_exit_codes(tmp_path, monkeypatch):
     assert excinfo.value.code == 0  # now matches
 
 
+@pytest.mark.live_db
 def test_cron_preflight_validates_generated_crontab(tmp_path, monkeypatch):
     from scripts import cron_preflight
 
@@ -17240,6 +17241,14 @@ def test_daily_fetch_falls_back_to_the_other_active_dhan_id(monkeypatch):
         ohlcv._fetch_daily_with_alternate_id(Client(), identity, first, from_date=None, to_date=None, ticker="AARNAV")
 
 
+def test_unit_tests_cannot_open_a_live_database_connection():
+    """conftest's guard (2026-09-24): 37 tests used to reach production."""
+    from utils import db
+
+    with pytest.raises(RuntimeError, match="LIVE database"):
+        db._engine.raw_connection()
+
+
 def test_india_ratings_affirms_is_a_reaffirmation():
     from fundamentals.collectors.rating_agencies import classify_rating_action_type
 
@@ -20679,12 +20688,6 @@ def test_api_watchlist_detail_route_200_when_found(monkeypatch):
 
 
 
-def _fake_step_module(*, main_fn, run_state=None):
-    """A fake module object for run_pipeline.run_step tests -- registers itself into
-    sys.modules on "import" the same way a real importlib.import_module call would,
-    since run_step's SystemExit branch looks the module back up via sys.modules.get()."""
-    module = types.SimpleNamespace(main=main_fn, STOCKEY_RUN_STATE=run_state or {})
-    return module
 
 
 def test_run_pipeline_normalize_exit_code_never_returns_a_bool():
@@ -20698,125 +20701,70 @@ def test_run_pipeline_normalize_exit_code_never_returns_a_bool():
     assert type(fundamentals_run_pipeline._normalize_exit_code(False)) is int
 
 
-def test_run_step_bool_return_normalized_to_int_returncode(monkeypatch):
-    # A step whose main() returns a bare False (an easy mistake, e.g. `return sync_ok`)
-    # must produce a real int returncode -- json.dumps(result) elsewhere in run_pipeline
-    # would otherwise serialize this as literal `false` instead of `0`.
-    fake_module = _fake_step_module(main_fn=lambda: False, run_state={"status": "ok"})
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: fake_module)
-
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_bool_return")
-
-    assert result["returncode"] == 0
-    assert type(result["returncode"]) is int
-    assert json.dumps(result)  # would raise/silently emit `false` if returncode stayed a bool
 
 
-def test_run_step_success_extracts_run_state(monkeypatch):
-    fake_module = _fake_step_module(main_fn=lambda: 0, run_state={"source": "fake", "status": "ok"})
-
-    def fake_import(name):
-        sys.modules[name] = fake_module
-        return fake_module
-
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", fake_import)
-
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_ok")
-
-    assert result["module"] == "fundamentals.test.fake_ok"
-    assert result["returncode"] == 0
-    assert result["run_state"] == {"source": "fake", "status": "ok"}
-    assert "error" not in result
-    sys.modules.pop("fundamentals.test.fake_ok", None)
 
 
-def test_run_step_nonzero_return_marked_failed(monkeypatch):
-    fake_module = _fake_step_module(main_fn=lambda: 1, run_state={"status": "blocked"})
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: fake_module)
-
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_nonzero")
-
-    assert result["returncode"] == 1
-    assert result["run_state"] == {"status": "blocked"}
 
 
-def test_run_step_system_exit_nonzero_extracts_run_state(monkeypatch):
-    def fake_import(name):
-        fake_module.STOCKEY_RUN_STATE = {"status": "failed"}
-        sys.modules[name] = fake_module
-
-        def raising_main():
-            raise SystemExit(1)
-
-        fake_module.main = raising_main
-        return fake_module
-
-    fake_module = _fake_step_module(main_fn=lambda: 0)
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", fake_import)
-
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_sysexit")
-
-    assert result["returncode"] == 1
-    assert result["run_state"] == {"status": "failed"}
-    sys.modules.pop("fundamentals.test.fake_sysexit", None)
 
 
-def test_run_step_system_exit_none_normalizes_to_zero(monkeypatch):
-    def raising_main():
-        raise SystemExit()  # SystemExit(None) -- the raise SystemExit(main()) convention with a None main()
-
-    fake_module = _fake_step_module(main_fn=raising_main)
-
-    def fake_import(name):
-        sys.modules[name] = fake_module
-        return fake_module
-
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", fake_import)
-
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_sysexit_none")
-
-    assert result["returncode"] == 0
-    sys.modules.pop("fundamentals.test.fake_sysexit_none", None)
 
 
-def test_run_step_unexpected_exception_is_isolated(monkeypatch):
-    def raising_main():
-        raise RuntimeError("boom")
-
-    fake_module = _fake_step_module(main_fn=raising_main)
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: fake_module)
-
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.fake_exception")
-
-    assert result["returncode"] == 1
-    assert result["run_state"] == {}
-    assert "RuntimeError: boom" in result["error"]
 
 
-def test_run_step_import_error_is_isolated(monkeypatch):
-    def raise_import_error(name):
-        raise ModuleNotFoundError(f"No module named {name!r}")
 
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", raise_import_error)
 
-    result = fundamentals_run_pipeline.run_step("fundamentals.test.does_not_exist")
+class _FakePopen:
+    def __init__(self, lines, returncode):
+        self.stdout = iter(lines)
+        self._rc = returncode
 
-    assert result["returncode"] == 1
-    assert "ModuleNotFoundError" in result["error"]
+    def wait(self):
+        return self._rc
+
+
+def test_run_step_runs_each_step_in_a_fresh_process(monkeypatch):
+    """2026-09-23: in-process re-import left a step's DEPENDENCIES as loaded at 15:30, so a
+    mid-run edit to utils/ failed three steps. Each step is its own process now."""
+    seen = {}
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"], seen["cwd"] = cmd, kwargs.get("cwd")
+        return _FakePopen(["log line\n", '{"source": "fake", "rows": 3, "status": "ok"}\n'], 0)
+
+    monkeypatch.setattr(fundamentals_run_pipeline.subprocess, "Popen", fake_popen)
+    result = fundamentals_run_pipeline.run_step("fundamentals.screens.fake")
+    assert seen["cmd"][1:] == ["-m", "fundamentals.screens.fake"]
+    assert result["returncode"] == 0 and type(result["returncode"]) is int
+    assert result["run_state"] == {"source": "fake", "rows": 3, "status": "ok"}
+
+
+def test_run_step_nonzero_exit_is_failed_and_keeps_run_state(monkeypatch):
+    monkeypatch.setattr(fundamentals_run_pipeline.subprocess, "Popen",
+                        lambda cmd, **k: _FakePopen(['{"source": "fake", "status": "failed"}\n'], 2))
+    result = fundamentals_run_pipeline.run_step("fundamentals.screens.fake")
+    assert result["returncode"] == 2 and result["run_state"]["status"] == "failed"
+
+
+def test_run_step_launch_failure_is_isolated(monkeypatch):
+    def boom(cmd, **k):
+        raise OSError("no such interpreter")
+
+    monkeypatch.setattr(fundamentals_run_pipeline.subprocess, "Popen", boom)
+    result = fundamentals_run_pipeline.run_step("fundamentals.screens.fake")
+    assert result["returncode"] == 1 and "OSError" in result["error"] and result["run_state"] == {}
 
 
 def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
     calls = []
+    codes = iter([1, 0])
 
-    def make_fake(name, code):
-        def fake_import(_name, _code=code, _name2=name):
-            calls.append(_name2)
-            return _fake_step_module(main_fn=lambda c=_code: c)
+    def fake_popen(cmd, **k):
+        calls.append(cmd[-1])
+        return _FakePopen([], next(codes))
 
-        return fake_import
-
-    order = iter([make_fake("step_a", 1), make_fake("step_b", 0)])
-    monkeypatch.setattr(fundamentals_run_pipeline.importlib, "import_module", lambda name: next(order)(name))
+    monkeypatch.setattr(fundamentals_run_pipeline.subprocess, "Popen", fake_popen)
 
     result = fundamentals_run_pipeline.run_pipeline(["step_a", "step_b"])
 
@@ -23394,6 +23342,7 @@ def test_company_master_sql_contains_no_literal_percent():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live_db
 def test_confluence_evaluable_equals_supportive_plus_contradicting():
     """The identity that makes a bare "1/4" badge misleading: the denominator counts only
     axes that COULD be judged, so anything in it that is not supportive is actively

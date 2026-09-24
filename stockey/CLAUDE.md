@@ -396,13 +396,16 @@ made, diagnosed, and fixed live -- they are cheap to avoid and expensive to redi
 - **`builder.py` (no flags) rewrites the crontab and silently stops a LIVE go-crond from
   scheduling anything.** Use `--check-crontab` to test for drift; if you do regenerate,
   restart go-crond afterwards regardless of whether the diff was empty.
-- **Do not edit fundamentals code while the screener is running** (lock
-  `/tmp/stockey_fundamentals_screener.lock.d` present). `run_pipeline.run_step`
-  re-imports only the STEP module; its dependencies (`utils/`, other screens) stay as
-  loaded at 15:30 UTC. On 2026-09-23 a signature change in `utils/company_master.py`
-  mid-run failed l3_triggers, confluence_score and llm_triage with TypeError while every
-  test passed. If it happens, re-run those steps in a fresh process:
-  `scripts/with_lock.sh /tmp/stockey_fundamentals_screener.lock python -m fundamentals.run_pipeline --steps ...`.
+- **Pipeline steps run in their own process** (`run_pipeline.run_step`, since 2026-09-24).
+  They used to be re-imported in-process, which left their DEPENDENCIES as loaded at
+  15:30 UTC: a mid-run signature change in `utils/company_master.py` failed l3_triggers,
+  confluence_score and llm_triage on 2026-09-23 while every test passed. Each step now
+  loads what is on disk when it starts -- so an edit mid-run applies from the NEXT step,
+  and a half-finished edit can still break one. Prefer editing outside 15:30-17:30 UTC.
+- **Unit tests cannot reach the live DB.** conftest refuses any real connection unless a
+  test is marked `@pytest.mark.live_db`; stub `sql_to_df` / `db_session` / `upsert_to_db`
+  at the module under test. Before this, 37 tests touched production (some ran real
+  migrations; two passed only because of what production happened to hold).
 - **The fundamentals API does not hot-reload.** After changing anything under
   `fundamentals/api/`, kill the listener (`ss -tlnp | grep :8000`) and relaunch.
 

@@ -33,3 +33,30 @@ def _schema_migrations_never_run_from_tests(monkeypatch):
     monkeypatch.setattr(schema_migrations, "execute_db_operation", lambda *a, **k: None)
     monkeypatch.setattr(schema_migrations, "load_schema_migration",
                         lambda _migration_id: {"status": "applied", "checksum": ""})
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "live_db: the test deliberately reads the LIVE database (a data invariant, not a unit test)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_database_unless_marked(request, monkeypatch):
+    """Unit tests must not reach the live database. Measured 2026-09-24: 37 tests did --
+    some ran real schema migrations, two passed only because of what production happened
+    to contain. Any real connection now raises unless the test is marked live_db; stub
+    sql_to_df / db_session / upsert_to_db at the module under test instead."""
+    if request.node.get_closest_marker("live_db"):
+        return
+    from utils import db
+
+    def _refuse(*_a, **_k):
+        raise RuntimeError(
+            "unit test tried to open a LIVE database connection -- stub the DB call, "
+            "or mark the test @pytest.mark.live_db if reading production is the point"
+        )
+
+    monkeypatch.setattr(db._engine, "raw_connection", _refuse)
+    monkeypatch.setattr(db._engine, "connect", _refuse)

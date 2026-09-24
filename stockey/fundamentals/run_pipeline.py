@@ -72,10 +72,11 @@ gap."""
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
+import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 STEPS: list[str] = [
@@ -129,33 +130,65 @@ def _normalize_exit_code(value: object) -> int:
     return 1
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _last_run_state(lines: list[str]) -> dict[str, Any]:
+    """The step's STOCKEY_RUN_STATE, which every step prints as its last JSON line."""
+    for line in reversed(lines):
+        text = line.strip()
+        if not text.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 def run_step(module_name: str) -> dict[str, Any]:
-    """Import module_name fresh and call its main() directly. Never raises -- any
-    exception (including SystemExit) is caught and reported in the returned dict so
-    run_pipeline() can move on to the next step."""
+    """Run one step in its OWN Python process. Never raises -- a failed or crashed step
+    is reported in the returned dict so run_pipeline() can move on to the next one.
+
+    A fresh process per step (2026-09-24), not import-and-call: re-importing only the
+    step module left its dependencies as loaded when the pipeline started, so editing
+    utils/company_master.py mid-run failed l3_triggers, confluence_score and llm_triage
+    with a TypeError on 2026-09-23 while every test passed. Each step now loads the code
+    that is on disk when it starts. Its stdout (including the run-state JSON line) is
+    streamed through to this process's stdout; stderr is inherited."""
     started_at = time.monotonic()
-    sys.modules.pop(module_name, None)
     print(f"[fundamentals.run_pipeline] step={module_name} start", file=sys.stderr, flush=True)
 
     code = 1
-    run_state: dict[str, Any] = {}
+    lines: list[str] = []
     error: str | None = None
     try:
-        module = importlib.import_module(module_name)
-        code = _normalize_exit_code(module.main())
-        run_state = getattr(module, "STOCKEY_RUN_STATE", {})
-    except SystemExit as exc:
-        code = _normalize_exit_code(exc.code)
-        module = sys.modules.get(module_name)
-        run_state = getattr(module, "STOCKEY_RUN_STATE", {}) if module else {}
-    except Exception as exc:  # noqa: BLE001 -- one step's exception must not abort the pipeline
+        proc = subprocess.Popen(
+            [sys.executable, "-m", module_name],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            lines.append(line)
+            if len(lines) > 200:
+                del lines[:100]
+        code = _normalize_exit_code(proc.wait())
+    except Exception as exc:  # noqa: BLE001 -- one step's failure must not abort the pipeline
         error = f"{type(exc).__name__}: {exc}"
 
     elapsed = round(time.monotonic() - started_at, 2)
     status = "ok" if code == 0 else "failed"
     print(f"[fundamentals.run_pipeline] step={module_name} status={status} elapsed={elapsed:.2f}s", file=sys.stderr, flush=True)
 
-    result: dict[str, Any] = {"module": module_name, "returncode": code, "elapsed_seconds": elapsed, "run_state": run_state}
+    result: dict[str, Any] = {"module": module_name, "returncode": code, "elapsed_seconds": elapsed,
+                              "run_state": _last_run_state(lines)}
     if error:
         result["error"] = error
     return result
