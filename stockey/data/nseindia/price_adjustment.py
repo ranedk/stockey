@@ -291,7 +291,7 @@ FACTORS_MIGRATION_ID = "20260814_nseindia_adjustment_factors"
 # guard) -- so composing tr_adj_* with cum_price_adjustment_factor (see VIEW_SCHEMA_STATEMENTS below)
 # needed a new migration_id, not a mutation of the 2026-08-14 one. Confirmed live: reusing the old ID
 # raised ValueError("Migration checksum mismatch...") exactly as designed.
-VIEW_MIGRATION_ID = "20260819_advisory_adjusted_ohlcv_daily_view_tr_composed"
+VIEW_MIGRATION_ID = "20260924_advisory_adjusted_ohlcv_daily_view_sme_series"
 
 FACTORS_SCHEMA_STATEMENTS = [
     f"""
@@ -341,7 +341,10 @@ VIEW_SCHEMA_STATEMENTS = [
         f.load_ts
     FROM nseindia_ohlcv o
     JOIN {ADJUSTMENT_FACTORS_TABLE} f ON f.symbol = o.symbol AND f.date = o.date
-    WHERE o.series IN ('EQ', 'BE')
+    -- SM/ST (NSE SME) added 2026-09-24: SME stocks had raw bhavcopy prices but no adjusted
+    -- series at all, so no stage read and nothing downstream (stockey's watchlist holds SME
+    -- names -- Happy Steels, Mos Utility, TechEra). systrader's backtests filter series='EQ'.
+    WHERE o.series IN ('EQ', 'BE', 'SM', 'ST')
     """,
 ]
 
@@ -437,12 +440,12 @@ def compute_total_return_factor(prices: pd.DataFrame, dividends: pd.DataFrame, *
 
 
 def build_adjustment_factors(*, dry_run: bool = False) -> dict[str, Any]:
-    """Populate nseindia_adjustment_factors for the whole EQ+BE universe (EQ+BE treated as one series per
-    symbol, so a T2T migration stays continuous). Split/bonus factor: price-step detection (adjust_frame,
+    """Populate nseindia_adjustment_factors for the whole EQ+BE+SM+ST universe (treated as one series per
+    symbol, so a T2T or SME->main-board migration stays continuous). Split/bonus factor: price-step detection (adjust_frame,
     unchanged). Total-return factor: events_dividend-derived (compute_total_return_factor). Returns a summary."""
     from utils.db import sql_to_df, upsert_to_db
     raw = sql_to_df(
-        "SELECT symbol, date, series, open, close, previous_close FROM nseindia_ohlcv WHERE series IN ('EQ','BE') "
+        "SELECT symbol, date, series, open, close, previous_close FROM nseindia_ohlcv WHERE series IN ('EQ','BE','SM','ST') "
         "ORDER BY symbol, date"
     )
     if raw.empty:

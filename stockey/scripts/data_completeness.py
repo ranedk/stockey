@@ -159,9 +159,9 @@ def check_adjustment_join(f: Findings) -> None:
     was three whole trading days wide, with every cron job still exiting 0."""
     row = sql_to_df(
         """
-        SELECT (SELECT count(*) FROM nseindia_ohlcv WHERE series IN ('EQ','BE')) AS price_bars,
+        SELECT (SELECT count(*) FROM nseindia_ohlcv WHERE series IN ('EQ','BE','SM','ST')) AS price_bars,
                (SELECT count(*) FROM advisory_adjusted_ohlcv_daily)              AS view_rows,
-               (SELECT max(date) FROM nseindia_ohlcv WHERE series IN ('EQ','BE')) AS ohlcv_max,
+               (SELECT max(date) FROM nseindia_ohlcv WHERE series IN ('EQ','BE','SM','ST')) AS ohlcv_max,
                (SELECT max(date) FROM nseindia_adjustment_factors)                AS factors_max
         """
     )
@@ -176,7 +176,7 @@ def check_adjustment_join(f: Findings) -> None:
         f.add(
             ERROR,
             "adjustment_join",
-            f"{orphans} EQ/BE price bars have no adjustment-factor row and are silently "
+            f"{orphans} EQ/BE/SM/ST price bars have no adjustment-factor row and are silently "
             f"missing from advisory_adjusted_ohlcv_daily "
             f"(factors reach {factors_max.date()}, prices reach {ohlcv_max.date()}, {lag} day(s) behind). "
             f"Fix: ./all_price_adjustment.sh",
@@ -184,7 +184,7 @@ def check_adjustment_join(f: Findings) -> None:
         )
     else:
         f.add(OK, "adjustment_join",
-              f"all {int(r['price_bars'])} EQ/BE bars have a factor row (through {factors_max.date()})",
+              f"all {int(r['price_bars'])} EQ/BE/SM/ST bars have a factor row (through {factors_max.date()})",
               price_bars=int(r["price_bars"]))
 
 
@@ -312,7 +312,7 @@ def check_universe_coverage(f: Findings, window_days: int) -> None:
           -- (2026-09-24).
           SELECT DISTINCT COALESCE(a.canonical_nse_ticker, o.symbol) FROM nseindia_ohlcv o
             LEFT JOIN company_master_nse_alias a ON a.alias_ticker = o.symbol
-           WHERE o.series IN ('EQ','BE')
+           WHERE o.series IN ('EQ','BE','SM','ST')
              AND o.date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
           EXCEPT
           SELECT DISTINCT ticker FROM dhan_ohlcv_intraday
@@ -324,7 +324,7 @@ def check_universe_coverage(f: Findings, window_days: int) -> None:
     universe = _scalar(
         """
         SELECT count(DISTINCT symbol) FROM nseindia_ohlcv
-         WHERE series IN ('EQ','BE')
+         WHERE series IN ('EQ','BE','SM','ST')
            AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
         """
     )

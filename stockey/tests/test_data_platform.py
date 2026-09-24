@@ -340,7 +340,7 @@ def test_get_equity_universe_queries_bhavcopy(monkeypatch):
     assert result == ["RELIANCE", "TCS"]
     assert universe_mod.UNIVERSE_SOURCE_TABLE in captured["query"]
     assert "series = ANY(%s)" in captured["query"]
-    assert captured["params"] == (["EQ", "BE"],)
+    assert captured["params"] == (["EQ", "BE", "SM", "ST"],)  # SME included 2026-09-24
 
 
 def test_get_equity_universe_empty_on_db_error(monkeypatch):
@@ -6852,7 +6852,7 @@ def test_dhan_precheck_symbols_samples_by_liquidity(monkeypatch):
 
     assert result == ["BHARTIARTL", "ASTRAL"]
     assert "ORDER BY total_value DESC" in captured["query"]
-    assert captured["params"] == (["EQ", "BE"], download_runner.DHAN_PRECHECK_SAMPLE_SIZE)
+    assert captured["params"] == (["EQ", "BE", "SM", "ST"], download_runner.DHAN_PRECHECK_SAMPLE_SIZE)
 
 
 def test_dhan_precheck_symbols_empty_on_db_error(monkeypatch):
@@ -17284,6 +17284,18 @@ def test_negative_only_names_are_not_watched():
     assert status != "no_thesis"
 
 
+def test_stage_lookup_falls_back_to_the_renamed_symbol_then_the_bse_key():
+    """nse:TATAMOTORS trades as TMPV; BSE-only names are listed as BSE:<scrip> (2026-09-24).
+    The bare-suffix lookup found neither, and a missing stage blocks entry."""
+    from fundamentals.screens.portfolio_ruleset import stage_for
+
+    keys = {"nse:TATAMOTORS": ["TATAMOTORS", "TMPV", "BSE:500570"], "nse:543531-BOM": ["543531-BOM", "BSE:543531"]}
+    assert stage_for("nse:TATAMOTORS", {"TMPV": 2}, keys) == 2
+    assert stage_for("nse:543531-BOM", {"BSE:543531": 4}, keys) == 4
+    assert stage_for("nse:RELIANCE", {"RELIANCE": 1}, keys) == 1
+    assert stage_for("nse:NOPE", {}, keys) is None
+
+
 def test_india_ratings_affirms_is_a_reaffirmation():
     from fundamentals.collectors.rating_agencies import classify_rating_action_type
 
@@ -23357,7 +23369,7 @@ def test_company_master_admits_traded_symbols_dhan_labels_other():
     nse_query = src[src.index("SELECT DISTINCT ON (underlying_symbol)"):src.index('operation="sync_dhan_nse"')]
     assert "instrument_type IN ('ES', 'ETF')" in nse_query
     assert "FROM nseindia_ohlcv" in nse_query      # the universe escape hatch
-    assert "series IN ('EQ', 'BE')" in nse_query
+    assert "series IN ('EQ', 'BE', 'SM', 'ST')" in nse_query  # SME included 2026-09-24
 
 
 def test_company_master_sql_contains_no_literal_percent():
@@ -23572,6 +23584,7 @@ def test_stop_is_volatility_scaled_and_clamped_to_the_band(monkeypatch):
 def test_missing_stage_read_fails_closed(monkeypatch):
     """No price read must never be treated as a passing one -- the same
     absence-of-evidence error the evaluable_count guard exists to prevent."""
+    monkeypatch.setattr(__import__("fundamentals.screens.portfolio_ruleset", fromlist=["x"]), "load_stage_keys", lambda ids: {})
     import fundamentals.screens.portfolio_ruleset as pr
 
     monkeypatch.setattr(pr, "load_stage_reads", lambda: {})
@@ -23666,6 +23679,7 @@ def _pf_exit_env(monkeypatch, *, positions, price=100.0, contradicting=0, stage=
     monkeypatch.setattr(px, "_current_scores", lambda c: {
         i: {"contradicting_count": contradicting, "evaluable_count": 2} for i in c})
     monkeypatch.setattr(px, "load_stage_reads", lambda: {} if stage is None else {"X": stage})
+    monkeypatch.setattr(px, "load_stage_keys", lambda ids: {})
     return px
 
 
@@ -24472,6 +24486,7 @@ def test_stale_stage_reads_block_entry_rather_than_passing_silently(monkeypatch)
     """The consequence that matters: if every read is stale, the ruleset must report the
     stage API as unavailable so portfolio_runner BLOCKS the run -- not record a day of
     zero entries that later reads as "the rule found nothing"."""
+    monkeypatch.setattr(__import__("fundamentals.screens.portfolio_ruleset", fromlist=["x"]), "load_stage_keys", lambda ids: {})
     import fundamentals.screens.portfolio_ruleset as pr
 
     monkeypatch.setattr(pr, "load_stage_reads", lambda: {})

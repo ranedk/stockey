@@ -49,7 +49,9 @@ from fundamentals.screens.portfolio_ruleset import (
     CONFLUENCE_MAX_AGE_DAYS,
     ENTRY_STAGE,
     RULESET_VERSION,
+    load_stage_keys,
     load_stage_reads,
+    stage_for,
 )
 from utils.db import db_session, sql_to_df
 
@@ -165,6 +167,7 @@ def evaluate_exit_triggers() -> dict[str, object]:
     prices = _latest_prices(tickers)
     scores = _current_scores(company_ids)
     stages = load_stage_reads()
+    stage_keys = load_stage_keys([str(c) for c in positions["company_master_id"]])
     # IST, not the server's clock: between 18:30 UTC and midnight the two are different
     # calendar days, so a system-local date fires the target_date exit a day early or late
     # depending only on when cron happened to run.
@@ -220,9 +223,9 @@ def evaluate_exit_triggers() -> dict[str, object]:
                 triggers.append(_trigger(p, "thesis_invalidation", price,
                                          f"{int(contradicting)} contradicting axis/axes on score "
                                          f"v{base_version}, up from {base_count} at baseline",
-                                         score=score, stage_now=stages.get(str(p.ticker))))
+                                         score=score, stage_now=stage_for(p.company_master_id, stages, stage_keys)))
                 continue
-        stage_now = stages.get(str(p.ticker))
+        stage_now = stage_for(p.company_master_id, stages, stage_keys)
         if stage_now is not None and int(stage_now) != ENTRY_STAGE:
             triggers.append(_trigger(p, "thesis_invalidation", price,
                                      f"Weinstein stage left {ENTRY_STAGE} (now {int(stage_now)})",

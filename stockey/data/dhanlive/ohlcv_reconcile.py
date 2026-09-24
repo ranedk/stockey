@@ -54,7 +54,7 @@ env = Env()
 # 2026-09-21: 289/1500 at 07:40 vs 177/200 at 12:00 and ~1410/1500 at 23:15), so the backlog
 # outgrew the cap and never drained: coverage sat at 664-910 of ~2,900 symbols. A full pass
 # at ~1.3s per symbol is about an hour, which both slots have.
-DEFAULT_MAX_SYMBOLS = env.int("OHLCV_RECONCILE_MAX_SYMBOLS", default=3000)
+DEFAULT_MAX_SYMBOLS = env.int("OHLCV_RECONCILE_MAX_SYMBOLS", default=4000)  # universe ~3,500 with SME (2026-09-24)
 # After this hour (IST) on a trading day, today's EOD bars are expected to exist, so the
 # pre-advisory reconcile (18:45) pulls TODAY's bars instead of stopping at yesterday.
 TODAY_COMPLETE_AFTER_HOUR_IST = env.int("OHLCV_RECONCILE_TODAY_COMPLETE_AFTER_HOUR_IST", default=18)

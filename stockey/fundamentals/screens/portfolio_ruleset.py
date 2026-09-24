@@ -127,6 +127,43 @@ def load_stage_reads() -> dict[str, int]:
     return out
 
 
+def load_stage_keys(company_master_ids: list[str]) -> dict[str, list[str]]:
+    """company_master_id -> the keys systrader's stage API may list it under, in order.
+
+    2026-09-24: the lookup used `company_master_id.replace("nse:", "")` alone, so a
+    renamed company (nse:TATAMOTORS, trading as TMPV) and every BSE-only company
+    never found a stage -- and the entry rule fails closed without one (48 of 137
+    active watchlist names). Now: the id's own symbol, its current NSE symbol after a
+    rename, then "BSE:<scrip_code>" (systrader classifies BSE-only names since the same
+    date)."""
+    if not company_master_ids:
+        return {}
+    df = sql_to_df(
+        """
+        SELECT cm.company_master_id, cm.bse_scrip_code, a.alias_ticker
+          FROM company_master cm
+          LEFT JOIN company_master_nse_alias a ON a.company_master_id = cm.company_master_id
+         WHERE cm.company_master_id = ANY(%s)
+        """,
+        params=(list(company_master_ids),),
+    )
+    keys: dict[str, list[str]] = {cmid: [str(cmid).replace("nse:", "")] for cmid in company_master_ids}
+    for r in df.itertuples():
+        found = keys.setdefault(str(r.company_master_id), [str(r.company_master_id).replace("nse:", "")])
+        if isinstance(r.alias_ticker, str) and r.alias_ticker and r.alias_ticker not in found:
+            found.append(r.alias_ticker)
+        if isinstance(r.bse_scrip_code, str) and r.bse_scrip_code:
+            found.append(f"BSE:{r.bse_scrip_code}")
+    return keys
+
+
+def stage_for(company_master_id: str, stages: dict[str, int], stage_keys: dict[str, list[str]]):
+    for key in stage_keys.get(str(company_master_id)) or [str(company_master_id).replace("nse:", "")]:
+        if key in stages:
+            return stages[key]
+    return None
+
+
 def compute_stop_pct(symbols: list[str]) -> dict[str, dict]:
     """Volatility-scaled stop percentage per symbol, clamped to the operator's band.
 
@@ -216,6 +253,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
         return {"ruleset_version": RULESET_VERSION, "evaluated": 0, "candidates": [], "stage_reads": 0}
 
     stages = load_stage_reads()
+    stage_keys = load_stage_keys(rows["company_master_id"].astype(str).tolist())
     score_cutoff = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=CONFLUENCE_MAX_AGE_DAYS)
     stale_scores: list[str] = []
     candidates = []
@@ -224,7 +262,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
             stale_scores.append(str(r.company_master_id))
             continue
         ticker = str(r.company_master_id).replace("nse:", "")
-        stage = stages.get(ticker)
+        stage = stage_for(r.company_master_id, stages, stage_keys)
         # Each condition recorded individually so a rejection is explainable, not just
         # a boolean. This is what makes a later "why was X not taken" answerable.
         checks = {

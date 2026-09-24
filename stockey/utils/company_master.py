@@ -124,7 +124,7 @@ def sync_company_master() -> pd.DataFrame:
             -- The series each symbol traded in on its LATEST bhavcopy day. See ORDER BY.
             SELECT DISTINCT ON (symbol) symbol AS current_symbol, series AS current_series
               FROM nseindia_ohlcv
-             WHERE series IN ('EQ', 'BE')
+             WHERE series IN ('EQ', 'BE', 'SM', 'ST')  -- SME (SM/ST) included 2026-09-24
                AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
              ORDER BY symbol, date DESC
         ) current_listing ON current_listing.current_symbol = underlying_symbol
@@ -154,7 +154,7 @@ def sync_company_master() -> pd.DataFrame:
                 -- bhavcopy says it traded this week, trust the bhavcopy.
                 OR underlying_symbol IN (
                      SELECT DISTINCT symbol FROM nseindia_ohlcv
-                      WHERE series IN ('EQ', 'BE')
+                      WHERE series IN ('EQ', 'BE', 'SM', 'ST')  -- SME (SM/ST) included 2026-09-24
                         AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
                    )
           )
@@ -344,7 +344,7 @@ def sync_nse_symbol_aliases() -> int:
         WITH listed AS (
             SELECT DISTINCT ON (symbol) symbol, isin
               FROM nseindia_ohlcv
-             WHERE series IN ('EQ', 'BE') AND isin IS NOT NULL
+             WHERE series IN ('EQ', 'BE', 'SM', 'ST') AND isin IS NOT NULL
                AND date >= (SELECT max(date) FROM nseindia_ohlcv) - interval '7 days'
              ORDER BY symbol, date DESC
         ), unmapped AS (

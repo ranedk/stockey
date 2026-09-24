@@ -37,7 +37,11 @@ env = Env()
 
 DEFAULT_LOOKBACK_DAYS = env.int("EQUITY_UNIVERSE_LOOKBACK_DAYS", default=7)
 UNIVERSE_SOURCE_TABLE = "nseindia_ohlcv"
-UNIVERSE_SERIES = ("EQ", "BE")
+# SM/ST (NSE SME) added 2026-09-24: Dhan serves daily and intraday for SME stocks (under
+# the id of the series they trade in -- company_master picks it), but they were outside
+# this universe, so no Dhan data was ever collected for ~565 listed companies, several of
+# them on stockey's own fundamentals watchlist.
+UNIVERSE_SERIES = ("EQ", "BE", "SM", "ST")
 
 
 def get_equity_universe(lookback_days: int | None = None) -> list[str]:

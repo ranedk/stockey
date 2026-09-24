@@ -73,7 +73,7 @@ both sides.
 
 | Table | Producer (stockey) | Notes |
 |---|---|---|
-| advisory_adjusted_ohlcv_daily | VIEW over `nseindia_ohlcv` × `nseindia_adjustment_factors` (the latter written by `data/nseindia/price_adjustment.py`) | PRIMARY equity series (2013+, CA-adjusted + total-return-adjusted, incl. delisted). Not a written table — `\copy (SELECT * FROM ...)` works against it exactly like a table |
+| advisory_adjusted_ohlcv_daily | VIEW over `nseindia_ohlcv` × `nseindia_adjustment_factors` (the latter written by `data/nseindia/price_adjustment.py`) | PRIMARY equity series (2013+, CA-adjusted + total-return-adjusted, incl. delisted). Series EQ/BE, plus NSE SME (SM/ST) since 2026-09-24 -- filter `series = 'EQ'` for backtests. Not a written table — `\copy (SELECT * FROM ...)` works against it exactly like a table |
 | nseindia_ohlcv | `data/nseindia/bhavcopy_history.py` | raw OHLC; source of adjusted opens |
 | nseindia_mto | `data/nseindia/bhavcopy_parser.py` (`parse_mto`) | security-wise delivery position, 2013+: traded vs deliverable quantity and delivery %, one row per (date, symbol), all series. Retired 2026-08-15, revived 2026-09-11 for systrader's trait library. Raw (unadjusted) quantities — use the ratio, or adjust volumes before comparing across a split |
 | nseindia_circuit_hit | `data/nseindia/bhavcopy_parser.py` (`parse_circuit_hit`) | price-band hits, 2013+: one row per (date, symbol, series, H/L) for each stock that hit its upper (H) or lower (L) band that day. The file lists hits only — a stock-day with no row had no hit, not missing data. Retired 2026-08-15, revived 2026-09-11 for systrader's trait library |
@@ -81,12 +81,15 @@ both sides.
 | dhan_ohlcv_daily | `data/dhanlive/ohlcv_pull.py` | fallback only (2021+ coverage) |
 | dhan_ohlcv_intraday | `data/dhanlive/ohlcv.py` (via `sync_many_intraday`) | 1-min bars, live in the cloud DB (not a local-only landing zone as originally planned). systrader reads this table live via a `postgres_fdw` foreign table (2026-08-26 — both Postgres instances are colocated on one disk, so a local mirror would duplicate the same bytes for no isolation benefit); NOT in `sync_from_stockey.sh`'s table lists, and shouldn't be added there — that script's own daily-bar sync model is superseded here by the FDW read. See `docs/HF_DATA_PLATFORM_PLAN.md` for the fuller history |
 | master_dhan_instruments | `data/dhanlive/scrip_master.py` | security ids, lots, expiries |
-| dim_security | `data/nseindia/security_history.py` | identity mapping |
+| dim_security | `data/nseindia/security_history.py` + `data/nseindia/security_dimension.py` (scheduled in `download_runner`'s parser steps since 2026-09-24 -- before that it had no scheduled producer and was frozen at 2026-08-10) | identity mapping; sector_code falls back to Sharpely by ISIN |
+| company_master | `utils/company_master.py` (`data/company_master.py`) | one row per company: nse_ticker, bse_ticker/bse_scrip_code, Dhan ids (the id of the series the stock trades in). Synced (full) since 2026-09-24 for the stage API's NSE<->BSE join |
+| company_master_nse_alias | `utils/company_master.py` (`sync_nse_symbol_aliases`) | NSE symbol renames (TMPV -> nse:TATAMOTORS): current bhavcopy symbol -> existing company_master_id, by ISIN. Synced (full) since 2026-09-24 |
+| bse_advisory_adjusted_ohlcv_daily | VIEW over `bseindia_ohlcv` x BSE adjustment factors (`data/bseindia/price_adjustment.py`) | BSE adjusted series (2025-08+), keyed by scrip_code. Synced since 2026-09-24 for the stage API ONLY (BSE-only names, and pre-NSE-listing history); not a backtest series |
 | nseindia_corporate_actions_bc_raw / nseindia_corporate_actions_normalized | `data/nseindia/bhavcopy_parser.py` / `data/nseindia/adjusted_prices.py` | `_bc_raw` (bhavcopy CA feed) is the comprehensive corporate-actions source; `_normalized` derives from it |
 | nseindia_mcap | `data/nseindia/bhavcopy_parser.py`'s `parse_mcap` | point-in-time universe, 2024-02+ |
 | historical_mcap | frozen archive, no longer written | pre-2024 market-cap history (2012+, ~970 symbols) `nseindia_mcap` doesn't have |
 | nseindia_holidays | `data/nseindia/holidays.py` | |
-| dim_trading_days | producer unidentified — locate before relying on it | confirmed live 2026-08-14: no write site anywhere in the current codebase, yet it's read by `utils/advisory_date.py` (used in the 18:45 IST `ohlcv_reconcile.py` cron job) and is currently populated 2014-01-01→2026-12-31 (3245 rows) — not stale today, but nothing will extend it past 2026-12-31 until a producer is found/rebuilt |
+| dim_trading_days | `data/nseindia/calendar_creator.py` (restored 2026-09-02, parser step after bhavcopy) | trading-day calendar; populated through the end of the current year |
 | rbi_bank_rates / fbil_gsec_par | `data/rbi/*` | risk-free (repo/T-bill) + G-sec carry |
 | events_dividend | `data/nseindia/corporate_action_events.py` | keyed on `ex_date`; a minority of rows lack `dividend_amount` — TR math must handle nulls. Input for NIFTY TR benchmark + equity carry |
 | events_capital_change | `data/nseindia/corporate_action_events.py` | |
