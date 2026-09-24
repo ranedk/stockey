@@ -509,3 +509,61 @@ each — neither changes the §1 rule that L4 is a human act):
 
 Nothing above blocks starting. Step 0 (security master extension) and step
 1 (rate limiter generalization) can begin immediately.
+
+## 14. What each L1 filter costs in names (TODO B0, measured 2026-09-24)
+
+The L1 screen (`fundamentals/screens/l1_universe.py`, `L1_QUERY`, screener.in), one
+clause per line:
+
+```
+Market Capitalization > 100 AND
+Market Capitalization < 5000 AND
+Volume 1month average * Current Price > 1000000 AND
+FII holding + DII holding < 20 AND
+Number of Shareholders < 50000 AND
+(Cash from operations last year + Cash from operations preceding year) /
+  (Operating profit last year + Operating profit preceding year) >= 0.6 AND
+Debtor days <= Debtor days 3years back AND
+Contingent liabilities / Net worth < 0.25
+```
+
+Survivors with each clause dropped in turn, same session, 2026-09-24 ~19:45 UTC. Counts
+are the screen's own, before the post-hoc auditor-change/RPT exclusion (that night's L1
+kept 192 of 196). Filters overlap, so the "added" column does not sum.
+
+| variant | survivors | vs baseline |
+|---|---:|---:|
+| baseline (all eight clauses) | 196 | |
+| drop market cap > Rs 100 cr | 219 | +23 |
+| drop market cap < Rs 5,000 cr | 208 | +12 |
+| drop both market-cap bounds | 231 | +35 |
+| drop liquidity > Rs 10 L/day | 282 | +86 |
+| drop FII + DII < 20% | 207 | +11 |
+| drop shareholders < 50,000 | 277 | +81 |
+| drop cash conversion >= 0.6 | 438 | +242 |
+| drop debtor days <= 3 years ago | 466 | +270 |
+| drop contingent liabilities < 25% of net worth | 208 | +12 |
+
+B2 (liquidity floor, all other clauses kept) and B3 (ceiling):
+
+| variant | survivors |
+|---|---:|
+| liquidity > Rs 1 cr/day | 76 |
+| liquidity > Rs 5 cr/day | 22 |
+| liquidity > Rs 10 cr/day (systrader's floor) | 11 |
+| market cap < Rs 10,000 cr | 204 |
+| market cap < Rs 25,000 cr | 206 |
+| market cap < Rs 50,000 cr | 208 |
+| market cap < Rs 50,000 cr AND no FII+DII or shareholder cap | 441 |
+
+What it says:
+
+- **The two quality clauses bind hardest.** Cash conversion and debtor days each more
+  than double the list when dropped. They are the screen's real selectivity.
+- **Raising the market-cap ceiling alone does almost nothing** (+12 even at Rs 50,000 cr):
+  the neglect clauses already exclude larger companies, the shareholder cap above all
+  (+81 when dropped). Widening the universe (B3) is a decision about the neglect
+  clauses, not the ceiling: ceiling and both neglect clauses together give 441.
+- **Liquidity is the constraint on anything tradeable at size.** At Rs 1 cr/day the list
+  falls from 196 to 76; at systrader's Rs 10 cr floor, 11 names survive. B2's choice
+  is a choice about how many names the portfolio can hold.
