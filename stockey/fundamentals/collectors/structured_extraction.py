@@ -77,6 +77,16 @@ DEFAULT_MODEL = env("STRUCTURED_EXTRACTION_MODEL", "gpt-5.4-mini")
 # pin them to the most-severe instrument) -- see RATING_ACTION_SCHEMA's own
 # docstring. Same global-version convention as the 1->2 bump above.
 SCHEMA_VERSION = 3
+
+# Closed vocabularies (2026-09-24). The descriptions below always named these values, but
+# as free strings a model could return "Quarter 1" or "downgrade" and the rule triggers,
+# which compare exact strings, would silently miss it. Adding an enum does NOT bump
+# SCHEMA_VERSION: the shape is unchanged and every stored value already fits (checked
+# live: period_type Q1/Annual, rating_action upgraded/assigned/reaffirmed, transaction_type
+# buy/sell/pledge/release_of_pledge/other), so nothing needs re-extracting.
+PERIOD_TYPES = ("Q1", "Q2", "Q3", "Q4", "H1", "H2", "9M", "Annual")
+RATING_ACTIONS = ("upgraded", "downgraded", "reaffirmed", "withdrawn", "assigned", "suspended", "placed_on_watch")
+TRANSACTION_TYPES = ("buy", "sell", "pledge", "release_of_pledge", "other")
 CIRCUIT_BREAKER_THRESHOLD = 3
 # 2026-08-15: raised 50 -> 400 (user request: "pace up so we don't have backlog").
 # This stage is a plain LLM text-extraction call, not an OCR image-render job --
@@ -132,7 +142,7 @@ RESULTS_SCHEMA = {
     "properties": {
         "company_name": {"type": ["string", "null"]},
         "period_ended": {"type": ["string", "null"]},
-        "period_type": {"type": ["string", "null"], "description": "Q1/Q2/Q3/Q4/H1/H2/9M/Annual, inferred from the period label -- H1/H2 for a half-yearly (SME-platform) filer, not every company reports quarterly"},
+        "period_type": {"type": ["string", "null"], "enum": [*PERIOD_TYPES, None], "description": "Q1/Q2/Q3/Q4/H1/H2/9M/Annual, inferred from the period label -- H1/H2 for a half-yearly (SME-platform) filer, not every company reports quarterly"},
         "consolidated_or_standalone": {"type": ["string", "null"]},
         "revenue_current_rs_lakh": {"type": ["number", "null"]},
         "revenue_qoq_rs_lakh": {
@@ -211,6 +221,7 @@ RATING_ACTION_SCHEMA = {
         "current_rating": {"type": ["string", "null"], "description": "that same most-severe instrument's current rating"},
         "rating_action": {
             "type": ["string", "null"],
+            "enum": [*RATING_ACTIONS, None],
             "description": (
                 "upgraded / downgraded / reaffirmed / withdrawn / assigned / suspended / placed_on_watch. "
                 "If this filing covers multiple instruments/facilities with DIFFERENT actions, set this to "
@@ -229,7 +240,7 @@ RATING_ACTION_SCHEMA = {
                     "rated_amount_rs_cr": {"type": ["number", "null"]},
                     "previous_rating": {"type": ["string", "null"]},
                     "current_rating": {"type": ["string", "null"]},
-                    "rating_action": {"type": ["string", "null"], "description": "same vocabulary as the top-level rating_action, for this one instrument only"},
+                    "rating_action": {"type": ["string", "null"], "enum": [*RATING_ACTIONS, None], "description": "same vocabulary as the top-level rating_action, for this one instrument only"},
                 },
                 "required": ["instrument_description", "rated_amount_rs_cr", "previous_rating", "current_rating", "rating_action"],
                 "additionalProperties": False,
@@ -284,7 +295,7 @@ PIT_SAST_SCHEMA = {
         "disclosure_type": {"type": ["string", "null"], "description": "trading_window_notice / pit_disclosure / sast_disclosure / other"},
         "insider_name": {"type": ["string", "null"]},
         "insider_category": {"type": ["string", "null"], "description": "promoter / kmp / director / employee / other"},
-        "transaction_type": {"type": ["string", "null"], "description": "buy / sell / pledge / release_of_pledge / other"},
+        "transaction_type": {"type": ["string", "null"], "enum": [*TRANSACTION_TYPES, None], "description": "buy / sell / pledge / release_of_pledge / other"},
         "quantity_shares": {"type": ["number", "null"]},
         "pct_of_holding_before": {"type": ["number", "null"]},
         "pct_of_holding_after": {"type": ["number", "null"]},

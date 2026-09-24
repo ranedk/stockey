@@ -25493,3 +25493,15 @@ def test_readmit_bse_sast_failures_takes_sast_disclosures_not_trading_window_not
     assert not as_regex.match("Closure of Trading Window")
     assert not as_regex.match("Code of Conduct under SEBI (PIT) Regulations, 2015")
     assert "filing_type = 'pit_sast'" in statement and "ocr_status = 'failed'" in statement
+
+
+def test_extraction_schemas_close_the_vocabularies_the_triggers_compare_exactly():
+    se = fundamentals_structured_extraction
+    rating = se.RATING_ACTION_SCHEMA["properties"]
+    assert rating["rating_action"]["enum"] == [*se.RATING_ACTIONS, None]
+    item = rating["instrument_actions"]["items"]["properties"]["rating_action"]
+    assert item["enum"] == [*se.RATING_ACTIONS, None]
+    assert se.RESULTS_SCHEMA["properties"]["period_type"]["enum"] == [*se.PERIOD_TYPES, None]
+    assert se.PIT_SAST_SCHEMA["properties"]["transaction_type"]["enum"] == [*se.TRANSACTION_TYPES, None]
+    # The trigger's severity ladder must cover exactly the vocabulary the model may return.
+    assert set(fundamentals_l3_triggers.RATING_ACTION_SEVERITY_ORDER) == set(se.RATING_ACTIONS)
