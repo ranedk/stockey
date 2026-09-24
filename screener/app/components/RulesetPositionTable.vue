@@ -9,11 +9,18 @@ function toggle(id: string) {
   expanded.value = expanded.value === id ? null : id
 }
 
+/** The price a position is judged at: its exit price once closed, today's price while
+ *  open. Closed rows used to show P&L against TODAY's price (2026-09-23 audit). */
+function markPrice(p: RulesetPosition): number | null {
+  return p.status === 'closed' ? (p.exit_price ?? null) : p.last_price
+}
+
 /** Gain since entry. The stop-room bar below says how much rope is left; this
  *  says whether the position is actually working. */
 function positionReturn(p: RulesetPosition): number | null {
-  if (p.entry_price === null || p.last_price === null || p.entry_price <= 0) return null
-  return p.last_price / p.entry_price - 1
+  const mark = markPrice(p)
+  if (p.entry_price === null || mark === null || p.entry_price <= 0) return null
+  return mark / p.entry_price - 1
 }
 
 function axes(p: RulesetPosition): string {
@@ -27,6 +34,8 @@ function axes(p: RulesetPosition): string {
  * whether a position is about to be closed, so it is worth more space than P&L.
  */
 function roomToStop(p: RulesetPosition): number | null {
+  // A closed position has no stop left to approach.
+  if (p.status === 'closed') return null
   if (p.entry_price === null || p.stop_pct === null || p.last_price === null) return null
   const stopLevel = p.entry_price * (1 - p.stop_pct / 100)
   const distance = p.entry_price - stopLevel
@@ -88,7 +97,7 @@ function daysToTarget(p: RulesetPosition): number | null {
               {{ p.entry_price === null ? '—' : formatPrice(p.entry_price) }}
             </td>
             <td class="px-3 py-2 text-right text-slate-800">
-              {{ p.last_price === null ? '—' : formatPrice(p.last_price) }}
+              {{ markPrice(p) === null ? '—' : formatPrice(markPrice(p) as number) }}
             </td>
             <td class="px-3 py-2 text-right text-slate-600">
               <span v-if="p.position_size_rs !== null" :title="p.sizing_basis || ''">

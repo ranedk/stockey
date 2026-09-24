@@ -17,6 +17,10 @@ export const STRATEGY_LABELS: Record<string, string> = {
   results_delayed: 'Results delayed',
   auditor_change: 'Auditor change',
   related_party_transaction: 'Related-party transaction',
+  // Added 2026-09-23: these triggers fire but rendered as raw names.
+  pledge_increase: 'Promoter pledge increase',
+  bulk_deal_buy: 'Bulk/block deal buy (net)',
+  bulk_deal_sell: 'Bulk/block deal sell (net)',
 }
 
 // Falls back to the raw trigger_type for anything not listed above so a new

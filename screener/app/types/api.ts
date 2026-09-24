@@ -436,7 +436,11 @@ export interface RulesetPosition {
   entry_decision: 'accept' | 'reject' | null
   deferral_count: number
   close_reason: string | null
+  closed_at: string | null
+  exit_price: number | null
   last_price: number | null
+  entry_price_date: string | null
+  score_version: number | null
   prediction_text: string | null
   target_date: string | null
   invalidation_criteria: string | null
