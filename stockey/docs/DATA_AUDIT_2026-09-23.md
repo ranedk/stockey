@@ -19,7 +19,7 @@ Status key: **fixed** (code + data, tested) · **open** (recorded, not done, wit
 | # | Finding | Status |
 |---|---|---|
 | O1 | Portfolio (16:30 UTC) ran before the screener finished (65-109 min from 15:30) on 5 of 6 days: decisions on today's L2 beside yesterday's confluence and technicals. | **fixed** -- `all_portfolio_ruleset.sh` waits on the screener lock (5h cap -> no run); ruleset refuses confluence older than `PORTFOLIO_CONFLUENCE_MAX_AGE_DAYS`. |
-| O2 | Confluence scores only the active watchlist, synced in the LAST step, so new names score next day. | open -- a one-day lag, documented in `run_pipeline.py`; moving the sync is a larger reorder. |
+| O2 | Confluence scores only the active watchlist, synced in the LAST step, so new names score next day. | **fixed 2026-09-24** -- a `watchlist` step runs after `llm_triage` and before `confluence_score`; the portfolio enters from that night's score. |
 | O3 | `rating_action` and `capital_raise` were judged before OCR/extraction; OCR'd-but-unextracted rows counted as finished. `rating_downgrade` had never fired. | **fixed** -- both wait for the document; extraction status NULL no longer means done. |
 
 ## Not captured
@@ -32,7 +32,7 @@ Status key: **fixed** (code + data, tested) · **open** (recorded, not done, wit
 | C4 | `institutional_pct` NULL when both FII and DII rows are absent (~12% of latest rows) although the table parsed. | **fixed** -- 0 when the Promoters row is present. TODO C2's institutional half. |
 | C5 | The company->L2 map covered only today's L1, so 19-22 watchlist names that left L1 scored with every L2 axis None (and passed "no contradicting axis" more easily). | **fixed** -- `build_l1_ticker_by_company_master_id(include_history=True)` for identity lookups. |
 | C6 | Open positions on flagged/invalidated names were never re-scored, so no later contradiction could reach the exit. | **fixed** -- confluence scores active watchlist UNION open positions. |
-| C7 | 48 of 137 watchlist names can never get a Weinstein stage (systrader's stage universe is NSE; these are mostly BSE-only), so they can never enter. | open -- cross-repo: systrader computes stage; stockey must not author TA. Needs a decision on who computes stage from BSE prices. |
+| C7 | 48 of 137 watchlist names can never get a Weinstein stage (systrader's stage universe is NSE; these are mostly BSE-only), so they can never enter. | **fixed 2026-09-24** (operator: systrader computes it) -- systrade 9b15b79 serves every NSE series plus `BSE:<scrip>` keys and prefixes BSE history before an NSE listing; stockey looks up symbol -> rename alias -> BSE key. Active watchlist with a stage: 89 -> 126 of 138 (rest: genuinely short history or suspended). |
 | C8 | NSE insider filings matched on the raw L1 slug, which is a BSE code for some NSE-listed names. | **fixed** -- also keyed by `company_master.nse_ticker`. |
 | C9 | Watchlist-only names priced only while 'active' -> stale price -> flagged name flipped active for a day. | **fixed** -- all statuses priced; a stale price cannot un-flag. |
 
@@ -149,16 +149,27 @@ table current through 09-23. Findings, each traced to source before fixing:
 | P13 | 518,182 identical 1-min bars stored twice (under both Dhan ids) for 17 stocks, loaded 2026-04..09. | **fixed** -- kept the current id's bars. Note: on the compressed hypertable a self-referencing `DELETE ... USING` / `IN (subquery)` silently matched 0 rows; literal `timestamp = ANY(array)` batches worked. |
 | P9 | A dedupe DELETE (self-join on IS NOT DISTINCT FROM) ran >10 min holding the migrations lock and queued three cron sessions. | cancelled via pg_cancel_backend within ~1 min of detection; rewritten as a one-pass window delete (0.5 s). |
 
+## 2026-09-24 (afternoon): the gap list
+
+Operator decisions taken first (all four "recommended"): mechanical veto horizon; systrader
+computes stage for BSE names; only positive alerts add to the watchlist; rework the sector
+phase over one company set.
+
+| # | Finding | Status |
+|---|---|---|
+| G1 | Vetoed rows had no target date -> the accepted-vs-vetoed comparison could only ever hold accepts. | **fixed** -- `VETO_HORIZON_DAYS` gives rejects a mechanical horizon (6 existing rows backfilled); resolution skips them; `price_return_by_entry_decision` compares arms on closed-position price, shown on /portfolio. |
+| G2 | Negative-only names (a lone `results_decline`/`bulk_deal_sell`) joined the watchlist and never left. | **fixed** -- only positive alerts add; such names exit as `no_thesis`. |
+| G3 | **NSE SME boards (SM/ST) were outside every equity filter**: ~550 listed stocks had no adjusted prices, no Dhan id, no daily or intraday data -- several on the watchlist. | **fixed** -- adjusted view (new migration id), factors, company_master, universe, gate. 542/546 got Dhan ids; daily reconciled; 5-year intraday backfill run under the WAL/disk guard. |
+| G4 | Sector phase compared SUMMED gross block (one company set) with median QUARTERLY sales growth (another); one large company set a sector (Chemicals -10.25 percent). | **fixed** -- one screener.in query gives gross block, prior gross block and annual `Sales growth` for the same companies; phase = median per-company gap; no phase for Financial Services / IT / Realty; confluence v4. |
+| G5 | BSE-only companies never had a sector (dim_security is NSE-only): 16 of 17 sectorless watchlist names. | **fixed** -- `fundamentals_company_sector` view (dim_security, then Sharpely by NSE/BSE ticker) read by all six sector readers; watchlist 121 -> 137 of 138; L1 excluded from sector aggregation 38 -> 2. |
+| G6 | "359 companies with no sector" (P3/P8) was mostly not companies. | **measured** -- of 358 active main-board symbols without a sector, 313 are ETFs, 12 Dhan "Other", 1 MF, 25 with no Dhan listing; 7 real equities (new listings / merger successors Sharpely has not classified yet). |
+| G7 | Rights entitlements (`-RE`, `-RE1`) in the Dhan universe and the coverage gate. | **fixed** -- excluded from `get_equity_universe`, company_master's bhavcopy branch and `universe_coverage`. |
+| G8 | The 584 failed BSE insider PDFs were held back on the premise that NSE's feed covers them. It carries PIT trades only (since 2026-08-17), not SAST. | **fixed** -- 152 SAST disclosures (Reg 29/31/10) re-admitted; ~390 trading-window notices stay out. (The 09-23 re-admission of ~414 other BSE rows was committed 09-24 08:45 UTC and applies in that evening's run.) |
+| G9 | Dates stored as TEXT: `l3_alerts.l2_run_date` (`str(Timestamp)`), `sector_reference.as_of_date`. | **fixed** -- DATE by migration. `fundamentals_events.disclosure_date` stays TEXT with the ISO CHECK (09-23 decision). |
+| G10 | Extraction enums (`period_type`, `rating_action`, `transaction_type`). | **fixed** -- strict-schema enums, verified live; no SCHEMA_VERSION bump (every stored value already fits). |
+| G11 | Frontend: 6 typecheck errors; no label for `no_thesis`. | **fixed** -- 0 errors (screener 3005fc5). |
+| G12 | Gate timing watch (gate 08:00 IST vs the 12:00 IST morning Dhan pass). | **watching** -- 09-24 gate PASSED on the evening pass alone, the first clean night since 09-13. The evening reconcile now overlaps the 18:10 UTC intraday sync (36 min on 09-23, longer with SME); both go through the cross-process Dhan gate, so it only queues. |
+
 ## Open, needing a decision
 
-- **Paired comparison is one-sided.** Vetoed rows have no target date, so they never
-  resolve and never take the target-date exit; the accepted-vs-vetoed panel can only
-  ever contain accepts. A mechanical horizon for rejects is a PRD decision.
-- **Sector phase inputs are mismatched** (summed historical-cost gross block vs median
-  quarterly nominal sales growth, different company sets) -- 326 of 499 rows read
-  "discipline". The low-confidence gate is in; the method is a design question.
-- **Negative-only names** (a lone `results_decline` or `bulk_deal_sell`) are added to the
-  watchlist and never invalidated.
-- **LLM extraction fields** (`period_type`, `rating_action`, `transaction_type`) have no
-  enum in the strict schemas.
-- **Stage for BSE-only names** (C7).
+- Nothing from the 09-23 list. Watch items: G12 (gate timing).

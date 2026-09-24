@@ -343,6 +343,13 @@ made, diagnosed, and fixed live -- they are cheap to avoid and expensive to redi
   interpolate it and raises `IndexError: tuple index out of range`, which names nothing
   useful. Hit three separate times in one session (`ilike '%dhan%'`, `like
   'fundamentals_%'`, a `%` in a comment).
+- **Read a company's sector from `fundamentals_company_sector`, not `dim_security`.**
+  dim_security is built from NSE listings, so BSE-only companies have no row there; the
+  view falls back to Sharpely by ticker (2026-09-24). An AST guard enforces this for the
+  six current readers. Most "sectorless" symbols are ETFs, not a data gap.
+- **screener.in reveals only ~3 queried columns, in QUERY ORDER.** Put the fields you
+  need first and filters whose column shows by default (Market Capitalization) last;
+  `sector_cycle.fetch_gross_block_data` fails loudly if a required column is missing.
 - **Never guess a column or table name -- read `information_schema` first.** Guessing cost
   four failed queries in one session: `dim_trading_days.is_trading_day` (does not exist),
   `ingestion_file_state.file_name`, `advisory_fallback_events.created_at` (it is
