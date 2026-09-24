@@ -20862,7 +20862,12 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 16  # +2 2026-08-29: deal_flow (todo #3), confluence_score (todo #4)
+    assert len(fundamentals_run_pipeline.STEPS) == 17  # +2 2026-08-29 (deal_flow, confluence_score); +1 2026-09-24 (watchlist)
+    # O2 (2026-09-24): the portfolio enters from THIS run's confluence, so tonight's alerts
+    # must reach the watchlist before confluence scores it.
+    steps = fundamentals_run_pipeline.STEPS
+    assert (steps.index("fundamentals.screens.l3_triggers") < steps.index("fundamentals.screens.llm_triage")
+            < steps.index("fundamentals.screens.watchlist") < steps.index("fundamentals.screens.confluence_score"))
     assert fundamentals_run_pipeline.STEPS[-1] == "fundamentals.screens.notifications"
     assert "fundamentals.screens.investor_classification" in fundamentals_run_pipeline.STEPS
     assert fundamentals_run_pipeline.STEPS.index("fundamentals.screens.deal_flow") < fundamentals_run_pipeline.STEPS.index(

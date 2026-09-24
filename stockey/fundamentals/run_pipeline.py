@@ -99,16 +99,16 @@ STEPS: list[str] = [
     "fundamentals.screens.investor_classification",  # needs structured_extraction's + deal_flow's investor_names, runs right after both
     "fundamentals.screens.sector_cycle",
     "fundamentals.screens.l3_triggers",
-    # Needs sector_cycle's fresh phases and l3_triggers' fresh alerts (both above).
-    # Scoped to fundamentals_watchlist WHERE status='active' -- reads that table's
-    # state as of the END of the PREVIOUS run (notifications' own internal
-    # watchlist-sync, this run's copy, hasn't happened yet -- it's deliberately
-    # last). One-cycle staleness, same "eventually consistent next run" tolerance
-    # investor_classification's own catch-up already has -- not worth reaching
-    # into notifications.py's internal call chain to close for a confluence READ,
-    # not a decision (PRD §12 todo #4, 2026-08-29).
-    "fundamentals.screens.confluence_score",
     "fundamentals.screens.llm_triage",
+    # Watchlist sync BEFORE confluence (2026-09-24, audit item O2). It used to run only
+    # inside notifications (last), so confluence scored the PREVIOUS run's watchlist and a
+    # name added tonight had no score until tomorrow. That was defended as "a READ, not a
+    # decision" -- no longer true: the 22:00 IST portfolio ruleset enters from THIS run's
+    # confluence. After llm_triage, the last step that writes alerts; notifications still
+    # re-runs the (idempotent) sync before narratives and exit evaluation.
+    "fundamentals.screens.watchlist",
+    # Needs sector_cycle's fresh phases, this run's alerts and this run's watchlist.
+    "fundamentals.screens.confluence_score",
     "fundamentals.screens.technicals",
     "fundamentals.screens.notifications",  # must run last -- see module docstring
 ]
