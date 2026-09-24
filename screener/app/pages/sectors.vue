@@ -33,16 +33,15 @@ const growthTone: Record<string, 'good' | 'bad' | 'neutral' | 'warn'> = {
       recommendation.
     </p>
     <PipelineNote layer="L1" title="Where the sector view comes from">
-      Capital-cycle phase per sector, computed only over companies in the L1 universe — capacity
-      growth (capital work-in-progress and fixed-asset additions) read against demand growth
-      (sales). It describes where a sector sits in its own investment cycle; it does not rank
-      sectors, score them, or feed any selection decision.
+      Capital-cycle phase per sector, over L1-universe companies only. For each company, gross-block
+      growth (last year vs the year before) is read against the same company's annual sales growth;
+      the phase is the sector's median gap. Capacity well behind demand reads as discipline, well
+      ahead as expansion. The phase is one of the five confluence axes on the watchlist, so it
+      does feed the portfolio's entry rule; it does not rank sectors.
     </PipelineNote>
     <p class="mt-1 text-xs text-slate-400">
-      Capacity is derived from gross block, a weak-to-meaningless proxy for
-      asset-light sectors (e.g. Financial Services, IT/Services) that aren't
-      constrained by physical fixed assets -- treat phase and growth badges with
-      more skepticism there than in capital-intensive sectors.
+      Financial Services, IT and Realty get no phase: their gross block is offices or land, not
+      operating capacity. Their growth badge still shows.
     </p>
 
     <div v-if="error" class="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
@@ -63,7 +62,9 @@ const growthTone: Record<string, 'good' | 'bad' | 'neutral' | 'warn'> = {
             <BadgePill v-if="sector.sample_size_confidence === 'low'" label="low sample size" tone="warn" />
           </div>
           <div class="text-xs text-slate-500">
-            capacity {{ formatPct(sector.capacity_growth_pct) }} · demand {{ formatPct(sector.demand_growth_pct) }} · {{ sector.n_companies_in_l1 }} L1 companies
+            capacity {{ formatPct(sector.capacity_growth_pct) }} · sales {{ formatPct(sector.demand_growth_pct) }}
+            <template v-if="sector.capacity_minus_demand_pts != null"> · gap {{ sector.capacity_minus_demand_pts.toFixed(1) }} pts</template>
+            · {{ sector.n_companies_with_demand_data ?? 0 }} of {{ sector.n_companies_in_l1 }} L1 companies
           </div>
         </div>
 

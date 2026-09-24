@@ -6,6 +6,7 @@ const STATUS_TABS: { value: WatchlistStatus | 'all'; label: string }[] = [
   { value: 'stale', label: 'Stale' },
   { value: 'invalidated', label: 'Invalidated' },
   { value: 'price_flagged', label: 'Price flagged' },
+  { value: 'no_thesis', label: 'No thesis' },
   { value: 'all', label: 'All' },
 ]
 

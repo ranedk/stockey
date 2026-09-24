@@ -74,6 +74,31 @@ const { data: scoring, status, error } = await useAsyncData(
       </section>
 
       <section class="mt-4 rounded-lg border border-slate-200 bg-white p-4">
+        <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Accepted vs vetoed, on price</h2>
+        <p class="mt-1 text-xs text-slate-400">
+          Closed positions only. Vetoed names are tracked as shadows and take the same exits, so their
+          return is the price of the veto. Averages appear from 5 closed positions per arm.
+        </p>
+        <div v-if="!Object.keys(scoring.price_return_by_entry_decision ?? {}).length" class="mt-3 text-sm text-slate-500">
+          No closed positions yet.
+        </div>
+        <table v-else class="mt-3 w-full text-sm">
+          <thead class="text-left text-xs text-slate-400">
+            <tr><th class="py-1">Decision</th><th>Closed</th><th>Mean</th><th>Median</th><th>Share positive</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(arm, decision) in scoring.price_return_by_entry_decision" :key="decision" class="border-t border-slate-100">
+              <td class="py-1 font-medium">{{ decision === 'reject' ? 'Vetoed' : decision === 'accept' ? 'Accepted' : decision }}</td>
+              <td>{{ arm.closed }}</td>
+              <td>{{ arm.mean_return_pct !== null ? `${arm.mean_return_pct}%` : '—' }}</td>
+              <td>{{ arm.median_return_pct !== null ? `${arm.median_return_pct}%` : '—' }}</td>
+              <td>{{ arm.share_positive_pct !== null ? `${arm.share_positive_pct}%` : '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="mt-4 rounded-lg border border-slate-200 bg-white p-4">
         <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Calibration</h2>
         <p class="mt-1 text-xs text-slate-400">
           A hit rate only appears once a group has at least 5 resolved forecasts — below

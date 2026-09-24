@@ -16,7 +16,7 @@ const LABEL: Record<string, string> = { ok: 'OK', warn: 'Warning', error: 'Faili
 // Problems first; healthy checks stay visible but below them.
 const ordered = computed<SchedulerFinding[]>(() => {
   const rank: Record<string, number> = { error: 0, warn: 1, ok: 2 }
-  return [...(data.value?.findings ?? [])].sort((a, b) => rank[a.level] - rank[b.level])
+  return [...(data.value?.findings ?? [])].sort((a, b) => (rank[a.level] ?? 3) - (rank[b.level] ?? 3))
 })
 </script>
 
@@ -50,7 +50,7 @@ const ordered = computed<SchedulerFinding[]>(() => {
         class="flex flex-wrap items-baseline gap-2 rounded border bg-white px-3 py-2 text-sm"
         :class="f.level === 'error' ? 'border-rose-200' : f.level === 'warn' ? 'border-amber-200' : 'border-slate-200'"
       >
-        <BadgePill :label="LABEL[f.level]" :tone="TONE[f.level]" />
+        <BadgePill :label="LABEL[f.level] ?? f.level" :tone="TONE[f.level] ?? 'warn'" />
         <span class="text-xs uppercase tracking-wide text-slate-400">{{ f.section }}</span>
         <span class="text-slate-700">{{ f.message }}</span>
       </li>

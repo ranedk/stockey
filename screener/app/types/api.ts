@@ -6,7 +6,7 @@
 // specific value) to /api/watchlist to see the others. See fundamentals/screens/
 // watchlist_exit.py: nothing is ever deleted, this is a soft-status/visibility
 // filter, not a destructive removal.
-export type WatchlistStatus = 'active' | 'stale' | 'invalidated' | 'price_flagged'
+export type WatchlistStatus = 'active' | 'stale' | 'invalidated' | 'price_flagged' | 'no_thesis'
 
 export interface WatchlistItem {
   company_master_id: string
@@ -121,8 +121,13 @@ export interface SectorWatchedCompany {
 export interface SectorInfo {
   sector_code: string
   sector_name: string | null
+  // Medians over the same companies (2026-09-24): gross-block growth vs annual sales growth.
   capacity_growth_pct: number | null
   demand_growth_pct: number | null
+  // Median per-company gap (capacity minus sales growth, points) -- what phase is read from.
+  capacity_minus_demand_pts: number | null
+  n_companies_with_demand_data: number | null
+  // null for asset-light sectors (Financial Services, IT, Realty) and for no data.
   phase: string | null
   // High/medium/low growth or no_pattern (2026-08-13) -- a separate axis from phase:
   // phase reads capacity vs demand (cyclical positioning), this reads demand alone
@@ -155,6 +160,16 @@ export interface PortfolioScoring {
   hit_rate_by_confluence_count: Record<string, HitRateGroup>
   failure_attribution_breakdown: Record<string, number>
   time_to_confirmation_days: { median_days?: number, mean_days?: number, count?: number }
+  // Accepted vs vetoed on PRICE, over closed positions (2026-09-24). Means read null below 5
+  // closed positions; the count always shows.
+  price_return_by_entry_decision: Record<string, PriceArm>
+}
+
+export interface PriceArm {
+  closed: number
+  mean_return_pct: number | null
+  median_return_pct: number | null
+  share_positive_pct: number | null
 }
 
 export interface UniverseCompany {

@@ -54,7 +54,7 @@ async function forceRefresh() {
 
 const ordered = computed<DataHealthFinding[]>(() => {
   const rank: Record<string, number> = { error: 0, warn: 1, ok: 2 }
-  return [...(data.value?.findings ?? [])].sort((a, b) => rank[a.level] - rank[b.level])
+  return [...(data.value?.findings ?? [])].sort((a, b) => (rank[a.level] ?? 3) - (rank[b.level] ?? 3))
 })
 
 function metricEntries(f: DataHealthFinding): [string, string | number][] {
@@ -119,7 +119,7 @@ function metricEntries(f: DataHealthFinding): [string, string | number][] {
           :class="f.level === 'error' ? 'border-rose-200' : f.level === 'warn' ? 'border-amber-200' : 'border-slate-200'"
         >
           <div class="flex flex-wrap items-center gap-3">
-            <BadgePill :label="LEVEL_LABEL[f.level]" :tone="LEVEL_TONE[f.level]" />
+            <BadgePill :label="LEVEL_LABEL[f.level] ?? f.level" :tone="LEVEL_TONE[f.level] ?? 'warn'" />
             <span class="font-medium">{{ CHECK_LABELS[f.check] ?? f.check }}</span>
             <code class="text-xs text-slate-400">{{ f.check }}</code>
           </div>
