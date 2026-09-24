@@ -91,7 +91,7 @@ _ALERTS_TABLE_STATEMENT = """
         company_master_id TEXT,
         alert_date DATE,
         reasoning TEXT,
-        l2_run_date TEXT,
+        l2_run_date DATE,
         l2_state_snapshot_json TEXT,
         status TEXT,
         model TEXT,
@@ -121,6 +121,18 @@ def _ensure_alerts_table() -> None:
             cur.execute(_ALERTS_TABLE_STATEMENT)
 
     execute_db_operation(_op, operation_name="fundamentals_l3_alerts:ensure_table")
+    # l2_run_date was TEXT holding str(Timestamp) -- '2026-08-10 00:00:00+00:00' (2026-09-23
+    # audit). upsert_to_db casts to the column type, so writers need no change.
+    from utils.schema_migrations import apply_schema_migration
+    apply_schema_migration(
+        migration_id="20260924_fundamentals_l3_alerts_l2_run_date_date",
+        description="fundamentals_l3_alerts.l2_run_date TEXT -> DATE.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN l2_run_date TYPE DATE USING left(l2_run_date, 10)::date",
+        ],
+    )
 
 
 def load_candidate_events(limit: int | None = None) -> pd.DataFrame:

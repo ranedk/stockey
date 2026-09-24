@@ -113,6 +113,15 @@ def main() -> int:
     # Every sector reader downstream reads this view; first pipeline step, so ensure it here.
     from fundamentals.screens.company_sector import ensure_company_sector_view
     ensure_company_sector_view()
+    # as_of_date was created TEXT by upsert_to_db's dtype inference (2026-09-23 audit).
+    from utils.schema_migrations import apply_schema_migration
+    apply_schema_migration(
+        migration_id="20260924_fundamentals_sector_reference_as_of_date_date",
+        description="fundamentals_sector_reference.as_of_date TEXT -> DATE.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [SECTOR_TABLE]},
+        statements=[f"ALTER TABLE {SECTOR_TABLE} ALTER COLUMN as_of_date TYPE DATE USING as_of_date::date"],
+    )
     result = run_sector_reference_refresh()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
