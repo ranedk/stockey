@@ -242,7 +242,7 @@ def load_sector_context_for_company(company_master_id: str) -> dict | None:
         """
         SELECT ds.sector_code, sr.description AS sector_name, sc.phase,
                sc.capacity_growth_pct, sc.demand_growth_pct, sc.sample_size_confidence
-        FROM dim_security ds
+        FROM fundamentals_company_sector ds  -- see company_sector.py
         LEFT JOIN LATERAL (
             SELECT description FROM fundamentals_sector_reference
             WHERE code = ds.sector_code AND level = 'sector'
@@ -254,9 +254,7 @@ def load_sector_context_for_company(company_master_id: str) -> dict | None:
             WHERE sector_code = ds.sector_code
             ORDER BY run_date DESC LIMIT 1
         ) sc ON TRUE
-        WHERE ds.company_master_id = %s AND ds.sector_code IS NOT NULL
-        ORDER BY ds.last_trade_date DESC NULLS LAST, ds.effective_to DESC NULLS LAST
-        LIMIT 1
+        WHERE ds.company_master_id = %s
         """,
         params=(company_master_id,),
     )

@@ -690,7 +690,8 @@ def load_sector_codes_for_tickers(tickers: list[str]) -> dict[str, str]:
     if not resolved_ids:
         return {}
     df = sql_to_df(
-        "SELECT company_master_id, sector_code FROM dim_security WHERE company_master_id = ANY(%s) AND sector_code IS NOT NULL",
+        # fundamentals/screens/company_sector.py: dim_security, then Sharpely (BSE-only names)
+        "SELECT company_master_id, sector_code FROM fundamentals_company_sector WHERE company_master_id = ANY(%s)",
         params=(resolved_ids,),
     )
     if df.empty:

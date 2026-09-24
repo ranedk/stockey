@@ -110,6 +110,9 @@ def run_sector_reference_refresh() -> dict[str, object]:
 
 def main() -> int:
     global STOCKEY_RUN_STATE
+    # Every sector reader downstream reads this view; first pipeline step, so ensure it here.
+    from fundamentals.screens.company_sector import ensure_company_sector_view
+    ensure_company_sector_view()
     result = run_sector_reference_refresh()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,

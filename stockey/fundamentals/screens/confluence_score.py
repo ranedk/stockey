@@ -378,10 +378,8 @@ def load_sector_phase_by_company_id(company_master_ids: list[str]) -> dict[str, 
         return {}
     sector_df = sql_to_df(
         """
-        SELECT DISTINCT ON (company_master_id) company_master_id, sector_code
-        FROM dim_security
-        WHERE company_master_id = ANY(%s) AND sector_code IS NOT NULL
-        ORDER BY company_master_id, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST
+        SELECT company_master_id, sector_code FROM fundamentals_company_sector  -- see company_sector.py
+        WHERE company_master_id = ANY(%s)
         """,  # noqa: S608 -- fixed internal query, company list is parameterized
         params=(company_master_ids,),
     )

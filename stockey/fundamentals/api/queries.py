@@ -433,8 +433,8 @@ def get_sectors() -> list[dict]:
         """
         SELECT ds.sector_code, w.company_master_id, w.alert_count, w.narrative_text
         FROM fundamentals_watchlist w
-        JOIN dim_security ds ON ds.company_master_id = w.company_master_id
-        WHERE ds.sector_code IS NOT NULL
+        -- one row per company (dim_security had one per listing), BSE-only names included
+        JOIN fundamentals_company_sector ds ON ds.company_master_id = w.company_master_id
         """
     )
     watched_by_sector: dict[str, list[dict]] = {}

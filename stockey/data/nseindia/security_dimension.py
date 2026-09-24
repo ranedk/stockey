@@ -87,7 +87,7 @@ def build_dim_security() -> pd.DataFrame:
     # row by ticker; map_company_master_ids falls back to the ISIN-derived alias table, so
     # the dimension carries the existing company id -- and its sector -- for the renamed
     # symbol instead of NULL (2026-09-24: 52 active EQ symbols).
-    missing = df["company_master_id"].isna() & df["series"].isin(["EQ", "BE"])
+    missing = df["company_master_id"].isna() & df["series"].isin(["EQ", "BE", "SM", "ST"])
     if missing.any():
         df.loc[missing, "company_master_id"] = map_company_master_ids(df.loc[missing, "symbol"], exchange="NSE")
         by_id = company_master.drop_duplicates(subset=["company_master_id"]).set_index("company_master_id")

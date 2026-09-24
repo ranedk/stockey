@@ -22,7 +22,8 @@ Two inputs, both screener.in, both confirmed live 2026-08-11:
   (`qtr_sales_var_pct`), already sitting in fundamentals_l1_universe.metrics_json from
   L1's own crawl -- no new fetch needed for this half.
 
-Sector grouping key: dim_security.sector_code, decoded via
+Sector grouping key: fundamentals_company_sector (dim_security, then Sharpely for
+BSE-only names -- fundamentals/screens/company_sector.py), decoded via
 fundamentals/collectors/sector_data.py's fundamentals_sector_reference table (built
 alongside this module). ~73% L1 coverage confirmed live -- companies with no
 sector_code are excluded from aggregation and counted, not silently dropped.
@@ -175,10 +176,8 @@ def load_l1_companies_with_sector() -> pd.DataFrame:
 
     sector_df = sql_to_df(
         """
-        SELECT DISTINCT ON (company_master_id) company_master_id, sector_code
-        FROM dim_security
-        WHERE sector_code IS NOT NULL
-        ORDER BY company_master_id, last_trade_date DESC NULLS LAST, effective_to DESC NULLS LAST
+        -- fundamentals/screens/company_sector.py: dim_security, then Sharpely (BSE-only names)
+        SELECT company_master_id, sector_code FROM fundamentals_company_sector
         """
     )
     sector_by_cmid = dict(zip(sector_df["company_master_id"], sector_df["sector_code"])) if not sector_df.empty else {}

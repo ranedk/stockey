@@ -25440,3 +25440,37 @@ def test_the_book_fills_at_the_buckets_position_count(monkeypatch):
     out = runner.run_portfolio()
     assert out["book_capacity"] == 25 and out["bucket"] == "longterm"
     assert out["turned_away_book_full"] == ["NEWNAME"] and out["entered"] == 0
+
+
+def test_sector_readers_use_the_company_sector_view_not_dim_security():
+    # 2026-09-24: dim_security holds NSE listings only, so BSE-only companies (16 of the 17
+    # active watchlist names without a sector) never got one. Walk string literals only, so
+    # comments that mention dim_security do not trip this.
+    import ast
+    import pathlib
+    import re
+
+    pattern = re.compile(r"(FROM|JOIN)\s+dim_security\b", re.IGNORECASE)
+    readers = [
+        "fundamentals/screens/sector_cycle.py", "fundamentals/screens/confluence_score.py",
+        "fundamentals/screens/l2_state.py", "fundamentals/screens/watch_summary.py",
+        "fundamentals/screens/signal_pointers.py", "fundamentals/api/queries.py",
+    ]
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for rel in readers:
+        tree = ast.parse((root / rel).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "sector_code" in node.value and pattern.search(node.value):
+                    offenders.append(f"{rel}:{node.lineno}")
+    assert offenders == []
+
+
+def test_company_sector_view_prefers_dim_security_then_nse_then_bse_ticker():
+    from fundamentals.screens import company_sector
+
+    sql = company_sector.VIEW_STATEMENTS[0]
+    order = [sql.index(s) for s in ("'dim_security' AS sector_source, 0", "'sharpely_nse_ticker', 1", "'sharpely_bse_ticker', 2")]
+    assert order == sorted(order)
+    assert "ORDER BY company_master_id, preference" in sql
