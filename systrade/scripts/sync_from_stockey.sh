@@ -132,6 +132,65 @@ for t in "${FULL_TABLES[@]}"; do
   full_copy "$t"
 done
 
+# RECONCILE BY KEY (2026-09-24). Incremental-on-date is blind to rows inserted or
+# REWRITTEN at historical dates. The old guard compared row count + max(load_ts), which
+# cannot see an in-place update at all: on 2026-09-24 systrader's copy of
+# advisory_adjusted_ohlcv_daily held stale total-return factors for 524 symbols (same row
+# counts; the view's timestamp column is not load_ts, so the check was a bare count), and
+# 90k nseindia_ohlcv rows lacked the company_master_id stockey had since backfilled.
+# Now: hash every key's VALUE columns on both sides (timestamp metadata such as
+# load_ts/computed_at excluded -- it differs on every recompute without the values
+# changing), then delete + re-copy only the keys that differ. A key present on one side
+# only is covered too (count differs). More than half the keys differing -> full copy.
+declare -A RECONCILE_KEY=(
+  [dhan_ohlcv_daily]=security_id
+  [nseindia_ohlcv]=symbol
+  [nseindia_mto]=symbol
+  [nseindia_circuit_hit]=symbol
+  [nseindia_indices]=index_name
+  [advisory_adjusted_ohlcv_daily]=symbol
+)
+
+reconcile_by_key() {
+  local t="$1" key="$2"
+  local cols src_list="$SPOOL_DIR/$t.src.fp" dst_list="$SPOOL_DIR/$t.dst.fp" keys="$SPOOL_DIR/$t.keys" spool="$SPOOL_DIR/$t.fix.tsv"
+  cols=$(psql "$SRC" -tAc "select string_agg(column_name, ',' order by ordinal_position) from information_schema.columns
+                             where table_schema='public' and table_name='$t'
+                               and (column_name = 'date' or data_type not like 'timestamp%')")
+  local fp="select $key::text, count(*), sum(hashtext(row($cols)::text)::bigint) from $t group by 1 order by 1"
+  psql "$SRC" -Atc "$fp" > "$src_list"
+  psql "$DST" -Atc "$fp" > "$dst_list"
+  # keys whose (count, hash) differ, or that exist on one side only
+  sort "$src_list" > "$src_list.s"; sort "$dst_list" > "$dst_list.s"
+  comm -3 "$src_list.s" "$dst_list.s" | sed 's/^\t//' | cut -d'|' -f1 | sort -u > "$keys"
+  local n total
+  n=$(wc -l < "$keys"); total=$(wc -l < "$src_list")
+  if [ "$n" -eq 0 ]; then
+    echo "  reconcile $t: all $total ${key}s match"
+    return 0
+  fi
+  if [ "$total" -gt 0 ] && [ $((n * 2)) -gt "$total" ]; then
+    echo "  reconcile $t: $n of $total ${key}s differ → full re-copy"
+    full_copy "$t"
+    return 0
+  fi
+  echo "  reconcile $t: $n of $total ${key}s differ → re-copying those"
+  psql "$SRC" -q -v ON_ERROR_STOP=1 <<SQL
+CREATE TEMP TABLE fix_keys (k text);
+\copy fix_keys from '$keys'
+\copy (select t.* from $t t join fix_keys f on t.$key::text = f.k) to '$spool'
+SQL
+  psql "$DST" -q -v ON_ERROR_STOP=1 <<SQL
+BEGIN;
+CREATE TEMP TABLE fix_keys (k text) ON COMMIT DROP;
+\copy fix_keys from '$keys'
+DELETE FROM $t t USING fix_keys f WHERE t.$key::text = f.k;
+\copy $t from '$spool'
+COMMIT;
+SQL
+  rm -f "$spool"
+}
+
 for t in "${INCR_TABLES[@]}"; do
   if ! src_has_table "$t"; then echo "skip $t (absent at source)"; continue; fi
   ensure_table "$t"
@@ -140,20 +199,7 @@ for t in "${INCR_TABLES[@]}"; do
   psql "$SRC" -Atc "\copy (select * from $t where date > '$last') to stdout" \
     | psql "$DST" -q -c "\copy $t from stdin"
 
-  # RECONCILE: incremental-on-date is blind to rows inserted/rewritten at
-  # historical dates (gap backfills, corporate-action re-adjustment). Compare
-  # a cheap fingerprint (row count + max load_ts when the column exists);
-  # any drift → truncate and re-copy the whole table. Self-healing.
-  fp_sql="select count(*)::text from $t"
-  if [ "$(psql "$SRC" -tAc "select count(*) from information_schema.columns where table_schema='public' and table_name='$t' and column_name='load_ts'")" = "1" ]; then
-    fp_sql="select count(*)::text||'|'||coalesce(max(load_ts)::text,'-') from $t"
-  fi
-  src_fp=$(psql "$SRC" -tAc "$fp_sql")
-  dst_fp=$(psql "$DST" -tAc "$fp_sql")
-  if [ "$src_fp" != "$dst_fp" ]; then
-    echo "  drift on $t (src $src_fp != local $dst_fp) → full re-copy"
-    full_copy "$t"
-  fi
+  reconcile_by_key "$t" "${RECONCILE_KEY[$t]}"
 done
 
 # Indexes systrader queries rely on (idempotent).
