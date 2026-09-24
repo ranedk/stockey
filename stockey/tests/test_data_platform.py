@@ -25474,3 +25474,22 @@ def test_company_sector_view_prefers_dim_security_then_nse_then_bse_ticker():
     order = [sql.index(s) for s in ("'dim_security' AS sector_source, 0", "'sharpely_nse_ticker', 1", "'sharpely_bse_ticker', 2")]
     assert order == sorted(order)
     assert "ORDER BY company_master_id, preference" in sql
+
+
+def test_readmit_bse_sast_failures_takes_sast_disclosures_not_trading_window_notices(monkeypatch):
+    # nse_pit carries PIT insider trades only; SAST (Reg 29 acquisitions, Reg 31 pledges)
+    # exists only in the BSE PDFs, so those come back. Trading-window notices stay out.
+    import re
+
+    calls = []
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "apply_schema_migration", lambda **k: calls.append(k))
+    fundamentals_ocr_pipeline.readmit_bse_sast_failures()
+
+    (statement,) = calls[0]["statements"]
+    like = re.search(r"subcategory LIKE '([^']+)'", statement).group(1)
+    as_regex = re.compile("^" + ".*".join(re.escape(part) for part in like.split("%")) + "$")
+    assert as_regex.match("Disclosures under Reg. 29(2) of SEBI (SAST) Regulations, 2011")
+    assert as_regex.match("Disclosures under Reg. 31(1) and 31(2) of SEBI (SAST) Regulations, 2011")
+    assert not as_regex.match("Closure of Trading Window")
+    assert not as_regex.match("Code of Conduct under SEBI (PIT) Regulations, 2015")
+    assert "filing_type = 'pit_sast'" in statement and "ocr_status = 'failed'" in statement

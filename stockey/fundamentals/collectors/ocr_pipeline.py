@@ -330,6 +330,27 @@ def readmit_bse_attachlive_failures() -> None:
     )
 
 
+def readmit_bse_sast_failures() -> None:
+    """One-time (2026-09-24): re-admit the failed BSE pit_sast rows that are SAST
+    disclosures -- Reg 29 substantial acquisitions, Reg 31 promoter pledges/encumbrance,
+    Reg 10 exemptions. The note above assumed NSE's structured feed covers these; it does
+    not: nse_pit carries PIT insider trades only (and only since 2026-08-17), so for SAST
+    the BSE PDF is the only source, and l3_triggers' pledge rules read it. ~190 rows, all
+    NSE-listed companies, nearly all on the active watchlist. Trading-window closures and
+    code-of-conduct notices (~390) stay out: they carry no holding information."""
+    apply_schema_migration(
+        migration_id="20260924_fundamentals_events_readmit_bse_sast_ocr_failures",
+        description="fundamentals_events: BSE pit_sast SAST disclosures ocr_status=failed -> NULL.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": ["fundamentals_events"]},
+        statements=[
+            "UPDATE fundamentals_events SET ocr_status = NULL "
+            " WHERE source = 'bse' AND ocr_status = 'failed' AND attachment_name IS NOT NULL"
+            "   AND filing_type = 'pit_sast' AND subcategory LIKE 'Disclosures under Reg.%%SAST%%'",
+        ],
+    )
+
+
 def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
     # BUG FOUND LIVE 2026-08-17: plain load_ts ASC processes strictly oldest-inserted-
     # first, with no regard for how old the FILING itself is. bse_announcements.py's
@@ -599,6 +620,7 @@ def main() -> int:
     global STOCKEY_RUN_STATE
     ensure_ocr_timeout_column()
     readmit_bse_attachlive_failures()
+    readmit_bse_sast_failures()
     result = run_ocr_pipeline()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
