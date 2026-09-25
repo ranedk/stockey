@@ -226,3 +226,4 @@ logs/
 live_dashboard/
 **/*/.output/
 reports/
+.pause_fundamentals
