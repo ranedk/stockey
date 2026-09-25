@@ -358,10 +358,15 @@ def parse_mcap(path):
     ensure_mcap_last_trade_date_is_typed_date()
     data = open(path).read()
     lines = [line.strip().rstrip(".") for line in data.strip().split("\n")]
-    cleaned_data = "\n".join(lines[:-3])
-    df = pd.read_csv(io.StringIO(cleaned_data), skiprows=1)
+    # Start at the real header line. The file used to carry a title line above it; NSE's current
+    # file does not, and the old fixed `skiprows=1` turned the first stock (20MICRONS) into the
+    # header, dropping it every day since 2024-02 (found 2026-09-25).
+    header_at = next(i for i, line in enumerate(lines) if line.lower().startswith("trade date"))
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_at:])))
     df = df.reset_index(drop=True)
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+    # Trailer rows (Listed / Permitted / Total) have no series; drop them by content, not count.
+    df = df[df.iloc[:, 2].fillna("").astype(str).str.strip() != ""].reset_index(drop=True)
     df.columns = [
         "trade_date",
         "symbol",

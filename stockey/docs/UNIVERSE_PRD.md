@@ -112,7 +112,14 @@ switching over, report how many of today's 5x winners it would reject, and why.
 
 ## 7. Build order
 
-1. Layer 1 rules 1-5 from our own tables; report the count.
+1. Layer 1 rules 1-5 from our own tables; report the count. **Done 2026-09-25**
+   (`fundamentals/screens/universe.py`, `python -m fundamentals.screens.universe`): rules 1, 3,
+   4, 5 pass **1,399** of 2,664 EQ stocks (session 2026-09-24). Failing only one rule: market
+   cap 151, traded value 173, listing age 139 (mostly genuine 2025 IPOs). Two fixes on the way:
+   listing age counts sessions under the current ISIN OR symbol (a face-value split issues a
+   new ISIN and made ADANIPOWER, NAZARA look newly listed; +34 stocks), and `parse_mcap`
+   dropped the first row of every NSE market-cap file since 2024-02 (20MICRONS; fixed, today's
+   file reloaded, history not backfilled).
 2. Surveillance-list rule (Dhan flag) and pledge rule; report the count.
 3. NSE industry-label collector; assign groups; measure asset intensity and set X with
    the operator.

@@ -3069,6 +3069,30 @@ def test_parse_mcap_converts_not_traded_sentinel_to_null_date(monkeypatch, tmp_p
     assert pd.isna(suspended["last_trade_date"])  # 'Not Traded' -> real NULL, not the literal string
 
 
+def test_parse_mcap_keeps_first_row_when_file_has_no_title_line(monkeypatch, tmp_path):
+    # 2026-09-25: NSE's mcap file starts directly with the header. The old fixed skiprows=1 made
+    # the first stock the header, so 20MICRONS was missing from nseindia_mcap on every day.
+    monkeypatch.setattr(bhavcopy_parser, "ensure_mcap_last_trade_date_is_typed_date", lambda: None)
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: None)
+
+    path = tmp_path / "mcap24092026.csv"
+    path.write_text(
+        "Trade Date,Symbol,Series,Security Name,Category,Last Trade Date,Face Value(Rs.),Issue Size,Close Price/Paid up value(Rs.),Market Cap(Rs.)              \n"
+        "24 SEP 2026,20MICRONS,EQ,20 MICRONS LTD           ,Listed    ,24 SEP 2026,               5.00,          35286502,            213.85,     7546724182.75 \n"
+        "24 SEP 2026,21STCENMGM,EQ,21ST CENTURY MGMT SERVICE,Listed    ,24 SEP 2026,              10.00,          10500000,             39.75,      417585000.00\n"
+        "24 SEP 2026,Listed    ,  ,                         ,          ,           ,               0.00,                 0,              0.00,472003070866481.25\n"
+        "24 SEP 2026,Permitted ,  ,                         ,          ,           ,               0.00,                 0,              0.00,  3841058781113.05\n"
+        "24 SEP 2026,Total     ,  ,                         ,          ,           ,               0.00,                 0,              0.00,475844129647594.30\n",
+        encoding="utf-8",
+    )
+
+    frame = bhavcopy_parser.parse_mcap(str(path))
+
+    assert frame["symbol"].tolist() == ["20MICRONS", "21STCENMGM"]
+    assert frame.loc[0, "market_cap_rs"] == 7546724182.75
+
+
 def test_ensure_mcap_last_trade_date_migration_uses_schema_registry(monkeypatch):
     calls = []
     monkeypatch.setattr(bhavcopy_parser, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
