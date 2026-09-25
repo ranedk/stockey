@@ -20,6 +20,7 @@ see `docs/FUNDAMENTAL_SCREENER_PRD.md`.
 | NSE indices | `nseindia/indices_{downloader,parser}` | `nseindia_indices` |
 | NSE calendar | `nseindia/holidays` | `nseindia_holidays`, `dim_trading_days` |
 | NSE off-market deals | `data/nseindia/{offmarket,offmarket_parser}.py` (revived 2026-08-29, see "Retired 2026-08-15" below for history) | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_short_selling` — fundamentals-screener deal-flow signal (PRD §12), not systrader's PRIMARY series |
+| NSE surveillance indicators | `data/nseindia/surveillance_indicator.py` (2026-09-25) | `nseindia_surveillance_indicator` — NSE's daily REG1_IND file: GSM/ASM/ESM/IRP stages, pledge and encumbrance flags per security (100 = not flagged), full row in `raw`; from 2025-01. Read by the universe rebuild's Layer 1 (`docs/UNIVERSE_PRD.md`) |
 | Dhan broker | `dhanlive/*` (incl. auth/web_login) | `master_dhan_instruments`, `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` (1-min bars) |
 | Intraday backfill state | `scripts/backfill_intraday_5yr.py` | `dhan_intraday_backfill_state` — per-(ticker, interval) completion marker for the one-off 5-year fill. Added 2026-08-31: the previous resume signal ("earliest stored bar reaches target_start") could never match for a symbol whose history genuinely starts inside the window, so every restart re-fetched and re-upserted those symbols in full. Bookkeeping only; no market data, no readers outside that script |
 | RBI/FBIL | `rbi/*` | `rbi_bank_rates`, `rbi_currency_rates`, `fbil_gsec_par` |

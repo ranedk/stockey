@@ -3,12 +3,15 @@ import pandas as pd
 from fundamentals.screens import universe
 
 
-def _row(symbol, *, mcap=500e7, value=80e5, value_sessions=63, listed=400, category="Listed"):
+def _row(symbol, *, mcap=500e7, value=80e5, value_sessions=63, listed=400, category="Listed",
+         gsm=100, lt_asm=100, st_asm=100, encumbered=100, surveillance_date="2026-09-24"):
     return {
         "symbol": symbol, "isin": f"INE{symbol}", "company_master_id": f"nse:{symbol}",
         "session_date": pd.Timestamp("2026-09-24", tz="UTC"), "category": category,
         "market_cap_rs": mcap, "mcap_date": None, "median_value_rs": value,
         "value_sessions": value_sessions, "listed_sessions": listed,
+        "surveillance_date": surveillance_date, "gsm": gsm, "lt_asm": lt_asm, "st_asm": st_asm,
+        "esm": 100, "irp": 100, "encumbered_over_50": encumbered,
     }
 
 
@@ -46,15 +49,40 @@ def test_layer1_report_counts():
     report = universe.layer1_report(df)
 
     assert report["session_date"] == "2026-09-24"
-    assert report["pass_rules_1_3_4_5"] == 2
+    assert report["pass_layer1"] == 2
     assert report["pass_by_category"] == {"Listed": 1, "Permitted": 1}
-    assert report["fails"] == {"rule3_mcap": 1, "rule4_traded_value": 0, "rule5_listed": 2}
-    assert report["fails_only_this_rule"] == {"rule3_mcap": 0, "rule4_traded_value": 0, "rule5_listed": 1}
+    assert report["fails"] == {"rule2_surveillance": 0, "rule3_mcap": 1, "rule4_traded_value": 0, "rule5_listed": 2}
+    assert report["fails_only_this_rule"] == {"rule2_surveillance": 0, "rule3_mcap": 0, "rule4_traded_value": 0,
+                                              "rule5_listed": 1}
 
 
 def test_layer1_query_bounds_every_ohlcv_read():
     # Hypertable gotcha: every nseindia_ohlcv / nseindia_mcap read must carry a date bound.
     sql = universe.LAYER1_INPUTS_QUERY
-    reads = sql.count("FROM nseindia_ohlcv") + sql.count("FROM nseindia_mcap")
-    assert reads == 5
-    assert sql.count("date >= now() - interval") == reads
+    reads = (sql.count("FROM nseindia_ohlcv") + sql.count("FROM nseindia_mcap")
+             + sql.count("FROM nseindia_surveillance_indicator"))
+    assert reads == 6
+    assert sql.count("date >= now() - interval") + sql.count("date >= (now() - interval") == reads
+
+
+def test_rule2_excludes_gsm_any_stage_and_asm_stage_2_up_but_keeps_asm_stage_1():
+    # ASM stage 1 is NSE's mechanical reaction to a price run; the operator keeps it in (2026-09-25).
+    df = universe.apply_layer1_rules(pd.DataFrame([
+        _row("ASM1", lt_asm=1, st_asm=1),
+        _row("LTASM2", lt_asm=2),
+        _row("STASM2", st_asm=2),
+        _row("GSM0", gsm=0),
+        _row("NOROW", gsm=None, lt_asm=None, st_asm=None, surveillance_date=None),
+        _row("ENCUMBERED", encumbered=0),
+    ])).set_index("symbol")
+
+    assert df["layer1_pass"].to_dict() == {
+        "ASM1": True, "LTASM2": False, "STASM2": False, "GSM0": False, "NOROW": True, "ENCUMBERED": True,
+    }
+    assert df.at["LTASM2", "fail_reasons"] == ["on surveillance: LT_ASM stage 2"]
+    assert df.at["GSM0", "fail_reasons"] == ["on surveillance: GSM stage 0"]
+
+    report = universe.layer1_report(df.reset_index())
+    assert report["passing_but_asm_stage1"] == 1
+    assert report["passing_but_encumbered_over_50"] == 1
+    assert report["no_surveillance_row"] == 1

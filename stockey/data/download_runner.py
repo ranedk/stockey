@@ -92,6 +92,10 @@ PARSER_STEPS = [
     # rest of the chain having already run; offmarket_parser depends on nothing
     # here and has nothing depending on it).
     {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "fundamentals_deal_flow"},
+    # NSE surveillance indicators (ASM/GSM/ESM/IRP/encumbrance), 2026-09-25, for the universe
+    # rebuild (docs/UNIVERSE_PRD.md). After bhavcopy_parser: it asks only for sessions that
+    # nseindia_ohlcv already holds. Non-critical purpose.
+    {"module": "data.nseindia.surveillance_indicator", "args": [], "purpose": "surveillance"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
 ]
 

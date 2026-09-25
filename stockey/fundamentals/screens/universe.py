@@ -1,14 +1,24 @@
 """The rebuilt stock universe, Layer 1 (docs/UNIVERSE_PRD.md sections 3 and 7).
 
-Layer 1 is the same for every stock and only EXCLUDES. Built so far (PRD build step 1),
-all from tables stockey already collects:
+Layer 1 is the same for every stock and only EXCLUDES (PRD build steps 1-2):
 
   1. NSE main board: series EQ on the latest session (SME SM/ST and trade-to-trade BE out)
+  2. not under serious NSE surveillance: no GSM stage, no long- or short-term ASM stage >= 2
   3. market cap >= Rs 300 cr (latest nseindia_mcap row)
   4. median daily traded value over the last 63 sessions >= Rs 50 L
   5. listed >= 252 sessions
 
-Not built yet (build step 2): 2 surveillance list (ASM/GSM), 6 promoter pledge < 50%.
+Rule 2 reads NSE's daily surveillance-indicator file (nseindia_surveillance_indicator).
+ASM stage 1 is left in on purpose (operator, 2026-09-25): NSE applies it mechanically
+after a large price move, and excluding it removed 87 stocks including WELCORP,
+KIRLOSENG and TATACHEM -- the runners this universe exists to keep. Only a positive flag
+excludes; a stock absent from the file passes and is counted (`no_surveillance_row`).
+
+Rule 6 (promoter pledge < 50%) moved to Layer 2 (operator, 2026-09-25). NSE's "> 50%
+encumbered" flag also counts parent and PE non-disposal undertakings (it removed VEDL,
+HINDZINC, OBEROIRLTY, AFFLE, EUREKAFORB), and screener.in's pledge % covers only the
+old ~190-name universe. The report still shows how many passing stocks carry the flag.
+
 Nothing reads this module in the nightly pipeline until the operator signs off the
 counts (build step 5); until then `python -m fundamentals.screens.universe` reports.
 
@@ -31,6 +41,10 @@ VALUE_FLOOR_RS = 50e5  # Rs 50 lakh a day
 VALUE_WINDOW_SESSIONS = 63
 VALUE_MIN_SESSIONS = 40  # a stock traded on fewer of the 63 sessions has no honest median
 MIN_LISTED_SESSIONS = 252
+NOT_FLAGGED = 100  # NSE surveillance file: 100 = not flagged, anything else = stage/flag
+SURVEILLANCE_COLUMNS = ("gsm", "lt_asm", "st_asm")
+# lowest stage that excludes, per column (GSM: any stage, including stage 0)
+SURVEILLANCE_MIN_STAGE = {"gsm": 0, "lt_asm": 2, "st_asm": 2}
 
 # One row per stock trading as EQ on the latest session, with the inputs every rule reads.
 # Every read of nseindia_ohlcv is date-bounded. Listing age counts sessions under the
@@ -61,6 +75,12 @@ WITH sessions AS (
       JOIN ranked r ON r.date = o.date AND r.k <= %(value_window)s
      WHERE o.date >= now() - interval '150 days' AND o.series IN ('EQ', 'BE')
      GROUP BY o.symbol
+), surveillance AS (
+    SELECT DISTINCT ON (symbol) symbol, date AS surveillance_date, gsm, lt_asm, st_asm, esm, irp,
+           encumbered_over_50
+      FROM nseindia_surveillance_indicator
+     WHERE date >= (now() - interval '15 days')::date AND series = 'EQ'
+     ORDER BY symbol, date DESC
 ), history AS (
     SELECT DISTINCT o.date, o.isin, o.symbol
       FROM nseindia_ohlcv o
@@ -75,13 +95,15 @@ WITH sessions AS (
 SELECT l.symbol, l.isin, l.company_master_id, s.d AS session_date,
        m.category, m.market_cap_rs, m.mcap_date,
        v.median_value_rs, v.value_sessions,
-       greatest(coalesce(ai.n, 0), coalesce(asym.n, 0)) AS listed_sessions
+       greatest(coalesce(ai.n, 0), coalesce(asym.n, 0)) AS listed_sessions,
+       sv.surveillance_date, sv.gsm, sv.lt_asm, sv.st_asm, sv.esm, sv.irp, sv.encumbered_over_50
   FROM latest l
   CROSS JOIN latest_session s
   LEFT JOIN mcap m ON m.symbol = l.symbol
   LEFT JOIN traded_value v ON v.symbol = l.symbol
   LEFT JOIN age_by_isin ai ON ai.isin = l.isin
   LEFT JOIN age_by_symbol asym ON asym.symbol = l.symbol
+  LEFT JOIN surveillance sv ON sv.symbol = l.symbol
  ORDER BY l.symbol
 """
 
@@ -100,15 +122,24 @@ def apply_layer1_rules(inputs: pd.DataFrame) -> pd.DataFrame:
     value_sessions = pd.to_numeric(df["value_sessions"], errors="coerce").fillna(0)
     listed = pd.to_numeric(df["listed_sessions"], errors="coerce").fillna(0)
 
+    def excluding(col: str) -> pd.Series:
+        v = pd.to_numeric(df[col], errors="coerce")
+        return v.notna() & (v != NOT_FLAGGED) & (v >= SURVEILLANCE_MIN_STAGE[col])
+
     df["rule1_main_board"] = True
+    df["rule2_surveillance"] = ~pd.concat([excluding(c) for c in SURVEILLANCE_COLUMNS], axis=1).any(axis=1)
     df["rule3_mcap"] = mcap >= MCAP_FLOOR_RS  # NaN (no mcap row: ETFs, bonds) fails
     df["rule4_traded_value"] = (value >= VALUE_FLOOR_RS) & (value_sessions >= VALUE_MIN_SESSIONS)
     df["rule5_listed"] = listed >= MIN_LISTED_SESSIONS
-    rules = ["rule1_main_board", "rule3_mcap", "rule4_traded_value", "rule5_listed"]
+    rules = ["rule1_main_board", "rule2_surveillance", "rule3_mcap", "rule4_traded_value", "rule5_listed"]
     df["layer1_pass"] = df[rules].all(axis=1)
 
     def reasons(row) -> list[str]:
         out = []
+        if not row["rule2_surveillance"]:
+            out.append("on surveillance: " + ", ".join(
+                f"{c.upper()} stage {int(row[c])}" for c in SURVEILLANCE_COLUMNS
+                if pd.notna(row[c]) and row[c] != NOT_FLAGGED and row[c] >= SURVEILLANCE_MIN_STAGE[c]))
         if not row["rule3_mcap"]:
             out.append("no market cap" if pd.isna(row["market_cap_rs"]) else "market cap < Rs 300 cr")
         if not row["rule4_traded_value"]:
@@ -124,8 +155,12 @@ def apply_layer1_rules(inputs: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(NOT_FLAGGED)
+
+
 def layer1_report(df: pd.DataFrame) -> dict[str, object]:
-    rules = ["rule3_mcap", "rule4_traded_value", "rule5_listed"]
+    rules = ["rule2_surveillance", "rule3_mcap", "rule4_traded_value", "rule5_listed"]
     only_fail = {
         r: int((~df[r] & df[[x for x in rules if x != r]].all(axis=1)).sum()) for r in rules
     }
@@ -134,7 +169,13 @@ def layer1_report(df: pd.DataFrame) -> dict[str, object]:
         "eq_on_latest_session": len(df),
         "fails": {r: int((~df[r]).sum()) for r in rules},
         "fails_only_this_rule": only_fail,
-        "pass_rules_1_3_4_5": int(df["layer1_pass"].sum()),
+        "pass_layer1": int(df["layer1_pass"].sum()),
+        "no_surveillance_row": int(df["surveillance_date"].isna().sum()),
+        # Not Layer 1 rules; shown so the operator can decide whether they should be.
+        "passing_but_asm_stage1": int((df["layer1_pass"] & (_num(df["lt_asm"]).eq(1) | _num(df["st_asm"]).eq(1))).sum()),
+        "passing_but_encumbered_over_50": int((df["layer1_pass"] & _num(df["encumbered_over_50"]).ne(NOT_FLAGGED)).sum()),
+        "passing_but_esm": int((df["layer1_pass"] & pd.to_numeric(df["esm"], errors="coerce").fillna(NOT_FLAGGED).ne(NOT_FLAGGED)).sum()),
+        "passing_but_irp": int((df["layer1_pass"] & pd.to_numeric(df["irp"], errors="coerce").fillna(NOT_FLAGGED).ne(NOT_FLAGGED)).sum()),
         "pass_by_category": {str(k): int(v) for k, v in df.loc[df["layer1_pass"], "category"].value_counts().items()},
     }
 

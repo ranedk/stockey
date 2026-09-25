@@ -35,11 +35,11 @@ fundamentals look like).
 | # | Rule | Source (already collected) |
 |---|---|---|
 | 1 | NSE main board only: series EQ. No SME (SM/ST), not trade-to-trade (BE) | `nseindia_ohlcv` |
-| 2 | Not on NSE's surveillance list (ASM/GSM) | `master_dhan_instruments.asm_gsm_flag` |
+| 2 | Not under serious NSE surveillance: no GSM stage, no long- or short-term ASM stage >= 2 | NSE daily surveillance-indicator file (`nseindia_surveillance_indicator`, from 2025-01) |
 | 3 | Market cap >= Rs 300 cr | `nseindia_mcap` |
 | 4 | Median daily traded value over the last 63 sessions >= Rs 50 L | `nseindia_ohlcv.total_value` |
 | 5 | Listed >= 252 sessions | `nseindia_ohlcv` |
-| 6 | Promoter pledge < 50% | screener.in market-wide pledge fetch (`fundamentals_l2_market_snapshot`) |
+| ~~6~~ | ~~Promoter pledge < 50%~~ -- moved to Layer 2 (see below) | |
 
 About 1,350 stocks pass rules 1, 3, 4 and 5 today (2026-09-24); rules 2 and 6 will
 remove some.
@@ -54,6 +54,17 @@ almost no recall, so it stays at a year. Every winner the rules missed was SME,
 trade-to-trade or newly listed -- mostly the intended exclusions.
 
 Not testable on history (none held): the surveillance list and pledge rules.
+
+Rule 2 as decided (operator, 2026-09-25): ASM stage 1 stays IN. NSE puts a stock on it
+mechanically after a large price move; excluding it removed 87 stocks including WELCORP
+(Rs 71,000 cr), KIRLOSENG, TATACHEM and SANSERA -- the runners this universe is for. GSM
+(any stage) and ASM stage 2+ remove 4. Dhan's `asm_gsm_flag` was the planned source but
+marks only ~20 mostly-suspended names; NSE's own file is used instead.
+
+Rule 6 moved to Layer 2 (operator, 2026-09-25): NSE's "> 50% encumbered" flag also counts
+parent and PE non-disposal undertakings (it removed VEDL, HINDZINC, OBEROIRLTY, AFFLE,
+EUREKAFORB), and screener.in's pledge % covers only the old ~190-name universe. Pledge
+becomes a Layer 2 check once screener.in pledge is fetched for the whole universe.
 
 ## 4. Groups (assigned in Layer 1)
 
@@ -120,7 +131,10 @@ switching over, report how many of today's 5x winners it would reject, and why.
    new ISIN and made ADANIPOWER, NAZARA look newly listed; +34 stocks), and `parse_mcap`
    dropped the first row of every NSE market-cap file since 2024-02 (20MICRONS; fixed, today's
    file reloaded, history not backfilled).
-2. Surveillance-list rule (Dhan flag) and pledge rule; report the count.
+2. Surveillance-list rule (Dhan flag) and pledge rule; report the count. **Done 2026-09-25:**
+   collector `data/nseindia/surveillance_indicator.py` (nightly, after bhavcopy_parser;
+   history backfilled from 2025-01). Layer 1 = **1,395** stocks (session 2026-09-24): rule 2
+   removes 4 more; 83 passing stocks are on ASM stage 1, 14 carry the encumbrance flag.
 3. NSE industry-label collector; assign groups; measure asset intensity and set X with
    the operator.
 4. Layer 2 per group via screener.in; report survivors per group and the 5x winners it
