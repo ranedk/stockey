@@ -112,6 +112,22 @@ no longer a gate; it becomes a scoring signal (rising debtor days counts against
 company). Exact lender thresholds and field availability on screener.in are confirmed
 during the build.
 
+As decided (operator, 2026-09-25) -- the table above as first written removed 377 of
+1,395, mostly healthy companies:
+
+- Contingent liabilities: not applied to lenders (guarantees are banking business: it
+  removed every large bank); for the rest >= 100% of net worth, not 25% (L&T, BHEL: 203 -> 27).
+- Operating cash flow negative in 2 of 3 years only excludes together with a loss last
+  year (lending arms consolidated into Grasim / Kirloskar Oil, order-book growers like
+  Kaynes and Cochin Shipyard: 139 -> 25). The third year is derived from screener.in's
+  3-year total.
+- Real estate / holding debt/equity >= 1.5 applies to developers only (holding companies
+  carry their lending subsidiaries' debt: 14 -> 6).
+- Lender NPA: net NPA >= 6% (RBI's prompt-corrective-action threshold). Capital adequacy is
+  not on screener.in and is not checked. Other financials use "loss in both of the last 2
+  years" (screener.in has no third-year profit field).
+- Pledge >= 50% (screener.in's promoter pledge, market-wide) applies to every group.
+
 Layer 2 cannot be tested on history until point-in-time snapshots exist (TODO C4). Before
 switching over, report how many of today's 5x winners it would reject, and why.
 
@@ -150,7 +166,13 @@ switching over, report how many of today's 5x winners it would reject, and why.
 3. NSE industry-label collector; assign groups; measure asset intensity and set X with
    the operator. **Done 2026-09-25** -- see section 4 "As built". No X: one operating group.
 4. Layer 2 per group via screener.in; report survivors per group and the 5x winners it
-   would reject.
+   would reject. **Done 2026-09-25** (`fundamentals/screens/universe_layer2.py`): **1,266**
+   of 1,395 pass (operating 1,076/1,185, lenders 89/95, real estate + holding 56/64, other
+   financials 45/51). Of the 798 Layer 1 stocks that rose 5x since 2019, 72 (9%) are
+   rejected -- the same rate as everyone (9.2%); on today's accounts, so this is not a
+   point-in-time test. Inputs: four market-wide screener.in queries + lender NPA from
+   company pages; stored dated in `fundamentals_universe_layer2_inputs`. Thresholds changed
+   by the operator after the PRD values removed 377 -- see section 5 "As decided".
 5. Operator sign-off, then switch `l1_universe` to the new definition (new version).
 6. Move OCR to its own job; extend coverage (section 6).
 
