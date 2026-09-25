@@ -63,21 +63,32 @@ def fetch_npa(session, ticker: str) -> dict[str, float | None]:
 # Each query reveals the columns it filters on, in query order (~3 at most); the filters
 # are always-true bounds so every company with a value comes back. A company missing
 # from a query simply has no value for those fields (and is never excluded for it).
+# Loss-maker-only queries ("Net Profit last year < 0") feed the turnaround and growth
+# allow-rules; restricting them keeps each to a few pages. Latest-quarter profit and YoY
+# quarterly sales growth are default screener.in columns, so they are read from the first
+# of those queries only (a field is taken from one query, never merged from two).
+_LOSS = "Net Profit last year < 0 AND Market Capitalization > 250"
 QUERIES = {
     "ocf": ("Cash from operations last year > -10000000 AND Cash from operations preceding year > -10000000 AND "
-            "Operating cash flow 3years > -10000000 AND Market Capitalization > 250"),
+            "Operating cash flow 3years > -10000000 AND Market Capitalization > 250",
+            {"cf_operations_rscr": "ocf_y1", "cf_operations_py_rscr": "ocf_y2", "cf_opr_3yrs_rscr": "ocf_3y_total"}),
     "profit": ("Net Profit last year > -10000000 AND Net Profit preceding year > -10000000 AND "
-               "Net worth > -10000000 AND Market Capitalization > 250"),
-    "debt": ("Debt to equity > -10000 AND Interest Coverage Ratio > -1000000 AND Contingent liabilities > -1 AND "
-             "Market Capitalization > 250"),
-    "misc": "Return on assets > -1000 AND Pledged percentage > -1 AND Market Capitalization > 250",
+               "Net worth > -10000000 AND Market Capitalization > 250",
+               {"np_ann_rscr": "profit_y1", "np_prev_ann_rscr": "profit_y2", "net_worth_rscr": "net_worth"}),
+    "debt": ("Debt to equity > -10000 AND Interest Coverage Ratio > -1000000 AND Market Capitalization > 250",
+             {"debt___eq": "debt_to_equity", "int_coverage": "interest_cover"}),
+    "misc": ("Return on assets > -1000 AND Pledged percentage > -1 AND Market Capitalization > 250",
+             {"roa_12m_pct": "return_on_assets_pct", "pledged_pct": "promoter_pledged_pct"}),
+    "loss_growth": (f"Sales growth > -1000 AND Price to Sales > -1 AND {_LOSS}",
+                    {"sales_growth_pct": "sales_growth_pct", "cmp___sales": "price_to_sales",
+                     "np_qtr_rscr": "profit_q", "qtr_sales_var_pct": "sales_growth_q_pct"}),
+    "loss_quarters": (f"Net profit > -10000000 AND Net Profit preceding quarter > -10000000 AND "
+                      f"Net Profit preceding year quarter > -10000000 AND {_LOSS}",
+                      {"np_12m_rscr": "profit_ttm", "np_prev_qtr_rscr": "profit_prev_q", "np_py_qtr_rscr": "profit_q_year_ago"}),
+    "loss_margin": (f"OPM latest quarter > -100000 AND OPM preceding year quarter > -100000 AND {_LOSS}",
+                    {"opm_qtr_pct": "opm_q", "opm_py_qtr_pct": "opm_q_year_ago"}),
 }
-FIELDS = {
-    "cf_operations_rscr": "ocf_y1", "cf_operations_py_rscr": "ocf_y2", "cf_opr_3yrs_rscr": "ocf_3y_total",
-    "np_ann_rscr": "profit_y1", "np_prev_ann_rscr": "profit_y2", "net_worth_rscr": "net_worth",
-    "debt___eq": "debt_to_equity", "int_coverage": "interest_cover", "cont_liab_rscr": "contingent_liabilities",
-    "roa_12m_pct": "return_on_assets_pct", "pledged_pct": "promoter_pledged_pct",
-}
+FIELDS = {k: v for _, fields in QUERIES.values() for k, v in fields.items()}
 
 # --- Thresholds (docs/UNIVERSE_PRD.md section 5) -----------------------------------------
 # Operator decisions 2026-09-25, after the PRD's values removed 377 of 1,395 (27%):
@@ -87,7 +98,23 @@ FIELDS = {
 # order-book growers (Kaynes, Cochin Shipyard) -> also requires a loss last year (25, was
 # 139); debt/equity 1.5 hit Bajaj Finserv, AB Capital, Chola Holdings (their lending
 # subsidiaries' borrowings) -> developers only (6, was 14).
-CONTINGENT_SHARE_OF_NET_WORTH = 1.0
+# Contingent liabilities check DROPPED (operator, 2026-09-25): even at 100% of net worth it
+# removed Colgate, Gillette, P&G Hygiene (tax disputes against a net worth kept small by
+# full payouts) and Mazagon Dock, RVNL, GRSE (government-contract guarantees).
+#
+# Two allow-rules lift ONLY the loss / cash-burn exclusions (never pledge, debt, negative
+# net worth): systrader research/LEDGER.md row 45, operator 2026-09-25.
+#  - Turnaround: profitable over the trailing 12 months and in each of the last 2
+#    quarters -- the annual loss is stale (JSW Cement, India Cements, Centum, ...).
+#  - Scaling growth: sales up >= 20% both for the year and the latest quarter (YoY); the
+#    latest quarter's profit AND operating margin better than a year earlier; net worth
+#    > 0 and debt/equity <= 0.5; market cap >= Rs 2,000 cr, >= Rs 5 cr/day traded;
+#    price/sales >= 2 (Swiggy, Ather, ideaForge).
+GROWTH_SALES_PCT = 20.0
+GROWTH_MAX_DEBT_TO_EQUITY = 0.5
+GROWTH_MIN_MCAP_RS = 2000e7
+GROWTH_MIN_TRADED_VALUE_RS = 5e7
+GROWTH_MIN_PRICE_TO_SALES = 2.0
 PLEDGE_PCT_CEILING = 50.0             # moved here from Layer 1 rule 6 (operator, 2026-09-25)
 LENDER_NET_NPA_CEILING_PCT = 6.0      # RBI prompt-corrective-action risk threshold 1 (banks and NBFCs)
 OPERATING_DEBT_TO_EQUITY = 2.0        # together with interest cover below the floor
@@ -101,20 +128,20 @@ def fetch_screener_inputs(session=None) -> pd.DataFrame:
 
     session = session or build_authenticated_session()
     frames = []
-    for query in QUERIES.values():
+    for query, fields in QUERIES.values():
         _, companies = run_query(session, query)
-        frames.append(companies_to_frame(companies))
+        frames.append(companies_to_frame(companies, fields))
     out = frames[0]
     for f in frames[1:]:
         out = out.merge(f, on=["screener_company_id", "screener_ticker"], how="outer")
     return out
 
 
-def companies_to_frame(companies: list[dict]) -> pd.DataFrame:
+def companies_to_frame(companies: list[dict], fields: dict[str, str]) -> pd.DataFrame:
     rows = []
     for c in companies:
         row = {"screener_company_id": c.get("company_id"), "screener_ticker": c.get("ticker")}
-        for key, name in FIELDS.items():
+        for key, name in fields.items():
             if key in c.get("metrics", {}):
                 row[name] = c["metrics"][key]
         rows.append(row)
@@ -124,7 +151,7 @@ def companies_to_frame(companies: list[dict]) -> pd.DataFrame:
 def attach_inputs(layer1: pd.DataFrame, inputs: pd.DataFrame, bse_code_by_cmid: dict) -> pd.DataFrame:
     """screener.in's ticker is the NSE symbol, or the BSE scrip code for some listings."""
     by_ticker = inputs.dropna(subset=["screener_ticker"]).drop_duplicates("screener_ticker", keep=False)
-    by_ticker = by_ticker.set_index("screener_ticker")
+    by_ticker = by_ticker.set_index("screener_ticker", drop=False)
     df = layer1.copy()
     key = df["symbol"].where(df["symbol"].isin(by_ticker.index),
                              df["company_master_id"].map(bse_code_by_cmid).astype("string"))
@@ -138,17 +165,54 @@ def _v(row, col):
     return None if v is None or pd.isna(v) else float(v)
 
 
+def is_turnaround(row) -> bool:
+    ttm, q, prev_q = _v(row, "profit_ttm"), _v(row, "profit_q"), _v(row, "profit_prev_q")
+    return all(v is not None and v > 0 for v in (ttm, q, prev_q))
+
+
+def is_scaling_growth(row) -> bool:
+    g, gq = _v(row, "sales_growth_pct"), _v(row, "sales_growth_q_pct")
+    q, q_ago = _v(row, "profit_q"), _v(row, "profit_q_year_ago")
+    m, m_ago = _v(row, "opm_q"), _v(row, "opm_q_year_ago")
+    nw, de = _v(row, "net_worth"), _v(row, "debt_to_equity")
+    mcap, traded, ps = _v(row, "market_cap_rs"), _v(row, "median_value_rs"), _v(row, "price_to_sales")
+    if None in (g, gq, q, q_ago, m, m_ago, nw, mcap, traded, ps):
+        return False
+    return (g >= GROWTH_SALES_PCT and gq >= GROWTH_SALES_PCT and q > q_ago and m > m_ago
+            and nw > 0 and (de or 0.0) <= GROWTH_MAX_DEBT_TO_EQUITY
+            and mcap >= GROWTH_MIN_MCAP_RS and traded >= GROWTH_MIN_TRADED_VALUE_RS
+            and ps >= GROWTH_MIN_PRICE_TO_SALES)
+
+
+def allowed_by(row) -> str | None:
+    """Which allow-rule lifts this stock's loss / cash-burn exclusions, if any."""
+    if is_turnaround(row):
+        return "turnaround"
+    if row.get("group") == "operating" and is_scaling_growth(row):
+        return "scaling_growth"
+    return None
+
+
+_LOSS_REASONS = ("loss-making both of the last 2 years",
+                 "operating cash flow negative in 2 of the last 3 years and a loss last year")
+
+
 def layer2_reasons(row) -> list[str]:
-    """Every check a stock fails, for its group. Missing inputs never exclude."""
+    """Every check a stock fails, for its group, after the allow-rules. Missing inputs
+    never exclude."""
+    out = _raw_reasons(row)
+    if any(r in _LOSS_REASONS for r in out) and allowed_by(row):
+        out = [r for r in out if r not in _LOSS_REASONS]
+    return out
+
+
+def _raw_reasons(row) -> list[str]:
     group = row.get("group")
     out: list[str] = []
     nw, de, ic = _v(row, "net_worth"), _v(row, "debt_to_equity"), _v(row, "interest_cover")
     p1, p2 = _v(row, "profit_y1"), _v(row, "profit_y2")
-    cl, pledge = _v(row, "contingent_liabilities"), _v(row, "promoter_pledged_pct")
+    pledge = _v(row, "promoter_pledged_pct")
 
-    if (group != "lender" and nw is not None and nw > 0 and cl is not None
-            and cl >= CONTINGENT_SHARE_OF_NET_WORTH * nw):
-        out.append("contingent liabilities >= net worth")
     if pledge is not None and pledge >= PLEDGE_PCT_CEILING:
         out.append("promoter pledge >= 50%")
     negative_nw = nw is not None and nw < 0
@@ -188,13 +252,15 @@ def apply_layer2(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["layer2_reasons"] = out.apply(layer2_reasons, axis=1)
     out["layer2_pass"] = out["layer2_reasons"].map(len).eq(0)
+    rescued = out.apply(lambda r: any(x in _LOSS_REASONS for x in _raw_reasons(r)) and allowed_by(r), axis=1)
+    out["layer2_allowed_by"] = [allowed_by(r) if flag else None for flag, (_, r) in zip(rescued, out.iterrows())]
     return out
 
 
 # --- Run ------------------------------------------------------------------------------
 INPUTS_TABLE = "fundamentals_universe_layer2_inputs"
 _STORED_COLUMNS = ["symbol", "isin", "company_master_id", "group", "screener_company_id", "screener_ticker",
-                   *FIELDS.values(), "gross_npa_pct", "net_npa_pct"]
+                   *FIELDS.values(), "gross_npa_pct", "net_npa_pct", "layer2_allowed_by"]
 
 
 def layer2_report(df: pd.DataFrame) -> dict[str, object]:
@@ -213,6 +279,8 @@ def layer2_report(df: pd.DataFrame) -> dict[str, object]:
         "exclusions_by_reason": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         "no_screener_match": int(df["screener_company_id"].isna().sum()),
         "lenders_without_npa": int((df["group"].eq("lender") & df["net_npa_pct"].isna()).sum()),
+        "allowed_by": {str(k): list(v) for k, v in df.dropna(subset=["layer2_allowed_by"])
+                       .groupby("layer2_allowed_by")["symbol"]},
     }
 
 

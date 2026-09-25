@@ -126,7 +126,23 @@ As decided (operator, 2026-09-25) -- the table above as first written removed 37
 - Lender NPA: net NPA >= 6% (RBI's prompt-corrective-action threshold). Capital adequacy is
   not on screener.in and is not checked. Other financials use "loss in both of the last 2
   years" (screener.in has no third-year profit field).
-- Pledge >= 50% (screener.in's promoter pledge, market-wide) applies to every group.
+- Pledge >= 50% (screener.in's promoter pledge, market-wide) applies to every group. Kept
+  although several hits are PE/acquirer-owned (Mphasis, Nuvama, Thyrocare): the data cannot
+  yet tell an acquisition pledge from a distressed promoter; revisit with shareholding data.
+
+Second pass (operator, 2026-09-25, after looking at what the rejects were -- systrader
+LEDGER row 45, exploration):
+
+- Contingent liabilities check DROPPED: even at 100% of net worth it removed Colgate,
+  Gillette, P&G Hygiene (tax disputes against small, fully paid-out net worth) and Mazagon
+  Dock, RVNL, GRSE (government-contract guarantees).
+- Two allow-rules lift ONLY the loss / cash-burn exclusions (never pledge, debt, negative
+  net worth): **turnaround** -- profitable over the trailing 12 months and in each of the
+  last 2 quarters (JSW Cement, India Cements, Centum, Gujarat Alkalies, Aurum); **scaling
+  growth** (operating group) -- sales up >= 20% for the year and the latest quarter, the
+  latest quarter's profit and operating margin both better than a year earlier, debt/equity
+  <= 0.5, market cap >= Rs 2,000 cr, >= Rs 5 cr/day traded, price/sales >= 2 (Swiggy, Ather,
+  ideaForge). Which rule rescued a stock is stored (`layer2_allowed_by`).
 
 Layer 2 cannot be tested on history until point-in-time snapshots exist (TODO C4). Before
 switching over, report how many of today's 5x winners it would reject, and why.

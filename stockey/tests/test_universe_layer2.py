@@ -18,7 +18,7 @@ def test_parse_npa_missing_rows_is_none():
 
 def _r(group, **kw):
     base = {"group": group, "basic_industry": None, "net_worth": 1000.0, "debt_to_equity": 0.5, "interest_cover": 5.0,
-            "profit_y1": 100.0, "profit_y2": 100.0, "contingent_liabilities": 10.0, "promoter_pledged_pct": 0.0,
+            "profit_y1": 100.0, "profit_y2": 100.0, "promoter_pledged_pct": 0.0,
             "ocf_y1": 50.0, "ocf_y2": 50.0, "ocf_3y_total": 150.0, "return_on_assets_pct": 1.5, "net_npa_pct": 1.0}
     base.update(kw)
     return l2.layer2_reasons(base)
@@ -29,10 +29,8 @@ def test_clean_company_passes_in_every_group():
         assert _r(g) == []
 
 
-def test_contingent_liabilities_not_applied_to_lenders_and_needs_full_net_worth():
-    assert _r("lender", contingent_liabilities=50_000.0) == []
-    assert _r("operating", contingent_liabilities=999.0) == []
-    assert _r("operating", contingent_liabilities=1000.0) == ["contingent liabilities >= net worth"]
+def test_contingent_liabilities_no_longer_checked():
+    assert _r("operating", contingent_liabilities=50_000.0) == []
 
 
 def test_operating_cash_burn_excludes_only_with_a_loss_last_year():
@@ -60,3 +58,38 @@ def test_lender_checks_and_missing_data_never_excludes():
     assert _r("lender", net_npa_pct=None, return_on_assets_pct=None) == []
     assert _r("other_financial", profit_y1=-1.0, profit_y2=-1.0) == ["loss-making both of the last 2 years"]
     assert _r("operating", promoter_pledged_pct=50.0) == ["promoter pledge >= 50%"]
+
+
+_GROWER = {"profit_y1": -50.0, "profit_y2": -80.0, "sales_growth_pct": 45.0, "sales_growth_q_pct": 40.0,
+           "profit_q": -10.0, "profit_q_year_ago": -30.0, "opm_q": -5.0, "opm_q_year_ago": -15.0,
+           "debt_to_equity": 0.1, "market_cap_rs": 50_000e7, "median_value_rs": 100e7, "price_to_sales": 5.0}
+
+
+def test_scaling_growth_lifts_loss_checks_only():
+    assert _r("operating", profit_y1=-50.0, profit_y2=-80.0) == ["loss-making both of the last 2 years"]
+    assert _r("operating", **_GROWER) == []
+    # never lifts a pledge or debt finding
+    assert _r("operating", **{**_GROWER, "promoter_pledged_pct": 60.0}) == ["promoter pledge >= 50%"]
+
+
+def test_scaling_growth_needs_every_leg():
+    for broken in [{"sales_growth_q_pct": 10.0}, {"profit_q": -40.0}, {"opm_q": -20.0}, {"debt_to_equity": 0.8},
+                   {"market_cap_rs": 1000e7}, {"median_value_rs": 1e7}, {"price_to_sales": 1.5}]:
+        assert _r("operating", **{**_GROWER, **broken}) == ["loss-making both of the last 2 years"], broken
+
+
+def test_turnaround_needs_ttm_and_two_profitable_quarters():
+    base = {"profit_y1": -50.0, "profit_y2": -80.0, "profit_ttm": 90.0, "profit_q": 30.0, "profit_prev_q": 20.0}
+    assert _r("operating", **base) == []
+    assert _r("other_financial", **base) == []
+    assert _r("operating", **{**base, "profit_prev_q": -5.0}) == ["loss-making both of the last 2 years"]
+
+
+def test_apply_layer2_records_which_rule_rescued():
+    import pandas as pd
+    rows = [{"symbol": "GROW", "group": "operating", "net_worth": 1000.0, "interest_cover": 5.0, "ocf_y1": 1.0,
+             "ocf_y2": 1.0, "ocf_3y_total": 3.0, "promoter_pledged_pct": 0.0, **_GROWER},
+            {"symbol": "CLEAN", "group": "operating", "net_worth": 1000.0, "profit_y1": 5.0, "profit_y2": 5.0}]
+    out = l2.apply_layer2(pd.DataFrame(rows)).set_index("symbol")
+    assert out.at["GROW", "layer2_allowed_by"] == "scaling_growth" and bool(out.at["GROW", "layer2_pass"])
+    assert out.at["CLEAN", "layer2_allowed_by"] is None
