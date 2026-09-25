@@ -70,20 +70,31 @@ becomes a Layer 2 check once screener.in pledge is fetched for the whole univers
 
 | Group | Rule |
 |---|---|
-| Lenders | Financial Services sector AND a lending business (bank, NBFC, housing finance) |
-| Other financials | Financial Services, not lending (insurers, fund houses, brokers, exchanges) |
-| Real estate and holding companies | Realty sector, or a pure investment/holding company |
-| Asset-heavy | everything else with fixed assets (gross block) >= X times annual sales |
-| Asset-light | everything else below X |
+| Lenders | basic industry is a bank, NBFC, housing finance, microfinance or financial institution; or any Financial Services company the RBI registers as a lender (ICC/HFC/MFI/IFC) |
+| Other financials | the rest of Financial Services: insurers, fund houses, brokers, exchanges, depositories, ratings, fintech, distributors |
+| Real estate and holding companies | Realty sector; basic industry Holding Company or Investment Company; or registered with the RBI as a core investment company (CIC) whatever the label |
+| Operating companies | everything else |
 
-- Sector comes from `fundamentals_company_sector`. Asset intensity is measured from the
-  company's own numbers, so new kinds of business land in the right group without a
-  label (e.g. "Capital Goods" holds both plant-heavy makers and asset-light electronics
-  assemblers).
-- **X starts at 0.5** (fixed assets worth half a year's sales) and is set after looking
-  at how stocks spread around it; shown to the operator before it is fixed.
-- **Lenders vs other financials** needs NSE's finer industry label per stock (we store
-  only the broad sector). One small new collector.
+As built (step 3, `fundamentals/screens/universe.py`, 2026-09-25):
+
+- **Labels.** NSE, BSE and screener.in carry the same four-level exchange scheme (checked on
+  12 stocks: identical). Every stock gets Sharpely's codes for it in one bulk request
+  (`master_sharpely_equity.industry_code` / `nse_basic_ind_code`, names in
+  `fundamentals_sector_reference`); BSE's current label (`fundamentals_industry_
+  classification`, per stock, finance and real estate first) replaces it where held,
+  because Sharpely lags reclassification (19 of 303 differed; 3 would change group:
+  ABREL, HEMIPROP, NSIL). Dhan carries no industry label.
+- **RBI register** (`fundamentals_rbi_nbfc_registry`, matched by normalised name, 37 of 41
+  listed specialist NBFCs matched). It is what puts JIOFIN (labelled NBFC, registered CIC)
+  with the holding companies.
+- **No asset-heavy / asset-light split** (operator, 2026-09-25). Neither measure had a
+  natural break (fixed assets / sales: median 0.56, smooth; depreciation / sales: median
+  3.3%, smooth) and each misplaced well-known names: HUL 0.99, Wipro 0.73, Naukri 0.67
+  on fixed assets (acquired brands and goodwill count), Trent on depreciation (store
+  leases), IOC on both (refining sales swamp the plant). All the split changed in Layer 2
+  was how much debt is allowed.
+- **Today (session 2026-09-24), of 1,395:** operating 1,185, lenders 95, real estate and
+  holding 64, other financials 51.
 
 ## 5. Layer 2 checks by group (lenient; exclusion only)
 
@@ -91,11 +102,12 @@ becomes a Layer 2 check once screener.in pledge is fetched for the whole univers
 |---|---|
 | Lenders | gross/net NPA above a ceiling, capital adequacy below the regulatory minimum, return on assets <= 0, or negative net worth |
 | Other financials | loss-making in 2 of the last 3 years, or negative net worth |
-| Asset-heavy | operating cash flow negative in 2 of the last 3 years, debt/equity >= 2, or interest cover < 1.5 |
-| Asset-light | operating cash flow negative in 2 of the last 3 years, loss-making in both of the last 2 years, or debt/equity >= 1 |
+| Operating companies | operating cash flow negative in 2 of the last 3 years, loss-making in both of the last 2 years, or debt/equity >= 2 together with interest cover < 1.5 |
 | Real estate and holding | debt/equity >= 1.5, or negative net worth |
 
-Every group also: contingent liabilities >= 25% of net worth excludes. Debtor days is
+Every group also: contingent liabilities >= 25% of net worth excludes; promoter pledge >= 50%
+excludes (moved here from Layer 1 rule 6, once screener.in pledge is fetched for the whole
+universe). Debtor days is
 no longer a gate; it becomes a scoring signal (rising debtor days counts against a
 company). Exact lender thresholds and field availability on screener.in are confirmed
 during the build.
@@ -136,7 +148,7 @@ switching over, report how many of today's 5x winners it would reject, and why.
    history backfilled from 2025-01). Layer 1 = **1,395** stocks (session 2026-09-24): rule 2
    removes 4 more; 83 passing stocks are on ASM stage 1, 14 carry the encumbrance flag.
 3. NSE industry-label collector; assign groups; measure asset intensity and set X with
-   the operator.
+   the operator. **Done 2026-09-25** -- see section 4 "As built". No X: one operating group.
 4. Layer 2 per group via screener.in; report survivors per group and the 5x winners it
    would reject.
 5. Operator sign-off, then switch `l1_universe` to the new definition (new version).
@@ -148,5 +160,5 @@ Decided (operator, 2026-09-25): traded-value floor Rs 50 L; size floor Rs 300 cr
 from 500 after the recall test); lenders included with their own checks; two layers,
 groups by business model; OCR must not limit the universe.
 
-Open: SME stays out for now (revisit with a stricter bar once C4 gives history); X for
-the asset-heavy line; lender thresholds.
+Open: SME stays out for now (revisit with a stricter bar once C4 gives history); lender
+thresholds.

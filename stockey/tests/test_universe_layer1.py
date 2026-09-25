@@ -86,3 +86,44 @@ def test_rule2_excludes_gsm_any_stage_and_asm_stage_2_up_but_keeps_asm_stage_1()
     assert report["passing_but_asm_stage1"] == 1
     assert report["passing_but_encumbered_over_50"] == 1
     assert report["no_surveillance_row"] == 1
+
+
+def test_assign_groups_uses_labels_and_rbi_register():
+    df = pd.DataFrame([
+        {"symbol": s, "isin": f"INE{s}", "company_master_id": f"nse:{s}"}
+        for s in ["BANK", "NBFC", "HOLDCO", "CICNBFC", "AMC", "OTHERLENDER", "REALTY", "FACTORY", "NOLABEL"]
+    ])
+    fs = ("Financial Services", "Financial Services")
+    labels = pd.DataFrame([
+        {"isin": "INEBANK", "macro_sector": fs[0], "sector": fs[1], "industry": "Banks", "basic_industry": "Private Sector Bank"},
+        {"isin": "INENBFC", "macro_sector": fs[0], "sector": fs[1], "industry": "Finance",
+         "basic_industry": "Non Banking Financial Company (NBFC)"},
+        {"isin": "INEHOLDCO", "macro_sector": fs[0], "sector": fs[1], "industry": "Finance", "basic_industry": "Holding Company"},
+        {"isin": "INECICNBFC", "macro_sector": fs[0], "sector": fs[1], "industry": "Finance",
+         "basic_industry": "Non Banking Financial Company (NBFC)"},
+        {"isin": "INEAMC", "macro_sector": fs[0], "sector": fs[1], "industry": "Capital Markets",
+         "basic_industry": "Asset Management Company"},
+        {"isin": "INEOTHERLENDER", "macro_sector": fs[0], "sector": fs[1], "industry": "Finance",
+         "basic_industry": "Other Financial Services"},
+        {"isin": "INEREALTY", "macro_sector": "Realty", "sector": "Realty", "industry": "Realty",
+         "basic_industry": "Residential, Commercial Projects"},
+        {"isin": "INEFACTORY", "macro_sector": "Commodities", "sector": "Construction Materials", "industry": "Cement",
+         "basic_industry": "Cement & Cement Products"},
+    ])
+    rbi = pd.Series({"nse:CICNBFC": "CIC", "nse:OTHERLENDER": "HFC", "nse:NBFC": "ICC"}, name="rbi_classification")
+
+    out = universe.assign_groups(df, labels, rbi).set_index("symbol")["group"].to_dict()
+
+    assert out == {
+        "BANK": "lender", "NBFC": "lender", "HOLDCO": "realty_holding",
+        "CICNBFC": "realty_holding",  # RBI says core investment company: a holding company whatever the label
+        "AMC": "other_financial", "OTHERLENDER": "lender", "REALTY": "realty_holding",
+        "FACTORY": "operating", "NOLABEL": "unlabelled",
+    }
+
+
+def test_normalise_company_name_matches_rbi_and_exchange_spellings():
+    n = universe.normalise_company_name
+    assert n("JIO Financial Services Ltd.") == n("Jio Financial Services Limited (Formerly: Reliance Strategic Investments Limited)")
+    assert n("Cholamandalam Financial Holdings Ltd.") == n("Cholamandalam Financial Holdings Limited")
+    assert n("Power Finance Corporation Ltd.") == n("Power Finance Corporation Limited")

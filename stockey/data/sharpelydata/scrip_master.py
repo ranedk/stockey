@@ -36,6 +36,11 @@ def get_latest_from_sharpely(headers):
         "nse_segment",
         "bse_segment",
         "sector_code",
+        # The two finer levels of the same exchange industry scheme (2026-09-25): industry
+        # group (IN050101) and basic industry (IN050101004). Names come from
+        # fundamentals_sector_reference. Read by the universe rebuild's groups.
+        "industry_code",
+        "nse_basic_ind_code",
     ]
 
     resp = get_with_retries(

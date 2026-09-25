@@ -1,4 +1,10 @@
-"""Industry labels per listed company -> fundamentals_industry_classification.
+"""Exchange (BSE) industry labels per listed company -> fundamentals_industry_classification.
+
+Every stock already has a label from Sharpely's bulk master (master_sharpely_equity,
+one request). This collector is the slower, current check on top: Sharpely's labels
+lag the exchanges' reclassifications (19 of 303 differed on 2026-09-25), so where a BSE
+label exists the universe groups use it. Finance and real-estate names are fetched
+first, since those are the labels that decide a stock's group.
 
 For the universe rebuild's groups (docs/UNIVERSE_PRD.md section 4). India's exchanges
 share one four-level scheme (2023): macro sector > sector > industry > basic industry,
@@ -242,7 +248,11 @@ def main(argv: list[str] | None = None) -> int:
         from fundamentals.screens.universe import apply_layer1_rules, load_layer1_inputs
 
         layer1 = apply_layer1_rules(load_layer1_inputs())
-        priority = set(layer1.loc[layer1["layer1_pass"], "symbol"])
+        in_layer1 = layer1.loc[layer1["layer1_pass"], ["symbol", "isin"]]
+        group_deciding = sql_to_df(
+            "SELECT isin FROM master_sharpely_equity WHERE sector_code IN ('IN0501', 'IN0205') AND isin IS NOT NULL"
+        )
+        priority = set(in_layer1.loc[in_layer1["isin"].isin(group_deciding["isin"]), "symbol"])
     except Exception as exc:  # ordering only; never block collection on it
         print(f"layer1 priority unavailable: {exc!r}", flush=True)
         priority = set()

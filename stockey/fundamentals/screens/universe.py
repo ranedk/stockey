@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 
 import pandas as pd
 
@@ -180,16 +181,125 @@ def layer1_report(df: pd.DataFrame) -> dict[str, object]:
     }
 
 
+# --- Groups (docs/UNIVERSE_PRD.md section 4, PRD build step 3) --------------------------
+#
+# Four groups, by business model, each with its own Layer 2 checks. Operator decision
+# 2026-09-25: non-financial companies are ONE group. The planned asset-heavy/light line had
+# no natural break on either measure tried (fixed assets / sales: median 0.56, smooth;
+# depreciation / sales: median 3.3%, smooth) and each misplaced well-known names (HUL,
+# Wipro, Naukri heavy on fixed assets because acquired brands count; Trent heavy on
+# depreciation because leases do), while all it changed in Layer 2 was the debt allowance.
+#
+# Labels come from the exchanges' shared four-level scheme. Every stock has one from
+# Sharpely (master_sharpely_equity codes + fundamentals_sector_reference names, one bulk
+# request); where BSE's own current label has been collected
+# (fundamentals_industry_classification) it wins, because Sharpely's lags reclassification
+# (checked 2026-09-25: 19 of 303 differ, e.g. ABREL still "Paper" after its demerger into
+# real estate). RBI's NBFC register (fundamentals_rbi_nbfc_
+# registry, matched by normalised company name) adds what the label cannot say: a core
+# investment company (CIC) is a holding company whatever its label, and a registered
+# lender labelled "Other Financial Services" is still a lender.
+
+GROUP_LENDER = "lender"
+GROUP_OTHER_FINANCIAL = "other_financial"
+GROUP_REALTY_HOLDING = "realty_holding"
+GROUP_OPERATING = "operating"
+GROUP_UNLABELLED = "unlabelled"  # no industry label collected yet
+
+LENDING_BASIC_INDUSTRIES = frozenset({
+    "Public Sector Bank", "Private Sector Bank", "Other Bank",
+    "Non Banking Financial Company (NBFC)", "Housing Finance Company",
+    "Microfinance Institutions", "Financial Institution",
+})
+HOLDING_BASIC_INDUSTRIES = frozenset({"Holding Company", "Investment Company"})
+RBI_HOLDING_CLASSES = frozenset({"CIC"})
+RBI_LENDER_CLASSES = frozenset({"ICC", "HFC", "MFI", "IFC"})
+FINANCIAL_SERVICES = "Financial Services"
+REALTY = "Realty"
+
+
+def normalise_company_name(name) -> str:
+    s = str(name or "").lower()
+    s = re.sub(r"\(formerly.*$", "", s).replace("&", " and ")
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\b(limited|ltd|the|co|company|corporation|corpn|private|pvt|india)\b", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+SHARPELY_LABELS_QUERY = """
+WITH names AS (
+    SELECT DISTINCT ON (code) code, description FROM fundamentals_sector_reference ORDER BY code, as_of_date DESC
+)
+SELECT DISTINCT ON (e.isin) e.isin, NULL::text AS macro_sector, s.description AS sector,
+       i.description AS industry, b.description AS basic_industry
+  FROM master_sharpely_equity e
+  LEFT JOIN names s ON s.code = e.sector_code
+  LEFT JOIN names i ON i.code = e.industry_code
+  LEFT JOIN names b ON b.code = e.nse_basic_ind_code
+ WHERE e.isin IS NOT NULL AND e.nse_basic_ind_code IS NOT NULL
+ ORDER BY e.isin, e.nse_active DESC NULLS LAST
+"""
+
+
+def load_group_inputs() -> pd.DataFrame:
+    """Per company_master_id / isin: latest industry label and RBI classification."""
+    from fundamentals.collectors.industry_classification import load_latest_industry
+    from fundamentals.collectors.rbi_nbfc_registry import load_latest_registry
+
+    cols = ["isin", "macro_sector", "sector", "industry", "basic_industry"]
+    exchange = load_latest_industry()
+    exchange = exchange[cols].assign(label_source="bse") if not exchange.empty else pd.DataFrame(columns=[*cols, "label_source"])
+    sharpely = sql_to_df(SHARPELY_LABELS_QUERY).assign(label_source="sharpely")
+    labels = pd.concat([exchange, sharpely[~sharpely["isin"].isin(exchange["isin"])]], ignore_index=True)
+    names = sql_to_df("SELECT company_master_id, company_name FROM company_master WHERE nse_ticker IS NOT NULL")
+    rbi = load_latest_registry()
+    rbi = rbi[rbi["is_listed"].astype(bool)].copy()
+    rbi["_k"] = rbi["nbfc_name"].map(normalise_company_name)
+    names["_k"] = names["company_name"].map(normalise_company_name)
+    matched = names.merge(rbi[["_k", "classification"]].drop_duplicates("_k"), on="_k", how="inner")
+    rbi_by_cmid = matched.drop_duplicates("company_master_id").set_index("company_master_id")["classification"]
+    return labels, rbi_by_cmid.rename("rbi_classification")
+
+
+def assign_groups(df: pd.DataFrame, labels: pd.DataFrame, rbi_by_cmid: pd.Series) -> pd.DataFrame:
+    out = df.merge(labels, on="isin", how="left")
+    out["rbi_classification"] = out["company_master_id"].map(rbi_by_cmid)
+
+    def group(row) -> str:
+        basic, rbi_class = row["basic_industry"], row["rbi_classification"]
+        financial = FINANCIAL_SERVICES in (row["macro_sector"], row["sector"])
+        if rbi_class in RBI_HOLDING_CLASSES or basic in HOLDING_BASIC_INDUSTRIES:
+            return GROUP_REALTY_HOLDING
+        if REALTY in (row["macro_sector"], row["sector"]):
+            return GROUP_REALTY_HOLDING
+        if basic in LENDING_BASIC_INDUSTRIES:
+            return GROUP_LENDER
+        if financial and rbi_class in RBI_LENDER_CLASSES:
+            return GROUP_LENDER
+        if financial:
+            return GROUP_OTHER_FINANCIAL
+        if pd.isna(basic):
+            return GROUP_UNLABELLED
+        return GROUP_OPERATING
+
+    out["group"] = out.apply(group, axis=1)
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Report the Layer 1 universe count (docs/UNIVERSE_PRD.md).")
     parser.add_argument("--csv", help="also write every EQ stock with its rule results to this path")
     args = parser.parse_args()
     df = apply_layer1_rules(load_layer1_inputs())
+    labels, rbi_by_cmid = load_group_inputs()
+    df = assign_groups(df, labels, rbi_by_cmid)
     if args.csv:
         out = df.copy()
         out["fail_reasons"] = out["fail_reasons"].map("; ".join)
         out.to_csv(args.csv, index=False)
-    print(json.dumps(layer1_report(df), indent=2), flush=True)
+    report = layer1_report(df)
+    report["groups"] = {str(k): int(v) for k, v in df.loc[df["layer1_pass"], "group"].value_counts().items()}
+    print(json.dumps(report, indent=2), flush=True)
     return 0
 
 

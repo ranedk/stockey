@@ -21,11 +21,10 @@ Three-level hierarchy in the response, all keyed the same way dim_security.secto
 already is at the top level: sector (22, e.g. "IN0101"->"Chemicals") -> industry group
 (59, e.g. "IN010101"->"Chemicals & Petrochemicals") -> basic industry (197, e.g.
 "IN010101001"->"Commodity Chemicals"). dim_security only carries the top (sector)
-level, so that's what this module stores and what sector_cycle.py groups by. The finer
-levels used to also be captured (for a possible future finer-grained pass) and written
-to fundamentals_industry_group_reference/fundamentals_basic_industry_reference --
-retired 2026-08-15, zero readers anywhere from the day they were first written,
-confirmed live. Re-add if that finer-grained pass actually gets built.
+level, so that's what sector_cycle.py groups by. The finer levels were captured once and
+retired 2026-08-15 for lack of readers; since 2026-09-25 all three levels are stored
+again, in this one table (the `level` column), because the universe rebuild's groups
+(docs/UNIVERSE_PRD.md) read the basic industry.
 """
 
 from __future__ import annotations
@@ -89,10 +88,15 @@ def _rows_from_level(entries: list[dict], *, code_key: str, desc_key: str, level
 
 def build_reference_rows(data: dict, *, as_of_date=None) -> dict[str, list[dict]]:
     as_of_date = as_of_date or pd.Timestamp.now(tz="UTC").date()
-    sector_entries = (data.get("sector") or {}).get("EQ") or []
+    def entries(key: str) -> list[dict]:
+        return (data.get(key) or {}).get("EQ") or []
 
     return {
-        "sector": _rows_from_level(sector_entries, code_key="sector_code", desc_key="sector_desc", level="sector", as_of_date=as_of_date),
+        "sector": _rows_from_level(entries("sector"), code_key="sector_code", desc_key="sector_desc", level="sector", as_of_date=as_of_date),
+        "industry_group": _rows_from_level(entries("indgrp"), code_key="industry_code", desc_key="industry_desc",
+                                           level="industry_group", as_of_date=as_of_date),
+        "basic_industry": _rows_from_level(entries("ind"), code_key="basic_industry_code", desc_key="basic_industry_desc",
+                                           level="basic_industry", as_of_date=as_of_date),
     }
 
 
@@ -100,11 +104,14 @@ def run_sector_reference_refresh() -> dict[str, object]:
     data = fetch_sector_reference_data()
     rows = build_reference_rows(data)
 
-    if rows["sector"]:
-        upsert_to_db(pd.DataFrame(rows["sector"]), SECTOR_TABLE, unique_keys=["code", "as_of_date"])
+    all_rows = rows["sector"] + rows["industry_group"] + rows["basic_industry"]
+    if all_rows:
+        upsert_to_db(pd.DataFrame(all_rows), SECTOR_TABLE, unique_keys=["code", "as_of_date"])
 
     return {
         "sectors": len(rows["sector"]),
+        "industry_groups": len(rows["industry_group"]),
+        "basic_industries": len(rows["basic_industry"]),
     }
 
 

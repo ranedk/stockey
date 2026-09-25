@@ -18608,11 +18608,12 @@ SECTOR_DATA_FIXTURE = {
 
 
 def test_build_reference_rows_extracts_sector_level():
-    # 2026-08-15: industry_group/basic_industry levels retired (zero readers) -- only sector is
-    # extracted now, even though the fixture still carries indgrp/ind data (unused, ignored).
+    # 2026-09-25: industry_group/basic_industry are stored again (universe groups read them).
     rows = fundamentals_sector_data.build_reference_rows(SECTOR_DATA_FIXTURE, as_of_date=date(2026, 8, 11))
     assert len(rows["sector"]) == 2
-    assert set(rows) == {"sector"}
+    assert set(rows) == {"sector", "industry_group", "basic_industry"}
+    assert [(r["code"], r["level"]) for r in rows["basic_industry"]] == [("IN010101001", "basic_industry")]
+    assert rows["industry_group"][0]["description"] == "Chemicals & Petrochemicals"
 
 
 def test_build_reference_rows_collapses_embedded_whitespace():
@@ -18666,7 +18667,8 @@ def test_run_sector_reference_refresh_upserts_sector_table(monkeypatch):
 
     result = fundamentals_sector_data.run_sector_reference_refresh()
 
-    assert result == {"sectors": 2}
+    assert result == {"sectors": 2, "industry_groups": 1, "basic_industries": 1}
+    assert [n for _, n, _ in upserts] == [4]  # all three levels in one write
     tables_upserted = {table for table, _, _ in upserts}
     assert tables_upserted == {fundamentals_sector_data.SECTOR_TABLE}
     for _, _, kwargs in upserts:
