@@ -13,6 +13,11 @@ Checked 2026-09-25 on 12 stocks: NSE, BSE and screener.in return identical label
 every level (screener's /market/IN.. codes are NSE's; Sharpely's sector_code is the top
 two levels of the same scheme), so one source is enough.
 
+Not usable as a bulk source (checked 2026-09-25): the calls behind BSE's Industry Watch
+page. GetINDUSTRYWATCHLIST_ng lists all ~186 basic industries with codes, but
+HeatMap_ng?flag=Ind&issubcode=.. returns only the day's top 30 movers per industry, padded
+with "aaaa" placeholders (NBFC: 354 companies, 30 returned), and needs a `random` param.
+
 Source: BSE's quote-header API (plain requests through the BSE rate gate, no browser),
 keyed by BSE scrip code. A stock with no BSE listing (NSE-exclusive: CDSL, BSE Ltd, ...)
 falls back to NSE's quote API through the shared Chrome (nse_goto + nse_request_gate).
