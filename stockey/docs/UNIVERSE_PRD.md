@@ -144,6 +144,10 @@ LEDGER row 45, exploration):
   <= 0.5, market cap >= Rs 2,000 cr, >= Rs 5 cr/day traded, price/sales >= 2 (Swiggy, Ather,
   ideaForge). Which rule rescued a stock is stored (`layer2_allowed_by`).
 
+After the second pass, live run 2026-09-25: **1,297 of 1,394 pass Layer 2** (operating 1,108,
+lenders 90, real estate + holding 53, other financials 46); turnaround rescued 5, scaling
+growth 3. First dated snapshot stored in `fundamentals_universe_layer2_inputs`.
+
 Layer 2 cannot be tested on history until point-in-time snapshots exist (TODO C4). Before
 switching over, report how many of today's 5x winners it would reject, and why.
 
