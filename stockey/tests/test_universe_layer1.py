@@ -127,3 +127,21 @@ def test_normalise_company_name_matches_rbi_and_exchange_spellings():
     assert n("JIO Financial Services Ltd.") == n("Jio Financial Services Limited (Formerly: Reliance Strategic Investments Limited)")
     assert n("Cholamandalam Financial Holdings Ltd.") == n("Cholamandalam Financial Holdings Limited")
     assert n("Power Finance Corporation Ltd.") == n("Power Finance Corporation Limited")
+
+
+def test_l1_loader_keeps_tracked_names_that_left_the_universe(monkeypatch):
+    from fundamentals.screens import l1_universe
+
+    latest = pd.DataFrame([{"company_id": 1, "company_name": "In", "ticker": "IN"}])
+    tracked = pd.DataFrame([{"company_master_id": "bse:500001"}, {"company_master_id": "nse:IN"}])
+    history = pd.DataFrame([{"company_id": 1, "company_name": "In", "ticker": "IN"},
+                            {"company_id": 2, "company_name": "Held BSE-only", "ticker": "500001"},
+                            {"company_id": 3, "company_name": "Gone, untracked", "ticker": "GONE"}])
+    results = iter([latest, tracked, history])
+    monkeypatch.setattr(l1_universe, "sql_to_df", lambda *a, **k: next(results).copy())
+    monkeypatch.setattr(l1_universe, "map_company_master_ids_nse_or_bse",
+                        lambda s: s.map({"500001": "bse:500001", "GONE": "nse:GONE"}))
+
+    out = l1_universe.load_l1_universe_tickers()
+
+    assert out["company_id"].tolist() == [1, 2]

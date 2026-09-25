@@ -128,19 +128,25 @@ def fetch_screener_inputs(session=None) -> pd.DataFrame:
 
     session = session or build_authenticated_session()
     frames = []
-    for query, fields in QUERIES.values():
+    for name, (query, fields) in QUERIES.items():
         _, companies = run_query(session, query)
-        frames.append(companies_to_frame(companies, fields))
+        frames.append(companies_to_frame(companies, fields, keep_identity=(name == "profit")))
     out = frames[0]
     for f in frames[1:]:
         out = out.merge(f, on=["screener_company_id", "screener_ticker"], how="outer")
     return out
 
 
-def companies_to_frame(companies: list[dict], fields: dict[str, str]) -> pd.DataFrame:
+def companies_to_frame(companies: list[dict], fields: dict[str, str], *, keep_identity: bool = False) -> pd.DataFrame:
+    """keep_identity: also keep screener.in's name, URL and the full default metrics dict
+    (price, market cap, quarterly figures) -- taken from ONE query only, since every
+    query returns the same defaults."""
     rows = []
     for c in companies:
         row = {"screener_company_id": c.get("company_id"), "screener_ticker": c.get("ticker")}
+        if keep_identity:
+            row.update({"screener_name": c.get("name"), "screener_url": c.get("url"),
+                        "screener_metrics": c.get("metrics", {})})
         for key, name in fields.items():
             if key in c.get("metrics", {}):
                 row[name] = c["metrics"][key]

@@ -71,7 +71,9 @@ WITH sessions AS (
      ORDER BY symbol, date DESC
 ), traded_value AS (
     SELECT o.symbol, count(*) AS value_sessions,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY o.total_value) AS median_value_rs
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY o.total_value) AS median_value_rs,
+           -- 1-month average volume: l5_sizing's ADV input (was screener.in's, in the v1 screen)
+           avg(o.volume) FILTER (WHERE r.k <= 21) AS avg_volume_1m
       FROM nseindia_ohlcv o
       JOIN ranked r ON r.date = o.date AND r.k <= %(value_window)s
      WHERE o.date >= now() - interval '150 days' AND o.series IN ('EQ', 'BE')
@@ -93,9 +95,9 @@ WITH sessions AS (
     SELECT symbol, count(DISTINCT date) AS n FROM history
      WHERE symbol IN (SELECT symbol FROM latest) GROUP BY symbol
 )
-SELECT l.symbol, l.isin, l.company_master_id, s.d AS session_date,
+SELECT l.symbol, l.isin, l.company_master_id, s.d AS session_date, l.close,
        m.category, m.market_cap_rs, m.mcap_date,
-       v.median_value_rs, v.value_sessions,
+       v.median_value_rs, v.value_sessions, v.avg_volume_1m,
        greatest(coalesce(ai.n, 0), coalesce(asym.n, 0)) AS listed_sessions,
        sv.surveillance_date, sv.gsm, sv.lt_asm, sv.st_asm, sv.esm, sv.irp, sv.encumbered_over_50
   FROM latest l

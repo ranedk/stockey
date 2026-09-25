@@ -72,7 +72,12 @@ from utils.fallback_telemetry import record_local_fallback_event
 SYNC_SOURCE_NAME = "fundamentals.screens.l1_universe"
 RESULTS_TABLE = "fundamentals_l1_universe"
 L1_QUERY_NAME = "l1_universe"
-L1_QUERY_VERSION = 1
+# Version 2 (2026-09-25, operator sign-off): the rebuilt universe of docs/UNIVERSE_PRD.md --
+# Layer 1 (fundamentals/screens/universe.py) + Layer 2 (fundamentals/screens/universe_
+# layer2.py), ~1,300 stocks. Version 1 is the screener.in query below (~196 stocks); its
+# rows stay in RESULTS_TABLE and `run_v1_candidates` can still rebuild it.
+L1_QUERY_VERSION = 2
+L1_QUERY_TEXT_V2 = "UNIVERSE_PRD v2: Layer 1 (fundamentals/screens/universe.py) + Layer 2 (fundamentals/screens/universe_layer2.py)"
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 L1_QUERY = (
@@ -277,6 +282,57 @@ def apply_post_hoc_exclusions(companies: list[dict]) -> tuple[list[dict], dict[s
     }
 
 
+def run_v1_candidates(session=None) -> tuple[str, str, list[dict]]:
+    """The version-1 screen (L1_QUERY on screener.in). Kept so the old universe can be
+    rebuilt; not called by the pipeline since version 2."""
+    session = session or build_authenticated_session()
+    screener_url, companies = run_query(session, L1_QUERY)
+    return L1_QUERY, screener_url, companies
+
+
+def _as_float(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(f) else f
+
+
+def load_v2_candidates() -> list[dict]:
+    """The rebuilt universe: stocks passing Layer 1 and Layer 2, in the same shape
+    run_query returns (company_id / name / ticker / url / metrics), so every reader of
+    RESULTS_TABLE works unchanged. metrics carries screener.in's default columns (price,
+    market cap, quarterly figures -- sector_cycle reads qtr_sales_var_pct) plus
+    avg_vol_1mth from our own bhavcopy (l5_sizing's ADV input), the group, and the
+    Layer 2 inputs. Also stores the dated Layer 2 snapshot."""
+    from fundamentals.screens import universe_layer2
+
+    df, report = universe_layer2.run(store=True)
+    passing = df[df["layer2_pass"] & df["screener_company_id"].notna()]
+    companies = []
+    for row in passing.to_dict("records"):
+        metrics = dict(row.get("screener_metrics") or {}) if isinstance(row.get("screener_metrics"), dict) else {}
+        # float(): postgres avg() arrives as Decimal, which json.dumps(default=str) would
+        # write as a STRING -- l5_sizing only accepts numbers, so ADV would silently vanish.
+        metrics.setdefault("cmp_rs", _as_float(row.get("close")))
+        metrics["avg_vol_1mth"] = _as_float(row.get("avg_volume_1m"))
+        metrics["universe_group"] = row.get("group")
+        metrics["layer2_allowed_by"] = row.get("layer2_allowed_by")
+        for field in universe_layer2.FIELDS.values():
+            if field in row and pd.notna(row[field]):
+                metrics[field] = _as_float(row[field]) if not isinstance(row[field], str) else row[field]
+        ticker = row["screener_ticker"] if pd.notna(row.get("screener_ticker")) else row["symbol"]
+        companies.append({
+            "company_id": int(row["screener_company_id"]),
+            "name": row.get("screener_name") if pd.notna(row.get("screener_name")) else row["symbol"],
+            "ticker": ticker,
+            "url": row.get("screener_url") if pd.notna(row.get("screener_url")) else f"/company/{ticker}/",
+            "metrics": {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in metrics.items()},
+        })
+    print(json.dumps({"layer2_report": report}, default=str), flush=True)
+    return companies
+
+
 def run_l1_universe_refresh(session=None) -> dict[str, object]:
     """Run L1_QUERY, then apply_post_hoc_exclusions over its own candidates, and
     upsert survivors into RESULTS_TABLE, keyed by (query_name, query_version,
@@ -287,8 +343,11 @@ def run_l1_universe_refresh(session=None) -> dict[str, object]:
     transaction) but not written anywhere -- same "flags are exclusions, not scores"
     treatment the rest of L1 already applies, nothing downstream needs to know why a
     company isn't there."""
-    session = session or build_authenticated_session()
-    screener_url, screened_companies = run_query(session, L1_QUERY)
+    if L1_QUERY_VERSION == 1:
+        query_text, screener_url, screened_companies = run_v1_candidates(session)
+    else:
+        query_text, screener_url, screened_companies = L1_QUERY_TEXT_V2, None, load_v2_candidates()
+    # The auditor-change / material-RPT exclusions carry over to version 2 unchanged.
     companies, exclusions = apply_post_hoc_exclusions(screened_companies)
 
     run_date = pd.Timestamp.now(tz="UTC").normalize()
@@ -296,7 +355,7 @@ def run_l1_universe_refresh(session=None) -> dict[str, object]:
         {
             "query_name": L1_QUERY_NAME,
             "query_version": L1_QUERY_VERSION,
-            "query_text": L1_QUERY,
+            "query_text": query_text,
             "run_date": run_date,
             "company_id": company["company_id"],
             "company_name": company["name"],
@@ -328,12 +387,14 @@ def run_l1_universe_refresh(session=None) -> dict[str, object]:
 
 
 def load_l1_universe_tickers() -> pd.DataFrame:
-    """The latest L1 refresh's (company_id, company_name, ticker) rows -- shared reader
-    for downstream steps (L2 state, L3 feeds) that need "which companies are we
-    watching", not the full query-result metrics blob. Ticker here is the NSE symbol
-    (screener.in's own ticker slug), the same identity callers already resolve to
-    company_master via utils.company_master.map_company_master_ids(..., exchange="NSE")."""
-    return sql_to_df(
+    """The latest L1 refresh's (company_id, company_name, ticker) rows, PLUS every company
+    still being tracked -- on the watchlist (active / price_flagged) or held in the
+    portfolio (open) -- that has left the universe, via its most recent L1 row. Shared
+    reader for the per-company crawls (L2 state, BSE announcements, NSE PIT): a name
+    that drops out (e.g. BSE-only companies under version 2) keeps getting fresh data
+    until it exits by the normal rules (docs/UNIVERSE_PRD.md section 6). Ticker is
+    screener.in's slug (NSE symbol, or BSE scrip code for some listings)."""
+    latest = sql_to_df(
         """
         SELECT company_id, company_name, ticker
         FROM fundamentals_l1_universe
@@ -341,6 +402,28 @@ def load_l1_universe_tickers() -> pd.DataFrame:
         ORDER BY company_id
         """
     )
+    tracked = sql_to_df(
+        """
+        SELECT company_master_id FROM fundamentals_watchlist WHERE status IN ('active', 'price_flagged')
+        UNION
+        SELECT company_master_id FROM fundamentals_portfolio_position WHERE status = 'open'
+        """
+    )
+    if tracked.empty:
+        return latest
+    history = sql_to_df(
+        """
+        SELECT DISTINCT ON (company_id) company_id, company_name, ticker
+        FROM fundamentals_l1_universe
+        ORDER BY company_id, run_date DESC
+        """
+    )
+    history = history[~history["company_id"].isin(latest["company_id"])]
+    if history.empty:
+        return latest
+    cmids = map_company_master_ids_nse_or_bse(history["ticker"].astype("string"))
+    kept = history[cmids.isin(set(tracked["company_master_id"])).to_numpy()]
+    return pd.concat([latest, kept], ignore_index=True).sort_values("company_id").reset_index(drop=True)
 
 
 def main() -> int:

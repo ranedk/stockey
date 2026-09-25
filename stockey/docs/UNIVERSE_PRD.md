@@ -194,6 +194,12 @@ switching over, report how many of today's 5x winners it would reject, and why.
    company pages; stored dated in `fundamentals_universe_layer2_inputs`. Thresholds changed
    by the operator after the PRD values removed 377 -- see section 5 "As decided".
 5. Operator sign-off, then switch `l1_universe` to the new definition (new version).
+   **Done 2026-09-25:** `L1_QUERY_VERSION = 2`; first run wrote 1,295 stocks (1,297 pass
+   Layer 2; the carried-over auditor-change check removed 2). Version 1 stays rebuildable
+   (`run_v1_candidates`). The per-company crawls read `load_l1_universe_tickers()`, which
+   now also returns watched / held names that left the universe (91 today), so they keep
+   fresh data until they exit. **The fundamentals pipeline stays paused until step 6**: at
+   ~196 names OCR already took 1.8-3 h a night.
 6. Move OCR to its own job; extend coverage (section 6).
 
 ## 8. Decided / open

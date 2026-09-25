@@ -11973,6 +11973,7 @@ def test_run_query_zero_results_does_not_fetch_a_second_page(monkeypatch):
 
 
 def test_run_l1_universe_refresh_upserts_and_summarizes(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "L1_QUERY_VERSION", 1)
     companies = [
         {"company_id": 1, "name": "Menon Pistons", "ticker": "MENNPIS", "url": "/company/MENNPIS/", "metrics": {"mar_cap_rscr": 381.73}},
         {"company_id": 2, "name": "Coral India Fin.", "ticker": "CORALFINAC", "url": "/company/CORALFINAC/", "metrics": {"mar_cap_rscr": 137.9}},
@@ -12019,6 +12020,7 @@ def test_run_l1_universe_refresh_upserts_and_summarizes(monkeypatch):
 
 
 def test_run_l1_universe_refresh_skips_upsert_when_no_results(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "L1_QUERY_VERSION", 1)
     monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", []))
     monkeypatch.setattr(fundamentals_l1_universe, "apply_post_hoc_exclusions", lambda cs: (cs, {"excluded_auditor_change": [], "excluded_related_party_transaction": []}))
     upserts = []
@@ -12039,6 +12041,7 @@ def test_run_l1_universe_refresh_skips_upsert_when_no_results(monkeypatch):
 
 
 def test_run_l1_universe_refresh_reports_exclusions_from_post_hoc_pass(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "L1_QUERY_VERSION", 1)
     companies = [{"company_id": 1, "name": "Menon Pistons", "ticker": "MENNPIS", "url": "/company/MENNPIS/", "metrics": {}}]
     monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda session, query_text: ("screener_url", companies))
     monkeypatch.setattr(
@@ -12056,7 +12059,35 @@ def test_run_l1_universe_refresh_reports_exclusions_from_post_hoc_pass(monkeypat
     assert result["excluded_related_party_transaction"] == []
 
 
+def test_run_l1_universe_refresh_v2_writes_the_rebuilt_universe(monkeypatch):
+    assert fundamentals_l1_universe.L1_QUERY_VERSION == 2
+    companies = [{"company_id": 7, "name": "Acme", "ticker": "ACME", "url": "/company/ACME/",
+                  "metrics": {"cmp_rs": 100.0, "avg_vol_1mth": 5000.0, "universe_group": "operating"}}]
+    monkeypatch.setattr(fundamentals_l1_universe, "load_v2_candidates", lambda: companies)
+    monkeypatch.setattr(fundamentals_l1_universe, "run_query", lambda *a, **k: (_ for _ in ()).throw(AssertionError("v1 query ran")))
+    monkeypatch.setattr(fundamentals_l1_universe, "apply_post_hoc_exclusions",
+                        lambda cs: (cs, {"excluded_auditor_change": [], "excluded_related_party_transaction": []}))
+    upserts = []
+    monkeypatch.setattr(fundamentals_l1_universe, "upsert_to_db", lambda df, table, **k: upserts.append(df))
+
+    result = fundamentals_l1_universe.run_l1_universe_refresh()
+
+    assert result["query_version"] == 2 and result["rows"] == 1
+    row = upserts[0].iloc[0]
+    assert row["query_text"] == fundamentals_l1_universe.L1_QUERY_TEXT_V2
+    assert row["screener_url"] is None
+    assert json.loads(row["metrics_json"])["avg_vol_1mth"] == 5000.0  # l5_sizing's ADV input survives
+
+
+def test_as_float_turns_postgres_decimals_into_numbers():
+    from decimal import Decimal
+    assert fundamentals_l1_universe._as_float(Decimal("159115.95")) == 159115.95
+    assert fundamentals_l1_universe._as_float(None) is None
+    assert fundamentals_l1_universe._as_float(float("nan")) is None
+
+
 def test_run_l1_universe_refresh_builds_a_session_when_none_given(monkeypatch):
+    monkeypatch.setattr(fundamentals_l1_universe, "L1_QUERY_VERSION", 1)
     monkeypatch.setattr(fundamentals_l1_universe, "build_authenticated_session", lambda: "the-session")
     seen_sessions = []
 
