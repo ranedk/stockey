@@ -464,6 +464,77 @@ def fetch_company_announcements(scrip_code: str, *, from_date, to_date) -> list[
     return all_rows
 
 
+# Market-wide daily fetch (2026-09-25, universe rebuild step 6). The same endpoint with an
+# empty strscrip returns EVERY company's announcements for a date (2026-09-24: 1,641 rows,
+# 33 pages). ~33 requests a day regardless of universe size, against one request per
+# company per run (1,386 companies at the 10s BSE gate = ~4h) for the per-company crawl.
+# BSE refuses a multi-day range without a category (empty Table), so it is one day per
+# call. Days are tracked in MARKET_DAYS_TABLE: a day counts as complete once fetched at
+# least MARKET_DAY_SETTLE_HOURS after it ended (IST), so late disseminations are caught
+# by one re-read; every run re-reads the days not yet complete.
+MARKET_DAYS_TABLE = "fundamentals_bse_market_days"
+MARKET_DAY_SETTLE_HOURS = 12
+BSE_MARKET_MAX_PAGES = 200
+
+_MARKET_DAYS_TABLE_STATEMENT = f"""
+    CREATE TABLE IF NOT EXISTS {MARKET_DAYS_TABLE} (
+        day DATE PRIMARY KEY,
+        fetched_at TIMESTAMPTZ NOT NULL,
+        rows_total INTEGER,
+        rows_in_scope INTEGER
+    )
+"""
+
+
+def _ensure_market_days_table() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(_MARKET_DAYS_TABLE_STATEMENT)
+
+    execute_db_operation(_op, operation_name=f"{MARKET_DAYS_TABLE}:ensure_table")
+
+
+def fetch_market_announcements(day) -> list[dict]:
+    """Every company's BSE announcements disseminated on `day`, all pages."""
+    params = {"pageno": 1, "strCat": "-1", "subcategory": "-1", "strPrevDate": day.strftime("%Y%m%d"),
+              "strToDate": day.strftime("%Y%m%d"), "strSearch": "P", "strscrip": "", "strType": "C"}
+    payload = _bse_get(ANNOUNCEMENTS_URL, params)
+    if "Table" not in payload:
+        raise BseBlockedError("response missing expected 'Table' key")
+    rows = list(payload["Table"] or [])
+    table1 = payload.get("Table1")
+    row_count = int(table1[0]["ROWCNT"]) if table1 and isinstance(table1, list) and "ROWCNT" in table1[0] else None
+    page = 1
+    while row_count is not None and len(rows) < row_count and page < BSE_MARKET_MAX_PAGES:
+        page += 1
+        next_payload = _bse_get(ANNOUNCEMENTS_URL, {**params, "pageno": page})
+        next_rows = next_payload.get("Table") or []
+        if not next_rows:
+            break
+        rows.extend(next_rows)
+    return rows
+
+
+def days_to_fetch(*, today, lookback_days: int) -> list:
+    """IST dates in [today - lookback_days, today] not yet complete, oldest first."""
+    fetched = sql_to_df(f"SELECT day, fetched_at FROM {MARKET_DAYS_TABLE} WHERE day >= %s",
+                        params=(today - timedelta(days=lookback_days),))
+    complete = set()
+    for d, at in zip(fetched.get("day", []), fetched.get("fetched_at", [])):
+        day = pd.Timestamp(d).date()
+        settled = pd.Timestamp(day, tz="Asia/Kolkata") + pd.Timedelta(days=1, hours=MARKET_DAY_SETTLE_HOURS)
+        if pd.Timestamp(at).tz_convert("Asia/Kolkata") >= settled:
+            complete.add(day)
+    window = [today - timedelta(days=n) for n in range(lookback_days, -1, -1)]
+    return [d for d in window if d not in complete]
+
+
+def _mark_market_day(day, *, rows_total: int, rows_in_scope: int) -> None:
+    upsert_to_db(pd.DataFrame([{"day": day, "fetched_at": pd.Timestamp.now(tz="UTC"),
+                                "rows_total": rows_total, "rows_in_scope": rows_in_scope}]),
+                 MARKET_DAYS_TABLE, unique_keys=["day"])
+
+
 def fetch_result_calendar() -> list[dict]:
     payload = _bse_get(RESULT_CALENDAR_URL, {})
     if not isinstance(payload, list):
@@ -598,52 +669,60 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
         )
     universe = universe.dropna(subset=["bse_scrip_code"])
 
-    to_date = datetime.now(timezone.utc)
-    from_date = to_date - timedelta(days=lookback_days if lookback_days is not None else LOOKBACK_DAYS)
+    _ensure_market_days_table()
+    identity = {
+        str(int(code)): (cmid, isin if pd.notna(isin) else None)
+        for code, cmid, isin in zip(universe["bse_scrip_code"], universe["company_master_id"], universe["isin"])
+    }
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    days = days_to_fetch(today=today, lookback_days=lookback_days if lookback_days is not None else LOOKBACK_DAYS)
 
     rows: list[dict] = []
-    failed_companies: list[str] = []
+    failed_days: list[str] = []
     consecutive_failures = 0
     blocked = False
-    companies_scanned = 0
+    days_fetched = 0
 
-    for _, company in universe.iterrows():
-        scrip_code = str(int(company["bse_scrip_code"]))
-        company_master_id = company["company_master_id"]
-        isin = company["isin"] if pd.notna(company.get("isin")) else None
+    for day in days:
         try:
-            raw_rows = fetch_company_announcements(scrip_code, from_date=from_date, to_date=to_date)
+            raw_rows = fetch_market_announcements(day)
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
-            failed_companies.append(company["ticker"])
+            failed_days.append(str(day))
             _record_fallback(
                 "l3_bse_announcement_fetch_failed",
-                reason="BSE announcement fetch failed for this company; it is missing from this run.",
+                reason="BSE market-wide announcement fetch failed for this day; it is re-read next run (not marked complete).",
                 error=exc,
-                metadata={"ticker": company["ticker"], "scrip_code": scrip_code},
+                metadata={"day": str(day)},
             )
             if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
                 blocked = True
                 _record_fallback(
                     "l3_bse_circuit_breaker_tripped",
                     reason=(
-                        f"{consecutive_failures} consecutive BSE requests failed -- stopping this run "
-                        "immediately rather than continuing to hit a possibly-blocking BSE. The next "
-                        "scheduled run will retry the remaining companies (upsert-keyed, idempotent)."
+                        f"{consecutive_failures} consecutive BSE day fetches failed -- stopping this run "
+                        "immediately rather than continuing to hit a possibly-blocking BSE."
                     ),
                     error="circuit breaker",
                     severity="error",
-                    metadata={"companies_scanned": companies_scanned, "companies_remaining": len(universe) - companies_scanned},
+                    metadata={"days_fetched": days_fetched, "days_remaining": len(days) - days_fetched},
                 )
                 break
             continue
 
         consecutive_failures = 0
-        companies_scanned += 1
+        days_fetched += 1
+        in_scope = 0
         for raw in raw_rows:
+            scrip_code = str(raw.get("SCRIP_CD") or "")
+            if scrip_code not in identity:
+                continue
+            company_master_id, isin = identity[scrip_code]
             row = build_announcement_row(scrip_code, company_master_id, isin, raw)
             if row is not None:
                 rows.append(row)
+                in_scope += 1
+        _mark_market_day(day, rows_total=len(raw_rows), rows_in_scope=in_scope)
 
     result_calendar_rows: list[dict] = []
     if not blocked:
@@ -694,9 +773,11 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
         "announcement_rows": len(rows),
         "result_calendar_rows": len(result_calendar_rows),
         "merged_rows": upsert_result["merged"],
-        "companies_scanned": companies_scanned,
+        "companies_scanned": int(len(universe)) if days_fetched and not blocked else 0,
         "companies_total": int(len(universe)),
-        "failed_companies": failed_companies,
+        "days_fetched": days_fetched,
+        "failed_days": failed_days,
+        "failed_companies": [],
         "blocked": blocked,
     }
 
@@ -732,6 +813,11 @@ BACKFILL_LOOKBACK_DAYS = 1095
 # them in the FIFO queue ever gets attempted (see load_pending_ocr_targets's own
 # ordering fix in ocr_pipeline.py for the other half of this fix).
 BACKFILL_FILING_TYPES = ("auditor_change", "related_party_transaction")
+# 2026-09-25 (universe rebuild): the same per-company fetch also keeps EVERY filing type
+# from the last RECENT_ALL_TYPES_DAYS, so a company new to the universe arrives with its
+# latest quarter's results, ratings and deals -- not only whatever the daily crawl sees
+# after it joined.
+RECENT_ALL_TYPES_DAYS = 90
 # BUG FOUND LIVE 2026-08-18 (re-audit): run_auditor_rpt_backfill() was manual-only
 # -- no reference in run_pipeline.py's STEPS, the crontab, or docs/DATA_INVENTORY.md
 # -- so the 43 BSE-only companies it exists to cover would never finish (confirmed
@@ -816,6 +902,7 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
 
     to_date = datetime.now(timezone.utc)
     from_date = to_date - timedelta(days=lookback_days)
+    recent_cutoff = pd.Timestamp(to_date).tz_localize(None) - pd.Timedelta(days=RECENT_ALL_TYPES_DAYS)
 
     rows: list[dict] = []
     failed_companies: list[str] = []
@@ -858,7 +945,9 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
             row = build_announcement_row(scrip_code, company_master_id, isin, raw)
             if row is None:
                 continue
-            if row["filing_type"] not in BACKFILL_FILING_TYPES:
+            recent = (row.get("disclosure_date") is not None
+                      and pd.Timestamp(row["disclosure_date"]).tz_localize(None) >= recent_cutoff)
+            if row["filing_type"] not in BACKFILL_FILING_TYPES and not recent:
                 off_target_discarded += 1
                 continue
             rows.append(row)
@@ -902,10 +991,12 @@ def main() -> int:
         "rows_written": result["rows"],
         "companies_scanned": result["companies_scanned"],
         "companies_total": result["companies_total"],
+        "days_fetched": result.get("days_fetched", 0),
+        "failed_days": result.get("failed_days", []),
         "failed_companies": result["failed_companies"],
         "blocked": result["blocked"],
         "auditor_rpt_backfill": backfill_result,
-        "fallback_used": bool(result["failed_companies"]) or result["blocked"] or bool(backfill_result.get("failed_companies")) or bool(backfill_result.get("blocked")),
+        "fallback_used": bool(result.get("failed_days")) or result["blocked"] or bool(backfill_result.get("failed_companies")) or bool(backfill_result.get("blocked")),
         "state_advanced": result["rows"] > 0,
         # a tripped breaker is a partial-success run, not a failed one -- whatever was
         # collected before the trip is real and already upserted; it just isn't "ok"

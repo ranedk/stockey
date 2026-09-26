@@ -93,7 +93,8 @@ STEPS: list[str] = [
     "fundamentals.collectors.bse_announcements",
     "fundamentals.collectors.nse_pit",
     "fundamentals.collectors.rating_agencies",
-    "fundamentals.collectors.ocr_pipeline",
+    # ocr_pipeline is its own continuous job since 2026-09-25 (all_fundamentals_ocr.sh);
+    # structured_extraction below extracts whatever OCR has finished.
     "fundamentals.collectors.structured_extraction",
     # Needs fundamentals_l1_universe (l1_universe step above) to scope which
     # companies' deals matter; writes synthetic bulk_deal_buy/bulk_deal_sell events

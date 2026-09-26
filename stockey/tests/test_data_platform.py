@@ -13653,17 +13653,31 @@ def _bse_identity_df(tickers, scrip_codes, isins=None):
     )
 
 
+def _market_days(monkeypatch, days=(date(2026, 9, 24),)):
+    """The market-wide crawl's day bookkeeping, stubbed: these days are due, marks captured."""
+    marks = []
+    monkeypatch.setattr(fundamentals_bse_announcements, "_ensure_market_days_table", lambda: None)
+    monkeypatch.setattr(fundamentals_bse_announcements, "days_to_fetch", lambda **k: list(days))
+    monkeypatch.setattr(fundamentals_bse_announcements, "_mark_market_day", lambda day, **k: marks.append((day, k)))
+    return marks
+
+
 def test_run_bse_l3_detection_happy_path_upserts_announcements_and_calendar(monkeypatch):
     universe = _bse_universe_df(2)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    marks = _market_days(monkeypatch)
     monkeypatch.setattr(
         fundamentals_bse_announcements,
         "resolve_company_identity",
         lambda tickers: _bse_identity_df(tickers, ["111111", "222222"]),
     )
 
-    interesting_raw = {"NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}
-    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [interesting_raw])
+    def raw(scrip, news_id):
+        return {"SCRIP_CD": scrip, "NEWSID": news_id, "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}
+
+    # one market-wide day: both universe companies plus one outside it
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_market_announcements",
+                        lambda day: [raw(111111, "n1"), raw(222222, "n2"), raw(999999, "n3")])
     monkeypatch.setattr(
         fundamentals_bse_announcements,
         "fetch_result_calendar",
@@ -13684,7 +13698,9 @@ def test_run_bse_l3_detection_happy_path_upserts_announcements_and_calendar(monk
     result = fundamentals_bse_announcements.run_bse_l3_detection()
 
     assert result["companies_scanned"] == 2
-    assert result["announcement_rows"] == 2  # one per company
+    assert result["announcement_rows"] == 2  # the out-of-universe company is dropped
+    assert result["days_fetched"] == 1
+    assert marks == [(date(2026, 9, 24), {"rows_total": 3, "rows_in_scope": 2})]
     assert result["result_calendar_rows"] == 1  # only scrip 111111 matched the universe
     assert result["merged_rows"] == 0
     assert result["blocked"] is False
@@ -13695,18 +13711,20 @@ def test_run_bse_l3_detection_happy_path_upserts_announcements_and_calendar(monk
 
 
 def test_run_bse_l3_detection_trips_circuit_breaker_after_consecutive_failures(monkeypatch):
-    universe = _bse_universe_df(5)
+    universe = _bse_universe_df(2)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    days = [date(2026, 9, d) for d in range(20, 25)]
+    marks = _market_days(monkeypatch, days)
     monkeypatch.setattr(
         fundamentals_bse_announcements,
         "resolve_company_identity",
-        lambda tickers: _bse_identity_df(tickers, ["1", "2", "3", "4", "5"]),
+        lambda tickers: _bse_identity_df(tickers, ["1", "2"]),
     )
 
-    def always_fails(scrip, **k):
+    def always_fails(day):
         raise fundamentals_bse_announcements.BseBlockedError("HTTP 403")
 
-    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", always_fails)
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_market_announcements", always_fails)
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     fallback_events = []
@@ -13717,54 +13735,58 @@ def test_run_bse_l3_detection_trips_circuit_breaker_after_consecutive_failures(m
     result = fundamentals_bse_announcements.run_bse_l3_detection()
 
     assert result["blocked"] is True
-    # stopped after CIRCUIT_BREAKER_THRESHOLD consecutive failures, not all 5 companies
-    assert len(result["failed_companies"]) == fundamentals_bse_announcements.CIRCUIT_BREAKER_THRESHOLD
+    # stopped after CIRCUIT_BREAKER_THRESHOLD consecutive failed days, not all 5
+    assert len(result["failed_days"]) == fundamentals_bse_announcements.CIRCUIT_BREAKER_THRESHOLD
     assert result["companies_scanned"] == 0
+    assert marks == []  # a failed day is never marked complete
     assert any(e["fallback_type"] == "l3_bse_circuit_breaker_tripped" for e in fallback_events)
     # a tripped breaker must not then go on to call the result-calendar endpoint either
     assert result["result_calendar_rows"] == 0
 
 
 def test_run_bse_l3_detection_resets_failure_streak_on_a_success(monkeypatch):
-    universe = _bse_universe_df(4)
+    universe = _bse_universe_df(1)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    days = [date(2026, 9, d) for d in (21, 22, 23, 24)]
+    marks = _market_days(monkeypatch, days)
     monkeypatch.setattr(
         fundamentals_bse_announcements,
         "resolve_company_identity",
-        lambda tickers: _bse_identity_df(tickers, ["1", "2", "3", "4"]),
+        lambda tickers: _bse_identity_df(tickers, ["1"]),
     )
-
     call_log = []
 
-    def flaky_fetch(scrip, **k):
-        call_log.append(scrip)
+    def flaky_fetch(day):
+        call_log.append(day)
         # fail, fail, succeed, fail -- never CIRCUIT_BREAKER_THRESHOLD (3) in a row
-        if scrip in ("1", "2", "4"):
+        if day.day != 23:
             raise fundamentals_bse_announcements.BseBlockedError("boom")
         return []
 
-    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", flaky_fetch)
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_market_announcements", flaky_fetch)
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     monkeypatch.setattr(fundamentals_bse_announcements, "record_local_fallback_event", lambda **kwargs: None)
 
     result = fundamentals_bse_announcements.run_bse_l3_detection()
 
-    assert call_log == ["1", "2", "3", "4"]  # ran through the whole universe
+    assert call_log == days  # ran through every due day
     assert result["blocked"] is False
-    assert result["companies_scanned"] == 1
-    assert result["failed_companies"] == ["TICK1", "TICK2", "TICK4"]
+    assert result["days_fetched"] == 1
+    assert result["failed_days"] == ["2026-09-21", "2026-09-22", "2026-09-24"]
+    assert [m[0] for m in marks] == [date(2026, 9, 23)]
 
 
 def test_run_bse_l3_detection_skips_companies_with_no_bse_scrip_code(monkeypatch):
     universe = _bse_universe_df(2)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    marks = _market_days(monkeypatch)
     monkeypatch.setattr(
         fundamentals_bse_announcements,
         "resolve_company_identity",
         lambda tickers: _bse_identity_df(tickers, ["111111", pd.NA]),
     )
-    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_company_announcements", lambda scrip, **k: [])
+    monkeypatch.setattr(fundamentals_bse_announcements, "fetch_market_announcements", lambda day: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
     fallback_events = []
@@ -13854,13 +13876,14 @@ def test_bse_announcements_main_backfill_failure_does_not_fail_the_run(monkeypat
 def test_run_bse_l3_detection_pulls_crawl_forward_for_fresh_results(monkeypatch):
     universe = _bse_universe_df(1)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    marks = _market_days(monkeypatch)
     monkeypatch.setattr(
         fundamentals_bse_announcements, "resolve_company_identity", lambda tickers: _bse_identity_df(tickers, ["111111"])
     )
     monkeypatch.setattr(
         fundamentals_bse_announcements,
-        "fetch_company_announcements",
-        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Financial Results", "HEADLINE": "Q1 results"}],
+        "fetch_market_announcements",
+        lambda day: [{"SCRIP_CD": 111111, "NEWSID": "n1", "SUBCATNAME": "Financial Results", "HEADLINE": "Q1 results"}],
     )
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
@@ -13876,13 +13899,14 @@ def test_run_bse_l3_detection_pulls_crawl_forward_for_fresh_results(monkeypatch)
 def test_run_bse_l3_detection_no_results_rows_skips_pull_crawl_forward(monkeypatch):
     universe = _bse_universe_df(1)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    marks = _market_days(monkeypatch)
     monkeypatch.setattr(
         fundamentals_bse_announcements, "resolve_company_identity", lambda tickers: _bse_identity_df(tickers, ["111111"])
     )
     monkeypatch.setattr(
         fundamentals_bse_announcements,
-        "fetch_company_announcements",
-        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}],
+        "fetch_market_announcements",
+        lambda day: [{"SCRIP_CD": 111111, "NEWSID": "n1", "SUBCATNAME": "Credit Rating", "HEADLINE": "CRISIL rating action"}],
     )
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
@@ -13898,13 +13922,14 @@ def test_run_bse_l3_detection_no_results_rows_skips_pull_crawl_forward(monkeypat
 def test_run_bse_l3_detection_pull_crawl_forward_failure_is_non_fatal(monkeypatch):
     universe = _bse_universe_df(1)
     monkeypatch.setattr(fundamentals_bse_announcements, "load_l1_universe_tickers", lambda: universe)
+    marks = _market_days(monkeypatch)
     monkeypatch.setattr(
         fundamentals_bse_announcements, "resolve_company_identity", lambda tickers: _bse_identity_df(tickers, ["111111"])
     )
     monkeypatch.setattr(
         fundamentals_bse_announcements,
-        "fetch_company_announcements",
-        lambda scrip, **k: [{"NEWSID": "n1", "SUBCATNAME": "Financial Results", "HEADLINE": "Q1 results"}],
+        "fetch_market_announcements",
+        lambda day: [{"SCRIP_CD": 111111, "NEWSID": "n1", "SUBCATNAME": "Financial Results", "HEADLINE": "Q1 results"}],
     )
     monkeypatch.setattr(fundamentals_bse_announcements, "fetch_result_calendar", lambda: [])
     monkeypatch.setattr(fundamentals_bse_announcements, "upsert_events_with_dedup", lambda rows: {"inserted": len(rows), "merged": 0})
@@ -13920,6 +13945,23 @@ def test_run_bse_l3_detection_pull_crawl_forward_failure_is_non_fatal(monkeypatc
 
     assert result["rows"] == 1  # the run itself still succeeds
     assert any(e["fallback_type"] == "l3_bse_pull_crawl_forward_failed" for e in fallback_events)
+
+
+def test_days_to_fetch_rereads_days_until_settled(monkeypatch):
+    today = date(2026, 9, 25)
+    fetched = pd.DataFrame({
+        "day": [date(2026, 9, 22), date(2026, 9, 23), date(2026, 9, 24)],
+        # 22nd read on the 24th (settled); 23rd read at 20:00 IST the same evening (not settled);
+        # 24th read the next day at 13:00 IST (settled: 12h after the day ended)
+        "fetched_at": [pd.Timestamp("2026-09-24 10:00", tz="Asia/Kolkata"),
+                       pd.Timestamp("2026-09-23 20:00", tz="Asia/Kolkata"),
+                       pd.Timestamp("2026-09-25 13:00", tz="Asia/Kolkata")],
+    })
+    monkeypatch.setattr(fundamentals_bse_announcements, "sql_to_df", lambda *a, **k: fetched)
+
+    days = fundamentals_bse_announcements.days_to_fetch(today=today, lookback_days=3)
+
+    assert days == [date(2026, 9, 23), date(2026, 9, 25)]
 
 
 def test_load_companies_needing_backfill_excludes_already_done(monkeypatch):
@@ -15843,6 +15885,33 @@ def test_ocr_pdf_bytes_raises_on_document_timeout_between_pages(monkeypatch):
         fundamentals_ocr_pipeline.ocr_pdf_bytes(b"%PDF-1.4 fake")
 
 
+def test_extract_pdf_text_uses_text_layer_and_sends_only_bad_pages_to_the_model(monkeypatch):
+    good = "Board of Directors approved the audited financial results for the quarter ended June " * 5
+    scanner = "#.4{,1,*,ffi :ff lqH,\".L,LP Chartered HO 6,02,.Floor il:? 3,'\",i;' il1ii il'iJ; |; " * 5
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "text_layer_pages", lambda path: [good, "", scanner])
+    rendered = {}
+
+    def fake_render(path, pages="all"):
+        rendered["pages"] = pages
+        return [(n, f"image-{n}") for n in pages]
+
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "render_pdf_pages", fake_render)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_page_with_local", lambda image, **k: f"MODEL({image})")
+
+    text, stats = fundamentals_ocr_pipeline.extract_pdf_text(b"%PDF-1.4 fake")
+
+    assert rendered["pages"] == [2, 3]  # blank page and scanner-OCR page; the clean page is not rendered
+    assert text == f"{good}\n\nMODEL(image-2)\n\nMODEL(image-3)"
+    assert stats == {"pages_total": 3, "pages_model": 2}
+
+
+def test_text_layer_is_usable_rejects_thin_and_garbled_pages():
+    usable = fundamentals_ocr_pipeline.text_layer_is_usable
+    assert usable("Revenue from operations increased to Rs 1,234 crore during the quarter. " * 5)
+    assert not usable("Page 1")
+    assert not usable("#.4{,1,*,ffi :ff lqH,.L,LP il:? 3,',i;' il1ii il'iJ; |; " * 10)
+
+
 def test_ocr_pdf_bytes_truncates_when_page_count_exceeds_max(monkeypatch):
     # BUG FOUND LIVE 2026-08-18 (re-audit): render_pdf_pages(path) with the default
     # pages="all" rasterizes every page into memory up front, before this document's
@@ -15870,7 +15939,7 @@ def test_ocr_pdf_bytes_truncates_when_page_count_exceeds_max(monkeypatch):
     assert result == "image-1\n\nimage-2\n\nimage-3"
     assert len(fallback_events) == 1
     assert fallback_events[0][0][0] == "ocr_pipeline_document_truncated"
-    assert fallback_events[0][1]["metadata"] == {"total_pages": 100, "max_ocr_pages": 3}
+    assert fallback_events[0][1]["metadata"] == {"pages": 100, "max_ocr_pages": 3}
 
 
 def test_ocr_pdf_bytes_uses_eager_render_when_page_count_within_max(monkeypatch):
@@ -15965,7 +16034,8 @@ def test_run_ocr_pipeline_happy_path_stores_pdf_and_text(monkeypatch):
     )
     monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", lambda url, **k: b"%PDF-1.4 fake")
-    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", lambda pdf_bytes: "extracted rationale text")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "extract_pdf_text",
+                        lambda pdf_bytes: ("extracted rationale text", {"pages_total": 1, "pages_model": 1}))
 
     saved_files = []
     monkeypatch.setattr(fundamentals_ocr_pipeline, "save_file_content", lambda key, content: saved_files.append((key, content)))
@@ -16010,7 +16080,7 @@ def test_run_ocr_pipeline_stops_at_time_budget_leaving_remaining_rows_pending(mo
     )
     monkeypatch.setattr(fundamentals_ocr_pipeline, "load_pending_ocr_targets", lambda limit=None: pending)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "fetch_document_bytes", lambda url, **k: b"%PDF-1.4 fake")
-    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", lambda pdf_bytes: "text")
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "extract_pdf_text", lambda pdf_bytes: ("text", {"pages_total": 1, "pages_model": 1}))
     monkeypatch.setattr(fundamentals_ocr_pipeline, "save_file_content", lambda key, content: None)
     from utils.blob_store import TextBlobMetadata
 
@@ -16077,7 +16147,7 @@ def test_run_ocr_pipeline_document_timeout_does_not_permanently_fail_or_trip_fet
     def always_times_out(pdf_bytes):
         raise fundamentals_ocr_pipeline.OcrTimeoutError("page 1 OCR exceeded PER_PAGE_OCR_TIMEOUT_SECONDS")
 
-    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", always_times_out)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "extract_pdf_text", always_times_out)
     status_calls = []
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: status_calls.append(kwargs))
     fallback_events = []
@@ -16106,7 +16176,7 @@ def test_run_ocr_pipeline_timeout_circuit_breaker_is_separate_from_fetch_failure
     def always_times_out(pdf_bytes):
         raise fundamentals_ocr_pipeline.OcrTimeoutError("boom")
 
-    monkeypatch.setattr(fundamentals_ocr_pipeline, "ocr_pdf_bytes", always_times_out)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "extract_pdf_text", always_times_out)
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_set_ocr_result", lambda **kwargs: None)
     fallback_events = []
     monkeypatch.setattr(fundamentals_ocr_pipeline, "_record_fallback", lambda *a, **k: fallback_events.append((a, k)))
@@ -20919,7 +20989,8 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 19  # +2 2026-08-29 (deal_flow, confluence_score); +1 2026-09-24 (watchlist); +2 2026-09-25 (industry_classification, rbi_nbfc_registry)
+    assert len(fundamentals_run_pipeline.STEPS) == 18  # +2 2026-08-29 (deal_flow, confluence_score); +1 2026-09-24 (watchlist); +2 2026-09-25 (industry_classification, rbi_nbfc_registry); -1 2026-09-25 (ocr_pipeline -> its own job)
+    assert "fundamentals.collectors.ocr_pipeline" not in fundamentals_run_pipeline.STEPS
     # O2 (2026-09-24): the portfolio enters from THIS run's confluence, so tonight's alerts
     # must reach the watchlist before confluence scores it.
     steps = fundamentals_run_pipeline.STEPS
