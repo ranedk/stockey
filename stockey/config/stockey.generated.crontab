@@ -1,0 +1,251 @@
+SHELL=/bin/bash
+PATH=/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/dev/.local/bin
+MAILTO=""
+
+STOCKEY_DIR=/home/dev/code/trading/stockey
+LOG_DIR=/home/dev/code/trading/stockey/logs/cron
+
+# Create log directory once before enabling the crontab:
+#   mkdir -p /home/dev/code/trading/stockey/logs/cron
+#
+# Run with go-crond:
+#   ./go-crond /home/dev/code/trading/stockey/config/stockey.generated.crontab --allow-unprivileged
+#
+# This file includes a username field. Remove that field before installing into a normal per-user crontab.
+#
+# Pure-TA cut (2026-08-02, PURE_TA_MIGRATION_PLAN.md Phase 4): only the 6 data-platform
+# jobs below remain. All advisory/paper-trading/research/frontend jobs were removed here;
+# their code lives on the advisory-archive-2026-07 branch until Phase 4 fully archives it.
+#
+# Fundamentals screener (2026-08-11, docs/FUNDAMENTAL_SCREENER_PRD.md): a deliberate,
+# separate carve-out from the pure-TA boundary above -- long-term fundamental screening
+# (screener/watchlist/narrative/portfolio), not technicals/trading. Two more jobs below:
+# the batch pipeline (fundamentals/run_pipeline.py) and its API server
+# (fundamentals/api/app.py), which serves the screener/ Nuxt frontend.
+#
+# TIMEZONE (2026-08-13, confirmed empirically via logs/cron/*.log real firing
+# timestamps): this go-crond build (webdevops/go-crond 23.12.0) does NOT honor a
+# CRON_TZ line -- there used to be one here and jobs fired at its literal UTC
+# numbers instead of IST-shifted ones. The server's system clock is UTC
+# (timedatectl: Etc/UTC) with no sudo to change it, and go-crond has no
+# --timezone flag and no documented CRON_TZ/TZ support. Every schedule below is
+# therefore written in UTC directly, with the intended IST wall-clock time noted
+# in each comment -- IST = UTC + 5:30, so UTC = IST - 5:30. All of today's IST
+# times are >= 06:50 IST, comfortably clear of the 05:30 IST / 00:00 UTC
+# boundary, so none of these conversions cross a UTC calendar day and the
+# weekday ("1-5") fields are unaffected. If a future job is intended for early
+# IST morning (before ~05:30 IST), remember it lands on the PREVIOUS UTC date
+# and its weekday field needs shifting too.
+
+# ---------------------------------------------------------------------------
+# Recurring cron-managed jobs.
+# ---------------------------------------------------------------------------
+
+# SCHEDULE DESIGN (retimed 2026-09-02) -- crawl each source just AFTER it publishes,
+# and keep a guaranteed morning catch-up behind it.
+#
+# The old schedule was set by convenience, not by when data actually appears, and every
+# downstream failure this repo has chased traced back to that. Measured evidence:
+#   * NSE bhavcopy -- ingestion_file_state shows every recent session's file was first
+#     processed the NEXT MORNING (~07:20 IST), never by the 17:30 EOD run. NSE publishes
+#     sec_bhavdata_full after 17:30, so that run could not have succeeded.
+#   * Dhan EOD bars -- every logged 18:45 reconcile reported current=0 of ~2,880 symbols.
+#     Dhan publishes staggered through the evening; this repo's own
+#     DATA_READINESS_DHAN_TODAY_AFTER_HOUR_IST default is 23, i.e. the code already knew.
+#   * FBIL G-Sec -- published early evening; asking before ~18:00 IST returns nothing and
+#     used to mark the whole run "partial" (fixed in download_fbil_gsec.py).
+#
+# EVENING = best effort, as early as the data plausibly exists:
+#   19:15 complete_data     (was 17:30 -- before NSE published)
+#   20:30 downloaders queue (new retry slot, second chance the same evening)
+#   21:00 fundamentals_screener
+#   22:00 portfolio_ruleset  (exits, then entries -- reads the screener's confluence scores)
+#   23:05 ohlcv_reconcile   (was 18:45 -- >4h before Dhan had anything)
+#   23:25 price_adjustment  (was 18:50 -- ran on whatever was in the DB, often stale)
+#   23:40 dhan_intraday_sync
+#
+# MORNING = the guarantee, and it runs Mon-SATURDAY (1-6), not Mon-Fri.
+#   BUG FOUND LIVE 2026-09-06: every recovery job was weekday-only, so a FRIDAY-evening
+#   miss had no catch-up until Monday 07:10 IST. That is exactly what happened on
+#   2026-09-04: NSE had not published sec_bhavdata_full when the 19:15 run asked, and
+#   Friday's bhavcopy then sat missing all weekend -- a whole-weekend hole in the very
+#   design that was supposed to be "the guarantee". Saturday morning closes it, because
+#   Friday's file is reliably published by then. The evening chain stays 1-5: Saturday is
+#   not a trading day, so there is no Saturday session to collect.
+#   07:10 complete_data -> 07:30 data_readiness --fix -> 07:40 ohlcv_reconcile
+#   -> 07:45 price_adjustment -> 08:00 completeness GATE -> 08:10/08:15 reporting
+#
+# Ordering is load-bearing: the gate and both reporting jobs sit AFTER the catch-up so
+# they judge final data. The gate used to run at 22:50, before the session's bhavcopy was
+# even published, and duly failed on its first night for data that was merely late.
+# A gate that cries wolf nightly is a gate nobody reads.
+#
+# No two jobs share a firing minute -- fundamentals_screener was deliberately moved off
+# the 20:30 queue slot because both drive Chrome/CDP and concurrent CDP use has caused a
+# connect timeout here before.
+
+
+# Late-night data catch-up: Dhan publishes EOD bars staggered (only a fraction of the
+# universe has them at the 18:45 reconcile), and a bad morning bhavcopy fetch must not
+# survive the night. Checks bhavcopy/Dhan/benchmark coverage and runs bounded fixes.
+# 17:00 UTC = 22:30 IST
+00 02 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
+
+# Daily coverage/staleness report across every KEEP table (docs/DATA_COVERAGE.md).
+# Non-fatal visibility layer, not a gate: writes to data_coverage_report (queryable
+# trend history) and the log below. Runs after data_readiness so its own freshness
+# reflects that pass's fixes.
+# 17:10 UTC = 22:40 IST
+40 02 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
+
+# Digest of open identity issues + recent fallback telemetry -- the read/summarize half
+# of the write-only advisory_identity_issues / advisory_fallback_events tables (recorded
+# but never surfaced, confirmed live 2026-08-14; docs/DATA_COVERAGE.md's "Still open"
+# list). Runs right after data_coverage_report so this reflects the same nightly pass.
+# 17:15 UTC = 22:45 IST
+45 02 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_issue_digest.lock ./all_issue_digest.sh >> "$LOG_DIR/issue_digest.log" 2>&1
+
+# Final verdict on the night's data: is it actually THERE, across the whole universe?
+# Added 2026-08-31 after Dhan collection died for 5 days with every job still exiting 0.
+# Two things make this different from data_readiness above, and both are deliberate:
+#   - it checks BREADTH, not just freshness. The old checks all asked "how recent is
+#     the newest row?", which the Dhan connectivity smoke test kept answering "today"
+#     for one single ticker while the other ~2,590 were dead.
+#   - it imports nothing browser- or broker-related. data_readiness was itself crashing
+#     on the same dead-Chrome CDP timeout as the collectors it was meant to be watching,
+#     which is exactly why nobody found out for five days.
+# Read-only: it never repairs. Exits non-zero on a hard error.
+
+# Daily log rotation before the morning jobs: archive sizable logs as
+# logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running
+# processes keep their handles) and prune archives past LOG_ROTATE_KEEP_DAYS.
+# 01:20 UTC = 06:50 IST
+20 01 * * * dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
+
+# Daily broad raw download + parse safety net before market open on weekdays.
+# A second end-of-day complete_data.sh run below repairs anything intraday jobs missed.
+# 01:40 UTC = 07:10 IST
+40 01 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
+
+# --- Morning catch-up: the previous session's data is not final until this runs ---
+# WHY THIS EXISTS (2026-09-01, caught by the completeness gate on its FIRST night):
+# NSE publishes the daily bhavcopy around 18:00-19:00 IST, but the EOD complete_data
+# run fires at 17:30 IST -- BEFORE it exists. The 18:45 reconcile and 18:50 price
+# adjustment then process whatever is in the DB at that moment, which on a slow
+# publishing day is still yesterday's data. Confirmed live for 2026-08-31: EOD ran
+# clean at 17:42 IST, reconcile and adjustment both ran on stale input, and the
+# session's bhavcopy only landed on the 07:10 IST morning run the next day -- leaving
+# 2,879 EQ/BE bars with no adjustment factor, silently absent from systrader's PRIMARY
+# series, exactly the failure of 2026-08-26..31.
+#
+# The evening pass is kept (when NSE is prompt it works, and earlier data is better).
+# These two re-runs are the guarantee. Both are cheap when there is nothing to do:
+# price_adjustment now writes ZERO rows on a no-change run (on_conflict=
+# update_if_changed), and ohlcv_reconcile only targets symbols that are actually stale.
+# Dhan token refresh -- MUST precede the morning Dhan work. Tokens expire ~20:35 UTC
+# (02:05 IST) and the catch-up reconcile below runs at 02:10 UTC, five minutes later.
+# Confirmed live 2026-09-04: the evening chain (17:45/18:10 UTC) sits inside the token's
+# life and succeeded on ~1412 symbols; the morning pass ran on a dead token and failed
+# ~950 of 1500, because an expired token on the daily endpoint returns
+# 400 "Missing required fields..." which the client's auth-error predicate does not
+# match, so it never refreshed. See all_dhan_auth_ensure.sh for why the predicate was
+# not loosened instead.
+# 02:05 UTC = 07:35 IST
+05 02 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dhan_auth_ensure.lock ./all_dhan_auth_ensure.sh >> "$LOG_DIR/dhan_auth_ensure.log" 2>&1
+
+# 06:30 UTC = 12:00 IST -- MOVED from 02:10 UTC (07:40 IST) on 2026-09-23. Dhan's daily
+# endpoint is unreliable in the 07:40 IST window: measured the same day, the same bulk
+# code completed 289/1500 symbols at 07:40, 177/200 at 12:00 and ~1410/1500 at 23:15,
+# and symbols that failed at 07:40 returned their bars on a manual retry hours later.
+# The backlog that built up behind those failures is why daily coverage sat at ~900 of
+# ~2,900 symbols. Midday costs a partial bar for the live session, which the 23:05 IST
+# pass overwrites (sync_daily_ohlcv writes update_if_changed for exactly this reason).
+30 06 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
+
+# 02:15 UTC = 07:45 IST -- after the morning complete_data has landed the bhavcopy (the
+# reconcile that used to sit at 02:10 moved to 06:30 UTC; price adjustment does not
+# depend on it, only on the bhavcopy)
+15 02 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+
+# Completeness gate -- MOVED here from 22:50 IST on 2026-09-01. It has to run after the
+# catch-up above, not before: at 22:50 the previous session's bhavcopy legitimately may
+# not have been published yet, so the gate failed on its first night for data that was
+# merely late rather than lost. A gate that fails most nights for a benign reason
+# teaches the operator to ignore it, which is the one thing it must never do.
+# 02:30 UTC = 08:00 IST
+30 02 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_completeness.lock ./all_data_completeness.sh >> "$LOG_DIR/data_completeness.log" 2>&1
+
+# Queue single-client downloader work and drain it without parallel NSE/Dhan/Screener sessions.
+# The direct complete_data.sh path remains the broad catch-up/backfill safety net.
+# all_external_workers.sh is NOT optional: all_downloaders_queue.sh routes every
+# data.nseindia.* module plus Dhan scrip_master/ohlcv into the nse/dhan queues instead of
+# running them inline -- this is the only thing that drains those queues (see DATA_INVENTORY.md).
+# 03:00,07:00,11:00 UTC = 08:30,12:30,16:30 IST
+00 03,07,11,15 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
+# 03:05,07:05,11:05 UTC = 08:35,12:35,16:35 IST
+05 03,07,11,15 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
+
+# End-of-day broad catch-up. This intentionally runs the full download+parse path so any
+# downloader/parser work missed earlier in the day is repaired.
+# 12:00 UTC = 17:30 IST
+45 13 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
+
+# Daily OHLCV coverage reconciliation. Backfills any universe symbol whose latest daily bar
+# predates the last completed trading day (e.g. after the scheduler was down during market
+# hours), so systrader never reads silently stale bars.
+# 13:15 UTC = 18:45 IST
+45 17 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
+
+# Split/bonus-adjusted price table (price-step derived) -- systrader's PRIMARY equity series
+# (advisory_adjusted_ohlcv_daily), promoted out of advisory/ 2026-07-28. Scheduled right after
+# the OHLCV reconcile now that the downstream advisory/research chain that used to sit between
+# them is gone -- no need to wait until 21:38 anymore.
+# 13:20 UTC = 18:50 IST
+30 14 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+
+# Daily incremental Dhan 1-min intraday OHLCV sync for the full active NSE equity
+# universe (data/dhanlive/intraday_daily_sync.py) -- HF_DATA_PLATFORM_PLAN.md
+# (systrader repo), 2026-08-22: companion to the one-time 5-year historical
+# backfill (scripts/backfill_intraday_5yr.py, run manually, not scheduled).
+# Independent of the fundamentals screener below (different tables, no
+# dependency either way) -- scheduled right after price_adjustment purely so
+# the day's EOD data is settled first.
+# 13:25 UTC = 18:55 IST
+10 18 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dhan_intraday_sync.lock ./all_dhan_intraday_sync.sh >> "$LOG_DIR/dhan_intraday_sync.log" 2>&1
+
+# Fundamentals screener pipeline: L1/L2 refresh, event collectors, OCR + structured
+# extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive
+# technicals, and the watchlist/narrative/email pipeline (fundamentals/run_pipeline.py,
+# one step failing does not abort the run). Scheduled after price_adjustment
+# (18:50 IST) so the descriptive-technicals step reads a same-day adjusted price series.
+# 13:45 UTC = 19:15 IST
+30 15 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_screener.lock ./all_fundamentals_screener.sh >> "$LOG_DIR/fundamentals_screener.log" 2>&1
+
+# Portfolio ruleset + LLM adjudication (docs/PORTFOLIO_RULESET_PRD.md): the mechanical
+# entry rule, the entry adjudicator (which may only REJECT), the mechanical exit
+# evaluator, and the exit adjudicator (which may only DEFER, and never a stop).
+# Scheduled an hour after fundamentals_screener (21:00 IST) because it reads that run's
+# fundamentals_confluence_score output, plus systrader's stage API for the price read.
+# RECORD-ONLY: --live is deliberately NOT passed -- rollout phase 1 commits no money.
+# 16:30 UTC = 22:00 IST
+30 16 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_portfolio_ruleset.lock ./all_portfolio_ruleset.sh >> "$LOG_DIR/portfolio_ruleset.log" 2>&1
+
+# Fundamentals screener API (fundamentals/api/app.py), serving the screener/ Nuxt
+# frontend. Long-running service, same respawn-under-lock pattern the old
+# all_frontend.sh used (see stockey-service-management memory): cron retries every 5
+# minutes, with_lock.sh no-ops while a real instance holds the lock, and the script's
+# own /api/health check no-ops again if something is already serving. No weekday
+# restriction -- this is a local dashboard, not a market-hours job.
+# Every 5 minutes, wall-clock -- not IST-anchored, no conversion needed.
+*/5 * * * * dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_api.lock ./all_fundamentals_api.sh >> "$LOG_DIR/fundamentals_api.log" 2>&1
+
+# ---------------------------------------------------------------------------
+# Manual / catch-up / long-running scripts. Keep these commented unless you
+# intentionally want extra end-of-day repair jobs.
+# ---------------------------------------------------------------------------
+#
+# Optional split refreshes if you want explicit control instead of complete_data.sh.
+# 01:35 UTC = 07:05 IST
+# 35 01 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
+# 02:10 UTC = 07:40 IST
+# 10 02 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1

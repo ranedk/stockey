@@ -1,0 +1,353 @@
+"""L3 LLM triage -- fundamental screener step 7, second half
+(docs/FUNDAMENTAL_SCREENER_PRD.md sec 3.2/8 step 7, fundamentals/screens/
+l3_triggers.py's rule-based half). A second, judgment-based path into
+fundamentals_l3_alerts, running ALONGSIDE the deterministic rule pass, not
+replacing it -- both can alert on the exact same event (they key on different
+trigger_type values, so no collision), and this never bypasses L4: it only flags a
+candidate for a human to review, it never opens or sizes a position.
+
+Fires only on an actual event (a filing already in fundamentals_events), never a
+standing scan -- same "event x primed state" shape the source PRD requires of the
+rule-based triggers, just with an LLM's judgment standing in for the deterministic
+rule. "Technical" context is stockey's OWN raw price data (nseindia_ohlcv), not
+systrader's systematic signals -- importing those would recouple the two repos
+(source PRD sec 3.2 is explicit about this boundary).
+
+Covers results too, unlike the rule-based half (fundamentals/screens/l3_triggers.py
+deliberately deferred rule-based results triggers -- reconciling multiple growth-rate
+sources needed more design thought than fit that step). Triage doesn't need that
+reconciliation; it just shows the LLM the filing content and lets it judge.
+
+Every alert this produces is provenance-stamped -- model, prompt_version, and the
+exact evidence bundle (event content + L2 state snapshot + price context) the LLM
+was shown, all stored on the alert row -- so a later review can see exactly what the
+LLM saw, not just its conclusion (fundamental_basic_goal.md sec 4: "version every
+signal definition").
+"""
+
+from __future__ import annotations
+
+import json
+
+import pandas as pd
+from environs import Env
+from openai import OpenAI
+from psycopg2 import sql as psycopg2_sql
+
+from fundamentals.screens.l3_triggers import RESULTS_TABLE, _ensure_alerts_table, load_latest_l2_state
+from utils.company_master import build_l1_ticker_by_company_master_id
+from utils.json_safe import dumps_strict
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.fallback_telemetry import record_local_fallback_event
+
+env = Env()
+env.read_env()
+
+SYNC_SOURCE_NAME = "fundamentals.screens.llm_triage"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+DEFAULT_MODEL = env("LLM_TRIAGE_MODEL", "gpt-5.4-mini")
+PROMPT_VERSION = 1
+CIRCUIT_BREAKER_THRESHOLD = 3
+DEFAULT_BATCH_LIMIT = 50
+PRICE_LOOKBACK_DAYS = 20
+
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "interesting": {"type": "boolean", "description": "true only if this event, in light of the company's own state and recent price action, is something a human fundamental-thesis reviewer should look at"},
+        "reasoning": {"type": "string", "description": "2-3 sentences grounded in the specific evidence shown -- not a generic restatement of the filing"},
+        "confidence": {"type": "string", "description": "high / medium / low"},
+    },
+    "required": ["interesting", "reasoning", "confidence"],
+    "additionalProperties": False,
+}
+
+TRIAGE_SYSTEM_PROMPT = (
+    "You are a triage assistant for a long-term (12-30 month) fundamental-investing screener "
+    "focused on Indian smallcap/microcap turnaround and deleveraging theses. You will be shown "
+    "one detected filing event for a company, the company's own computed state vector "
+    "(debt trajectory, promoter holding trend, pledge, etc.), and simple recent price action. "
+    "Judge whether this SPECIFIC event, in light of that state, is worth a human's attention -- "
+    "not whether the company is generally interesting. A routine event that merely confirms an "
+    "already-known trend is NOT interesting. An event that is surprising given the state, or that "
+    "independently corroborates a thesis-relevant trend (e.g. a rating action or insider trade "
+    "that lines up with an already-improving or deteriorating debt/pledge/holding trend), IS "
+    "interesting. You never recommend a trade, a position, or a price target -- you only flag "
+    "whether a human should look closer, and say why in terms of the specific evidence shown."
+)
+
+
+def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        source="openai",
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
+def _bootstrap_triage_column() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'fundamentals_events'")
+            if cur.fetchone() is None:
+                return
+            cur.execute(
+                psycopg2_sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS llm_triage_status TEXT").format(
+                    psycopg2_sql.Identifier("fundamentals_events")
+                )
+            )
+
+    execute_db_operation(_op, operation_name="fundamentals_events:ensure_llm_triage_column")
+
+
+def load_candidate_events_for_triage(limit: int | None = None) -> pd.DataFrame:
+    # BUG FOUND LIVE 2026-08-17: rating_agency wasn't selected here -- l3_triggers.py's
+    # own load_candidate_events() got this exact fix on 2026-08-13 (its own module
+    # docstring: "rating_agency is included so evaluate_rating_action_trigger()'s
+    # reasoning can name which agency acted"), but llm_triage.py's sibling query never
+    # did, so the LLM triaging a rating_action event never saw which agency acted --
+    # a real signal (ICRA vs a less-established agency, say) the model has no way to
+    # weigh without it.
+    #
+    # BUG FOUND LIVE 2026-08-18: same readiness gap l3_triggers.py's sibling query
+    # got fixed the same day -- this used to triage a candidate the moment it was
+    # detected, before OCR/extraction had run, so `results` events (which need
+    # structured_extraction_json entirely for the evidence bundle) got LLM-judged
+    # on category alone and burned a real API call for a permanent `flagged`/
+    # `not_interesting` verdict with no evidence behind it. Confirmed live: 16 of
+    # 30 stored llm_flagged alerts have "structured_extraction": null in their own
+    # persisted evidence bundle. Same readiness gate as l3_triggers.py's fix.
+    query = """
+        SELECT source, news_id, company_master_id, filing_type, headline, subcategory,
+               disclosure_date, rating_action_type, rating_agency, transaction_type,
+               insider_name, quantity, structured_extraction_json
+        FROM fundamentals_events
+        WHERE filing_type IN ('rating_action', 'pit_sast', 'results')
+          AND (llm_triage_status IS NULL OR llm_triage_status = 'pending')
+          AND (
+                -- rating_action no longer short-circuits on its flat action type
+                -- (2026-09-23 audit): that label comes from the agency LISTING headline,
+                -- so a downgrade on one instrument behind a "reaffirmed" headline was
+                -- judged before extraction could see it, and closed for good.
+                -- rating_downgrade had never fired. Ratings now wait for the document
+                -- like every other filing type.
+                (filing_type = 'pit_sast' AND transaction_type IS NOT NULL AND transaction_type != '')
+             OR (attachment_name IS NULL AND rationale_pdf_url IS NULL)
+             -- OCR'd rows wait for extraction to FINISH (2026-09-23 audit): "IS NULL"
+             -- used to count as finished, so a row OCR'd but not yet extracted was
+             -- judged with no JSON and closed for good. Extraction sets a status on
+             -- every OCR'd row (done / failed / unsupported_filing_type), so this
+             -- cannot strand one. A failed or document-less row has nothing to wait for.
+             OR (ocr_status = 'done' AND structured_extraction_status IS NOT NULL
+                 AND structured_extraction_status != 'pending')
+             OR ocr_status IN ('failed', 'no_document', 'timeout_exhausted')
+          )
+        ORDER BY load_ts ASC NULLS LAST
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    return sql_to_df(query)
+
+
+def load_price_context(company_master_id: str, event_date, *, lookback_days: int = PRICE_LOOKBACK_DAYS) -> dict:
+    """Simple, observable price action around the event -- stockey's own raw
+    nseindia_ohlcv, not systrader's systematic signals (see module docstring)."""
+    if event_date is None:
+        return {}
+    before = sql_to_df(
+        "SELECT date, close, volume FROM nseindia_ohlcv WHERE company_master_id = %s AND date <= %s ORDER BY date DESC LIMIT %s",
+        params=(company_master_id, event_date, lookback_days),
+    )
+    after = sql_to_df(
+        "SELECT date, close, volume FROM nseindia_ohlcv WHERE company_master_id = %s AND date > %s ORDER BY date ASC LIMIT %s",
+        params=(company_master_id, event_date, lookback_days),
+    )
+    if before.empty:
+        return {}
+
+    close_on_event = before.iloc[0]["close"]
+    close_lookback_ago = before.iloc[-1]["close"]
+    volume_on_event = before.iloc[0]["volume"]
+    # 2026-08-15 bug found live: averaging over `before` (which includes the event day itself,
+    # row 0) dilutes the ratio by the event's own spike -- confirmed live, e.g. nse:ONWARDTEC's
+    # 2026-06-26 event stored 18.1x when the true prior-19-day baseline ratio was 180.9x, a ~10x
+    # understatement. Prior-days-only average excludes row 0.
+    prior_volume = before["volume"].iloc[1:]
+    avg_volume_before = prior_volume.mean() if not prior_volume.empty else None
+
+    context = {
+        "close_on_or_before_event": float(close_on_event),
+        f"price_pct_change_last_{len(before)}_sessions": round((close_on_event - close_lookback_ago) / close_lookback_ago * 100, 2) if close_lookback_ago else None,
+        "volume_on_event_vs_avg_ratio": round(volume_on_event / avg_volume_before, 2) if avg_volume_before else None,
+    }
+    if not after.empty:
+        close_after = after.iloc[-1]["close"]
+        context["price_pct_change_since_event"] = round((close_after - close_on_event) / close_on_event * 100, 2) if close_on_event else None
+        context["sessions_since_event_available"] = int(len(after))
+    return context
+
+
+def build_evidence_bundle(event: dict, l2_row: dict | None, price_context: dict) -> dict:
+    return {
+        "event": {
+            "filing_type": event.get("filing_type"),
+            "headline": event.get("headline"),
+            "subcategory": event.get("subcategory"),
+            "disclosure_date": str(event.get("disclosure_date")),
+            "rating_action_type": event.get("rating_action_type"),
+            "rating_agency": event.get("rating_agency"),
+            "transaction_type": event.get("transaction_type"),
+            "insider_name": event.get("insider_name"),
+            "quantity": event.get("quantity"),
+            "structured_extraction": json.loads(event["structured_extraction_json"]) if event.get("structured_extraction_json") else None,
+        },
+        "l2_state": l2_row,
+        "price_context": price_context,
+    }
+
+
+def triage_event(evidence_bundle: dict, *, model: str = DEFAULT_MODEL) -> dict:
+    client = OpenAI(api_key=env("OPENAI_API_KEY"))
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": TRIAGE_SYSTEM_PROMPT},
+            {"role": "user", "content": dumps_strict(evidence_bundle)},
+        ],
+        response_format={"type": "json_schema", "json_schema": {"name": "triage_judgment", "schema": TRIAGE_SCHEMA, "strict": True}},
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def _set_triage_status(*, source: str, news_id: str, status: str) -> None:
+    def _update() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                "UPDATE fundamentals_events SET llm_triage_status = %s WHERE source = %s AND news_id = %s",
+                (status, source, news_id),
+            )
+
+    execute_db_operation(_update, operation_name="fundamentals_events:llm_triage_status_update")
+
+
+def run_llm_triage(*, limit: int | None = None, model: str = DEFAULT_MODEL) -> dict[str, object]:
+    _bootstrap_triage_column()
+    _ensure_alerts_table()
+
+    events = load_candidate_events_for_triage(limit or DEFAULT_BATCH_LIMIT)
+    if events.empty:
+        return {"flagged": 0, "not_interesting": 0, "failed": 0, "blocked": False}
+
+    l2_state = load_latest_l2_state()
+    l2_by_ticker = {row["ticker"]: row for row in l2_state.to_dict("records")}
+    # BUG FOUND LIVE 2026-08-18: same naive removeprefix("nse:") mistake fixed in
+    # l3_triggers.py's sibling loop -- wrong for the ~22% BSE-only cohort whose
+    # fundamentals_l2_state.ticker isn't their own company_master_id's symbol.
+    # Built once per run, same reverse map every other fixed call site uses.
+    l1_ticker_by_cmid = build_l1_ticker_by_company_master_id(include_history=True)
+
+    counts = {"flagged": 0, "not_interesting": 0, "failed": 0}
+    consecutive_failures = 0
+    blocked = False
+    alert_rows: list[dict] = []
+
+    for _, event in events.iterrows():
+        if blocked:
+            continue
+        event_dict = event.to_dict()
+        ticker = l1_ticker_by_cmid.get(event_dict.get("company_master_id"))
+        l2_row = l2_by_ticker.get(ticker) if ticker is not None else None
+        price_context = load_price_context(event_dict.get("company_master_id"), event_dict.get("disclosure_date"))
+        evidence_bundle = build_evidence_bundle(event_dict, l2_row, price_context)
+
+        try:
+            judgment = triage_event(evidence_bundle, model=model)
+        except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
+            consecutive_failures += 1
+            counts["failed"] += 1
+            _set_triage_status(source=event_dict["source"], news_id=event_dict["news_id"], status="failed")
+            _record_fallback(
+                "llm_triage_failed",
+                reason="LLM triage call failed for this event; it stays llm_triage_status=failed permanently -- load_candidate_events_for_triage only re-selects NULL/pending, so this needs a manual UPDATE to retry, not an automatic one.",
+                error=exc,
+                metadata={"news_id": event_dict["news_id"]},
+            )
+            if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+                blocked = True
+                _record_fallback(
+                    "llm_triage_circuit_breaker_tripped",
+                    reason=f"{consecutive_failures} consecutive LLM triage failures -- stopping this run immediately.",
+                    error="circuit breaker",
+                    severity="error",
+                )
+            continue
+
+        consecutive_failures = 0
+        if not judgment.get("interesting"):
+            counts["not_interesting"] += 1
+            _set_triage_status(source=event_dict["source"], news_id=event_dict["news_id"], status="not_interesting")
+            continue
+
+        counts["flagged"] += 1
+        alert_rows.append(
+            {
+                "source": event_dict["source"],
+                "news_id": event_dict["news_id"],
+                "trigger_type": "llm_flagged",
+                "origin": "llm_triage",
+                "company_master_id": event_dict.get("company_master_id"),
+                "alert_date": event_dict.get("disclosure_date"),
+                "reasoning": judgment.get("reasoning"),
+                "l2_run_date": str(l2_row.get("run_date")) if l2_row is not None else None,
+                "l2_state_snapshot_json": dumps_strict(l2_row) if l2_row is not None else None,
+                # LOW FINDING (re-audit 2026-08-18): "status" is write-only -- see
+                # l3_triggers.py's own identical comment on its twin write site.
+                "status": "new",
+                "model": model,
+                "prompt_version": PROMPT_VERSION,
+                "evidence_bundle_json": dumps_strict(evidence_bundle),
+                "load_ts": pd.Timestamp.now(tz="UTC"),
+            }
+        )
+        # llm_triage_status is NOT set to "flagged" here -- see below, after the
+        # batched upsert actually succeeds (same bug/fix as l3_triggers.py's own
+        # rule pass, found live 2026-08-15).
+
+    if alert_rows:
+        upsert_to_db(pd.DataFrame(alert_rows), RESULTS_TABLE, unique_keys=["source", "news_id", "trigger_type"])
+        # Only mark an event "flagged" once its alert row is confirmed durably
+        # written -- a transient failure on this single batched upsert would
+        # otherwise leave every already-processed event in the batch marked
+        # "flagged" with no corresponding fundamentals_l3_alerts row, permanently
+        # suppressed (load_candidate_events_for_triage only re-selects NULL/pending).
+        for row in alert_rows:
+            _set_triage_status(source=row["source"], news_id=row["news_id"], status="flagged")
+
+    return {**counts, "blocked": blocked}
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    result = run_llm_triage()
+    STOCKEY_RUN_STATE = {
+        "source": SYNC_SOURCE_NAME,
+        "flagged": result["flagged"],
+        "rows_written": result["flagged"],
+        "not_interesting": result["not_interesting"],
+        "failed": result["failed"],
+        "blocked": result["blocked"],
+        "fallback_used": bool(result["failed"] or result["blocked"]),
+        "state_advanced": result["flagged"] > 0,
+        "status": "blocked" if result["blocked"] else "ok",
+    }
+    print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,569 @@
+# Fundamental Screener — Build PRD (stockey)
+
+Companion to `fundamental_basic_goal.md` (the source spec, kept as-is at repo
+root — this document translates it into a concrete build plan against
+stockey's actual codebase, conventions, and infrastructure). Decision date
+2026-08-10.
+
+**Decisions locked 2026-08-10** (resolves §11's open questions from the first
+draft — kept here as the record of *why*, not just *what*):
+
+- **OCR**: GLM-OCR (0.9B params), self-hosted locally. Fits comfortably
+  alongside Postgres/Redis on this machine's 32GB RAM. Runs as a persistent
+  local inference service the OCR pipeline calls, not loaded per-call (a
+  daily batch job re-loading a model per document would waste most of its
+  own runtime on load time alone).
+- **Triage**: OpenAI `gpt-5.4-mini` — matches the model naming already used
+  for Codex CLI (`CODEX_CLI_MODEL`) elsewhere in `.env.example`. Credentials
+  already present (`OPENAI_API_KEY`).
+- **Crawl-time filtering, not filter-after-crawl**: screener.in's custom
+  query language and BSE/NSE's own search filters do most of L1's job
+  directly at the source — no reason to crawl ~5,000+ listed companies'
+  full financials just to discard most of them in SQL afterward. This
+  reshapes L1 (§8 below).
+- **One cron, not a separate file**: fundamentals jobs join the existing
+  `config/stockey.crontab.template`, in a clearly-labeled block, not a
+  second crontab file. The "never merge" rule (§1) is about decision
+  pipelines, not about which file a cron entry lives in — one `go-crond`
+  instance is simpler ops with no loss of the separation that actually
+  matters.
+
+## 1. Why this exists, and why it's not systrader
+
+Two products, two standards of evidence:
+
+- **systrader** — systematic, backtestable, Carver-framework trading.
+  ~20-30% of the portfolio. A signal only earns a place there after it
+  survives walk-forward + holdout + FDR discipline (`research/LEDGER.md`).
+- **This screener** — long-term (12-30mo) fundamental investing. ~70-80% of
+  the portfolio. Explicitly *not* trying to prove backtested alpha —
+  `fundamental_basic_goal.md` §5 measures forecast **calibration**, not
+  returns, and keeps a human at L4 committing to a falsifiable thesis before
+  any capital moves.
+
+A prior attempt at this failed by conflating four different epistemic
+categories into one automated pipeline: raw collection, fundamental state,
+backtested technical signals, and LLM-assisted judgment, all feeding one
+execution engine — no robust cross-regime selection alpha, and LLM-driven
+news/announcement pipelines burned tokens with no backtestable output. This
+PRD keeps those categories separate on purpose.
+
+**The one rule that matters more than any other in this document: this
+screener and systrader's systematic engine never merge into one decision
+pipeline.** No shared "final action" table, no engine blending a systematic
+score with a fundamental flag. If a name is interesting from both angles
+someday, that's a human synthesizing two independent read-outs — never a
+system doing it.
+
+## 2. What's genuinely different this time
+
+Hold the line on these four disciplines — they're *why* the old system
+became unmaintainable, not incidental complexity:
+
+1. **No sub-daily latency.** `fundamental_basic_goal.md` §2 already excludes
+   "anything sub-daily." The old system had 10-minute watchers and fast
+   signal refresh for an 18-30 month thesis horizon — pure complexity with
+   no payoff. L3 is one daily batch, ~8am. Nothing polls faster than that.
+2. **No general announcement ingestion.** OCR only the specific filing types
+   tied to the four L3 triggers (rating actions, PIT/SAST, shareholding
+   deltas, results). Not the firehose. This alone removes most of what made
+   the old announcement pipeline expensive and unreliable.
+3. **No LLM makes a capital decision.** ⚠️ **SUPERSEDED 2026-09-04 — see §11's
+   note and `docs/PORTFOLIO_RULESET_PRD.md` before relying on this.** As
+   originally written: the LLM's role is bounded to extraction and triage,
+   never sizing or execution, and L4 (a human committing to a falsifiable,
+   dated prediction) is the only gate capital passes through.
+
+   What actually holds now: an LLM authors versioned rules and may VETO an
+   action those rules propose, but can never select a position the ruleset did
+   not pass. The human L4 register was **deleted** — machine forecasts are
+   written by the entry adjudicator and resolved unattended by
+   `portfolio_resolution.py`. The narrower objection this clause was really
+   protecting (a per-position LLM buy call is unauditable) is respected, not
+   overturned.
+4. **Append-only, versioned state, always.** Already in the source PRD §4.
+   The old system's mutable state was part of why it couldn't be audited or
+   reasoned about after the fact. Every L2 snapshot, every L3 alert, every
+   signal-definition version is a new row, never an overwrite.
+
+## 3. The LLM's role — precisely scoped
+
+Two uses, both bounded, both logged, neither touches capital directly:
+
+### 3.1 Structured extraction (low risk)
+
+GLM-OCR (§6) produces raw filing text → an LLM turns it into typed fields
+per document type (e.g. a rating-action document → agency, old rating, new
+rating, outlook, debt quantum, rationale category). Pure data
+transformation. Output is a structured row plus a pointer back to the
+source S3 object, never a standalone judgment. Proposed default:
+`gpt-5.4-mini`, same as triage (§3.2) — not explicitly confirmed for this
+step, but reusing one already-configured provider/credential rather than
+adding a second is the sensible default; flag if you'd rather split them.
+
+### 3.2 Event-triggered triage ("has this become interesting")
+
+This is new relative to the source PRD, added per 2026-08-10 discussion.
+Functionally: **a second, judgment-based path into L3, running alongside
+the deterministic rule-based trigger, not a replacement for it and not a
+bypass of L4.**
+
+- Fires only on an actual event (a new L3-relevant filing, or a material
+  move in stockey's own raw OHLCV around a name already in L1) — never a
+  standing continuous scan. Same "event × primed state" shape as the
+  rule-based triggers.
+- "Technical" context here means stockey's own already-collected raw price
+  data (`nseindia_ohlcv`, `dhan_ohlcv_daily`) — simple, observable price
+  action around the event. It does **not** mean importing systrader's
+  systematic signals; that would recouple the two repos. stockey already
+  owns the raw data needed for this on its own.
+- Output is a flagged candidate with the LLM's stated reasoning, written to
+  the same alerts surface a rule-based trigger writes to, tagged
+  `origin=llm_triage` vs `origin=rule` (mirrors L4's existing
+  `origin_tag: systematic_screen | ad_hoc` pattern from the source PRD).
+  A human still reviews it and, only if convinced, writes the falsifiable
+  L4 thesis. The LLM never opens or sizes a position.
+- Model: OpenAI `gpt-5.4-mini` (`OPENAI_API_KEY`, already in `.env`) —
+  decided 2026-08-10, confirmed specifically for this step.
+- Versioned like everything else: prompt version, model, and the evidence
+  bundle it saw are stored with the alert row, so a later review can see
+  exactly what the LLM was shown, not just its conclusion.
+
+### 3.3 Explicitly not doing
+
+- No automated decision policy, portfolio construction, or adversarial
+  review (all deleted advisory/ concepts — do not reintroduce under a new
+  name).
+- No continuous/standing LLM polling — every LLM call traces back to a
+  specific event or a specific document.
+- No LLM call without a stored provenance record (model, prompt version,
+  input evidence, timestamp) — an un-audited LLM judgment is worse than no
+  judgment.
+
+## 4. Architecture — where this lives in the stockey repo
+
+New top-level package, sibling to `data/`, not inside it:
+
+```
+fundamentals/
+  collectors/
+    security_master.py     # extends dim_security/company_master (see §5) with EQUITY_L.csv + BSE scrip code
+    screenerin.py           # screener.in financials/ratios/shareholding (own crawler this time, not the old advisory/ one)
+    bse_announcements.py    # bseindia.com/corporates/ann.html
+    bse_announcements.py    # also covers PIT-SAST + results-calendar detection (3 of L3's 4 triggers in one crawler) -- built as bse_announcements.py, not the bse_pit_sast.py name planned here
+    nse_pit.py               # NSE structured PIT (api/corporates-pit-gg + per-filing XBRL, migrated from api/corporates-pit 2026-08-1x) -- built as nse_pit.py, not the nse_announcements.py name planned here; NSE is secondary/redundant per fundamental_basic_goal.md §3.2
+    rating_agencies.py       # CRISIL/ICRA/CARE/India Ratings/Acuité listing+detail (shell-plus-XHR pattern)
+    ocr_pipeline.py          # fetch filing -> OCR (pluggable provider) -> LLM structured extraction (see §6)
+  screens/
+    l1_universe.py           # quarterly universe filter + rejection log (append-only)
+    l2_state.py               # per-company state vector, versioned/append-only
+    l3_triggers.py             # daily rule-based triggers + LLM triage (see §3.2), one batch ~8am
+    portfolio_ruleset.py        # mechanical entry rule (v1)
+    portfolio_adjudicator.py    # LLM entry/exit adjudication + thesis authoring
+    portfolio_exit.py           # mechanical exit triggers
+    portfolio_resolution.py     # machine forecast resolution + scoring
+    portfolio_runner.py         # nightly entry orchestration
+```
+
+Reused as-is from existing stockey infrastructure — this is the entire
+reason this lives in stockey rather than a new repo:
+
+| Need | Existing module |
+|---|---|
+| Postgres upsert/retry | `utils/db.py` |
+| S3 blob storage | `utils/store.py` (new prefixes: `fundamentals/ocr/`, `fundamentals/filings/`) |
+| Browser automation / CDP | same Chrome CDP session `data/nseindia/*` already uses |
+| Cross-process rate limiting | `utils/nse_rate_limiter.py` — generalize to `utils/exchange_rate_limiter.py` (parameterized by domain) so BSE gets the same 1-request-floor + no-parallel discipline that just fixed the NSE Akamai block, not a copy-pasted second implementation |
+| OCR provider abstraction | `utils/ocr/llm_ocr.py` — already a pluggable `Provider` dispatch (openai/gemini/codex); add a `local` provider for GLM-OCR (§6, decided) — no redesign needed |
+| Fallback visibility | `utils/fallback_telemetry.py` — every degraded/failed fetch, every skipped enrichment, recorded the same way `data/` collectors already do it |
+| Run-state/status reporting | `STOCKEY_RUN_STATE` + accurate non-hardcoded `status`/exit-code convention (per the 2026-08-10 fix to the NSE collectors — apply from day one here, don't repeat that bug) |
+| Cron | Same `go-crond` instance, same `config/stockey.crontab.template` — decided 2026-08-10: one cron for stockey. A clearly-labeled `# ===== FUNDAMENTALS =====` block keeps it visually distinct, but no second file/instance |
+
+## 5. Security master — extend, don't rebuild
+
+`dim_security` already has `isin`, `symbol`, `bse_ticker`, `display_name`.
+`company_master` already links `dhan_bse_id`/`dhan_nse_id`/`bse_ticker`/
+`nse_ticker`. The source PRD's "Build order step 0" (half a day) is already
+~70% done. What's actually missing:
+
+1. Ingest `nsearchives.nseindia.com/content/equities/EQUITY_L.csv` (full
+   listed universe + ISIN) and reconcile against `dim_security` — this is
+   the explicit starting point you named. Flags any ISIN present in the CSV
+   but missing from `dim_security` (a coverage gap in the current identity
+   layer) rather than assuming it's already complete.
+2. Add a numeric **BSE scrip code** column (distinct from `bse_ticker`) —
+   BSE's APIs key on this, not the ticker. Backfill via the same
+   `getScripCode()`-style lookup `fundamental_basic_goal.md` §3.2 points at
+   (reference logic only, from `BennyThadikaran/BseIndiaApi`'s public
+   samples — no runtime dependency, per the source PRD's own instruction).
+
+No new `security_master` table — `dim_security`/`company_master` stay the
+one identity layer for the whole repo, fundamentals included.
+
+## 6. OCR pipeline
+
+**Decided 2026-08-10: GLM-OCR (0.9B params), self-hosted locally.** Fits
+alongside Postgres/Redis on this machine's 32GB RAM without contention.
+
+`utils/ocr/llm_ocr.py` already supports OpenAI/Gemini/Codex providers via a
+`Provider` literal + dispatch function — add `ocr_page_with_local(...)` /
+extend the `Provider` type the same way, no pipeline redesign needed. Two
+implementation decisions to make when this is actually built (not now):
+
+- **Serving mode**: run GLM-OCR as a small persistent local inference
+  server (HTTP, e.g. a lightweight FastAPI/vLLM/Ollama-style wrapper) that
+  the OCR pipeline calls per document, rather than loading the model
+  in-process per call. This is a daily batch job over a bounded set of
+  filings (per §2's "only OCR the specific types tied to L3's triggers"
+  discipline) — repeated model-load overhead would dominate runtime
+  otherwise. Exact serving stack is yours to set up per your note; the
+  pipeline only needs a stable local endpoint to call.
+- **Fallback behavior when the local service is down**: OCR failures must
+  follow the same visible-fallback discipline as every other stockey
+  collector (`utils/fallback_telemetry.py`) — a filing that fails OCR stays
+  in `enrichment_status=pending` (§7) and retries the next run, it never
+  silently drops or blocks the rest of that day's batch.
+
+Two-stage pipeline, not a choice between the two models: GLM-OCR (local)
+does image/PDF → raw text; `gpt-5.4-mini` (§3.2) then does raw text → typed
+structured fields (§3.1). GLM-OCR's own output is the *input* to structured
+extraction, not an alternative to it.
+
+Storage split (per your instruction):
+- Numeric/classification fields (extracted rating, debt quantum, shareholding
+  %, etc.) → Postgres, structured columns, versioned like everything else.
+- Raw OCR'd long-form text + the source filing (PDF/image) → S3, with the
+  Postgres row carrying only the S3 key + a short excerpt
+  (`BLOB_TEXT_EXCERPT_CHARS`, already in `.env.example` at 1200 chars) —
+  same pattern the deleted `announcement_pipeline_documents` table used
+  before it was removed for being fed by an unbounded general-ingestion
+  pipeline; the pattern itself was fine, the *scope* (§2) is what's fixed.
+
+## 7. Schema (draft — refine at implementation time, not now)
+
+- `security_master` extensions: `company_master.bse_scrip_code` (built here,
+  not on `dim_security` as originally planned), reconciliation flags from
+  the `EQUITY_L.csv` diff.
+- `fundamentals_events` — one normalized table, `source` as a column
+  (mirrors `fundamental_basic_goal.md` §4 exactly): dedupe on
+  `(isin, filing_type, disclosure_date, quantity)`, keep earliest
+  `announcement_timestamp` across BSE/NSE, `detection_source` +
+  `enrichment_status` (pending/fetched/failed) tracked separately so a
+  failed agency-site crawl never suppresses the underlying event.
+- `fundamentals_l1_universe` — append-only, one row per company per
+  quarterly refresh, plus `fundamentals_l1_rejections` (company, reason,
+  as-of date) — "log every rejection with reason" (§4 of the source PRD) is
+  not optional, it's what makes L1 backtestable-in-spirit later. **Honest
+  caveat from the crawl-time-filtering decision (§8 step 3)**: the
+  screener.in query itself doesn't hand back *why* a company it excluded
+  was excluded, only the ones it returned — full per-company rejection
+  reasons are only available for the smaller post-hoc pass (auditor/RPT)
+  applied to the query's output, not for the whole listed universe the
+  query silently narrowed. Store the query definition itself
+  (version + parameters) alongside each refresh so "why wasn't X in the
+  universe" is at least reconstructable from the query logic, even without
+  a per-company reason row for query-level exclusions.
+- `fundamentals_l2_state` — append-only, one row per company per
+  refresh/filing-triggered update, `state_vector_version` column.
+- `fundamentals_l3_alerts` — `origin` (`rule` | `llm_triage`), trigger type,
+  the L2 state snapshot it fired against, and for `llm_triage` rows: model,
+  prompt_version, evidence bundle reference.
+- `fundamentals_portfolio_position` (was `fundamentals_l4_thesis`, deleted
+  2026-09-04 with the human forecast — see `docs/PORTFOLIO_RULESET_PRD.md`)
+  — falsifiable prediction text, target date,
+  invalidation criteria, `origin_tag` (`systematic_screen` | `ad_hoc`),
+  signal_definition_version, resolution status + resolved-true/false +
+  resolution date (feeds the quarterly forecast-calibration scoring in §5
+  of the source PRD).
+
+## 8. Build order
+
+Concretizing `fundamental_basic_goal.md` §6 against what already exists:
+
+0. **Security master** (§5 above) — extend `dim_security`, not rebuild.
+   Smallest possible slice; validates nothing else depends on this being
+   perfect yet.
+1. **`utils/exchange_rate_limiter.py`** generalization from
+   `nse_rate_limiter.py` — needed before *any* BSE crawler exists, given
+   the 2026-08-09/10 NSE lesson. Cheap, and de-risks every collector after
+   it.
+2. **Deleveraging screen** — source PRD calls this "highest signal-to-effort,
+   ~90% screener-derivable, arithmetic mechanism" and explicitly the
+   pipeline-validation step. Build `fundamentals/collectors/screenerin.py`
+   scoped to only what this screen needs, not the full financials surface.
+   This is the first thing that should produce a real, inspectable output.
+   (Built 2026-08-10, scheduled 2026-08-14, retired 2026-08-15 -- its
+   output table had zero readers from the day it was scheduled. Validated
+   the pipeline as intended; `screenerin.py`'s shared screener.in scraping
+   infra it built stays, used by `l1_universe.py`/`l2_state.py` today.)
+3. **L1 universe filter — built as a screener.in custom query, not a
+   post-hoc SQL pass.** Decided 2026-08-10: filter at crawl time.
+   screener.in's query language can express most of the source PRD's L1
+   table directly (mcap band, liquidity floor, and derived ratios like cash
+   conversion/RoCE are exactly what that query language is for — see the
+   `ad_hoc_query` pattern already used elsewhere in this repo's history for
+   custom queries like `"Market capitalization > 500 AND ... Return on
+   capital employed > 22%"`). Two filters need checking rather than
+   assuming either way when this is actually built: **auditor changes** and
+   **contingent-liabilities/RPT-as-%-of-revenue** may not be pre-computed
+   ratios screener.in exposes as query fields — if not, those two stay a
+   smaller post-hoc pass over the query's *output* universe (still far
+   cheaper than filtering the full listed universe). "Every later signal is
+   worthless without this filter" (source PRD) — still true, just cheaper
+   to apply now.
+4. **L2 state store** — append-only, versioned, per §7.
+5. **L3 feeds, in this order**: BSE crawler first (primary per §3.2 of the
+   source PRD — no session/cookie gate, and covers BSE-only microcaps NSE
+   misses), NSE archive second (redundant, `nsearchives`-first), then rating
+   detection + enrichment (detection via exchange feed must be reliable;
+   enrichment via agency site may fail silently and retry tomorrow — do not
+   build seven robust agency crawlers, build one reliable detector). BSE's
+   own search filters (§3.2 of the source PRD's page list) scope these
+   crawls to the step-3 universe directly, same crawl-time-filtering
+   decision — no reason to pull PIT/SAST/announcement history for names L1
+   already excluded.
+6. **OCR + structured extraction** (§6) — wire in once L3 is producing real
+   filing references to OCR.
+7. **LLM triage** (§3.2) — deliberately *after* the rule-based L3 triggers
+   exist and are trusted; triage augments a working alert surface, it
+   doesn't bootstrap one.
+8. **L4 thesis register + quarterly forecast scoring.**
+9. Sector capital-cycle aggregation (source PRD step 6).
+10. *(Conditional, likely far out)* HS-code mapping table (source PRD step 7)
+    — "build after the strategy shows evidence of working, not to find out
+    whether it does."
+
+Each step should produce something inspectable before the next starts —
+the old system's failure mode was building interconnected pieces before any
+single one was validated end to end.
+
+## 9. `CLAUDE.md` boundary rewrite (do this alongside step 0, not after)
+
+Current text ("Stockey is a **pure data platform**... does no research,
+fundamental analysis...") becomes: stockey has two independent product
+lines — (1) the pure-TA data platform feeding systrader's systematic
+trading (unchanged, still governed by `docs/DATA_INVENTORY.md` and
+`DATA_CONTRACT.md`), and (2) this fundamental screener, governed by this
+document. Rule that survives from the old text unchanged: **the two must
+never be blended into one decision pipeline.** `fundamentals/` tables are
+never added to `DATA_CONTRACT.md`'s systrader-sync set.
+
+## 10. Explicitly not building (carried over from the source PRD §2, unchanged)
+
+- General BSE/NSE announcement classifier.
+- Concall transcript NLP.
+- HS-code → company mapping table (until the strategy shows evidence of
+  working).
+- Anything sub-daily.
+- (New, from this document) Any bridge/shared table between this screener
+  and systrader's decision pipeline.
+
+## 11. Decisions log
+
+All three open questions from the first draft resolved 2026-08-10 (folded
+into §1/§3/§4/§6/§8 above; kept here as a flat changelog for quick
+scanning):
+
+| Question | Decision |
+|---|---|
+| OCR provider | GLM-OCR (0.9B), self-hosted locally |
+| Structured-extraction model | `gpt-5.4-mini` (proposed default, not yet explicitly confirmed) |
+| Triage model | `gpt-5.4-mini` (confirmed) |
+| Crawl scope | Filter at crawl time (screener.in query language + BSE/NSE search filters), not filter-after-crawl |
+| Cron | Single shared `config/stockey.crontab.template`, labeled block — not a separate file |
+
+One item still genuinely open: whether extraction should use `gpt-5.4-mini`
+or something else — flagged in §3.1, not blocking.
+
+## 13. Portfolio ruleset (2026-09-04) — see docs/PORTFOLIO_RULESET_PRD.md
+
+§12 built a mechanical confluence score and stopped deliberately at "a richer READ for
+the human who still writes the L4 thesis by hand". The operator has since decided
+stockey should build and run the fundamental portfolio itself
+(`docs/PORTFOLIO_RULESET_PRD.md`, and the boundary revision in `CLAUDE.md`).
+
+That PRD reverses §1/§3.3's "no LLM makes a capital decision", narrowly and on purpose:
+an LLM authors versioned rules and may VETO an action the rules propose, but can never
+select a position the ruleset did not pass. §12's objection to holistic LLM buy calls is
+respected, not overturned — read that PRD's opening section before touching either.
+
+## 12. Confluence scoring & disciplined promotion (2026-08-29 addition)
+
+**Why**: the operator wants "more signals, better decision, better
+confidence" feeding whether a watchlist name is worth acting on — but NOT
+via an LLM synthesizing a lot of evidence into a holistic "invest" call, no
+matter how thorough. That's the same capital-decision-by-LLM pattern §1/§3.3
+already forbid, just with a richer prompt; a well-argued LLM thesis is
+*harder* to audit than a one-line news reaction, not easier, because it
+sounds more trustworthy without being any more falsifiable. Confidence has
+to come from something checkable after the fact, not from how convincing the
+LLM's prose reads.
+
+**The mechanism**: a *mechanical, versioned* confluence score — a count of
+independent evidence axes currently agreeing on a company, computed the same
+deterministic way every time, never an LLM holistic judgment. The count
+itself is what's falsifiable (unlike a "conviction score," which §11's own
+2026-08-15 entry and `l4_thesis_draft.py` already correctly refuse to build):
+you can go back and check whether high-confluence names resolved their L4
+theses true more often than low-confluence ones. The LLM's role does not
+change from §3 above — extraction, event-interest triage, and drafting the
+falsifiable prediction TEXT — it never assigns the score and never decides.
+
+Axes (first cut, each already backed by data this pipeline collects or is
+about to):
+1. Fundamentals trajectory — debt declining, CWIP converting to gross block,
+   interest coverage improving (`fundamentals_l2_state`).
+2. Event corroboration — does the firing L3 alert agree with L2 state
+   direction, or contradict it (already the rule for 3 of 12 trigger types;
+   this generalizes it into a count rather than a binary gate).
+3. Sector cycle phase — capacity discipline, not expansion
+   (`fundamentals_sector_cycle`).
+4. Ownership signal — institutional accumulation, promoter stake not
+   decreasing, pledge not rising, no recent insider/bulk-deal selling.
+5. Valuation vs. own history — cheap relative to itself, not just cheap in
+   absolute terms (`fundamentals_l2_state.valuation_vs_own_history_ratio`).
+
+**Build order** (each step should be independently inspectable before the
+next starts, same discipline as §8). **All 8 shipped 2026-08-29/30**, verified
+against the real DB and the live API/frontend, not just unit-tested:
+
+1. **DONE** — Revived the retired bulk/block-deal + short-selling collector
+   (`data/nseindia/offmarket.py`/`offmarket_parser.py`, deleted 2026-08-15 for
+   being broken — NSE download-trigger timeouts — not for being low-value).
+   Root cause fixed: the old downloader skipped the homepage-warmup
+   navigation every other nseindia collector does before a deep-page
+   `nse_goto`, and requested up to 365 days per CSV; now visits nseindia.com
+   first and caps blocks at `NSE_OFFMARKET_MAX_BLOCK_DAYS=30`. **Caveat**: the
+   actual NSE navigation path could not be live-smoke-tested this session — a
+   local Chrome/CDP connection attempt timed out (a shared-resource
+   contention issue, not a code error) — verify with a real
+   `python -m data.nseindia.offmarket` run before trusting it fully.
+2. **DONE** — `pledge_increase` L3 trigger, off a new
+   `compute_pledge_trend()` in `l2_state.py` (diffs against the last STORED
+   snapshot — screener.in has no pledge history of its own).
+3. **DONE** — `fundamentals/screens/deal_flow.py`: `bulk_deal_buy`/
+   `bulk_deal_sell` L3 triggers, always-alert (NSE's own disclosure threshold
+   is the size filter), investor tier folded into reasoning when known.
+   Deliberately does NOT claim promoter-specific detection (see that module's
+   docstring) or cover `short_selling` (anonymous aggregate, no client name).
+4. **DONE** — `fundamentals/screens/confluence_score.py`, 5 mechanical axes,
+   `fundamentals_confluence_score` table. Live-verified: 75/75 active
+   watchlist companies scored on first real run (0 crashed), confluence
+   counts spread 0-3 across real names.
+5. **DONE** — `INVALIDATING_TRIGGER_TYPES` widened:
+   `institutional_first_entry` now invalidated by `pledge_increase`/
+   `bulk_deal_sell`; `rating_confirms_deleveraging`/`results_confirm_turnaround`
+   by `pledge_increase`. `bulk_deal_sell` deliberately NOT added to
+   `insider_buy` (can't confirm the SAME named insider sold).
+6. **DONE** — score surfaced in `get_watchlist()`/`load_full_watchlist()` and
+   the `screener/` watchlist page (badge + min-confluence filter dropdown).
+   **Two live-production bugs found and fixed during verification, both the
+   same failure class as `_load_draft_theses_by_company`'s 2026-08-18 fix**:
+   (a) the new `LEFT JOIN LATERAL fundamentals_confluence_score` 500'd every
+   `/api/watchlist` request on this DB (`UndefinedTable` — the table had
+   never been written to yet); (b) `confluence_score.py`'s own L2 read then
+   hit `UndefinedColumn` on `pledge_pct_trend_direction` for the same
+   underlying reason. Both fixed with defensive `_ensure_*` calls before the
+   read, not just the write.
+7. **DONE** — `compute_quarterly_scoring()` now returns
+   `hit_rate_by_origin_tag`/`hit_rate_by_trigger_type`/
+   `hit_rate_by_confluence_count`, each entry `{"hit_rate": pct-or-None,
+   "count": n}` — `hit_rate` stays `None` below `MIN_SAMPLE_SIZE_FOR_BREAKDOWN`
+   (5) so a thin breakdown reads as visibly thin, never a fake percentage.
+8. **DONE** — `fundamentals/screens/l5_sizing.py` + `GET /api/watchlist/
+   {company_master_id}/sizing?total_capital_rs=...&target_position_count=...`
+   (both required, no server-side default). 404s without an OPEN L4 thesis;
+   sizes off `min(capital / target_position_count, ADV_pct_cap)` using
+   `avg_vol_1mth`/`cmp_rs` already sitting in L1's own `metrics_json` — no new
+   data source needed.
+
+**Frontend follow-up (2026-08-31)**: items 7 and 8 were backend-scoped by design and
+never claimed a UI — and none was built. `/api/watchlist/{id}/sizing` has zero
+frontend consumers, and `portfolio.vue` drops all three `hit_rate_by_*` breakdowns, so
+the operator can filter the watchlist by confluence but cannot see whether confluence
+predicts anything, and the funnel stops one call short of "how much to buy". Both are
+planned in `docs/FRONTEND_COMPLETION_PLAN.md` (Part A), which is blocked on there
+being at least one open L4 thesis to verify against (`total_theses` is currently 0).
+
+Not built (deliberately, see each item's own reasoning): a "results_on_time"
+reassurance trigger to pair with `results_delayed` (no such event exists in
+this taxonomy); a short-selling trigger (needs its own baseline/spike design,
+different kind of signal); the source spec's optional 200-DMA reclaim entry
+gate (a timing/entry rule, separate from sizing).
+
+**What this does not change**: §1's boundary (never merges with systrader's
+decision pipeline), §3.3's "no LLM makes a capital decision," and L4 staying
+a human act. A high confluence score makes a draft thesis fast to approve;
+it does not make the approval automatic.
+
+**2026-08-15 additions** (both user-requested, both bounded to a new table
+each — neither changes the §1 rule that L4 is a human act):
+
+| Question | Decision |
+|---|---|
+| L4 thesis drafting cadence | Daily, as part of the existing watchlist/email pipeline — but gated on the same `last_alert_at` staleness signal watch_summary already uses, not a fixed re-run of every company every day (no new evidence -> nothing to re-draft). `fundamentals/screens/l4_thesis_draft.py` writes only `fundamentals_l4_thesis_draft`, never `fundamentals_l4_thesis` — see that module's own docstring for the guardrail this preserves. |
+| L4 draft confidence score | 0–100, LLM-self-calibrated per prediction — scores the FORECAST ("will this specific prediction resolve true"), never the company or a buy/sell conviction. Surfaced in the daily digest email, clearly labeled candidate/not-saved. |
+| BSE-only-company price coverage | `data/bseindia/` (new package, pure-TA scope, not inside `fundamentals/`) — one market-wide bhavcopy CSV/day, reusing `data/nseindia/price_adjustment.py`'s price-step adjustment algorithm rather than a second implementation. Confirmed live 2026-08-15: 43 active L1-universe companies (not the earlier "10" estimate) have no NSE listing at all. |
+
+---
+
+Nothing above blocks starting. Step 0 (security master extension) and step
+1 (rate limiter generalization) can begin immediately.
+
+## 14. What each L1 filter costs in names (TODO B0, measured 2026-09-24)
+
+The L1 screen (`fundamentals/screens/l1_universe.py`, `L1_QUERY`, screener.in), one
+clause per line:
+
+```
+Market Capitalization > 100 AND
+Market Capitalization < 5000 AND
+Volume 1month average * Current Price > 1000000 AND
+FII holding + DII holding < 20 AND
+Number of Shareholders < 50000 AND
+(Cash from operations last year + Cash from operations preceding year) /
+  (Operating profit last year + Operating profit preceding year) >= 0.6 AND
+Debtor days <= Debtor days 3years back AND
+Contingent liabilities / Net worth < 0.25
+```
+
+Survivors with each clause dropped in turn, same session, 2026-09-24 ~19:45 UTC. Counts
+are the screen's own, before the post-hoc auditor-change/RPT exclusion (that night's L1
+kept 192 of 196). Filters overlap, so the "added" column does not sum.
+
+| variant | survivors | vs baseline |
+|---|---:|---:|
+| baseline (all eight clauses) | 196 | |
+| drop market cap > Rs 100 cr | 219 | +23 |
+| drop market cap < Rs 5,000 cr | 208 | +12 |
+| drop both market-cap bounds | 231 | +35 |
+| drop liquidity > Rs 10 L/day | 282 | +86 |
+| drop FII + DII < 20% | 207 | +11 |
+| drop shareholders < 50,000 | 277 | +81 |
+| drop cash conversion >= 0.6 | 438 | +242 |
+| drop debtor days <= 3 years ago | 466 | +270 |
+| drop contingent liabilities < 25% of net worth | 208 | +12 |
+
+B2 (liquidity floor, all other clauses kept) and B3 (ceiling):
+
+| variant | survivors |
+|---|---:|
+| liquidity > Rs 1 cr/day | 76 |
+| liquidity > Rs 5 cr/day | 22 |
+| liquidity > Rs 10 cr/day (systrader's floor) | 11 |
+| market cap < Rs 10,000 cr | 204 |
+| market cap < Rs 25,000 cr | 206 |
+| market cap < Rs 50,000 cr | 208 |
+| market cap < Rs 50,000 cr AND no FII+DII or shareholder cap | 441 |
+
+What it says:
+
+- **The two quality clauses bind hardest.** Cash conversion and debtor days each more
+  than double the list when dropped. They are the screen's real selectivity.
+- **Raising the market-cap ceiling alone does almost nothing** (+12 even at Rs 50,000 cr):
+  the neglect clauses already exclude larger companies, the shareholder cap above all
+  (+81 when dropped). Widening the universe (B3) is a decision about the neglect
+  clauses, not the ceiling: ceiling and both neglect clauses together give 441.
+- **Liquidity is the constraint on anything tradeable at size.** At Rs 1 cr/day the list
+  falls from 196 to 76; at systrader's Rs 10 cr floor, 11 names survive. B2's choice
+  is a choice about how many names the portfolio can hold.

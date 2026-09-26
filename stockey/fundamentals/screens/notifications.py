@@ -1,0 +1,767 @@
+"""Watchlist email notifications -- fundamental screener step 12, closing out the
+watchlist pipeline started by fundamentals/screens/watchlist.py (step 10),
+fundamentals/screens/watch_summary.py (step 11), and fundamentals/screens/
+l4_thesis_draft.py (step 11.5, added 2026-08-15 at the user's request to make L4
+thesis-drafting part of the daily run and its own email).
+
+RETIRED 2026-09-07: this module no longer sends mail. The outbound email is
+fundamentals/screens/portfolio_notify.py (entries and exits only), sent at the end of the
+portfolio chain. Everything else here still runs nightly and feeds the screener UI.
+
+send_daily_digest() is retained, working and tested -- it sends exactly one consolidated
+email per call, listing
+the ENTIRE active watchlist regardless of whether anything changed today -- a
+standing end-of-day summary, not a per-change alert. (Until 2026-08-14 this module
+also sent a separate email per new-candidate/narrative-change event via
+notify_watchlist_events(); removed at the user's request so a run producing several
+watchlist changes sends one digest, not a burst of individual emails.) Rendered as
+an HTML table + narrative section + draft-theses section (2026-08-12, "more like a
+dashboard than a textual email" per the user) -- a plain-text part is always included
+alongside it as the universal fallback every client falls back to when HTML rendering
+is off, per RFC 2046's multipart/alternative convention.
+
+The draft-theses section is clearly labeled CANDIDATE / NOT SAVED throughout (in both
+the HTML and plain-text bodies) -- l4_thesis_draft.py never writes fundamentals_l4_
+thesis, and this email never implies it did. See that module's own docstring for the
+full guardrail rationale; this module just renders what it already wrote.
+
+SAFETY: sending is OFF by default (WATCHLIST_ALERT_EMAIL_ENABLED, unset/false).
+Turning it on requires WATCHLIST_ALERT_EMAIL_FROM and WATCHLIST_ALERT_EMAIL_TO to be
+set, and the sender identity must be verified in AWS SES (and the account out of SES
+sandbox mode, or every recipient also verified) before anything actually delivers --
+this module does not attempt to verify that state itself, it will simply fail loudly
+(fallback-recorded, not silently swallowed) if SES rejects the send. Confirmed live
+2026-08-12 against a real SES send once japlin.com's domain identity + IAM send
+permissions were set up.
+
+WATCHLIST_ALERT_EMAIL_TO holds one or more addresses separated by whitespace (env
+vars can't hold a list, and SES's own SendEmail already accepts multiple recipients)
+-- _parse_recipients() splits it. send_email() puts these addresses in Bcc (not To,
+per the 2026-08-14 privacy fix -- multiple real people are configured here and
+shouldn't see each other's addresses); WATCHLIST_ALERT_EMAIL_FROM is used as both the
+Source and the (self-addressed) To, since a valid message needs a To header.
+
+run_watchlist_notification_pipeline() is the single daily entrypoint chaining all
+four steps (sync watchlist -> regenerate stale narratives -> evaluate exits -> send
+the daily digest) so cron/manual invocation is one command, matching how the rest of
+this fundamentals screener is run step-by-step
+(`python -m fundamentals.screens.<module>`)."""
+
+from __future__ import annotations
+
+import html
+import json
+
+import boto3
+import pandas as pd
+from environs import Env
+
+from fundamentals.screens.confluence_score import _ensure_confluence_score_table
+from fundamentals.screens.l4_thesis_draft import load_current_drafts_by_company, run_l4_thesis_drafting
+from fundamentals.screens.signal_pointers import load_satisfied_strategies_by_company
+from fundamentals.screens.watch_summary import run_watch_summary_refresh
+from fundamentals.screens.watchlist import sync_watchlist_from_alerts
+from fundamentals.screens.watchlist_exit import run_watchlist_exit_evaluation
+from utils.db import sql_to_df
+from utils.fallback_telemetry import record_local_fallback_event
+
+env = Env()
+env.read_env()
+
+SYNC_SOURCE_NAME = "fundamentals.screens.notifications"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+WATCHLIST_ALERT_EMAIL_ENABLED = env.bool("WATCHLIST_ALERT_EMAIL_ENABLED", False)
+WATCHLIST_ALERT_EMAIL_FROM = env.str("WATCHLIST_ALERT_EMAIL_FROM", "")
+# One or more addresses separated by whitespace -- see module docstring.
+WATCHLIST_ALERT_EMAIL_TO = env.str("WATCHLIST_ALERT_EMAIL_TO", "")
+AWS_REGION = env.str("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = env.str("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = env.str("AWS_SECRET_ACCESS_KEY", "")
+
+
+def _parse_recipients(value: str) -> list[str]:
+    return [addr for addr in (value or "").split() if addr]
+
+
+_SES_CLIENT: "boto3.client | None" = None  # cache, same pattern as utils/store.py's S3 client
+
+
+def _get_ses_client():
+    global _SES_CLIENT
+    if _SES_CLIENT is None:
+        _SES_CLIENT = boto3.client(
+            "ses",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )
+    return _SES_CLIENT
+
+
+def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = "warn", metadata=None) -> None:
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        source="ses",
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
+def send_email(subject: str, text_body: str, html_body: str | None = None) -> dict | None:
+    """Sends via SES to every address in WATCHLIST_ALERT_EMAIL_TO, as Bcc -- recipients
+    don't see each other's addresses (2026-08-14; multiple real people are configured
+    here). Source doubles as the To: address (a valid RFC 5322 message needs one, and
+    a self-addressed To reads better than an empty one) -- the actual recipients only
+    ever appear in Bcc. Always includes a plain-text part (universal fallback);
+    html_body, when given, is attached alongside it as the primary rendering most
+    clients show (multipart/alternative, per RFC 2046 -- a client picks whichever part
+    it can render best, never both). Returns None (not an error) if sending is
+    disabled -- callers that need to distinguish "disabled" from "sent" should check
+    WATCHLIST_ALERT_EMAIL_ENABLED themselves, same as send_daily_digest does."""
+    if not WATCHLIST_ALERT_EMAIL_ENABLED:
+        return None
+    client = _get_ses_client()
+    body: dict = {"Text": {"Data": text_body, "Charset": "UTF-8"}}
+    if html_body:
+        body["Html"] = {"Data": html_body, "Charset": "UTF-8"}
+    return client.send_email(
+        Source=WATCHLIST_ALERT_EMAIL_FROM,
+        Destination={
+            "ToAddresses": [WATCHLIST_ALERT_EMAIL_FROM],
+            "BccAddresses": _parse_recipients(WATCHLIST_ALERT_EMAIL_TO),
+        },
+        Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": body},
+    )
+
+
+def load_full_watchlist() -> list[dict]:
+    """Every ACTIVE watchlist row (2026-08-13: status='active' filter -- the daily
+    digest is "here's your current watchlist", the exact place the "crowding"
+    complaint this feature fixes was actually about; stale/invalidated/price_flagged
+    companies stay fully queryable, just not in this standing summary), company name
+    joined from the latest L1 universe run, current_price from the latest
+    technicals run, and confluence_count/contradicting_count/evaluable_count from
+    the latest confluence_score run (same three joins fundamentals/api/queries.py's
+    get_watchlist() does, kept as their own small query here rather than importing
+    the API layer -- screens/ modules stay independent of api/, not the other way
+    around).
+
+    BUG FOUND LIVE 2026-08-29: same UndefinedTable crash as fundamentals/api/
+    queries.py's get_watchlist() -- see that function's own docstring for the
+    fix (_ensure_confluence_score_table() called defensively first, same
+    established pattern as _ensure_draft_table())."""
+    _ensure_confluence_score_table()
+    df = sql_to_df(
+        """
+        SELECT w.company_master_id, w.first_seen_at, w.first_seen_price, w.last_alert_at,
+               w.alert_count, w.narrative_text, w.suggested_watch_until, l1.company_name,
+               tech.close AS current_price, tech.price_data_stale, tech.as_of_date AS current_price_as_of,
+               conf.confluence_count, conf.contradicting_count, conf.evaluable_count
+        FROM fundamentals_watchlist w
+        LEFT JOIN LATERAL (
+            SELECT company_name FROM fundamentals_l1_universe
+            WHERE ticker IN (
+                -- Through company_master, not string surgery (2026-09-23 audit): the id's
+                -- suffix is not the L1 slug for BSE-only names ('nse:543531-BOM' vs
+                -- '543531') or NSE names whose slug is a BSE code (ALUFLUOR = 524634),
+                -- so ~22 percent of the watchlist showed no company name.
+                SELECT cm.nse_ticker FROM company_master cm WHERE cm.company_master_id = w.company_master_id
+                UNION SELECT cm.bse_scrip_code FROM company_master cm WHERE cm.company_master_id = w.company_master_id
+                UNION SELECT REPLACE(w.company_master_id, 'nse:', ''))
+            ORDER BY run_date DESC LIMIT 1
+        ) l1 ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT close, price_data_stale, as_of_date FROM fundamentals_technicals
+            WHERE company_master_id = w.company_master_id
+            ORDER BY run_date DESC LIMIT 1
+        ) tech ON TRUE
+        LEFT JOIN LATERAL (
+            -- PRD §12 todo #6 (2026-08-29) -- same third join fundamentals/api/
+            -- queries.py's get_watchlist() has, kept in sync per this function's
+            -- own "same two joins" convention (now three). Not yet rendered in the
+            -- digest body itself (see this module's docstring) -- available on the
+            -- row for a future enhancement, same staged approach the draft L4
+            -- thesis confidence score used before it got its own digest column.
+            SELECT confluence_count, contradicting_count, evaluable_count
+            FROM fundamentals_confluence_score
+            WHERE company_master_id = w.company_master_id
+            ORDER BY run_date DESC, score_version DESC LIMIT 1
+        ) conf ON TRUE
+        WHERE w.status = 'active'
+        ORDER BY w.last_alert_at DESC NULLS LAST
+        """
+    )
+    rows = df.to_dict("records") if not df.empty else []
+    if not rows:
+        return rows
+
+    # 2026-08-13: strategies per row -- was previously just a bare alert_count in the
+    # digest table, same gap fixed on the API's get_watchlist(). load_satisfied_
+    # strategies_by_company() is a screens/-level shared helper (not imported from
+    # api/queries.py, keeping the "screens/ stays independent of api/" direction).
+    strategies_by_company = load_satisfied_strategies_by_company()
+    drafts_by_company = load_current_drafts_by_company()
+    for row in rows:
+        row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
+        row["draft_thesis"] = drafts_by_company.get(row["company_master_id"])
+    return rows
+
+
+def load_portfolio_positions() -> list[dict]:
+    """Open positions from the machine portfolio (docs/PORTFOLIO_RULESET_PRD.md).
+
+    Accepted and vetoed are both returned, because the vetoed names are the control arm:
+    a digest that showed only what was taken would quietly hide the half of the record
+    that says whether the adjudicator's veto is worth anything.
+
+    Read-only, and it never raises into the digest: a portfolio that cannot be read must
+    degrade to "no portfolio section", not lose the watchlist email that has been arriving
+    every day. The caller treats [] as "nothing to show".
+    """
+    try:
+        from fundamentals.screens.portfolio_adjudicator import _ensure_tables
+
+        _ensure_tables()
+        df = sql_to_df(
+            """
+            SELECT p.ticker, p.company_master_id, p.entry_decision, p.kind,
+                   p.opened_at, p.entry_price, p.stop_pct, p.target_date,
+                   p.prediction_text, p.adjudicator_reason, p.position_size_rs,
+                   p.metric_name, p.metric_operator, p.metric_threshold,
+                   (SELECT a.adj_close FROM advisory_adjusted_ohlcv_daily a
+                     WHERE a.symbol = p.ticker
+                       AND a.date >= now() - make_interval(days => 90)
+                     ORDER BY a.date DESC LIMIT 1) AS current_price
+              FROM fundamentals_portfolio_position p
+             WHERE p.status = 'open'
+             ORDER BY (p.entry_decision = 'accept') DESC, p.opened_at DESC
+            """
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        _record_fallback(
+            "watchlist_digest_portfolio_unavailable",
+            reason="Daily digest could not read the machine portfolio; digest sent without it.",
+            error=exc,
+        )
+        return []
+    return [] if df.empty else df.to_dict("records")
+
+
+def _room_to_stop_pct(entry_price, stop_pct, current_price):
+    """How much of the stop distance is left, as a percentage. 100 = just entered,
+    0 = at the stop. None when it cannot be computed -- never a guessed 100."""
+    try:
+        entry, stop, last = float(entry_price), float(stop_pct), float(current_price)
+    except (TypeError, ValueError):
+        return None
+    stop_level = entry * (1 - stop / 100.0)
+    distance = entry - stop_level
+    if distance <= 0:
+        return None
+    return max(0.0, min(100.0, (last - stop_level) / distance * 100.0))
+
+
+def build_portfolio_section(positions: list[dict]) -> tuple[str, list[str]]:
+    """(html, text_lines) for the portfolio block. ('', []) when there is nothing."""
+    if not positions:
+        return "", []
+
+    accepted = [p for p in positions if p.get("entry_decision") != "reject"]
+    vetoed = [p for p in positions if p.get("entry_decision") == "reject"]
+    committed = sum(float(p.get("position_size_rs") or 0) for p in accepted)
+    # 'real' is the only kind that risks money; record-only mode writes everything as
+    # 'shadow'. Stating this in the email matters more than anywhere else -- an emailed
+    # list of holdings reads as real unless it says otherwise.
+    is_live = any(p.get("kind") == "real" for p in accepted)
+    mode_label = "LIVE" if is_live else "RECORD-ONLY (no money committed)"
+
+    rows_html, text_lines = [], []
+    text_lines.append(
+        f"\nPORTFOLIO -- {mode_label}: {len(accepted)} position(s), "
+        f"Rs {committed:,.0f} notional, {len(vetoed)} vetoed by the adjudicator."
+    )
+    for p in accepted:
+        room = _room_to_stop_pct(p.get("entry_price"), p.get("stop_pct"), p.get("current_price"))
+        room_txt = "-" if room is None else f"{room:.0f}% of stop left"
+        rule = ""
+        if p.get("metric_name"):
+            rule = f"{p['metric_name']} {p.get('metric_operator')} {p.get('metric_threshold')}"
+        text_lines.append(
+            f"  {p['ticker']}: {_fmt_plain(_fmt_price(p.get('entry_price')))} -> "
+            f"{_fmt_plain(_fmt_price(p.get('current_price')))} | stop {_fmt_plain(p.get('stop_pct'))}% "
+            f"({room_txt}) | target {_fmt_plain(p.get('target_date'))}"
+        )
+        if p.get("prediction_text"):
+            text_lines.append(f"      thesis: {p['prediction_text']}")
+        if rule:
+            text_lines.append(f"      resolves on: {rule}")
+
+        tone = "neg" if (room is not None and room <= 25) else ("mid" if (room is not None and room <= 60) else "pos")
+        rows_html.append(
+            "<tr>"
+            f"<td><strong>{html.escape(str(p['ticker']))}</strong></td>"
+            f"<td>{html.escape(_fmt_price(p.get('entry_price')))} &rarr; "
+            f"{html.escape(_fmt_price(p.get('current_price')))}</td>"
+            f"<td>{html.escape(_fmt_plain(p.get('stop_pct')))}% "
+            f'<span class="{tone}">({html.escape(room_txt)})</span></td>'
+            f"<td>{html.escape(_fmt_plain(p.get('target_date')))}</td>"
+            f'<td class="thesis-cell">{html.escape(str(p.get("prediction_text") or "-"))}'
+            + (f'<div class="thesis-rule">resolves on: {html.escape(rule)}</div>' if rule else "")
+            + "</td></tr>"
+        )
+
+    veto_html = ""
+    if vetoed:
+        blocks = "".join(
+            f'<div class="veto-block"><span class="veto-ticker">{html.escape(str(v["ticker"]))}</span>'
+            f'<div class="veto-reason">{html.escape(str(v.get("adjudicator_reason") or "-"))}</div></div>'
+            for v in vetoed
+        )
+        veto_html = (
+            '<div class="card"><h1>Vetoed by the adjudicator</h1>'
+            '<div class="draft-banner">The mechanical rule passed these and the LLM rejected them. '
+            "They are tracked as if taken, so the veto itself can be scored: if the vetoed names "
+            "outperform the accepted ones, the veto layer is costing money.</div>"
+            f"{blocks}</div>"
+        )
+        text_lines.append(f"\n  Vetoed ({len(vetoed)}): " + ", ".join(str(v["ticker"]) for v in vetoed))
+
+    banner = (
+        "" if is_live else
+        '<div class="draft-banner">RECORD-ONLY &mdash; no money is committed. Every row is a '
+        "recorded decision, sized as it would be if it were real.</div>"
+    )
+    portfolio_html = (
+        '<div class="card"><h1>Portfolio</h1>'
+        f'<p class="sub">{len(accepted)} position(s) &middot; Rs {committed:,.0f} notional &middot; '
+        f"{len(vetoed)} vetoed</p>{banner}"
+        "<table><tr><th>Ticker</th><th>Entry &rarr; Today</th><th>Stop</th>"
+        f"<th>Target</th><th>Thesis</th></tr>{''.join(rows_html)}</table></div>{veto_html}"
+    )
+    return portfolio_html, text_lines
+
+
+def _fmt_price(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "n/a"
+    return f"Rs.{value:,.2f}"
+
+
+def _fmt_plain(value) -> str:
+    return "n/a" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+
+
+def _price_change_pct(first_seen_price, current_price) -> float | None:
+    """Shared by both the HTML and plain-text renderers -- BUG FOUND LIVE
+    2026-08-17: plain-text used to print only the two raw prices with no pct change
+    at all, an inconsistency with the HTML table cell right next to it (which always
+    computed one). Factored out so the two bodies can't silently re-diverge again."""
+    if first_seen_price is None or current_price is None or pd.isna(first_seen_price) or pd.isna(current_price) or first_seen_price == 0:
+        return None
+    return (current_price - first_seen_price) / first_seen_price * 100
+
+
+def _no_move_data_yet(first_seen_at, current_price_as_of) -> bool:
+    """BUG FOUND LIVE 2026-08-26: DBCORP showed "Rs.206.80 -> Rs.206.80 (+0.0%)"
+    -- a real, false "no move" reading, not the >7-day staleness
+    price_data_stale already guards against. Root cause: advisory_adjusted_
+    ohlcv_daily always runs a trading day behind nseindia_ohlcv (NSE's bhavcopy
+    for day D isn't published in time for the same evening's adjustment job),
+    a routine ~1-day lag that's invisible below STALE_PRICE_THRESHOLD_DAYS. It
+    only becomes misleading when a company's first_seen_at happens to equal the
+    latest available adjusted-price date -- entry price and "current" price
+    then resolve to the literal same row, so the digest reports a confident
+    "+0.0%" when in fact there has been zero fresh data to compare against yet."""
+    if first_seen_at is None or current_price_as_of is None or pd.isna(first_seen_at) or pd.isna(current_price_as_of):
+        return False
+    return pd.Timestamp(current_price_as_of).date() == pd.Timestamp(first_seen_at).date()
+
+
+def _price_change_cell_html(
+    first_seen_price, current_price, *, price_data_stale: bool = False, first_seen_at=None, current_price_as_of=None
+) -> str:
+    from_str = _fmt_price(first_seen_price)
+    to_str = _fmt_price(current_price)
+    # BUG FOUND LIVE 2026-08-18 (re-audit): watchlist_exit.py was fixed on
+    # 2026-08-15 to refuse judging a price move when price_data_stale is set (a
+    # stale current_price anchored to an old value makes a real move look like
+    # ~0% change, masking exactly the "look again" signal this exists to raise) --
+    # that fix stopped at the status-evaluation layer. This digest column is
+    # literally labeled "Entry -> Today's close" and rendered the raw stale close
+    # at face value with no indication it wasn't actually today's. Confirmed live:
+    # a real watchlist company showed "+66.1%" off a close that was 3.6 months old.
+    if price_data_stale:
+        return f'{from_str} &rarr; {to_str} <span class="stale">(stale price)</span>'
+    if _no_move_data_yet(first_seen_at, current_price_as_of):
+        return f'{from_str} &rarr; {to_str} <span class="stale">(no fresh price yet)</span>'
+    pct = _price_change_pct(first_seen_price, current_price)
+    if pct is None:
+        return f"{from_str} &rarr; {to_str}"
+    css_class = "pos" if pct >= 0 else "neg"
+    sign = "+" if pct >= 0 else ""
+    return f'{from_str} &rarr; {to_str} <span class="{css_class}">({sign}{pct:.1f}%)</span>'
+
+
+def _price_change_text(
+    first_seen_price, current_price, *, price_data_stale: bool = False, first_seen_at=None, current_price_as_of=None
+) -> str:
+    from_str = _fmt_price(first_seen_price)
+    to_str = _fmt_price(current_price)
+    if price_data_stale:
+        return f"{from_str} -> {to_str} (stale price, not a real move)"
+    if _no_move_data_yet(first_seen_at, current_price_as_of):
+        return f"{from_str} -> {to_str} (no fresh price yet, not a real move)"
+    pct = _price_change_pct(first_seen_price, current_price)
+    if pct is None:
+        return f"{from_str} -> {to_str}"
+    sign = "+" if pct >= 0 else ""
+    return f"{from_str} -> {to_str} ({sign}{pct:.1f}%)"
+
+
+def _confidence_label(confidence_score) -> str:
+    """Shared by both renderers -- BUG FOUND LIVE 2026-08-17: the HTML side already
+    guarded a null confidence_score ("n/a"), but the plain-text side interpolated it
+    directly, so a draft with no score printed the literal string "confidence
+    None/100" instead."""
+    if confidence_score is None or (isinstance(confidence_score, float) and pd.isna(confidence_score)):
+        return "n/a"
+    return f"{confidence_score}/100"
+
+
+_DIGEST_HTML_STYLE = (
+    "body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;background:#f8fafc;color:#0f172a;margin:0;padding:24px}"
+    ".card{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:20px;margin-bottom:16px}"
+    "table{width:100%;border-collapse:collapse;font-size:14px}"
+    "th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#64748b;border-bottom:1px solid #e2e8f0;padding:8px 10px}"
+    "td{padding:10px;border-bottom:1px solid #f1f5f9;vertical-align:top}"
+    "tr:last-child td{border-bottom:none}"
+    ".pos{color:#059669;font-weight:600}"
+    ".neg{color:#dc2626;font-weight:600}"
+    ".stale{color:#94a3b8;font-style:italic}"
+    ".badge{display:inline-block;background:#f1f5f9;color:#475569;border-radius:999px;padding:2px 8px;font-size:11px;white-space:nowrap}"
+    ".narrative-block{padding:14px 0;border-bottom:1px solid #f1f5f9}"
+    ".narrative-block:last-child{border-bottom:none}"
+    ".narrative-ticker{font-weight:600;font-size:14px}"
+    ".narrative-text{font-size:13px;color:#334155;margin-top:4px}"
+    "h1{font-size:18px;margin:0 0 4px}"
+    ".sub{color:#64748b;font-size:13px;margin:0 0 4px}"
+    ".footer{color:#94a3b8;font-size:12px;margin-top:8px}"
+    ".strategy-badge{display:inline-block;background:#eef2ff;color:#4338ca;border-radius:999px;padding:1px 7px;font-size:10px;margin:2px 4px 0 0;white-space:nowrap}"
+    ".mid{color:#d97706;font-weight:600}"
+    ".thesis-cell{font-size:12px;color:#334155;max-width:340px}"
+    ".thesis-rule{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#64748b;margin-top:3px}"
+    ".veto-block{padding:10px 0;border-bottom:1px solid #f1f5f9}"
+    ".veto-block:last-child{border-bottom:none}"
+    ".veto-ticker{font-weight:600;font-size:13px}"
+    ".veto-reason{font-size:12px;color:#334155;margin-top:3px}"
+    ".draft-banner{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:8px 12px;font-size:12px;margin:0 0 14px}"
+    ".draft-block{padding:14px 0;border-bottom:1px solid #f1f5f9}"
+    ".draft-block:last-child{border-bottom:none}"
+    ".draft-ticker{font-weight:600;font-size:14px}"
+    ".draft-confidence{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600;margin-left:8px}"
+    ".draft-confidence.high{background:#dcfce7;color:#166534}"
+    ".draft-confidence.mid{background:#fef3c7;color:#92400e}"
+    ".draft-confidence.low{background:#fee2e2;color:#991b1b}"
+    ".draft-prediction{font-size:13px;color:#0f172a;margin-top:6px}"
+    ".draft-meta{font-size:12px;color:#64748b;margin-top:4px}"
+    ".draft-rationale{font-size:12px;color:#334155;margin-top:6px}"
+    ".draft-invalidation{font-size:12px;color:#94a3b8;margin-top:4px;font-style:italic}"
+)
+
+# Mirrors the frontend's STRATEGY_LABELS map (screener/app/utils/strategyLabels.ts) --
+# 2026-08-13, same gap fix as get_watchlist()'s "strategies" field: the digest table
+# only ever showed a bare alert_count, no indication of WHICH strategies. Falls back
+# to the raw trigger_type for anything not listed here so a new trigger_type never
+# needs a code deploy before it shows up in the email.
+STRATEGY_LABELS = {
+    "rating_downgrade": "Rating downgrade",
+    "rating_confirms_deleveraging": "Rating confirms deleveraging",
+    "insider_buy": "Insider buy",
+    "insider_sell_surprise": "Insider sell (surprise)",
+    "capital_raise": "Capital raise",
+    "institutional_first_entry": "First institutional entry",
+    "llm_flagged": "LLM-flagged",
+    # Added 2026-08-13 alongside the L3 results trigger + auditor_change/RPT gap fix
+    # -- these existed for a full test-suite cycle before being added here, same
+    # oversight this whole audit pass was checking for.
+    "results_decline": "Results decline",
+    "results_confirm_turnaround": "Results confirm turnaround",
+    "results_delayed": "Results delayed",
+    "auditor_change": "Auditor change",
+    "related_party_transaction": "Related-party transaction",
+    # Added 2026-09-23 (data audit) -- fired but rendered as raw names.
+    "pledge_increase": "Promoter pledge increase",
+    "bulk_deal_buy": "Bulk/block deal buy (net)",
+    "bulk_deal_sell": "Bulk/block deal sell (net)",
+}
+
+
+def _strategy_label(trigger_type: str) -> str:
+    return STRATEGY_LABELS.get(trigger_type, trigger_type)
+
+
+def _confidence_css_class(confidence_score) -> str:
+    if confidence_score is None or (isinstance(confidence_score, float) and pd.isna(confidence_score)):
+        return "mid"
+    if confidence_score >= 66:
+        return "high"
+    if confidence_score >= 33:
+        return "mid"
+    return "low"
+
+
+def build_daily_digest_content(watchlist_rows: list[dict], portfolio_rows: list[dict] | None = None) -> tuple[str, str, str]:
+    """Returns (subject, text_body, html_body). HTML is the primary rendering -- a
+    compact table (watching-since, entry-vs-today's-close, event count, watch-until)
+    plus a per-company narrative section below it -- the plain-text part is the
+    universal fallback every client falls back to when HTML rendering is off."""
+    today = pd.Timestamp.now(tz="UTC").date()
+    portfolio_html, portfolio_text = build_portfolio_section(portfolio_rows or [])
+
+    if not watchlist_rows:
+        subject = "[Watchlist] Daily digest -- nothing on the watchlist"
+        text_body = "No companies are on the watchlist yet."
+        if portfolio_text:
+            # The portfolio is independent of the watchlist: positions stay open after a
+            # name leaves the watchlist, so an empty watchlist must not swallow the book.
+            text_body = "\n".join([text_body, *portfolio_text])
+        html_body = (
+            f"<html><head><meta charset=\"utf-8\"><style>{_DIGEST_HTML_STYLE}</style></head>"
+            f"<body><div class=\"card\"><p>No companies are on the watchlist yet.</p></div>"
+            f"{portfolio_html}</body></html>"
+        )
+        return subject, text_body, html_body
+
+    n_open = len([p for p in (portfolio_rows or []) if p.get("entry_decision") != "reject"])
+    subject = (f"[Watchlist] Daily digest -- {len(watchlist_rows)} companies"
+               + (f", {n_open} positions" if n_open else ""))
+    text_lines = [f"{len(watchlist_rows)} companies on the watchlist as of {today}. One consolidated summary, not a change alert.\n"]
+    table_rows_html = []
+    narrative_blocks_html = []
+    draft_blocks_html = []
+
+    for row in watchlist_rows:
+        ticker = str(row["company_master_id"]).removeprefix("nse:")
+        company_name = row.get("company_name") or "name unknown"
+        narrative = row.get("narrative_text") or "(narrative not generated yet)"
+        strategies = row.get("strategies") or []
+        draft = row.get("draft_thesis")
+
+        price_data_stale = bool(row.get("price_data_stale"))
+        text_lines.append(f"--- {ticker} ({company_name}) ---")
+        text_lines.append(
+            f"Watching since {_fmt_plain(row.get('first_seen_at'))} at "
+            f"{_price_change_text(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale, first_seen_at=row.get('first_seen_at'), current_price_as_of=row.get('current_price_as_of'))} "
+            f"today -- {row.get('alert_count') or 0} event(s)."
+        )
+        if strategies:
+            text_lines.append(f"Strategies: {', '.join(_strategy_label(s) for s in strategies)}")
+        text_lines.append(str(narrative))
+        if row.get("suggested_watch_until"):
+            text_lines.append(f"Suggested watch until: {row['suggested_watch_until']}")
+        if draft:
+            # BUG FOUND LIVE 2026-08-18 (re-audit): dbd861c routed confidence_score
+            # through the new null-safe _confidence_label() helper on this same line
+            # but left prediction_text/target_date interpolated raw -- a draft with
+            # either field null (schema allows it; nothing enforces non-null before
+            # this render) printed the literal string "None (by None)" instead of
+            # the "n/a" every other field on this digest already falls back to.
+            text_lines.append(
+                f"[CANDIDATE NOTE, not a position, confidence {_confidence_label(draft.get('confidence_score'))}] "
+                f"{_fmt_plain(draft.get('prediction_text'))} (by {_fmt_plain(draft.get('target_date'))})"
+            )
+            text_lines.append(f"  Rationale: {_fmt_plain(draft.get('rationale'))}")
+            text_lines.append(f"  Invalidation: {_fmt_plain(draft.get('invalidation_criteria'))}")
+            # BUG FOUND LIVE 2026-08-18 (re-audit): generated_at is already selected
+            # by load_current_drafts_by_company()'s SELECT d.* but was never rendered
+            # anywhere -- a draft is emailed in every digest until a human commits or
+            # discards it (never auto-expires, see module docstring), so with no age
+            # shown a week-old un-reviewed draft looked identical to a fresh one.
+            text_lines.append(f"  Drafted: {_fmt_plain(draft.get('generated_at'))}")
+        text_lines.append("")
+
+        strategy_badges_html = "".join(f'<span class="strategy-badge">{html.escape(_strategy_label(s))}</span>' for s in strategies)
+        table_rows_html.append(
+            "<tr>"
+            f'<td><strong>{html.escape(ticker)}</strong><br>'
+            f'<span style="color:#64748b;font-size:12px">{html.escape(company_name)}</span>'
+            f'<div>{strategy_badges_html}</div></td>'
+            f"<td>{html.escape(_fmt_plain(row.get('first_seen_at')))}</td>"
+            f"<td>{_price_change_cell_html(row.get('first_seen_price'), row.get('current_price'), price_data_stale=price_data_stale, first_seen_at=row.get('first_seen_at'), current_price_as_of=row.get('current_price_as_of'))}</td>"
+            f'<td><span class="badge">{row.get("alert_count") or 0} events</span></td>'
+            f"<td>{html.escape(_fmt_plain(row.get('suggested_watch_until')))}</td>"
+            "</tr>"
+        )
+        narrative_blocks_html.append(
+            '<div class="narrative-block">'
+            f'<div class="narrative-ticker">{html.escape(ticker)} '
+            f'<span style="color:#94a3b8;font-weight:400">-- {html.escape(company_name)}</span></div>'
+            f'<div class="narrative-text">{html.escape(str(narrative))}</div>'
+            "</div>"
+        )
+        if draft:
+            confidence_score = draft.get("confidence_score")
+            confidence_class = _confidence_css_class(confidence_score)
+            confidence_label = _confidence_label(confidence_score)
+            draft_blocks_html.append(
+                '<div class="draft-block">'
+                f'<span class="draft-ticker">{html.escape(ticker)}</span>'
+                f'<span class="draft-confidence {confidence_class}">confidence {html.escape(confidence_label)}</span>'
+                f'<div class="draft-prediction">{html.escape(str(draft.get("prediction_text") or ""))}</div>'
+                f'<div class="draft-meta">Target: {html.escape(_fmt_plain(draft.get("target_date")))} '
+                # BUG FOUND LIVE 2026-08-18 (re-audit): generated_at was selected but
+                # never rendered -- see the matching plain-text fix above.
+                f'&middot; Drafted: {html.escape(_fmt_plain(draft.get("generated_at")))}</div>'
+                # BUG FOUND LIVE 2026-08-17: the LLM's own rationale field
+                # (fundamentals_l4_thesis_draft.rationale, already selected by
+                # load_current_drafts_by_company()'s SELECT d.*) was never rendered
+                # here at all -- a human reviewing a draft to commit/discard saw the
+                # prediction and confidence score but not WHY the model made the call.
+                f'<div class="draft-rationale">{html.escape(_fmt_plain(draft.get("rationale")))}</div>'
+                f'<div class="draft-invalidation">Invalidation: {html.escape(_fmt_plain(draft.get("invalidation_criteria")))}</div>'
+                "</div>"
+            )
+
+    text_lines.extend(portfolio_text)
+    text_lines.append("\nThis is a descriptive screener digest, not a trade recommendation.")
+    if draft_blocks_html:
+        text_lines.append(
+            "DRAFT theses above are reading, not decisions. The portfolio is chosen by the "
+            "nightly ruleset, which never consults them."
+        )
+    text_body = "\n".join(text_lines)
+
+    draft_section_html = ""
+    if draft_blocks_html:
+        draft_section_html = (
+            '<div class="card"><h1>Candidate Notes</h1>'
+            '<div class="draft-banner">READING ONLY &mdash; machine-written notes on watchlist names. '
+            "The portfolio above is chosen by the nightly ruleset, which never consults these; nothing "
+            "here is waiting on you.</div>"
+            f'{"".join(draft_blocks_html)}</div>'
+        )
+
+    html_body = (
+        f'<html><head><meta charset="utf-8"><style>{_DIGEST_HTML_STYLE}</style></head><body>'
+        '<div class="card"><h1>Watchlist Digest</h1>'
+        f'<p class="sub">{len(watchlist_rows)} companies &middot; {today}</p>'
+        "<table><tr><th>Company</th><th>Watching since</th><th>Entry &rarr; Today's close</th>"
+        f"<th>Events</th><th>Watch until</th></tr>{''.join(table_rows_html)}</table></div>"
+        f"{portfolio_html}"
+        f'<div class="card"><h1>Why</h1>{"".join(narrative_blocks_html)}</div>'
+        f"{draft_section_html}"
+        '<p class="footer">Descriptive screener digest, not a trade recommendation.</p>'
+        "</body></html>"
+    )
+    return subject, text_body, html_body
+
+
+def send_daily_digest() -> dict[str, object]:
+    """One consolidated email per pipeline run listing the entire watchlist,
+    regardless of whether anything changed today -- the only email this module
+    sends, see module docstring."""
+    if not WATCHLIST_ALERT_EMAIL_ENABLED:
+        return {"sent": 0, "skipped_disabled": 1, "failed": 0}
+
+    if not WATCHLIST_ALERT_EMAIL_FROM or not _parse_recipients(WATCHLIST_ALERT_EMAIL_TO):
+        _record_fallback(
+            "watchlist_digest_email_misconfigured",
+            reason="WATCHLIST_ALERT_EMAIL_ENABLED is true but WATCHLIST_ALERT_EMAIL_FROM/TO is unset; digest not sent this run.",
+            error="missing sender/recipient",
+            severity="error",
+        )
+        return {"sent": 0, "skipped_disabled": 0, "failed": 1}
+
+    subject, text_body, html_body = build_daily_digest_content(
+        load_full_watchlist(), load_portfolio_positions()
+    )
+    try:
+        send_email(subject, text_body, html_body)
+        return {"sent": 1, "skipped_disabled": 0, "failed": 0}
+    except Exception as exc:  # noqa: BLE001 -- classified as a failure, not raised
+        _record_fallback(
+            "watchlist_digest_email_send_failed",
+            reason="SES send_email failed for the daily digest; not retried automatically.",
+            error=exc,
+        )
+        return {"sent": 0, "skipped_disabled": 0, "failed": 1}
+
+
+def run_watchlist_notification_pipeline() -> dict[str, object]:
+    """Chains watchlist sync -> narrative regen -> exit status evaluation -> L4
+    THESIS DRAFTING -> daily digest, in that order. watchlist_exit runs right after
+    narrative regen (2026-08-13, docs/FUNDAMENTAL_SCREENER_RESULTS_ARC.md's "we will
+    crowd the watchlist" gap fix) so it evaluates against a freshly-updated
+    suggested_watch_until/narrative_generated_at, and before the digest so
+    send_daily_digest's own default active-only filter reflects this run's status,
+    not last run's.
+
+    BUG FOUND LIVE 2026-08-18 (re-audit): L4 thesis drafting used to sit BEFORE exit
+    evaluation instead of after. load_companies_needing_draft_refresh() only drafts
+    for w.status = 'active' -- with drafting running first, that filter reflected
+    LAST run's status, so a company exit evaluation was about to invalidate/flag
+    stale THIS run still got a paid LLM draft call, immediately wasted the moment
+    exit evaluation ran right after it and hid the company from the digest's
+    active-only view. Moving drafting after exit evaluation costs nothing on the
+    "same-run email" requirement the old order was written to satisfy -- the digest
+    still runs after both either way -- while letting the active-company filter see
+    this run's real status instead of last run's.
+    """
+    sync_result = sync_watchlist_from_alerts()
+    summary_result = run_watch_summary_refresh()
+    exit_result = run_watchlist_exit_evaluation()
+    draft_result = run_l4_thesis_drafting()
+    # WATCHLIST DIGEST RETIRED 2026-09-07 (operator: "remove the watchlist from the email
+    # and only send the portfolio entry and exit stocks"). The outbound email is now
+    # fundamentals/screens/portfolio_notify.py, sent at the END of the portfolio chain --
+    # it has to be, because entry/exit decisions are not made until 22:00 IST and this
+    # pipeline runs at 21:00, so anything mailed from here would report YESTERDAY's
+    # actions while looking correct.
+    #
+    # Everything ABOVE this line still runs: the watchlist is synced, narrated, exit-
+    # evaluated and drafted every night. It is read on the screener's /watchlist page now
+    # rather than mailed. send_daily_digest() is kept and still tested so the digest can be
+    # revived (or sent by hand) without rebuilding it.
+    digest_result = {"sent": 0, "skipped_disabled": 0, "failed": 0, "retired": 1}
+    return {
+        "watchlist_companies": sync_result["companies"],
+        "new_candidates": sync_result["new_candidates"],
+        "narratives_generated": summary_result["generated"],
+        "narratives_failed": summary_result["failed"],
+        "narratives_blocked": summary_result["blocked"],
+        "theses_drafted": draft_result["drafted"],
+        "theses_draft_failed": draft_result["failed"],
+        "theses_draft_blocked": draft_result["blocked"],
+        "watchlist_active": exit_result["active"],
+        "watchlist_invalidated": exit_result["invalidated"],
+        "watchlist_price_flagged": exit_result["price_flagged"],
+        "watchlist_stale": exit_result["stale"],
+        "digest_sent": digest_result["sent"],
+        "digest_skipped_disabled": digest_result["skipped_disabled"],
+        "digest_failed": digest_result["failed"],
+        "digest_retired": digest_result.get("retired", 0),
+    }
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    result = run_watchlist_notification_pipeline()
+    STOCKEY_RUN_STATE = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": result["watchlist_companies"],
+        "rows_written": result["narratives_generated"],
+        **result,
+        "fallback_used": bool(result["narratives_failed"] or result["theses_draft_failed"] or result["digest_failed"]),
+        "state_advanced": result["narratives_generated"] > 0 or result["theses_drafted"] > 0 or result["digest_sent"] > 0,
+        "status": "blocked" if (result["narratives_blocked"] or result["theses_draft_blocked"]) else "ok",
+    }
+    print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

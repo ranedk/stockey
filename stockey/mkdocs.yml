@@ -1,0 +1,20 @@
+site_name: Stockey Docs
+docs_dir: docs
+site_dir: site
+
+nav:
+  - Home: index.md
+  - Setup: index.md
+  - Database Setup: db_setup.md
+  - Implementation: implementation.md
+  - Plan: plan.md
+  - Agents: agents.md
+  - Announcements: announcements.md
+  - Advisory Manual: advisory_manual.md
+  - Advisory Change Cookbook: advisory_change_cookbook.md
+  - Crawl Schema: crawl_schema.md
+  - Feature Schema: feature_schema.md
+  - Identity: identity.md
+  - Scripts: scripts.md
+  - Security Series: security_series.md
+  - Utilities: utils.md

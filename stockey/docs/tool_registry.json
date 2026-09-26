@@ -1,0 +1,209 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "sql_query",
+      "category": "storage",
+      "description": "Run a SQL query and return JSON.",
+      "command": ["python", "scripts/sql_query_runner.py"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--read-only", "select * from nseindia_ohlcv order by trade_date desc limit 5"],
+          "description": "Read recent NSE OHLCV rows"
+        }
+      ]
+    },
+    {
+      "name": "redis_scan",
+      "category": "storage",
+      "description": "Scan Redis keys and return JSON.",
+      "command": ["python", "scripts/redis_query_runner.py", "scan"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--pattern", "nse:*"],
+          "description": "Inspect NSE-related keys"
+        }
+      ]
+    },
+    {
+      "name": "redis_get",
+      "category": "storage",
+      "description": "Read one Redis key and return JSON.",
+      "command": ["python", "scripts/redis_query_runner.py", "get"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["bhav:parsed", "--max-items", "20"],
+          "description": "Inspect one parsed-set key"
+        }
+      ]
+    },
+    {
+      "name": "s3_list",
+      "category": "storage",
+      "description": "List S3 objects or prefixes as JSON.",
+      "command": ["python", "scripts/s3_query_runner.py", "list"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--prefix", "bhavcopy/", "--delimiter", "/"],
+          "description": "List bhavcopy prefixes"
+        }
+      ]
+    },
+    {
+      "name": "s3_head",
+      "category": "storage",
+      "description": "Fetch S3 object metadata as JSON.",
+      "command": ["python", "scripts/s3_query_runner.py", "head"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--key", "bhavcopy/example.zip"],
+          "description": "Read S3 object metadata"
+        }
+      ]
+    },
+    {
+      "name": "load_dhan_master",
+      "category": "ingestion",
+      "description": "Refresh the Dhan master instrument table.",
+      "command": ["python", "-m", "data.dhanlive.scrip_master"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_dhan_ohlcv",
+      "category": "ingestion",
+      "description": "Sync Dhan daily/intraday OHLCV for the tracked universe.",
+      "command": ["python", "-m", "data.dhanlive.ohlcv"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "pull_dhan_ohlcv",
+      "category": "utility",
+      "description": "Quick OHLCV pull utility for Dhan instruments. Defaults to NSE stock, 5-minute candles, and the last 60 minutes.",
+      "command": ["python", "-m", "data.dhanlive.ohlcv_pull"],
+      "read_only": true,
+      "examples": [
+        {"args": ["RELIANCE"], "description": "Pull the last 60 minutes of 5-minute NSE equity candles."},
+        {"args": ["HDFCBANK", "--interval-minutes", "1"], "description": "Pull the last 60 minutes of 1-minute candles."},
+        {"args": ["RELIANCE", "--mode", "daily", "--last-days", "90"], "description": "Pull the last 90 days of daily candles."},
+        {"args": ["RELIANCE", "--source", "db", "--format", "json"], "description": "Inspect locally stored OHLCV rows instead of calling Dhan."}
+      ]
+    },
+    {
+      "name": "load_sharpely_master",
+      "category": "ingestion",
+      "description": "Refresh Sharpely security master tables.",
+      "command": ["python", "-m", "data.sharpelydata.scrip_master"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "download_nse_bhavcopy",
+      "category": "download",
+      "description": "Run the NSE bhavcopy downloader.",
+      "command": ["python", "-m", "data.nseindia.bhavcopy_downloader"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "parse_nse_bhavcopy",
+      "category": "ingestion",
+      "description": "Parse downloaded NSE bhavcopy archives.",
+      "command": ["python", "-m", "data.nseindia.bhavcopy_parser"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "download_nse_indices",
+      "category": "download",
+      "description": "Run the NSE indices downloader.",
+      "command": ["python", "-m", "data.nseindia.indices_downloader"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "parse_nse_indices",
+      "category": "ingestion",
+      "description": "Parse downloaded NSE index archives.",
+      "command": ["python", "-m", "data.nseindia.indices_parser"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_rbi_bank_rates",
+      "category": "ingestion",
+      "description": "Refresh RBI key policy bank rates.",
+      "command": ["python", "-m", "data.rbi.download_bank_rates"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_rbi_fbil_gsec",
+      "category": "ingestion",
+      "description": "Refresh FBIL G-sec par-curve rates.",
+      "command": ["python", "-m", "data.rbi.download_fbil_gsec"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_rbi_currency_rates",
+      "category": "ingestion",
+      "description": "Refresh RBI reference currency rates.",
+      "command": ["python", "-m", "data.rbi.download_currency_rates"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "run_complete_data",
+      "category": "orchestration",
+      "description": "Run all downloader and parser modules in one combined data refresh.",
+      "command": ["bash", "complete_data.sh"],
+      "read_only": false,
+      "examples": [
+        {"args": [], "description": "Run the combined downloader and parser flow."}
+      ]
+    },
+    {
+      "name": "run_ohlcv_reconcile",
+      "category": "orchestration",
+      "description": "Backfill any universe symbol whose latest Dhan daily bar predates the last completed trading day.",
+      "command": ["bash", "all_ohlcv_reconcile.sh"],
+      "read_only": false,
+      "examples": [
+        {"args": ["--dry-run", "--format", "json"], "description": "Report stale coverage without syncing."}
+      ]
+    },
+    {
+      "name": "run_price_adjustment",
+      "category": "orchestration",
+      "description": "Rebuild nseindia_adjustment_factors from price steps; advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) is a view over it, not a written table.",
+      "command": ["bash", "all_price_adjustment.sh"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "run_data_readiness",
+      "category": "orchestration",
+      "description": "Check bhavcopy/Dhan/benchmark freshness and run bounded repairs.",
+      "command": ["python", "-m", "data.data_readiness", "--fix"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "run_data_coverage_report",
+      "category": "monitoring",
+      "description": "Per-KEEP-table row counts, staleness, and duplicate checks.",
+      "command": ["python", "scripts/data_coverage_report.py"],
+      "read_only": true,
+      "examples": [
+        {"args": ["--format", "json"], "description": "Machine-readable coverage report."}
+      ]
+    }
+  ]
+}
