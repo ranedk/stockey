@@ -14,5 +14,14 @@ PYTHON_BIN="$("${SCRIPT_DIR}/scripts/resolve_python.sh")"
 #
 # Deliberately NOT gated on .pause_fundamentals: it only reads documents already
 # collected and makes no judgement, so catching up during a pause is what we want.
-# Runs at low CPU priority so the local OCR model never slows the price jobs.
-exec nice -n 10 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "fundamentals_ocr" "${PYTHON_BIN}" -m fundamentals.collectors.ocr_pipeline "$@"
+# Sharing the machine (2026-09-26): the local model otherwise takes every idle core with
+# ~65 threads and several GB of RAM.
+#  - nice 10 / ionice idle: CPU and disk go to anything else that wants them first.
+#  - OCR_THREADS (default 12 of 16 cores) caps torch's thread pool, so a few cores stay free
+#    for Chrome, Postgres and the collectors even while a page is being read.
+#  - oom_score_adj 800: if memory ever runs out, the kernel kills this job, not Postgres or
+#    Chrome. A killed run loses nothing -- its document stays pending for the next run.
+OCR_THREADS="${OCR_THREADS:-12}"
+export OMP_NUM_THREADS="${OCR_THREADS}" MKL_NUM_THREADS="${OCR_THREADS}"
+echo 800 > /proc/self/oom_score_adj 2>/dev/null || true
+exec nice -n 10 ionice -c 3 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "fundamentals_ocr" "${PYTHON_BIN}" -m fundamentals.collectors.ocr_pipeline "$@"
