@@ -14,7 +14,7 @@ ordered within each section by what I'd do first, not by size.
 **Status key:** `[ ]` open · `[~]` partly done · `[x]` done · `[-]` deliberately
 not doing (with the reason, so it is not re-litigated).
 
-**Where the work lands.** Three git repos, and this file at the workspace root
+**Where the work lands.** Three projects in one git repo (since 2026-09-26), and this file at the workspace root
 above them, because most items cross at least two:
 
 - `stockey/` — data platform + the fundamentals carve-out. Sections B, C.

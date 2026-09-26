@@ -1,6 +1,12 @@
 # Trading Workspace
 
-Two sibling git repos, one purpose, one Claude session (launched from here):
+One git repo (`git@github.com:ranedk/stockey.git`, since 2026-09-26) holding three
+projects, one purpose, one Claude session (launched from here). Until 2026-09-26 these
+were separate repos (stockey: alphabuy/stockey, systrade: atman-care/systrade, screener:
+no remote); their full histories were merged in under their folders, and the old `.git`
+dirs are backed up at `~/code/trading-git-backup-2026-09-26/`. Commit from anywhere in
+the tree; there are no nested repos any more.
+
 
 - **`stockey/`** — the data platform (Python). Pure-TA scope: collects
   bhavcopy, corporate actions/dividends, indices, calendar, Dhan
