@@ -1,0 +1,5 @@
+# Workspace root of the trading monorepo (stockey/, systrade/, screener/).
+# Each project keeps its own .gitignore; these are root-level only.
+.claude/
+# Go build outputs dropped at systrade's root by `go build ./cmd/...`
+/systrade/costs
