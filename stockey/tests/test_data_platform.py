@@ -13617,7 +13617,7 @@ def test_fetch_company_announcements_paginates_until_rowcnt_satisfied(monkeypatc
         return pages[params["pageno"]]
 
     monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
-    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
+    rows = fundamentals_bse_announcements._fetch_company_range("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
 
     assert calls == [1, 2, 3]
     assert len(rows) == 120
@@ -13636,7 +13636,7 @@ def test_fetch_company_announcements_stops_on_empty_page_even_if_rowcnt_says_mor
         return pages[params["pageno"]]
 
     monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
-    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
+    rows = fundamentals_bse_announcements._fetch_company_range("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
 
     assert calls == [1, 2]
     assert len(rows) == 50
@@ -13650,10 +13650,30 @@ def test_fetch_company_announcements_missing_rowcnt_does_not_paginate(monkeypatc
         return {"Table": [{"NEWSID": str(i)} for i in range(50)], "Table1": []}
 
     monkeypatch.setattr(fundamentals_bse_announcements, "_bse_get", fake_bse_get)
-    rows = fundamentals_bse_announcements.fetch_company_announcements("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
+    rows = fundamentals_bse_announcements._fetch_company_range("524412", from_date=date(2023, 1, 1), to_date=date(2026, 8, 1))
 
     assert calls == [1]  # no ROWCNT to compare against -- can't safely assume more pages exist
     assert len(rows) == 50
+
+
+def test_fetch_company_announcements_splits_ranges_over_12_months(monkeypatch):
+    calls = []
+
+    def fake_range(scrip_code, *, from_date, to_date):
+        calls.append((from_date, to_date))
+        assert (to_date - from_date).days <= fundamentals_bse_announcements.BSE_MAX_RANGE_DAYS
+        return [{"NEWSID": f"{from_date}"}]
+
+    monkeypatch.setattr(fundamentals_bse_announcements, "_fetch_company_range", fake_range)
+
+    rows = fundamentals_bse_announcements.fetch_company_announcements(
+        "524412", from_date=date(2023, 9, 26), to_date=date(2026, 9, 26))
+
+    assert len(calls) == 4 and len(rows) == 4
+    assert calls[0][1] == date(2026, 9, 26) and calls[-1][0] == date(2023, 9, 26)
+    # chunks tile the range with no gap and no overlap
+    for (_, newer_start), (_, older_end) in zip([(None, c[0]) for c in calls[:-1]], [(None, c[1]) for c in calls[1:]]):
+        assert (newer_start - older_end).days == 1
 
 
 def test_resolve_company_identity_joins_on_ticker_and_preserves_index(monkeypatch):

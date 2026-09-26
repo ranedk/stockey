@@ -431,7 +431,7 @@ def _fetch_company_announcements_page(scrip_code: str, *, from_date, to_date, pa
         },
     )
     if "Table" not in payload:
-        raise BseBlockedError("response missing expected 'Table' key")
+        raise BseBlockedError(f"response missing expected 'Table' key: {str(payload.get('Message', ''))[:120]}")
     row_count = None
     table1 = payload.get("Table1")
     if table1 and isinstance(table1, list) and "ROWCNT" in table1[0]:
@@ -439,7 +439,24 @@ def _fetch_company_announcements_page(scrip_code: str, *, from_date, to_date, pa
     return payload["Table"] or [], row_count
 
 
+# BSE refuses a range over 12 months ({"Status": false, "Message": "Date range cannot exceed
+# 12 months."}, confirmed 2026-09-26) -- the 3-year backfill had been failing on every
+# company. Longer ranges are fetched in chunks of at most this many days.
+BSE_MAX_RANGE_DAYS = 360
+
+
 def fetch_company_announcements(scrip_code: str, *, from_date, to_date) -> list[dict]:
+    """All of a company's announcements between the two dates, in <= 12-month chunks."""
+    rows: list[dict] = []
+    chunk_end = to_date
+    while chunk_end > from_date:
+        chunk_start = max(from_date, chunk_end - timedelta(days=BSE_MAX_RANGE_DAYS))
+        rows.extend(_fetch_company_range(scrip_code, from_date=chunk_start, to_date=chunk_end))
+        chunk_end = chunk_start - timedelta(days=1)
+    return rows
+
+
+def _fetch_company_range(scrip_code: str, *, from_date, to_date) -> list[dict]:
     # BUG FOUND LIVE 2026-08-18: this endpoint paginates at BSE_ANNOUNCEMENTS_
     # PAGE_SIZE (50) rows/page and reports the true total in Table1[0].ROWCNT --
     # this function only ever requested page 1 and never read ROWCNT. Confirmed
