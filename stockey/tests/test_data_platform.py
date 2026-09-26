@@ -7274,7 +7274,7 @@ def test_nse_request_gate_sleeps_out_the_remaining_interval(monkeypatch, tmp_pat
         pass
 
     assert len(sleeps) == 1
-    assert sleeps[0] == pytest.approx(6.0)  # 10s floor - 4s already elapsed
+    assert 6.0 <= sleeps[0] <= 6.5  # 10s floor - 4s already elapsed, plus the fairness jitter
     assert timestamp_path.read_text(encoding="utf-8") == repr(1004.0)  # stamped at request time, not entry time
 
 
@@ -7307,6 +7307,56 @@ def test_nse_request_gate_first_ever_request_does_not_sleep(monkeypatch, tmp_pat
 
     assert sleeps == []
     assert timestamp_path.exists()
+
+
+def test_request_gate_waits_out_the_gap_without_holding_the_lock(monkeypatch, tmp_path):
+    # 2026-09-25: the gap used to be slept out while holding the lock, so a process looping
+    # on the gate starved every other one (OCR fetched ~1 PDF in 25 min beside a backfill).
+    lock_path = tmp_path / "gate.lock"
+    timestamp_path = tmp_path / "last_request_at"
+    timestamp_path.write_text(repr(1000.0), encoding="utf-8")
+    monkeypatch.setattr(nse_rate_limiter.time, "time", lambda: 1004.0)
+    lock_free_during_wait = []
+
+    def fake_sleep(seconds):
+        other = open(lock_path, "a+")
+        try:
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_free_during_wait.append(True)
+            fcntl.flock(other.fileno(), fcntl.LOCK_UN)
+        except BlockingIOError:
+            lock_free_during_wait.append(False)
+        finally:
+            other.close()
+
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", fake_sleep)
+
+    with nse_rate_limiter.nse_request_gate(lock_path=lock_path, timestamp_path=timestamp_path, min_interval_seconds=10.0):
+        pass
+
+    assert lock_free_during_wait == [True]
+
+
+def test_request_gate_waits_again_if_another_process_went_first(monkeypatch, tmp_path):
+    lock_path = tmp_path / "gate.lock"
+    timestamp_path = tmp_path / "last_request_at"
+    timestamp_path.write_text(repr(1000.0), encoding="utf-8")
+    now = {"t": 1004.0}
+    monkeypatch.setattr(nse_rate_limiter.time, "time", lambda: now["t"])
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:  # while we wait, another process makes its request at t=1008
+            timestamp_path.write_text(repr(1008.0), encoding="utf-8")
+            now["t"] = 1010.0
+
+    monkeypatch.setattr(nse_rate_limiter.time, "sleep", fake_sleep)
+
+    with nse_rate_limiter.nse_request_gate(lock_path=lock_path, timestamp_path=timestamp_path, min_interval_seconds=10.0):
+        pass
+
+    assert len(sleeps) == 2 and 8.0 <= sleeps[1] <= 8.5  # a fresh 10s gap from the other request at 1008
 
 
 def test_nse_request_gate_times_out_when_another_process_holds_it(tmp_path):

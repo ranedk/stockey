@@ -17,6 +17,7 @@ so that, per domain:
 from __future__ import annotations
 
 import fcntl
+import random
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -63,6 +64,24 @@ def _write_last_request_time(timestamp_path: Path) -> None:
     timestamp_path.write_text(repr(time.time()), encoding="utf-8")
 
 
+_WAIT_JITTER_SECONDS = 0.5
+_POLL_SECONDS = 0.05
+
+
+def _acquire(handle, *, deadline: float, domain: str, timeout_seconds: float) -> None:
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeout_seconds:.0f}s waiting for another process's "
+                    f"{domain} request to finish (exchange_request_gate)"
+                )
+            time.sleep(_POLL_SECONDS)
+
+
 @contextmanager
 def exchange_request_gate(
     *,
@@ -96,24 +115,26 @@ def exchange_request_gate(
     acquired = False
     try:
         deadline = time.monotonic() + timeout_seconds
+        waited_for = None
         while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
+            _acquire(handle, deadline=deadline, domain=domain, timeout_seconds=timeout_seconds)
+            acquired = True
+            last_request_at = _read_last_request_time(timestamp_path)
+            wait_seconds = 0.0 if last_request_at is None else min_interval_seconds - (time.time() - last_request_at)
+            # Proceed if the gap has passed, or if we already waited out exactly this last
+            # request and nobody else went in the meantime.
+            if wait_seconds <= 0 or last_request_at == waited_for:
                 break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out after {timeout_seconds:.0f}s waiting for another process's "
-                        f"{domain} request to finish (exchange_request_gate)"
-                    )
-                time.sleep(0.5)
-
-        last_request_at = _read_last_request_time(timestamp_path)
-        if last_request_at is not None:
-            wait_seconds = min_interval_seconds - (time.time() - last_request_at)
-            if wait_seconds > 0:
-                time.sleep(wait_seconds)
+            # FAIRNESS FIX 2026-09-25: the gap used to be slept out WHILE HOLDING the lock.
+            # A process that loops on the gate (a backfill) re-took the lock the instant it
+            # released it, and a second process polling every 0.5s almost never got a turn:
+            # the OCR job fetched ~1 document in 25 minutes beside the BSE announcements
+            # backfill. Now the wait happens outside the lock, so every waiting process
+            # competes when the gap ends; the jitter keeps the same one from always winning.
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            acquired = False
+            time.sleep(wait_seconds + random.uniform(0, _WAIT_JITTER_SECONDS))
+            waited_for = last_request_at
 
         yield
     finally:
