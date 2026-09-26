@@ -1,0 +1,28 @@
+# Row-18 family re-score — generated 2026-09-10T10:27Z
+# cmd/slice family (defaults). NOT a new trial: row 18's books, judged with internal/evidence.
+
+ROW-18 FAMILY RE-SCORED — 2013-07-01..2026-06-30, 50 bps round trip, monthly paired differences
+14 distinct members, 15 trials declared | FDR q = 0.10 | stationary bootstrap: mean block 5 months, 10000 resamples, seed 1
+Not a new trial: the same books row 18 already read, judged with the protocol's arithmetic.
+Intervals are 90% bootstrap intervals on the mean monthly difference; p is one-sided, no-edge.
+
+  member                                 ann    SR | vs equal-weight %/mo       | vs stable-shuffle %/mo     | decides       q    DSR 
+  always-trend ewmac32 r20 Rs1cr      26.69%  1.18 | +0.77 [+0.48,+1.06] p0.000 | +0.77 [+0.48,+1.06] p0.000 | equal-wt  0.000  0.996 survives both
+  washout-reverse ewmac32 r20 Rs1cr   27.19%  1.19 | +0.82 [+0.53,+1.12] p0.000 | +0.82 [+0.53,+1.11] p0.000 | equal-wt  0.000  0.998 survives both
+  washout-neutral ewmac32 r20 Rs1cr   26.58%  1.17 | +0.77 [+0.49,+1.05] p0.000 | +0.79 [+0.50,+1.07] p0.000 | equal-wt  0.000  0.996 survives both
+  always-trend ewmac32 r10 Rs10cr     22.24%  1.01 | +0.67 [+0.34,+1.00] p0.000 | +0.73 [+0.38,+1.05] p0.000 | equal-wt  0.001  0.969 survives both
+* always-trend ewmac32 r20 Rs10cr     20.11%  0.93 | +0.55 [+0.22,+0.86] p0.002 | +0.59 [+0.26,+0.91] p0.001 | equal-wt  0.003  0.915 FDR only
+  washout-reverse ewmac32 r20 Rs10cr  20.35%  0.93 | +0.58 [+0.27,+0.88] p0.001 | +0.62 [+0.31,+0.93] p0.000 | equal-wt  0.003  0.942 FDR only
+  washout-neutral ewmac32 r20 Rs10cr  19.89%  0.92 | +0.54 [+0.22,+0.85] p0.002 | +0.60 [+0.28,+0.90] p0.001 | equal-wt  0.003  0.916 FDR only
+  always-trend ewmac32 r40 Rs10cr     21.33%  0.97 | +0.64 [+0.32,+0.96] p0.000 | +0.70 [+0.37,+1.00] p0.000 | equal-wt  0.001  0.960 survives both
+  always-trend ewmac16 r10 Rs10cr     18.87%  0.88 | +0.45 [+0.17,+0.73] p0.005 | +0.44 [+0.13,+0.74] p0.008 | shuffle   0.010  0.718 FDR only
+  always-trend ewmac16 r20 Rs10cr     18.54%  0.87 | +0.44 [+0.15,+0.72] p0.005 | +0.41 [+0.11,+0.71] p0.014 | shuffle   0.015  0.714 FDR only
+  always-trend ewmac16 r40 Rs10cr     18.16%  0.85 | +0.42 [+0.11,+0.72] p0.010 | +0.39 [+0.05,+0.71] p0.024 | shuffle   0.024  0.679 FDR only
+  always-trend ewmac64 r10 Rs10cr     21.58%  1.01 | +0.62 [+0.27,+0.95] p0.001 | +0.65 [+0.31,+0.98] p0.001 | equal-wt  0.003  0.915 FDR only
+  always-trend ewmac64 r20 Rs10cr     20.00%  0.95 | +0.53 [+0.19,+0.85] p0.004 | +0.54 [+0.21,+0.86] p0.003 | equal-wt  0.006  0.844 FDR only
+  always-trend ewmac64 r40 Rs10cr     19.56%  0.93 | +0.50 [+0.17,+0.83] p0.006 | +0.52 [+0.18,+0.85] p0.005 | equal-wt  0.008  0.822 FDR only
+
+Deflation benchmark: the best of 15 no-skill configurations with this family's spread of Sharpe
+ratios would show 0.124 per month (0.43 annualised) on excess returns. DSR = P(true excess SR > that).
+Workspace-wide Bonferroni bar, context only (amended Law 2): t = 4.09 at M = 1160.
+* = the frozen paper-trading configuration (docs/strategies/2026-09-08_trend_quintile.md).

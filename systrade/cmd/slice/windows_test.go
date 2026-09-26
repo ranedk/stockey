@@ -1,0 +1,81 @@
+package main
+
+import (
+	"math"
+	"testing"
+	"time"
+
+	"github.com/ranedk/systrader/internal/sleeve"
+)
+
+func dday(n int) time.Time { return time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, n) }
+
+func book(start int, net ...float64) sleeve.Book {
+	b := sleeve.Book{Name: "b"}
+	for i, r := range net {
+		b.Dates = append(b.Dates, dday(start+i))
+		b.Gross = append(b.Gross, r+0.001)
+		b.Net = append(b.Net, r)
+		b.Turnover = append(b.Turnover, 0.1)
+	}
+	return b
+}
+
+func TestStaggerAveragesOnlyTheDatesEveryBookCovers(t *testing.T) {
+	a := book(0, 0.01, 0.02, 0.03, 0.04)
+	b := book(2, 0.05, 0.06, 0.07) // starts two days later, runs one day longer
+	s := stagger([]sleeve.Book{a, b})
+	if len(s.Dates) != 2 || !s.Dates[0].Equal(dday(2)) || !s.Dates[1].Equal(dday(3)) {
+		t.Fatalf("common dates = %v, want days 2 and 3", s.Dates)
+	}
+	if math.Abs(s.Net[0]-(0.03+0.05)/2) > 1e-12 || math.Abs(s.Net[1]-(0.04+0.06)/2) > 1e-12 {
+		t.Errorf("staggered net = %v", s.Net)
+	}
+}
+
+func TestTrimDropsTheCashOnlyWarmUp(t *testing.T) {
+	b := book(0, 0, 0, 0.01, 0.02)
+	b.Turnover[0], b.Turnover[1] = 0, 0 // no positions until day 2
+	start := firstTraded(b)
+	if !start.Equal(dday(2)) {
+		t.Fatalf("first traded %v, want day 2", start)
+	}
+	tr := trimFrom(b, start)
+	if len(tr.Net) != 2 || tr.Net[0] != 0.01 {
+		t.Errorf("trimmed book = %v", tr.Net)
+	}
+}
+
+func TestDoubleCostChargesTheCostTwice(t *testing.T) {
+	b := sleeve.Book{Dates: []time.Time{dday(0)}, Gross: []float64{0.010}, Net: []float64{0.0075}, Turnover: []float64{1}}
+	if got := doubleCost(b).Net[0]; math.Abs(got-0.005) > 1e-12 {
+		t.Errorf("net at 2x cost = %v, want 0.005 (cost 25bps -> 50bps)", got)
+	}
+}
+
+func TestWholePercentAlwaysSumsToAHundred(t *testing.T) {
+	for _, w := range [][]float64{{0.3333, 0.3333, 0.3334}, {0.403, 0.161, 0.436}, {0.25, 0.25, 0.25, 0.25}, {0.1049, 0.2951, 0.6}} {
+		p := wholePercent(w)
+		sum := 0
+		for i, v := range p {
+			sum += v
+			if math.Abs(float64(v)-100*w[i]) >= 1 {
+				t.Errorf("%v -> %v: %d is more than a point from %.2f", w, p, v, 100*w[i])
+			}
+		}
+		if sum != 100 {
+			t.Errorf("%v -> %v sums to %d", w, p, sum)
+		}
+	}
+}
+
+func TestAtRiskMatchesTheReferenceVolatility(t *testing.T) {
+	b := book(0, 0.01, -0.02, 0.03, -0.01, 0.02)
+	ref := book(0, 0.02, -0.04, 0.06, -0.02, 0.04) // exactly twice as volatile
+	s := atRisk(b, ref)
+	for i := range b.Net {
+		if math.Abs(s.Net[i]-2*b.Net[i]) > 1e-12 || math.Abs(s.Gross[i]-2*b.Gross[i]) > 1e-12 || math.Abs(s.Turnover[i]-2*b.Turnover[i]) > 1e-12 {
+			t.Fatalf("day %d: scaled %v/%v/%v, want twice %v/%v/%v", i, s.Net[i], s.Gross[i], s.Turnover[i], b.Net[i], b.Gross[i], b.Turnover[i])
+		}
+	}
+}

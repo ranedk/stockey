@@ -1,0 +1,68 @@
+# Momentum across time windows (LEDGER row 30) — RE-RUN 2026-09-12 by `slice windows` (defaults) with reproducible controls.
+# Pre-registered: research/preregistrations/2026-09-11_momentum_windows.md. Exploration years 2013-07..2021-12 only.
+# The first run (2026-09-11, in git history) drew the stable-shuffle control from scan-order symbol ids, which varied
+# between runs; ids are now assigned by name (LEDGER row 31). Verdict unchanged: the same 17 cells survive.
+
+MOMENTUM ACROSS TIME WINDOWS — pre-registered, research/preregistrations/2026-09-11_momentum_windows.md
+NSE adjusted EQ, Rs 10 cr floor, top quintile, equal weight, fills at the next open, 2013-07-01..2021-12-31
+50 bps round trip (100 bps shown separately); a K-month hold = K staggered books a month apart, averaged
+Exploration years only: this can kill a window family, never confirm one.
+
+net annual return (the book itself)
+                 hold 1m      hold 2m      hold 3m      hold 6m     hold 12m
+  mom3             15.4%        16.0%        16.7%        19.4%        13.9%
+  mom6             21.1%        19.9%        21.0%        18.4%        13.8%
+  mom9             23.7%        20.8%        22.3%        23.5%        13.5%
+  mom12            20.7%        19.6%        18.5%        16.5%        15.8%
+  mom12_1          18.1%        18.1%        16.9%        13.3%        12.8%
+  mom12_7          13.1%        11.3%        13.9%        13.3%        12.6%
+
+edge over the TOUGHER control, %/month at 50 bps  (✓ = beats both controls and survives FDR q=0.10)
+                 hold 1m      hold 2m      hold 3m      hold 6m     hold 12m
+  mom3            +0.09        +0.15        +0.22        +0.36✓       +0.32✓
+  mom6            +0.53✓       +0.43✓       +0.58✓       +0.27        +0.29 
+  mom9            +0.84✓       +0.63✓       +0.75✓       +0.82✓       +0.31 
+  mom12           +0.89✓       +0.76✓       +0.73✓       +0.55✓       +0.45✓
+  mom12_1         +0.70✓       +0.65✓       +0.62✓       +0.32        +0.25 
+  mom12_7         +0.32        +0.15        +0.40        +0.32        +0.24 
+
+same edge at 100 bps (worse of the two controls)
+                 hold 1m      hold 2m      hold 3m      hold 6m     hold 12m
+  mom3             -0.11        +0.01        +0.10        +0.30        +0.29
+  mom6             +0.39        +0.33        +0.49        +0.21        +0.26
+  mom9             +0.72        +0.54        +0.68        +0.78        +0.28
+  mom12            +0.79        +0.69        +0.67        +0.51        +0.43
+  mom12_1          +0.59        +0.57        +0.55        +0.27        +0.22
+  mom12_7          +0.16        +0.04        +0.32        +0.27        +0.21
+
+deflated Sharpe on the excess, 30 trials (0.95 is the customary bar)
+                 hold 1m      hold 2m      hold 3m      hold 6m     hold 12m
+  mom3             0.117        0.179        0.316        0.682        0.752
+  mom6             0.643        0.525        0.686        0.326        0.498
+  mom9             0.882        0.709        0.846        0.875        0.389
+  mom12            0.924        0.833        0.857        0.681        0.579
+  mom12_1          0.849        0.759        0.730        0.356        0.327
+  mom12_7          0.419        0.188        0.519        0.452        0.346
+
+one-way turnover per day
+                 hold 1m      hold 2m      hold 3m      hold 6m     hold 12m
+  mom3             5.24%        3.78%        3.08%        1.73%        0.97%
+  mom6             4.04%        3.00%        2.52%        1.75%        0.97%
+  mom9             3.51%        2.66%        2.22%        1.58%        0.96%
+  mom12            3.16%        2.42%        2.07%        1.46%        0.91%
+  mom12_1          3.32%        2.53%        2.15%        1.52%        0.94%
+  mom12_7          4.23%        3.03%        2.54%        1.67%        0.90%
+
+PRE-REGISTERED VERDICT: 17 of 30 momentum cells beat both controls and survive FDR, spanning 5 of 6 formation windows and 5 of 5 holding periods -> IN BETWEEN
+(plateau: >= 20 survivors not confined to one row or column; spike: < 10, or all in one row or column)
+
+KNOWN-SIGN CONTROLS (their own family of 10): edge over the tougher control, %/month  (✓ = survives)
+                 hold 1m      hold 2m      hold 3m      hold 6m     hold 12m
+  rev1            -0.54        -0.50        -0.47        -0.39        -0.35 
+  rev36           -0.21        -0.25        -0.20        -0.29        -0.30 
+
+Both reversals buy LOSERS; the literature says both should earn a positive edge.
+
+Reference: the equal-weight universe (held 1m) 8.1%/yr at 22.3% vol over 90 months.
+Workspace-wide Bonferroni bar, context only (amended Law 2): t = 4.10 at M = 1201.
+Surviving cells: mom12/12m, mom12/1m, mom12/2m, mom12/3m, mom12/6m, mom12_1/1m, mom12_1/2m, mom12_1/3m, mom3/12m, mom3/6m, mom6/1m, mom6/2m, mom6/3m, mom9/1m, mom9/2m, mom9/3m, mom9/6m

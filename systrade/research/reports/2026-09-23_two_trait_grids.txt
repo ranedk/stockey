@@ -1,0 +1,70 @@
+EXPLORATION — ewmac32_128, 20-day forward return, entries at the open after the decision close
+1904 decision days, 1203215 symbol-days, 3 dimensions, 27 buckets examined
+
+Statistic: mean forward return of the top-forecast fifth INSIDE a bucket, minus the
+mean of every name in that same bucket on that same day. Each slice is its own
+control, so the market's move and the slice's own drift both cancel.
+'bottom' is the same for the WORST-forecast fifth: a real ordering loses there.
+'vol x' is how volatile the selected names are relative to their bucket — well
+above 1.0 means the edge may be risk premium, not selection (LEDGER row 4).
+'churn' is the share of the selected names replaced each holding period — what
+actually trades; 'net' is the edge after 50 bps round trip on that churn.
+
+'vs ctl' asks whether the rule does better or worse in a bucket than it would anyway.
+A bucket of stocks is compared, day by day, with random groups of the SAME size drawn
+from the names its dimension covered that day (a small bucket's top fifth is less
+extreme, so comparing it with the whole universe would invent differences). A bucket
+of days — year, breadth — is compared with the rule on all other days. The score is
+that difference over its own standard error, from a block bootstrap
+(1000 resamples, mean block 60 trading days,
+so overlapping forward returns and slow-changing selections are not mistaken for
+independent evidence). The same blocks are drawn for every bucket, so the threshold is
+family-wise: with no real differences, the largest score of all 27 buckets exceeds 3.0
+in only 5% of resamples. ◆ marks a real bucket beyond it — worth writing a mechanism
+down for; still not a result.
+
+Read the halves and the years too: an edge that lives in one of them is the shape
+of LEDGER row 13's dead effect.
+
+  unsliced yardstick            names    days     edge  vs ctl   bottom  churn      net 1st half 2nd half  vol x  yrs +
+  whole universe                  632    1904   1.106%       ·  -0.778%    33%   0.943%   1.033%   1.178%   0.90    8/8
+
+--- liquidity x delivery % ---
+  bucket                        names    days     edge  vs ctl   bottom  churn      net 1st half 2nd half  vol x  yrs +
+  Q1 | Q1                          27    1904   1.122%   +0.2  -0.791%    73%   0.755%   1.728%   0.515%   0.98    6/8
+  Q1 | Q2                          76    1904   1.566%   +1.6  -1.273%    70%   1.217%   2.108%   1.025%   0.96    8/8
+  Q1 | Q3                         107    1904   1.131%   +0.2  -1.231%    54%   0.861%   0.743%   1.519%   0.89    7/8
+  Q2 | Q1                          60    1904   0.887%   -0.5  -0.428%    64%   0.567%   1.477%   0.298%   0.97    6/8
+  Q2 | Q2                          80    1904   1.281%   +0.5  -0.847%    65%   0.958%   1.300%   1.261%   0.93    8/8
+  Q2 | Q3                          68    1904   0.838%   -1.2  -0.905%    55%   0.562%   0.602%   1.074%   0.86    7/8
+  Q3 | Q1                         119    1904   0.966%   -0.8  -0.560%    42%   0.756%   0.876%   1.056%   0.88    8/8
+  Q3 | Q2                          49    1904   1.018%   -0.1  -0.698%    62%   0.708%   0.794%   1.243%   0.93    6/8
+  Q3 | Q3                          31    1904   0.529%   -1.4  -0.680%    55%   0.255%   0.475%   0.583%   0.94    4/8
+                               spread 1.037% between the widest and narrowest bucket
+
+--- liquidity x own volatility ---
+  bucket                        names    days     edge  vs ctl   bottom  churn      net 1st half 2nd half  vol x  yrs +
+  Q1 | Q1                          58    1904   0.637%   -1.9  -0.440%    58%   0.347%   0.547%   0.728%   0.94    7/8
+  Q1 | Q2                          69    1904   1.342%   +1.3  -0.833%    72%   0.983%   1.456%   1.227%   1.00    8/8
+  Q1 | Q3                          85    1904   1.620%   +1.6  -1.886%    65%   1.294%   2.151%   1.089%   0.93    7/8
+  Q2 | Q1                          62    1904   0.782%   -1.5  -0.752%    58%   0.490%   0.871%   0.693%   0.99    8/8
+  Q2 | Q2                          73    1904   1.175%   +0.6  -0.486%    69%   0.831%   0.901%   1.450%   1.00    8/8
+  Q2 | Q3                          76    1904   1.272%   +0.8  -1.106%    62%   0.960%   1.384%   1.160%   0.91    7/8
+◆ Q3 | Q1                          92    1904   0.240%   -4.3  -0.406%    48%   0.001%   0.319%   0.161%   0.98    5/8
+  Q3 | Q2                          69    1904   1.224%   +0.7  -0.465%    64%   0.903%   0.844%   1.604%   0.99    8/8
+  Q3 | Q3                          49    1904   1.451%   +1.0  -0.969%    61%   1.146%   1.312%   1.589%   0.89    7/8
+                               spread 1.381% between the widest and narrowest bucket
+
+--- own volatility x below 52w high ---
+  bucket                        names    days     edge  vs ctl   bottom  churn      net 1st half 2nd half  vol x  yrs +
+◆ Q1 | Q1                          37    1851  -0.071%   -3.2   0.060%    78%  -0.462%   0.027%  -0.165%   1.02    5/8
+  Q1 | Q2                          70    1852   0.347%   -2.6  -0.444%    80%  -0.052%   0.645%   0.065%   1.02    5/8
+◆ Q1 | Q3                         103    1852   0.178%   -4.3  -0.339%    57%  -0.106%   0.225%   0.133%   0.98    5/8
+◆ Q2 | Q1                          68    1852   0.064%   -3.7  -0.022%    83%  -0.353%   0.614%  -0.455%   1.02    4/8
+  Q2 | Q2                          77    1852   0.743%   -1.4  -0.398%    85%   0.318%   1.096%   0.409%   1.02    6/8
+  Q2 | Q3                          66    1852   1.227%   +0.6  -0.884%    73%   0.862%   0.622%   1.800%   1.00    8/8
+  Q3 | Q1                         105    1852   0.476%   -2.0  -1.120%    70%   0.127%   0.987%  -0.006%   0.96    6/8
+  Q3 | Q2                          63    1852   0.696%   -1.1  -0.799%    80%   0.298%   0.915%   0.489%   1.03    6/8
+  Q3 | Q3                          41    1850   1.806%   +1.6  -0.864%    76%   1.427%   1.219%   2.363%   0.96    8/8
+                               spread 1.878% between the widest and narrowest bucket
+

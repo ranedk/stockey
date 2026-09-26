@@ -1,0 +1,29 @@
+EXPLORATION — how deep a fall has to be before it stops bouncing
+ewmac32_128, 3095 days, 1141540 symbol-days (227047 of them held by the book)
+Depth = fall from the 120-day high, divided by what the name's own volatility says
+a move of that many days should be. Nothing is traded and no costs are charged:
+this measures whether a deep fall PREDICTS anything, not whether acting on it pays.
+
+depth             book obs   all obs book fwd20  all fwd20   vs same book fwd60 regains high
+0.0 - 0.5 sigma      34000    123650      1.97%      1.63%     0.17%      5.17%       91%
+0.5 - 1.0 sigma      78919    389466      1.85%      1.23%     0.66%      5.04%       75%
+1.0 - 1.5 sigma      66394    400118      2.04%      1.23%     0.90%      5.62%       63%
+1.5 - 2.0 sigma      28784    162735      1.98%      1.06%     0.77%      5.73%       64%
+2.0 - 3.0 sigma      13936     51965      2.07%      1.08%     0.98%      5.86%       68%
+3.0 - 4.0 sigma       2283      5361      2.24%      1.92%     1.11%      6.04%       70%
+4.0 - 6.0 sigma        740      1379      3.64%      2.83%     2.13%      4.93%       68%
+6.0+ sigma            1991      6866      0.75%      0.24%     0.23%      1.78%       50%
+
+'vs same' is the book's names minus EVERY liquid name at the same depth on the same
+day, so the market's own move that week cancels. 'regains high' is the share that
+got back to the high they fell from within 60 trading days.
+
+Read the SHAPE, not any one row. A smooth decline means there is no level to exit
+at; a sign flip that stays flipped is a level.
+
+TWO CAVEATS, both biting hardest in exactly the deep buckets that matter:
+  * SURVIVORSHIP. A name needs 60 more bars of history to contribute a forward
+    return, so one that falls hard and then stops trading is silently absent. The
+    worst outcomes are missing from the deep rows, which flatters them.
+  * CLUSTERING. Deep falls happen in crises, so the thousands of observations in
+    the tail rows come from a handful of weeks and are nothing like independent.

@@ -1,0 +1,46 @@
+# Momentum + low-volatility combination — construction, generated 2026-09-12 by `slice lookbacks -family combo`.
+# Law 6 inputs only; exploration years. The bootstrap cross-check at the end was read after the weights were fixed.
+
+MOMENTUM + LOW-VOLATILITY COMBINATION — CONSTRUCTION. 2013-07-01..2021-12-31, Rs 10 cr floor, top quintile, monthly rebalance, 50 bps
+Law 6 inputs only: costs (facts) and correlations (estimable). No return, SR or edge printed;
+only the bootstrap cross-check at the end sees sample means, as Carver's method requires.
+1844 common trading days from 2014-07-16.
+
+cost of trading each member's book
+  mom6     turnover  3.97%/day one-way   cost 0.099 SR/yr
+  mom9     turnover  3.43%/day one-way   cost 0.086 SR/yr
+  mom12    turnover  3.12%/day one-way   cost 0.078 SR/yr
+  mom12_1  turnover  3.28%/day one-way   cost 0.081 SR/yr
+  vol3     turnover  2.60%/day one-way   cost 0.111 SR/yr
+  vol6     turnover  1.69%/day one-way   cost 0.073 SR/yr
+  vol12    turnover  1.19%/day one-way   cost 0.052 SR/yr
+  beta12   turnover  1.60%/day one-way   cost 0.069 SR/yr
+  idio12   turnover  1.36%/day one-way   cost 0.053 SR/yr
+
+each branch at its own track's frozen weights
+  momentum        [0.33 0.33 0.17 0.17] over [mom6 mom9 mom12 mom12_1]   cost 0.088 SR/yr
+  low volatility  [0.11 0.11 0.11 0.33 0.34] over [vol3 vol6 vol12 beta12 idio12]   cost 0.067 SR/yr
+
+correlation of the two branches' daily returns in excess of equal-weight: -0.12
+(Table 8 row 2 splits two branches in halves whatever it is; it is printed as the diversification evidence)
+
+handcrafted (Table 8)
+  strategies     row 2                        momentum 50%, low volatility 50%
+
+Table 12 column A on the branches' cost difference
+  momentum        -0.011 -> x0.987   50.0% -> 49.1%
+  low volatility  +0.011 -> x1.024   50.0% -> 50.9%
+
+final member weights (branch weight x the track's own weight), whole percent
+  mom6     16.2% -> 16%
+  mom9     16.2% -> 16%
+  mom12    8.3% -> 8%
+  mom12_1  8.3% -> 8%
+  vol3     5.6% -> 6%
+  vol6     5.6% -> 6%
+  vol12    5.6% -> 6%
+  beta12   16.8% -> 17%
+  idio12   17.3% -> 17%
+
+cross-check: Carver's bootstrap on the two branches (500 resamples; 42 uninformative), read after the weights
+  momentum 66.7%, low volatility 33.3% (single fit 75.2% / 24.8%)

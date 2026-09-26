@@ -1,0 +1,16 @@
+# Stop-loss screen — generated 2026-09-09T08:41Z
+# NSE cash equity, Rs 10cr floor, ewmac32 top quintile, 2013-07-01..2026-09, 50bps round trip.
+# Exits are detected at the close and filled at the NEXT open: assuming a fill at the
+# stop price itself is an intraday fantasy on daily bars and would flatter every row.
+# The random-exit rows are the control — same exits, chosen by a hash instead of by price.
+
+config                                NAV   return   annvol    maxDD  cost/yr    exits
+none (baseline)                   1400.48   22.61%   19.85%   -37.8%      161        0
+fixed 0.05                         985.45   19.33%   19.01%   -38.1%      159     3644
+fixed 0.08                         988.01   19.35%   19.05%   -40.0%      160     2413
+trailing 0.05                      179.90    4.64%   17.23%   -50.9%      155     9112
+trailing 0.08                      364.07   10.49%   17.59%   -36.4%      157     6381
+volfixed 0.5                      1379.52   22.47%   19.80%   -37.4%      161      284
+voltrailing 0.5                   1259.20   21.61%   19.78%   -37.0%      161     1165
+random exits @ 0.0125             1208.60   21.22%   19.93%   -39.2%      156     2640
+random exits @ 0.0071             1210.28   21.24%   19.87%   -40.4%      158     1577

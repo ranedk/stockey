@@ -1,0 +1,95 @@
+========== NIFTY ==========
+9 slots stored -> 3 curve positions kept
+  position 1  NIFTY-2026-08-25     expiry 2026-08-25   2761 bars  2015-01-01..2026-08-21  last 24286.00
+  position 2  NIFTY-2026-09-29     expiry 2026-09-29   2826 bars  2015-01-01..2026-08-21  last 24391.10
+  position 3  NIFTY-2026-10-27     expiry 2026-10-27   2792 bars  2015-01-01..2026-08-21  last 24521.90
+  REJECTED    NIFTY-2025-09-30     level is 0.0695x the rest of the curve — recycled security id, not this instrument
+  REJECTED    NIFTY-2025-10-28     level is 2.87x the rest of the curve — recycled security id, not this instrument
+  REJECTED    NIFTY-2026-03-30     level is 0.0753x the rest of the curve — recycled security id, not this instrument
+  REJECTED    NIFTY-2026-04-28     level is 2.72x the rest of the curve — recycled security id, not this instrument
+  REJECTED    NIFTY-2026-06-30     level is 0.0239x the rest of the curve — recycled security id, not this instrument
+  REJECTED    NIFTY-2026-07-28     level is 0.115x the rest of the curve — recycled security id, not this instrument
+  reference detector (NIFTY, 20 sigma): biggest divergence 11.5 sigma, 0 days clear the bar
+      -> this reference cannot see the splices: the ladder step is only 39 bps and the
+         pair's day-to-day tracking noise is larger. Absence of detections here is NOT
+         evidence that the series is unspliced.
+  ladder: positions 1 month(s) apart (35 days) — monthly cycle, step 39 bps
+  rolls (calendar+ladder): 139, spacing 18/30/42 days (min/mean/max), 2015-01-23..2026-07-29
+  panama: 139 splices, mean basis 66.45, cumulative 9237.15, adjusted low 14554.65
+  stitch check: roll-day move is 2.08x a typical day raw, 1.28x adjusted (ordinary day 1.37x)
+  carry: mean -661.63 price units/yr over a 35-day gap (contango — the front is cheaper, so holding rolls up the curve and costs money)
+
+========== BANKNIFTY ==========
+10 slots stored -> 3 curve positions kept
+  position 1  BANKNIFTY-2026-08-25 expiry 2026-08-25   2759 bars  2015-01-01..2026-08-21  last 57721.80
+  position 2  BANKNIFTY-2026-09-29 expiry 2026-09-29   2825 bars  2015-01-01..2026-08-21  last 58044.40
+  position 3  BANKNIFTY-2026-10-27 expiry 2026-10-27   2792 bars  2015-01-01..2026-08-21  last 58381.00
+  REJECTED    BANKNIFTY-2025-08-28 level is 1.33x the rest of the curve — recycled security id, not this instrument
+  REJECTED    BANKNIFTY-2025-09-30 level is 0.027x the rest of the curve — recycled security id, not this instrument
+  REJECTED    BANKNIFTY-2025-10-28 level is 0.158x the rest of the curve — recycled security id, not this instrument
+  REJECTED    BANKNIFTY-2026-03-30 level is 1.24x the rest of the curve — recycled security id, not this instrument
+  REJECTED    BANKNIFTY-2026-04-28 level is 1.22x the rest of the curve — recycled security id, not this instrument
+  REJECTED    BANKNIFTY-2026-06-30 level is 0.0102x the rest of the curve — recycled security id, not this instrument
+  REJECTED    BANKNIFTY-2026-07-28 level is 0.0503x the rest of the curve — recycled security id, not this instrument
+  reference detector (BANKNIFTY, 20 sigma): biggest divergence 10.9 sigma, 0 days clear the bar
+      -> this reference cannot see the splices: the ladder step is only 38 bps and the
+         pair's day-to-day tracking noise is larger. Absence of detections here is NOT
+         evidence that the series is unspliced.
+  ladder: positions 1 month(s) apart (35 days) — monthly cycle, step 38 bps
+  rolls (calendar+ladder): 139, spacing 18/30/41 days (min/mean/max), 2015-01-27..2026-07-29
+  panama: 139 splices, mean basis 156.25, cumulative 21718.50, adjusted low 33163.90
+  stitch check: roll-day move is 2.24x a typical day raw, 1.55x adjusted (ordinary day 1.43x)
+  carry: mean -1505.60 price units/yr over a 35-day gap (contango — the front is cheaper, so holding rolls up the curve and costs money)
+
+========== GOLDM ==========
+7 slots stored -> 3 curve positions kept
+  position 1  GOLDM-2026-09-04     expiry 2026-09-04   2793 bars  2015-01-01..2026-08-21  last 160916.00
+  position 2  GOLDM-2026-10-05     expiry 2026-10-05   2813 bars  2015-01-01..2026-08-21  last 162323.00
+  position 3  GOLDM-2026-11-05     expiry 2026-11-05   2782 bars  2015-01-01..2026-08-21  last 163415.00
+  REJECTED    GOLDM-2025-08-05     byte-identical to GOLDM-2026-04-02 — Dhan serves one stream under several ids
+  REJECTED    GOLDM-2026-04-02     byte-identical to GOLDM-2026-07-03 — Dhan serves one stream under several ids
+  REJECTED    GOLDM-2026-07-03     byte-identical to GOLDM-2026-08-05 — Dhan serves one stream under several ids
+  REJECTED    GOLDM-2026-08-05     byte-identical to GOLDM-2026-09-04 — Dhan serves one stream under several ids
+  reference detector (GOLDBEES, 20 sigma): biggest divergence 14.3 sigma, 0 days clear the bar
+      -> this reference cannot see the splices: the ladder step is only 39 bps and the
+         pair's day-to-day tracking noise is larger. Absence of detections here is NOT
+         evidence that the series is unspliced.
+  ladder: positions 1 month(s) apart (31 days) — monthly cycle, step 39 bps
+  rolls (calendar+ladder): 139, spacing 21/31/57 days (min/mean/max), 2015-01-06..2026-08-04
+  panama: 139 splices, mean basis 312.34, cumulative 43415.00, adjusted low 65840.00
+  stitch check: roll-day move is 3.56x a typical day raw, 1.62x adjusted (ordinary day 1.99x)
+  carry: mean -3269.01 price units/yr over a 31-day gap (contango — the front is cheaper, so holding rolls up the curve and costs money)
+
+========== SILVERM ==========
+5 slots stored -> 3 curve positions kept
+  position 1  SILVERM-2026-08-31   expiry 2026-08-31   2794 bars  2015-01-01..2026-08-21  last 247903.00
+  position 2  SILVERM-2026-11-30   expiry 2026-11-30   2815 bars  2015-01-01..2026-08-21  last 255162.00
+  position 3  SILVERM-2027-02-26   expiry 2027-02-26   2768 bars  2015-01-01..2026-08-21  last 261995.00
+  REJECTED    SILVERM-2026-04-30   byte-identical to SILVERM-2026-06-30 — Dhan serves one stream under several ids
+  REJECTED    SILVERM-2026-06-30   byte-identical to SILVERM-2026-08-31 — Dhan serves one stream under several ids
+  reference detector (SILVERBEES, 20 sigma): biggest divergence 10.1 sigma, 0 days clear the bar
+      -> this reference cannot see the splices: the ladder step is only 166 bps and the
+         pair's day-to-day tracking noise is larger. Absence of detections here is NOT
+         evidence that the series is unspliced.
+  ladder: positions 3 month(s) apart (91 days) — quarterly cycle, step 166 bps
+  WARNING: roll spacing reaches 188 days against a 91-day cycle — there is a hole in this history
+  rolls (calendar+ladder): 45, spacing 84/93/188 days (min/mean/max), 2015-02-28..2026-05-28
+  panama: 45 splices, mean basis 1574.44, cumulative 70850.00, adjusted low 90604.00
+  stitch check: roll-day move is 4.73x a typical day raw, 1.91x adjusted (ordinary day 2.68x)
+  carry: mean -5518.05 price units/yr over a 91-day gap (contango — the front is cheaper, so holding rolls up the curve and costs money)
+
+========== CRUDEOILM ==========
+7 slots stored -> 3 curve positions kept
+  position 1  CRUDEOILM-2026-09-21 expiry 2026-09-21   2042 bars  2015-02-02..2026-08-21  last 8357.00
+  position 2  CRUDEOILM-2026-10-19 expiry 2026-10-19   2035 bars  2015-02-02..2026-08-21  last 8180.00
+  position 3  CRUDEOILM-2026-11-19 expiry 2026-11-19   2014 bars  2015-02-02..2026-08-21  last 8013.00
+  REJECTED    CRUDEOILM-2025-10-20 byte-identical to CRUDEOILM-2025-12-18 — Dhan serves one stream under several ids
+  REJECTED    CRUDEOILM-2025-12-18 byte-identical to CRUDEOILM-2026-01-16 — Dhan serves one stream under several ids
+  REJECTED    CRUDEOILM-2026-01-16 byte-identical to CRUDEOILM-2026-07-20 — Dhan serves one stream under several ids
+  REJECTED    CRUDEOILM-2026-07-20 byte-identical to CRUDEOILM-2026-09-21 — Dhan serves one stream under several ids
+  reference detector: NO REFERENCE SERIES EXISTS for CRUDEOILM
+  ladder: positions 1 month(s) apart (31 days) — monthly cycle, step 81 bps
+  WARNING: roll spacing reaches 1202 days against a 31-day cycle — there is a hole in this history
+  -> UNUSABLE: irregular rolls and no reference series to check them against
+
+4 underlying(s) produced a usable continuous series.

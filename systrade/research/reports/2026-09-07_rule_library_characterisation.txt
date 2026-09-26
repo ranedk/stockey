@@ -1,0 +1,86 @@
+# rulelab scalars — generated 2026-09-07T13:00Z
+# cmd: rulelab scalars (defaults: cache data/cache/bars_daily.bin, 2013-07-01..2026-06-30, min turnover Rs 1cr/day)
+
+universe 3899 symbols | 2682621 liquid symbol-days in 2013-07-01..2026-06-30 | min turnover Rs 10000000/day
+
+rule                    obs  mean|raw|   mean raw       scalar   p99|raw|
+ewmac16_64          2682621     2.2590     0.4270        4.427      7.355
+ewmac32_128         2682621     3.3726     0.7990        2.965     11.405
+ewmac64_256         2682621     4.9740     1.4124        2.010     19.365
+breakout40          2682169     0.2663     0.0166       37.549      0.485
+breakout80          2636113     0.2590     0.0309       38.603      0.475
+breakout160         2516884     0.2552     0.0494       39.178      0.475
+breakout320         2259400     0.2527     0.0651       39.566      0.465
+accel16             2682621     1.4509    -0.0640        6.893      4.995
+accel32             2682621     2.1392    -0.0633        4.675      7.615
+accel64             2664808     3.2844     0.0060        3.045     13.335
+meanrev512          2126939     0.5229    -0.1381       19.124      2.105
+meanrev1280         1351073     0.5167    -0.1785       19.355      2.375
+
+scalar = 10 / mean|raw| (Law 8's average-absolute-10 convention).
+EWMAC rows are the control: our measured scalar should land near
+Carver's published 3.75 / 2.65 / 1.87 for fast 16 / 32 / 64. If it
+does not, the procedure is wrong, not the book.
+
+# rulelab corr
+
+universe 3899 symbols | 2013-07-01..2026-06-30 | min turnover Rs 10000000/day | forecasts scaled + capped at +/-20, long-only clipping OFF
+
+rule                    obs   mean|fcst|     at cap
+ewmac16_64          2682621         8.10       5.2%
+ewmac32_128         2682621         8.39       5.8%
+ewmac64_256         2682621         8.49       6.1%
+breakout40          2682169         9.99       0.0%
+breakout80          2636113        10.00       0.0%
+breakout160         2516884        10.01       0.0%
+breakout320         2259400        10.01       0.0%
+accel16             2682621         9.31      11.1%
+accel32             2682621         9.26      10.9%
+accel64             2664808         9.00      10.3%
+meanrev512          2126939         9.08       8.0%
+meanrev1280         1351073         8.78       6.4%
+
+(mean|fcst| should sit near 10 for every rule; a rule far from it has a
+stale scalar. 'at cap' far above ~10% means the rule is a step function
+wearing a forecast's clothes.)
+
+pairwise forecast correlation (pooled over liquid symbol-days):
+              ewmac16_ewmac32_ewmac64_breakoutbreakoutbreakoutbreakout accel16 accel32 accel64meanrev5meanrev1
+ewmac16_64        1.00    0.87    0.59    0.84    0.94    0.78    0.52    0.33    0.67    0.64   -0.61   -0.38
+ewmac32_128       0.87    1.00    0.87    0.56    0.84    0.94    0.78   -0.01    0.35    0.67   -0.80   -0.51
+ewmac64_256       0.59    0.87    1.00    0.30    0.55    0.83    0.93   -0.13    0.02    0.37   -0.95   -0.69
+breakout40        0.84    0.56    0.30    1.00    0.78    0.49    0.27    0.63    0.72    0.36   -0.41   -0.26
+breakout80        0.94    0.84    0.55    0.78    1.00    0.79    0.50    0.20    0.62    0.68   -0.55   -0.34
+breakout160       0.78    0.94    0.83    0.49    0.79    1.00    0.80   -0.07    0.21    0.58   -0.74   -0.47
+breakout320       0.52    0.78    0.93    0.27    0.50    0.80    1.00   -0.12   -0.06    0.20   -0.90   -0.62
+accel16           0.33   -0.01   -0.13    0.63    0.20   -0.07   -0.12    1.00    0.42   -0.08   -0.05   -0.04
+accel32           0.67    0.35    0.02    0.72    0.62    0.21   -0.06    0.42    1.00    0.42   -0.10   -0.05
+accel64           0.64    0.67    0.37    0.36    0.68    0.58    0.20   -0.08    0.42    1.00   -0.24   -0.07
+meanrev512       -0.61   -0.80   -0.95   -0.41   -0.55   -0.74   -0.90   -0.05   -0.10   -0.24    1.00    0.76
+meanrev1280      -0.38   -0.51   -0.69   -0.26   -0.34   -0.47   -0.62   -0.04   -0.05   -0.07    0.76    1.00
+
+same correlation computed WITHIN each symbol, then averaged over symbols
+(only symbols with >= 250 overlapping observations for the pair):
+              ewmac16_ewmac32_ewmac64_breakoutbreakoutbreakoutbreakout accel16 accel32 accel64meanrev5meanrev1
+ewmac16_64        1.00    0.86    0.53    0.84    0.93    0.75    0.47    0.36    0.71    0.64   -0.59   -0.36
+ewmac32_128       0.86    1.00    0.84    0.54    0.83    0.92    0.74    0.00    0.40    0.71   -0.76   -0.47
+ewmac64_256       0.53    0.84    1.00    0.23    0.50    0.80    0.89   -0.14    0.04    0.45   -0.91   -0.62
+breakout40        0.84    0.54    0.23    1.00    0.77    0.46    0.22    0.64    0.73    0.34   -0.41   -0.26
+breakout80        0.93    0.83    0.50    0.77    1.00    0.77    0.46    0.21    0.64    0.68   -0.53   -0.32
+breakout160       0.75    0.92    0.80    0.46    0.77    1.00    0.77   -0.06    0.24    0.61   -0.69   -0.41
+breakout320       0.47    0.74    0.89    0.22    0.46    0.77    1.00   -0.14   -0.04    0.24   -0.84   -0.52
+accel16           0.36    0.00   -0.14    0.64    0.21   -0.06   -0.14    1.00    0.42   -0.08   -0.09   -0.08
+accel32           0.71    0.40    0.04    0.73    0.64    0.24   -0.04    0.42    1.00    0.42   -0.15   -0.10
+accel64           0.64    0.71    0.45    0.34    0.68    0.61    0.24   -0.08    0.42    1.00   -0.30   -0.16
+meanrev512       -0.59   -0.76   -0.91   -0.41   -0.53   -0.69   -0.84   -0.09   -0.15   -0.30    1.00    0.73
+meanrev1280      -0.36   -0.47   -0.62   -0.26   -0.32   -0.41   -0.52   -0.08   -0.10   -0.16    0.73    1.00
+
+correlation groups at rho >= 0.70 (complete linkage: every pair inside
+a group clears the threshold). Handcrafted weights are assigned BETWEEN
+groups first, then within, per Carver's App C:
+  group 1: ewmac16_64, ewmac32_128, breakout80, breakout160
+  group 2: ewmac64_256, breakout320, meanrev512
+  group 3: breakout40, accel32
+  group 4: accel16
+  group 5: accel64
+  group 6: meanrev1280

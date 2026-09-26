@@ -1,0 +1,20 @@
+# Momentum lookback blend — kill screen (LEDGER row 31, trials=1), generated 2026-09-12 by `slice lookbacks -screen`.
+# Pre-registered: research/preregistrations/2026-09-12_lookback_blend_screen.md
+# Deterministic run: symbol ids now assigned by name (stableIDs), so the stable-shuffle control is reproducible.
+# Two earlier runs, before that fix, drew the control at 8.35%/yr and 10.64%/yr and also passed both criteria.
+
+MOMENTUM LOOKBACK BLEND — KILL SCREEN (trials=1, pre-registered 2026-09-12). 2013-07-01..2021-12-31, Rs 10 cr, 50 bps
+weights [0.33 0.33 0.17 0.17] over [mom6 mom9 mom12 mom12_1], from 2014-07-07 (every member live). Exploration years: this can kill, never confirm.
+
+  lookback blend       18.70%/yr  vol  25.26%  SR  0.81  maxDD  -48.9%  turnover  3.57%/day
+  equal-weight          8.10%/yr  vol  22.26%  SR  0.46  maxDD  -58.2%  turnover  1.17%/day
+  stable-shuffle       11.10%/yr  vol  22.01%  SR  0.59  maxDD  -54.1%  turnover  1.18%/day
+
+edge, monthly paired, 90 months, 90% bootstrap intervals
+  vs equal-weight    +0.78 [+0.37,+1.19] p0.001
+  vs stable-shuffle  +0.57 [+0.12,+1.03] p0.024
+  at 100 bps: vs equal-weight +0.65%/mo, vs stable-shuffle +0.44%/mo
+
+  K1  p < 0.10 against both controls at 50 bps        PASS (p 0.0008, 0.0242)
+  K2  positive mean against both controls at 100 bps  PASS
+  VERDICT: SURVIVES — the forward track may start

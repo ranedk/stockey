@@ -1,0 +1,23 @@
+# Kill screen (LEDGER row 34, trials=1) — generated 2026-09-12 by `slice lookbacks -family combo -screen`.
+# Pre-registered: research/preregistrations/2026-09-12_lowvol_and_combination_screens.md
+
+MOMENTUM + LOW-VOLATILITY COMBINATION — KILL SCREEN (trials=1, pre-registered 2026-09-12). 2013-07-01..2021-12-31, Rs 10 cr, 50 bps
+weights [0.16 0.16 0.08 0.08 0.06 0.06 0.06 0.17 0.17] over [mom6 mom9 mom12 mom12_1 vol3 vol6 vol12 beta12 idio12], from 2014-07-16 (every member live). Exploration years: this can kill, never confirm.
+
+  momentum + low-volatility combination   16.66%/yr  vol  19.06%  SR  0.90  maxDD  -38.6%  turnover  2.53%/day
+  equal-weight          8.92%/yr  vol  22.12%  SR  0.50  maxDD  -58.2%  turnover  1.16%/day
+  stable-shuffle        8.88%/yr  vol  22.51%  SR  0.49  maxDD  -59.2%  turnover  1.27%/day
+
+edge, monthly paired, 90 months, 90% bootstrap intervals
+  vs equal-weight    +0.49 [+0.13,+0.85] p0.014
+  vs stable-shuffle  +0.48 [+0.09,+0.89] p0.024
+  at 100 bps: vs equal-weight +0.42%/mo, vs stable-shuffle +0.42%/mo
+
+edge at MATCHED risk (the book scaled, with hindsight, to each control's volatility) — the deciding statistic
+  vs equal-weight    +0.71 [+0.38,+1.04] p0.000
+  vs stable-shuffle  +0.73 [+0.37,+1.09] p0.000
+  at 100 bps: vs equal-weight +0.62%/mo, vs stable-shuffle +0.65%/mo
+
+  K1  p < 0.10 against both controls at 50 bps        PASS (p 0.0002, 0.0004)
+  K2  positive mean against both controls at 100 bps  PASS
+  VERDICT: SURVIVES — the forward track may start

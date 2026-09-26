@@ -1,0 +1,28 @@
+WEINSTEIN FOLLOW-UPS — pre-registered, research/preregistrations/2026-09-15_weinstein_followups.md
+NSE adjusted EQ, Rs 10 cr floor, 2013-07-01..2021-12-31, weekly stages (a day uses its last COMPLETED week),
+equal weight, decide at a close, fill at the next open, rebalanced every 5 trading days, 50 bps round trip.
+Controls: the equal-weight universe, and the same number of names at random from the same eligible set, held
+(stable shuffle). Exploration years: can kill, never confirm.
+
+(d) early Stage 2: every Stage 2 name except, each day, the top fifth of them by 30-week MA slope or by
+    distance above the MA. (e) faithful breakout: a weekly close above the prior 30 weeks' highest close,
+    out of a flat-MA base, MA not falling, above the MA, >= 2x volume, Mansfield RS > 0; exit on a weekly
+    close below the 30-week MA.
+
+                      the book: ret / vol / maxDD  turnover               equal-weight           same-size random
+  d-early-stage2            14.5% / 20.5% / -44%     1984%       13.6% / 22.3% / -58%       14.0% / 22.0% / -57%
+  e-faithful-breakout       14.1% / 28.3% / -48%     1194%        9.7% / 22.3% / -58%       10.8% / 22.4% / -53%
+
+  %/month              raw vs EW  matched vs EW (p) matched vs rnd (p)   100 bps   FDR q    DSR corr w/ mom  verdict
+  d-early-stage2           +0.02     +0.13 (0.300)     +0.09 (0.367)     -0.23   0.489  0.609        0.41  does not survive
+  e-faithful-breakout      +0.37     +0.10 (0.395)     +0.02 (0.489)     -0.01   0.489  0.467        0.37  does not survive
+
+Deciding: matched-risk edge over the tougher control; survive = beats both, FDR discovery within the family,
+100-bps edge not negative. 'corr w/ mom' = daily gross excess (book - equal-weight) vs the momentum lookback
+blend's, run here on the same days (weekly rebalanced); >= 0.8 means the same bet.
+
+plain Stage 2, same universe and clock: 17.1% / 21.8% / -47%
+(d) vs plain Stage 2, net: -0.20%/month, p = 0.990 (pre-registered: must be positive with p < 0.10)
+(e) entries a year: 2014: 2 2015: 35 2016: 47 2017: 75 2018: 36 2019: 32 2020: 52 2021: 45 | mean names held 15.8
+
+PRE-REGISTERED VERDICT: (d) does not survive; (e) does not survive.

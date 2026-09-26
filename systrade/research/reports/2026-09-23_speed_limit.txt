@@ -1,0 +1,41 @@
+THE SPEED LIMIT — what a book must earn before it has earned anything
+
+Tier Rs 10-25 cr, day value Rs 10.0 cr, daily volatility 2.0%, 100% of the book replaced each period.
+Charges are Dhan's published schedule; the spread is LEDGER row 35's measurement; impact is
+that row's square-root model. Every number below is a cost, so every number is a hurdle.
+
+One round trip, by position size (statutory 22.3 bps + DP charge + impact):
+                     6.0k      12.5k      20.0k         1L         3L
+  auction fill      50.0       38.5       35.3       36.4       44.7 bps
+  after open        59.6       48.1       44.9       46.0       54.3 bps
+
+Annual cost of running the book — auction fills (our operating rule, row 35)
+  hold           trips/yr       6.0k      12.5k      20.0k         1L         3L
+  1 day             252.0     125.9%      97.1%      89.0%      91.7%     112.6%
+  2 days            126.0      62.9%      48.6%      44.5%      45.9%      56.3%
+  3 days             84.0      42.0%      32.4%      29.7%      30.6%      37.5%
+  5 days             50.4      25.2%      19.4%      17.8%      18.3%      22.5%
+  10 days            25.2      12.6%       9.7%       8.9%       9.2%      11.3%
+  21 days            12.0       6.0%       4.6%       4.2%       4.4%       5.4%
+  42 days             6.0       3.0%       2.3%       2.1%       2.2%       2.7%
+  63 days             4.0       2.0%       1.5%       1.4%       1.5%       1.8%
+
+Annual cost of running the book — fills after the open (the spread added)
+  hold           trips/yr       6.0k      12.5k      20.0k         1L         3L
+  1 day             252.0     150.1%     121.3%     113.2%     115.9%     136.8%
+  2 days            126.0      75.0%      60.7%      56.6%      58.0%      68.4%
+  3 days             84.0      50.0%      40.4%      37.7%      38.6%      45.6%
+  5 days             50.4      30.0%      24.3%      22.6%      23.2%      27.4%
+  10 days            25.2      15.0%      12.1%      11.3%      11.6%      13.7%
+  21 days            12.0       7.1%       5.8%       5.4%       5.5%       6.5%
+  42 days             6.0       3.6%       2.9%       2.7%       2.8%       3.3%
+  63 days             4.0       2.4%       1.9%       1.8%       1.8%       2.2%
+
+How to read it. The five live tracks hold 21 days and replace about two thirds of the
+book each time, which is the 21-day row scaled by -churn: a cost in the low single
+digits a year, against books that returned 13-19%. A swing book held a week is the
+5-day row, and it starts every year that many points behind. Law 13's question is not
+whether a fast signal predicts — it is whether it predicts by MORE than this table.
+
+Two levers move these numbers, and neither is the signal: bigger positions (the DP
+charge is flat, so it hurts small slices most) and auction fills (which pay no spread).

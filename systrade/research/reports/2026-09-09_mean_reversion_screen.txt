@@ -1,0 +1,20 @@
+# Mean-reversion screen — generated 2026-09-09T09:43Z
+# NSE cash equity, Rs 10cr floor, 2013-07-01..2026-09, 50bps round trip, fills at the next open.
+# 'Reversal' here is depth below the N-bar high in units of the name's own volatility,
+# NOT the multi-year mean reversion rows 14-15 already killed (that one measured -0.95
+# correlated with slow EWMAC — it was negative trend wearing another name).
+
+config                                                NAV   return   annvol    maxDD  cost/yr
+momentum alone (the live strategy)                1400.48   22.61%   19.85%   -37.8%    2.27%
+reversal20 alone                                  1400.48   22.61%   19.85%   -37.8%    2.27%
+reversal60 alone                                  1400.48   22.61%   19.85%   -37.8%    2.27%
+SWITCH: momentum, rev20 below 40% breadth         1526.13   23.43%   20.88%   -42.6%    3.24%
+SWITCH: momentum, rev60 below 40% breadth         1604.83   23.91%   21.24%   -45.5%    3.10%
+BLEND control: half each, every day                664.84   15.75%   19.67%   -48.1%    4.08%
+SWITCH rev60, scaled to momentum's risk           1359.55   22.33%   19.84%   -43.0%    2.93%
+SWITCH rev20, scaled to momentum's risk           1351.94   22.28%   19.86%   -40.8%    3.11%
+equal-weight universe (benchmark)                  567.46   14.35%   19.53%   -56.8%    0.56%
+
+The last two rows are the comparison that decides it: the switch raises volatility
+along with return, so it must be read at matched risk. There it returns LESS than
+momentum alone and draws down more.
