@@ -111,6 +111,7 @@ the quarter the transition actually happened.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import pandas as pd
@@ -1343,9 +1344,16 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     }
 
 
+# Nightly cap on per-company crawls (2026-09-25, universe rebuild step 6). Steady state is
+# ~1,390 companies / 75-day interval = ~18 a night; the cap only binds after a wave of
+# new names (the v2 switch made ~1,100 due at once), spreading it over several nights
+# instead of stalling the pipeline for hours. Over-cap companies stay due for the next run.
+L2_NIGHTLY_LIMIT = int(os.environ.get("FUNDAMENTALS_L2_NIGHTLY_LIMIT", "200"))
+
+
 def main() -> int:
     global STOCKEY_RUN_STATE
-    result = run_l2_state_refresh()
+    result = run_l2_state_refresh(limit=L2_NIGHTLY_LIMIT)
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "rows": result["rows"],
