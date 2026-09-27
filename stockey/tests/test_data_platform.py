@@ -14034,6 +14034,18 @@ def test_days_to_fetch_rereads_days_until_settled(monkeypatch):
     assert days == [date(2026, 9, 23), date(2026, 9, 25)]
 
 
+def test_history_keys_marks_only_new_rows_already_old_when_fetched():
+    rows = [
+        {"source": "bse", "news_id": "old-new", "disclosure_date": "2026-07-01"},    # old, first seen now
+        {"source": "bse", "news_id": "old-known", "disclosure_date": "2026-07-01"},  # old but already stored
+        {"source": "bse", "news_id": "fresh", "disclosure_date": "2026-09-22"},      # within 7 days
+        {"source": "bse", "news_id": "nodate", "disclosure_date": None},
+    ]
+    keys = fundamentals_bse_announcements.history_keys(
+        rows, existed_before={("bse", "old-known")}, fetched_at=pd.Timestamp("2026-09-26 10:00", tz="UTC"))
+    assert keys == [("bse", "old-new")]
+
+
 def test_load_companies_needing_backfill_excludes_already_done(monkeypatch):
     universe = _bse_universe_df(3)
     monkeypatch.setattr(fundamentals_bse_announcements, "_ensure_backfill_progress_table", lambda: None)
@@ -14092,6 +14104,8 @@ def test_run_auditor_rpt_backfill_returns_early_when_nothing_remaining(monkeypat
 
 
 def test_run_auditor_rpt_backfill_marks_only_successful_companies(monkeypatch):
+    monkeypatch.setattr(fundamentals_bse_announcements, "_existing_event_keys", lambda rows: set())
+    monkeypatch.setattr(fundamentals_bse_announcements, "mark_new_rows_historical", lambda rows, **k: 0)
     universe = _bse_universe_df(2)
     identity = _bse_identity_df(universe["ticker"], ["111111", "222222"])
     combined = universe.join(identity)
@@ -14119,6 +14133,8 @@ def test_run_auditor_rpt_backfill_marks_only_successful_companies(monkeypatch):
 
 
 def test_run_auditor_rpt_backfill_discards_off_target_filing_types(monkeypatch):
+    monkeypatch.setattr(fundamentals_bse_announcements, "_existing_event_keys", lambda rows: set())
+    monkeypatch.setattr(fundamentals_bse_announcements, "mark_new_rows_historical", lambda rows, **k: 0)
     # BUG FOUND LIVE 2026-08-17: this backfill exists only for auditor_change/
     # related_party_transaction (L1's post-hoc exclusion needs 3yr history for those
     # two, unlike everything else). It used to store EVERY filing_type

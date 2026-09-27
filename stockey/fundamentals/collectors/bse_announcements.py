@@ -65,7 +65,7 @@ import pandas as pd
 import requests
 from environs import Env
 
-from fundamentals.collectors.events_store import RESULTS_TABLE, resolve_isin, upsert_events_with_dedup
+from fundamentals.collectors.events_store import RESULTS_TABLE, _existing_event_keys, resolve_isin, upsert_events_with_dedup
 from fundamentals.collectors.security_master import BSE_HEADERS
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
 from fundamentals.screens.l2_state import pull_crawl_forward
@@ -73,6 +73,7 @@ from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
 from utils.fallback_telemetry import record_local_fallback_event
+from utils.schema_migrations import apply_schema_migration
 
 
 env = Env()
@@ -835,6 +836,12 @@ BACKFILL_FILING_TYPES = ("auditor_change", "related_party_transaction")
 # latest quarter's results, ratings and deals -- not only whatever the daily crawl sees
 # after it joined.
 RECENT_ALL_TYPES_DAYS = 90
+# Filings the backfill stores that are already older than this when fetched are HISTORY:
+# kept for context (priors, auditor/RPT exclusion, the one-time catch-up admission) but
+# marked rule_trigger_status='historical' so the nightly alert step never treats a
+# months-old filing as news (2026-09-26, universe rebuild go-live).
+HISTORY_AFTER_DAYS = 7
+HISTORICAL_RULE_STATUS = "historical"
 # BUG FOUND LIVE 2026-08-18 (re-audit): run_auditor_rpt_backfill() was manual-only
 # -- no reference in run_pipeline.py's STEPS, the crontab, or docs/DATA_INVENTORY.md
 # -- so the 43 BSE-only companies it exists to cover would never finish (confirmed
@@ -892,6 +899,60 @@ def _mark_backfilled(company_master_ids: list[str]) -> None:
         pd.DataFrame({"company_master_id": company_master_ids, "backfilled_at": pd.Timestamp.now(tz="UTC")}),
         BACKFILL_PROGRESS_TABLE,
         unique_keys=["company_master_id"],
+    )
+
+
+def history_keys(rows: list[dict], *, existed_before: set, fetched_at) -> list[tuple[str, str]]:
+    """(source, news_id) of rows this call INSERTED that were already older than
+    HISTORY_AFTER_DAYS when fetched. A row that already existed (say, a recent filing the
+    daily crawl stored that is still waiting for OCR) is never marked."""
+    cutoff = pd.Timestamp(fetched_at).tz_localize(None).normalize() - pd.Timedelta(days=HISTORY_AFTER_DAYS)
+    keys = []
+    for row in rows:
+        key = (row["source"], str(row["news_id"]))
+        if key in existed_before or row.get("disclosure_date") is None:
+            continue
+        if pd.Timestamp(row["disclosure_date"]).tz_localize(None) < cutoff:
+            keys.append(key)
+    return keys
+
+
+def mark_new_rows_historical(rows: list[dict], *, existed_before: set, fetched_at) -> int:
+    keys = history_keys(rows, existed_before=existed_before, fetched_at=fetched_at)
+    if not keys:
+        return 0
+    marked = {"n": 0}
+
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"UPDATE {RESULTS_TABLE} SET rule_trigger_status = %s "
+                " WHERE (source, news_id) IN (SELECT * FROM unnest(%s::text[], %s::text[])) "
+                "   AND rule_trigger_status IS NULL",
+                (HISTORICAL_RULE_STATUS, [k[0] for k in keys], [k[1] for k in keys]),
+            )
+            marked["n"] = cur.rowcount
+
+    execute_db_operation(_op, operation_name=f"{RESULTS_TABLE}:mark_historical")
+    return marked["n"]
+
+
+def mark_catchup_rows_historical() -> None:
+    """One-time: filings the 2026-09-26 catch-up inserted before mark_new_rows_historical
+    existed. Inserted since the catch-up began AND already over HISTORY_AFTER_DAYS old when
+    stored; rows from earlier (the old universe) and the daily crawl's recent rows are
+    untouched."""
+    apply_schema_migration(
+        migration_id="20260926_fundamentals_events_catchup_rows_historical",
+        description="fundamentals_events: catch-up backfill rows older than 7 days at insert -> rule_trigger_status='historical'.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"UPDATE {RESULTS_TABLE} SET rule_trigger_status = 'historical' "
+            " WHERE load_ts >= '2026-09-26 00:00:00+00' AND rule_trigger_status IS NULL "
+            "   AND disclosure_date IS NOT NULL "
+            f"  AND disclosure_date::date < (load_ts AT TIME ZONE 'Asia/Kolkata')::date - {HISTORY_AFTER_DAYS}"
+        ],
     )
 
 
@@ -970,7 +1031,9 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
             rows.append(row)
 
     if rows:
+        existed_before = _existing_event_keys(rows)
         upsert_events_with_dedup(rows)
+        mark_new_rows_historical(rows, existed_before=existed_before, fetched_at=to_date)
     _mark_backfilled(newly_backfilled)
 
     return {
@@ -985,6 +1048,7 @@ def run_auditor_rpt_backfill(*, limit: int | None = None, lookback_days: int = B
 
 def main() -> int:
     global STOCKEY_RUN_STATE
+    mark_catchup_rows_historical()
     result = run_bse_l3_detection()
 
     # BUG FOUND LIVE 2026-08-18 (re-audit): see BACKFILL_DAILY_LIMIT's own comment --
