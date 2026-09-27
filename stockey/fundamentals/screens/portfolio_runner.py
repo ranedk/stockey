@@ -65,6 +65,69 @@ SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_runner"
 # was sized on (1.5x the 10-day sigma), so re-entry needs the price to have done something
 # other than sit where the stop fired.
 STOP_COOLDOWN_DAYS = int(os.getenv("PORTFOLIO_STOP_COOLDOWN_DAYS", "14"))
+
+# One-time catch-up admission (operator, 2026-09-26; fundamentals/screens/catchup_admission.py).
+# Companies new to the universe whose signals from the last 60 days were stored as history
+# go through the SAME entry rules as of today, at today's price. They are a separate,
+# capped cohort: a company counts as catch-up while every alert it has comes from a
+# catch-up filing (a fresh filing later makes it an ordinary name). Late entries behave
+# differently from fresh ones, so they are tagged (entry_cohort) and measured apart, and
+# capped so a one-time burst cannot fill the book. Also skipped if the price already ran
+# more than CATCHUP_MAX_RUN_PCT since the signal -- the move the signal pointed at is gone.
+CATCHUP_COHORT = "catchup_2026_09"
+CATCHUP_MAX_POSITIONS = int(os.getenv("PORTFOLIO_CATCHUP_MAX_POSITIONS", "15"))
+CATCHUP_MAX_RUN_PCT = 25.0
+
+
+def _catchup_signal_dates() -> dict[str, object]:
+    """company_master_id -> earliest catch-up signal date, for companies whose EVERY
+    alert comes from a filing tagged with CATCHUP_COHORT."""
+    df = sql_to_df(
+        """
+        SELECT a.company_master_id,
+               bool_and(e.admission_cohort IS NOT DISTINCT FROM %s) AS all_catchup,
+               min(e.disclosure_date) AS first_signal
+          FROM fundamentals_l3_alerts a
+          JOIN fundamentals_events e ON e.source = a.source AND e.news_id = a.news_id
+         GROUP BY a.company_master_id
+        """,
+        params=(CATCHUP_COHORT,),
+    )
+    if df.empty:
+        return {}
+    df = df[df["all_catchup"].astype(bool)]
+    return dict(zip(df["company_master_id"].astype(str), df["first_signal"]))
+
+
+def _open_catchup_count() -> int:
+    df = sql_to_df(
+        "SELECT count(*) AS n FROM fundamentals_portfolio_position "
+        " WHERE status = 'open' AND entry_decision = 'accept' AND entry_cohort = %s",
+        params=(CATCHUP_COHORT,),
+    )
+    return int(df.iloc[0]["n"]) if not df.empty else 0
+
+
+def _price_run_since(ticker: str, since) -> float | None:
+    """% change in adjusted close from the session on/before `since` to the latest."""
+    df = sql_to_df(
+        "SELECT date, adj_close FROM advisory_adjusted_ohlcv_daily WHERE symbol = %s "
+        "  AND date >= %s::date - interval '10 days' ORDER BY date",
+        params=(ticker, str(since)),
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    base = df[df["date"] <= pd.Timestamp(str(since))]
+    if base.empty:
+        return None
+    return (float(df["adj_close"].iloc[-1]) / float(base["adj_close"].iloc[-1]) - 1) * 100
+
+
+def _ensure_cohort_columns() -> None:
+    with db_session() as (_conn, cur):
+        cur.execute("ALTER TABLE fundamentals_portfolio_position ADD COLUMN IF NOT EXISTS entry_cohort TEXT")
+        cur.execute("ALTER TABLE fundamentals_events ADD COLUMN IF NOT EXISTS admission_cohort TEXT")
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
@@ -229,7 +292,7 @@ def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET) -> dict:
 
 
 def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
-                   bucket: str = DEFAULT_BUCKET) -> dict:
+                   bucket: str = DEFAULT_BUCKET, entry_cohort: str | None = None) -> dict:
     price, price_date = _latest_price(candidate["ticker"])
     stop = candidate.get("stop") or {}
     sizing = _size_for(candidate, bucket)
@@ -273,6 +336,7 @@ def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
         "target_date": verdict.get("target_date"),
         "invalidation_criteria": verdict.get("invalidation_criteria"),
         "target_date_basis": verdict.get("target_date_basis"),
+        "entry_cohort": entry_cohort,
     }
     if dry_run:
         return row
@@ -302,6 +366,7 @@ def _close_superseded_veto(ticker: str, *, dry_run: bool) -> None:
 
 def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, object]:
     _ensure_tables()
+    _ensure_cohort_columns()
     evaluation = evaluate_entry_candidates()
 
     # A dead stage API rejects EVERY candidate for a reason that has nothing to do with
@@ -338,11 +403,25 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     # on the old global count would let a bucket deploy four times its envelope.
     book_used = len(already_accepted)
     book_capacity = bucket_config(DEFAULT_BUCKET)["target_positions"] or MAX_POSITIONS
+    catchup_signal = _catchup_signal_dates()
+    catchup_open = _open_catchup_count() if catchup_signal else 0
+    catchup_entered, catchup_cap_reached, catchup_price_ran = [], [], []
+    # Strongest evidence first, so when a cap or the book binds it keeps the best names.
+    candidates = sorted(evaluation["candidates"], key=lambda c: -int(c.get("confluence_count") or 0))
 
-    for candidate in evaluation["candidates"]:
+    for candidate in candidates:
         if candidate["ticker"] in already_accepted:
             skipped.append(candidate["ticker"])
             continue
+        cohort = CATCHUP_COHORT if str(candidate["company_master_id"]) in catchup_signal else None
+        if cohort:
+            if catchup_open >= CATCHUP_MAX_POSITIONS:
+                catchup_cap_reached.append(candidate["ticker"])
+                continue
+            ran = _price_run_since(candidate["ticker"], catchup_signal[str(candidate["company_master_id"])])
+            if ran is not None and ran > CATCHUP_MAX_RUN_PCT:
+                catchup_price_ran.append(candidate["ticker"])
+                continue
         if candidate["ticker"] in stopped_recently:
             # Stopped out inside the cooldown. Skipping BEFORE adjudication also saves the
             # call, same as the veto branch below. Named, not silent: "we would not buy it"
@@ -393,9 +472,12 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 # and it stops accruing the accepted arm's future.
                 _close_superseded_veto(candidate["ticker"], dry_run=dry_run)
                 superseded.append(candidate["ticker"])
-            _open_position(candidate, verdict, kind=kind, dry_run=dry_run)
+            _open_position(candidate, verdict, kind=kind, dry_run=dry_run, **({"entry_cohort": cohort} if cohort else {}))
             entered.append(candidate["ticker"])
             book_used += 1
+            if cohort:
+                catchup_entered.append(candidate["ticker"])
+                catchup_open += 1
         else:
             if candidate["ticker"] in vetoed_at_by_ticker:
                 # Same name, vetoed again. The decision is recorded above; writing a second
@@ -404,7 +486,7 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 re_vetoed.append(candidate["ticker"])
                 continue
             # Rejected -> shadow, always. This is the measurement, not bookkeeping.
-            _open_position(candidate, verdict, kind="shadow", dry_run=dry_run)
+            _open_position(candidate, verdict, kind="shadow", dry_run=dry_run, **({"entry_cohort": cohort} if cohort else {}))
             rejected.append(candidate["ticker"])
             vetoed_at_by_ticker[candidate["ticker"]] = pd.Timestamp.now(tz="UTC")
 
@@ -436,6 +518,9 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         "vetoed_shadow_superseded_by_accept": superseded,
         "below_bucket_liquidity_floor": below_liquidity_floor,
         "stale_confluence_skipped": evaluation.get("stale_confluence_skipped", []),
+        "catchup_entered": catchup_entered,
+        "catchup_cap_reached": catchup_cap_reached,
+        "catchup_price_already_ran": catchup_price_ran,
     }
 
 

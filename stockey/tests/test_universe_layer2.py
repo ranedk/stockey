@@ -93,3 +93,23 @@ def test_apply_layer2_records_which_rule_rescued():
     out = l2.apply_layer2(pd.DataFrame(rows)).set_index("symbol")
     assert out.at["GROW", "layer2_allowed_by"] == "scaling_growth" and bool(out.at["GROW", "layer2_pass"])
     assert out.at["CLEAN", "layer2_allowed_by"] is None
+
+
+def test_catchup_readiness_waits_for_every_document_to_be_read():
+    import pandas as pd
+    from fundamentals.screens import catchup_admission as ca
+
+    sel = pd.DataFrame([
+        {"source": "bse", "news_id": "a", "company_master_id": "nse:A", "filing_type": "results",
+         "ocr_status": "done", "has_document": True},
+        {"source": "bse", "news_id": "b", "company_master_id": "nse:B", "filing_type": "rating_action",
+         "ocr_status": None, "has_document": True},                 # unread -> not ready
+        {"source": "bse", "news_id": "c", "company_master_id": "nse:B", "filing_type": "pit_sast",
+         "ocr_status": None, "has_document": False},                # no document needed
+        {"source": "bse", "news_id": "d", "company_master_id": "nse:C", "filing_type": "results",
+         "ocr_status": "failed", "has_document": True},             # failed counts as finished
+    ])
+    r = ca.readiness(sel)
+    assert r["waiting_for_ocr"] == 1 and r["ready"] is False and r["companies"] == 3
+    assert ca.readiness(sel[sel["news_id"] != "b"])["ready"] is True
+    assert ca.readiness(sel.iloc[0:0])["ready"] is False  # nothing selected is not "ready"

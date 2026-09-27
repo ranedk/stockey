@@ -23860,6 +23860,62 @@ def test_missing_stage_read_fails_closed(monkeypatch):
     assert out["stage_api_available"] is False
 
 
+@pytest.fixture(autouse=True)
+def _no_catchup_cohort(monkeypatch):
+    """The catch-up cohort reads the live alert/event tables; off unless a test turns it on."""
+    import fundamentals.screens.portfolio_runner as runner
+
+    monkeypatch.setattr(runner, "_ensure_cohort_columns", lambda: None)
+    monkeypatch.setattr(runner, "_catchup_signal_dates", lambda: {})
+
+
+def _catchup_env(monkeypatch, *, candidates, signal, open_catchup=0, runs=None):
+    import fundamentals.screens.portfolio_runner as runner
+
+    opened = []
+    monkeypatch.setattr(runner, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(runner, "_recently_stopped_tickers", lambda: {})
+    monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: set())
+    monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
+    monkeypatch.setattr(fundamentals_l5_sizing, "load_adv_inputs", lambda cmid: None)
+    monkeypatch.setattr(runner, "_catchup_signal_dates", lambda: signal)
+    monkeypatch.setattr(runner, "_open_catchup_count", lambda: open_catchup)
+    monkeypatch.setattr(runner, "_price_run_since", lambda t, since: (runs or {}).get(t, 5.0))
+    monkeypatch.setattr(runner, "_open_position",
+                        lambda c, v, *, kind, dry_run, entry_cohort=None, **k: opened.append((c["ticker"], kind, entry_cohort)))
+    monkeypatch.setattr(runner, "_record_decision", lambda **k: None)
+    monkeypatch.setattr(runner, "evaluate_entry_candidates",
+                        lambda: {"stage_api_available": True, "evaluated": len(candidates), "candidates": candidates})
+    monkeypatch.setattr(runner, "adjudicate_entry", lambda c: {"decision": "accept", "reason": "r", "model": "m", "prompt_version": 1})
+    return runner, opened
+
+
+def test_catchup_names_are_tagged_capped_and_strongest_first(monkeypatch):
+    import fundamentals.screens.portfolio_runner as pr_mod
+
+    weak, strong, normal = _pf_candidate("WEAK"), _pf_candidate("STRONG"), _pf_candidate("NORMAL")
+    weak["confluence_count"], strong["confluence_count"], normal["confluence_count"] = 1, 3, 2
+    runner, opened = _catchup_env(
+        monkeypatch, candidates=[weak, normal, strong],
+        signal={str(weak["company_master_id"]): "2026-08-10", str(strong["company_master_id"]): "2026-08-10"},
+        open_catchup=pr_mod.CATCHUP_MAX_POSITIONS - 1)
+
+    out = runner.run_portfolio(live=True)
+
+    # one catch-up slot left: the stronger catch-up name takes it, the weaker is named as capped
+    assert ("STRONG", "real", "catchup_2026_09") in opened
+    assert ("NORMAL", "real", None) in opened  # ordinary names are untouched by the cap
+    assert out["catchup_entered"] == ["STRONG"] and out["catchup_cap_reached"] == ["WEAK"]
+
+
+def test_catchup_name_skipped_when_price_already_ran(monkeypatch):
+    c = _pf_candidate("RAN")
+    runner, opened = _catchup_env(monkeypatch, candidates=[c], signal={str(c["company_master_id"]): "2026-08-01"},
+                                  runs={"RAN": 40.0})
+    out = runner.run_portfolio(live=True)
+    assert opened == [] and out["catchup_price_already_ran"] == ["RAN"]
+
+
 def test_runner_blocks_rather_than_recording_a_spurious_empty_day(monkeypatch):
     """A dead stage API rejects EVERY candidate for an infrastructure reason. Recording
     that as a normal zero-entry day would later read as 'the rule found nothing'."""
