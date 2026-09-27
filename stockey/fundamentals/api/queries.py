@@ -29,7 +29,6 @@ import pandas as pd
 from fundamentals.collectors.rating_agencies import get_unsupported_rating_agencies
 from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 from fundamentals.screens.investor_classification import get_all_investor_classifications, set_investor_override
-from fundamentals.screens.l1_universe import L1_QUERY, L1_QUERY_VERSION
 from fundamentals.screens.l5_sizing import MAX_POSITIONS
 from fundamentals.screens.portfolio_buckets import DEFAULT_BUCKET, bucket_config, capital_per_position_rs
 from fundamentals.screens.portfolio_exit import PRICE_LOOKBACK_DAYS
@@ -55,36 +54,60 @@ def _clean_records(df: pd.DataFrame) -> list[dict]:
 
 
 def get_universe() -> dict:
-    """The L1 universe list plus the exact screening query/version used to produce
-    it, shown on the same page per the user's own request (conversation 2026-08-11:
-    "show what the screener returned as a list and the parameters used to screen on
-    the same page")."""
+    """The current universe list plus how it was built, on one page (user request
+    2026-08-11: "show what the screener returned as a list and the parameters used to
+    screen on the same page"). Version and rule text come from the stored rows, never
+    from code constants, so the page cannot describe a different screen from the one
+    that produced the list (it did, for a day, after the 2026-09-25 switch to version 2).
+    Version 2 rows also carry each stock's group and which allow-rule (if any) let it
+    through Layer 2; `excluded` lists what Layer 2 removed on its latest run, and why."""
     df = sql_to_df(
         """
-        SELECT ticker, company_name, metrics_json, run_date
+        SELECT ticker, company_name, metrics_json, run_date, query_version, query_text
         FROM fundamentals_l1_universe
         WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_l1_universe)
         ORDER BY ticker
         """
     )
     companies = []
-    run_date = None
     for _, row in df.iterrows():
-        run_date = row["run_date"]
         metrics = json.loads(row["metrics_json"]) if row["metrics_json"] else {}
         companies.append(
             {
                 "ticker": row["ticker"],
                 "company_name": row["company_name"],
                 **{key: metrics.get(key) for key in _UNIVERSE_METRIC_KEYS},
+                "group": metrics.get("universe_group"),
+                "allowed_by": metrics.get("layer2_allowed_by"),
             }
         )
+    first = df.iloc[0] if not df.empty else None
     return {
-        "query_text": L1_QUERY,
-        "query_version": L1_QUERY_VERSION,
-        "run_date": str(run_date) if run_date is not None else None,
+        "query_text": first["query_text"] if first is not None else None,
+        "query_version": int(first["query_version"]) if first is not None else None,
+        "run_date": str(first["run_date"]) if first is not None else None,
         "companies": companies,
+        "excluded": _latest_layer2_exclusions(),
     }
+
+
+def _latest_layer2_exclusions() -> list[dict]:
+    try:
+        df = sql_to_df(
+            """
+            SELECT symbol, "group", layer2_reasons, run_date
+            FROM fundamentals_universe_layer2_inputs
+            WHERE run_date = (SELECT MAX(run_date) FROM fundamentals_universe_layer2_inputs)
+              AND layer2_reasons <> ''
+            ORDER BY symbol
+            """
+        )
+    except Exception:  # noqa: BLE001 -- table absent before the first version-2 run
+        return []
+    return [
+        {"ticker": r["symbol"], "group": r["group"], "reasons": [x for x in str(r["layer2_reasons"]).split("; ") if x]}
+        for _, r in df.iterrows()
+    ]
 
 
 def get_watchlist(status: str | None = "active") -> list[dict]:

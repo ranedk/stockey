@@ -182,13 +182,24 @@ export interface UniverseCompany {
   roce_pct: number | null
   qtr_sales_var_pct: number | null
   avg_vol_1mth: number | null
+  group: UniverseGroup | null
+  allowed_by: 'turnaround' | 'scaling_growth' | null
+}
+
+export type UniverseGroup = 'operating' | 'lender' | 'other_financial' | 'realty_holding' | 'unlabelled'
+
+export interface UniverseExclusion {
+  ticker: string
+  group: UniverseGroup | null
+  reasons: string[]
 }
 
 export interface UniverseResponse {
-  query_text: string
-  query_version: number
+  query_text: string | null
+  query_version: number | null
   run_date: string | null
   companies: UniverseCompany[]
+  excluded: UniverseExclusion[]
 }
 
 

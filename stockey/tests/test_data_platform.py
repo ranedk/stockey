@@ -20346,17 +20346,29 @@ def test_clean_records_empty_df_returns_empty_list():
 
 
 def test_get_universe_returns_query_and_parsed_metrics(monkeypatch):
-    df = pd.DataFrame(
-        [{"ticker": "FOO", "company_name": "Foo Co", "metrics_json": json.dumps({"cmp_rs": 100.0, "p_e": 15.0}), "run_date": date(2026, 8, 10)}]
-    )
-    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df", lambda q: df)
+    # Version and rule text come from the stored rows, not code constants (the page showed
+    # the version-1 query beside the version-2 list on 2026-09-26).
+    df = pd.DataFrame([{
+        "ticker": "FOO", "company_name": "Foo Co", "run_date": date(2026, 9, 25), "query_version": 2,
+        "query_text": "UNIVERSE_PRD v2", "metrics_json": json.dumps(
+            {"cmp_rs": 100.0, "p_e": 15.0, "universe_group": "lender", "layer2_allowed_by": "turnaround"}),
+    }])
+    excluded = pd.DataFrame([{"symbol": "BAR", "group": "operating", "run_date": date(2026, 9, 25),
+                              "layer2_reasons": "promoter pledge >= 50%; negative net worth"}])
+    monkeypatch.setattr(fundamentals_api_queries, "sql_to_df",
+                        lambda q: excluded if "fundamentals_universe_layer2_inputs" in q else df)
 
     result = fundamentals_api_queries.get_universe()
 
-    assert result["query_text"] == fundamentals_api_queries.L1_QUERY
-    assert result["query_version"] == fundamentals_api_queries.L1_QUERY_VERSION
-    assert result["run_date"] == "2026-08-10"
-    assert result["companies"] == [{"ticker": "FOO", "company_name": "Foo Co", "cmp_rs": 100.0, "p_e": 15.0, "mar_cap_rscr": None, "div_yld_pct": None, "roce_pct": None, "qtr_sales_var_pct": None, "avg_vol_1mth": None}]
+    assert result["query_text"] == "UNIVERSE_PRD v2"
+    assert result["query_version"] == 2
+    assert result["run_date"] == "2026-09-25"
+    assert result["companies"] == [{"ticker": "FOO", "company_name": "Foo Co", "cmp_rs": 100.0, "p_e": 15.0,
+                                    "mar_cap_rscr": None, "div_yld_pct": None, "roce_pct": None,
+                                    "qtr_sales_var_pct": None, "avg_vol_1mth": None,
+                                    "group": "lender", "allowed_by": "turnaround"}]
+    assert result["excluded"] == [{"ticker": "BAR", "group": "operating",
+                                   "reasons": ["promoter pledge >= 50%", "negative net worth"]}]
 
 
 def test_get_universe_empty_returns_empty_companies(monkeypatch):
