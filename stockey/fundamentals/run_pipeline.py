@@ -88,6 +88,8 @@ STEPS: list[str] = [
     # fundamentals.collectors.screenerin's deleveraging screen (was here 2026-08-14 to 08-15) is retired --
     # fundamentals_screenerin_query_results had zero readers from the day it was scheduled. The module
     # itself stays (l1_universe/l2_state still import its shared screener.in scraping infra).
+    # Dated market-wide fundamentals snapshot (TODO C4); l1_universe's Layer 2 reads it.
+    "fundamentals.collectors.fundamentals_snapshot",
     "fundamentals.screens.l1_universe",
     "fundamentals.screens.l2_state",
     "fundamentals.collectors.bse_announcements",

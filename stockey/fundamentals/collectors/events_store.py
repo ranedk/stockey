@@ -87,6 +87,27 @@ def _ensure_events_schema() -> None:
 
     execute_db_operation(_op, operation_name="fundamentals_events:ensure_schema")
     _ensure_event_date_types()
+    _ensure_detected_at()
+
+
+def _ensure_detected_at() -> None:
+    """When stockey FIRST knew of each filing (TODO C4/C7, 2026-09-27). disclosure_date is
+    when the company filed; an event-drift study must use when we could have acted, and
+    load_ts is not that -- merges and fills rewrite it. detected_at defaults to the insert
+    time for every writer and nothing updates it. Rows older than this migration get their
+    load_ts, the best value available (it may have been bumped by a later merge, so for
+    those rows it is an upper bound)."""
+    apply_schema_migration(
+        migration_id="20260927_fundamentals_events_detected_at",
+        description="fundamentals_events.detected_at: first-seen time, set once at insert (default now()).",
+        owner="fundamentals.collectors.events_store",
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[
+            f"ALTER TABLE {RESULTS_TABLE} ADD COLUMN IF NOT EXISTS detected_at TIMESTAMPTZ",
+            f"UPDATE {RESULTS_TABLE} SET detected_at = load_ts WHERE detected_at IS NULL",
+            f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN detected_at SET DEFAULT now()",
+        ],
+    )
 
 
 def _ensure_event_date_types() -> None:

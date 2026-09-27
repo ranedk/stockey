@@ -18,6 +18,8 @@ import re
 
 import pandas as pd
 
+from fundamentals.collectors.fundamentals_snapshot import FIELDS as SNAPSHOT_FIELDS
+from fundamentals.collectors.fundamentals_snapshot import companies_to_frame, snapshot_for_today
 from utils.exchange_rate_limiter import exchange_request_gate
 
 _ROW_RE = r'<tr[^>]*>\s*<td class="text">\s*{label}\s*</td>(?P<cells>.*?)</tr>'
@@ -68,17 +70,10 @@ def fetch_npa(session, ticker: str) -> dict[str, float | None]:
 # quarterly sales growth are default screener.in columns, so they are read from the first
 # of those queries only (a field is taken from one query, never merged from two).
 _LOSS = "Net Profit last year < 0 AND Market Capitalization > 250"
+# General inputs (cash flow, profit, net worth, debt, ROA, pledge) come from the dated
+# daily snapshot (fundamentals/collectors/fundamentals_snapshot.py, TODO C4) -- one crawl
+# of screener.in feeds both. Only the loss-maker queries for the allow-rules live here.
 QUERIES = {
-    "ocf": ("Cash from operations last year > -10000000 AND Cash from operations preceding year > -10000000 AND "
-            "Operating cash flow 3years > -10000000 AND Market Capitalization > 250",
-            {"cf_operations_rscr": "ocf_y1", "cf_operations_py_rscr": "ocf_y2", "cf_opr_3yrs_rscr": "ocf_3y_total"}),
-    "profit": ("Net Profit last year > -10000000 AND Net Profit preceding year > -10000000 AND "
-               "Net worth > -10000000 AND Market Capitalization > 250",
-               {"np_ann_rscr": "profit_y1", "np_prev_ann_rscr": "profit_y2", "net_worth_rscr": "net_worth"}),
-    "debt": ("Debt to equity > -10000 AND Interest Coverage Ratio > -1000000 AND Market Capitalization > 250",
-             {"debt___eq": "debt_to_equity", "int_coverage": "interest_cover"}),
-    "misc": ("Return on assets > -1000 AND Pledged percentage > -1 AND Market Capitalization > 250",
-             {"roa_12m_pct": "return_on_assets_pct", "pledged_pct": "promoter_pledged_pct"}),
     "loss_growth": (f"Sales growth > -1000 AND Price to Sales > -1 AND {_LOSS}",
                     {"sales_growth_pct": "sales_growth_pct", "cmp___sales": "price_to_sales",
                      "np_qtr_rscr": "profit_q", "qtr_sales_var_pct": "sales_growth_q_pct"}),
@@ -88,7 +83,7 @@ QUERIES = {
     "loss_margin": (f"OPM latest quarter > -100000 AND OPM preceding year quarter > -100000 AND {_LOSS}",
                     {"opm_qtr_pct": "opm_q", "opm_py_qtr_pct": "opm_q_year_ago"}),
 }
-FIELDS = {k: v for _, fields in QUERIES.values() for k, v in fields.items()}
+FIELDS = {**SNAPSHOT_FIELDS, **{k: v for _, fields in QUERIES.values() for k, v in fields.items()}}
 
 # --- Thresholds (docs/UNIVERSE_PRD.md section 5) -----------------------------------------
 # Operator decisions 2026-09-25, after the PRD's values removed 377 of 1,395 (27%):
@@ -124,34 +119,22 @@ DEVELOPER_BASIC_INDUSTRIES = frozenset({"Residential, Commercial Projects", "Rea
 
 
 def fetch_screener_inputs(session=None) -> pd.DataFrame:
+    """Today's dated snapshot (fetched and stored first if missing) plus the loss-maker
+    queries. The loss queries' own profit_q / sales_growth_q_pct replace the snapshot's
+    default columns of the same name for those companies (same figures, same source)."""
     from fundamentals.collectors.screenerin import build_authenticated_session, run_query
 
     session = session or build_authenticated_session()
-    frames = []
-    for name, (query, fields) in QUERIES.items():
+    base = snapshot_for_today(session)
+    keep = ["screener_company_id", "screener_ticker", "screener_name", "screener_url", "screener_metrics",
+            *[c for c in SNAPSHOT_FIELDS.values() if c in base.columns]]
+    out = base[[c for c in keep if c in base.columns]].copy()
+    for query, fields in QUERIES.values():
         _, companies = run_query(session, query)
-        frames.append(companies_to_frame(companies, fields, keep_identity=(name == "profit")))
-    out = frames[0]
-    for f in frames[1:]:
-        out = out.merge(f, on=["screener_company_id", "screener_ticker"], how="outer")
+        frame = companies_to_frame(companies, fields)
+        overlap = [c for c in frame.columns if c in out.columns and c not in ("screener_company_id", "screener_ticker")]
+        out = out.drop(columns=overlap).merge(frame, on=["screener_company_id", "screener_ticker"], how="outer")
     return out
-
-
-def companies_to_frame(companies: list[dict], fields: dict[str, str], *, keep_identity: bool = False) -> pd.DataFrame:
-    """keep_identity: also keep screener.in's name, URL and the full default metrics dict
-    (price, market cap, quarterly figures) -- taken from ONE query only, since every
-    query returns the same defaults."""
-    rows = []
-    for c in companies:
-        row = {"screener_company_id": c.get("company_id"), "screener_ticker": c.get("ticker")}
-        if keep_identity:
-            row.update({"screener_name": c.get("name"), "screener_url": c.get("url"),
-                        "screener_metrics": c.get("metrics", {})})
-        for key, name in fields.items():
-            if key in c.get("metrics", {}):
-                row[name] = c["metrics"][key]
-        rows.append(row)
-    return pd.DataFrame(rows).drop_duplicates("screener_company_id")
 
 
 def attach_inputs(layer1: pd.DataFrame, inputs: pd.DataFrame, bse_code_by_cmid: dict) -> pd.DataFrame:
