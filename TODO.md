@@ -258,7 +258,11 @@ being popular, not for being weak.
 - **Size:** small. **Do alongside C1.**
 
 ### C4. Point-in-time snapshots, starting now
-- [ ] **What:** snapshot every fundamental input the screens read, dated, on
+- [x] **Done 2026-09-27/28.** Daily dated snapshot of every company's screener.in fundamentals
+      (`fundamentals_snapshot_daily`, Layer 2 reads it), `fundamentals_events.detected_at`,
+      text->DATE fixes, and `fundamentals/pit.py` (`known_as_of`, `snapshot_panel`). Missed
+      weekdays are reported. History starts 2026-09-27.
+- **Was:** snapshot every fundamental input the screens read, dated, on
       every refresh — not just current state.
 - **Why:** the highest-value cheap item on this list. Quality and value cannot
   be backtested today because there is no history; in two years that is either
@@ -284,7 +288,9 @@ being popular, not for being weak.
 - **Size:** medium.
 
 ### C6. Quality, as a forward record
-- [ ] **What:** define quality from what stockey already collects (ROCE/ROE,
+- [x] **Built 2026-09-28** (`fundamentals/screens/forward_tracks.py`, quality v1 frozen, LEDGER 46);
+      the record starts 2026-10-01 and is judged after >= 12 months.
+- **Was:** define quality from what stockey already collects (ROCE/ROE,
       debt, earnings stability), rank the universe, hold the top slice, record
       it forward like a paper track.
 - **Why:** untested here, strong evidence elsewhere, and the classic partner
@@ -294,7 +300,9 @@ being popular, not for being weak.
 - **Size:** medium. **Blocked on B1 + C4.**
 
 ### C7. Event drift
-- [ ] **What:** a rule on events stockey already ingests — results beats,
+- [x] **Built 2026-09-28** (`fundamentals/screens/event_drift.py`, 9 trigger types, LEDGER 48);
+      forward record from 2026-09-28, judged as one family with FDR.
+- **Was:** a rule on events stockey already ingests — results beats,
       insider/promoter buying, bulk-deal buys, capital raises, rating actions —
       bought after the event and held weeks.
 - **Why:** the family stockey is *best* placed for. The trigger vocabulary is
@@ -305,7 +313,8 @@ being popular, not for being weak.
 - **Size:** medium. **Blocked on C4.**
 
 ### C8. Value
-- [ ] **What:** cheapest by earnings yield or EV/EBIT, screened for quality.
+- [x] **Built 2026-09-28** (value v1 within quality's better half, LEDGER 47); starts 2026-10-01.
+- **Was:** cheapest by earnings yield or EV/EBIT, screened for quality.
 - **Why:** documented and untested here — but the operator's own source calls
   its India record mixed, so it is third of the three.
 - **Size:** medium. **Blocked on B1 + C4.**
