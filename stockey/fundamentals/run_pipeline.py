@@ -91,6 +91,8 @@ STEPS: list[str] = [
     # Dated market-wide fundamentals snapshot (TODO C4); l1_universe's Layer 2 reads it.
     "fundamentals.collectors.fundamentals_snapshot",
     "fundamentals.screens.l1_universe",
+    # Forward records for quality / value (TODO C6/C8): acts on the first run of each month.
+    "fundamentals.screens.forward_tracks",
     "fundamentals.screens.l2_state",
     "fundamentals.collectors.bse_announcements",
     "fundamentals.collectors.nse_pit",
