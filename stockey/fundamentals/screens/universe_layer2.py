@@ -273,6 +273,20 @@ def layer2_report(df: pd.DataFrame) -> dict[str, object]:
     }
 
 
+def _ensure_run_date_type() -> None:
+    """upsert_to_db infers a Python date as TEXT on table creation (the repo's known trap;
+    fundamentals_sector_reference hit it first). Converted once, right after the first write."""
+    from utils.schema_migrations import apply_schema_migration
+
+    apply_schema_migration(
+        migration_id="20260928_fundamentals_universe_layer2_inputs_run_date_date",
+        description="fundamentals_universe_layer2_inputs.run_date TEXT -> DATE.",
+        owner="fundamentals.screens.universe_layer2",
+        metadata={"tables": [INPUTS_TABLE]},
+        statements=[f"ALTER TABLE {INPUTS_TABLE} ALTER COLUMN run_date TYPE DATE USING run_date::date"],
+    )
+
+
 def run(*, store: bool = True) -> tuple[pd.DataFrame, dict[str, object]]:
     from fundamentals.collectors.screenerin import build_authenticated_session
     from fundamentals.screens import universe
@@ -301,6 +315,7 @@ def run(*, store: bool = True) -> tuple[pd.DataFrame, dict[str, object]]:
         snap["layer2_reasons"] = df["layer2_reasons"].map("; ".join)
         snap["load_ts"] = pd.Timestamp.now(tz="UTC")
         upsert_to_db(snap, INPUTS_TABLE, unique_keys=["run_date", "isin"])
+        _ensure_run_date_type()
     return df, layer2_report(df)
 
 

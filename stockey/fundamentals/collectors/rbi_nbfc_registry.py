@@ -85,6 +85,20 @@ def parse_xlsx(content: bytes) -> pd.DataFrame:
     return df.drop_duplicates(["as_of_date", "cin"], keep="last").reset_index(drop=True)
 
 
+def _ensure_as_of_date_type() -> None:
+    """upsert_to_db infers a Python date as TEXT on table creation (the repo's known trap;
+    fundamentals_sector_reference hit it first). Converted once, right after the first write."""
+    from utils.schema_migrations import apply_schema_migration
+
+    apply_schema_migration(
+        migration_id="20260928_fundamentals_rbi_nbfc_registry_as_of_date_date",
+        description="fundamentals_rbi_nbfc_registry.as_of_date TEXT -> DATE.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [RESULTS_TABLE]},
+        statements=[f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN as_of_date TYPE DATE USING as_of_date::date"],
+    )
+
+
 def load_latest_registry() -> pd.DataFrame:
     return sql_to_df(
         f"SELECT * FROM {RESULTS_TABLE} WHERE as_of_date = (SELECT max(as_of_date) FROM {RESULTS_TABLE})"
@@ -96,6 +110,7 @@ def main() -> int:
     df = parse_xlsx(download_xlsx())
     df["load_ts"] = pd.Timestamp.now(tz="UTC")
     upsert_to_db(df, RESULTS_TABLE, unique_keys=["as_of_date", "cin"])
+    _ensure_as_of_date_type()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "rows": len(df),

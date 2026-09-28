@@ -114,7 +114,22 @@ def store_snapshot(df: pd.DataFrame, as_of_date) -> int:
     rows = rows.dropna(subset=["screener_company_id"])
     rows["screener_company_id"] = rows["screener_company_id"].astype(int)
     upsert_to_db(rows, SNAPSHOT_TABLE, unique_keys=["as_of_date", "screener_company_id"])
+    _ensure_as_of_date_type()
     return len(rows)
+
+
+def _ensure_as_of_date_type() -> None:
+    """upsert_to_db infers a Python date as TEXT on table creation (the repo's known trap;
+    fundamentals_sector_reference hit it first). Converted once, right after the first write."""
+    from utils.schema_migrations import apply_schema_migration
+
+    apply_schema_migration(
+        migration_id="20260928_fundamentals_snapshot_daily_as_of_date_date",
+        description="fundamentals_snapshot_daily.as_of_date TEXT -> DATE.",
+        owner=SYNC_SOURCE_NAME,
+        metadata={"tables": [SNAPSHOT_TABLE]},
+        statements=[f"ALTER TABLE {SNAPSHOT_TABLE} ALTER COLUMN as_of_date TYPE DATE USING as_of_date::date"],
+    )
 
 
 def load_snapshot(as_of_date) -> pd.DataFrame:
