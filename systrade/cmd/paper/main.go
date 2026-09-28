@@ -42,6 +42,10 @@ func main() {
 	// "paper run" reads better than "paper", and flag.Parse stops at the first
 	// positional argument, so the verb has to come off before the flags are
 	// read — otherwise every flag after it is silently ignored.
+	if len(os.Args) > 1 && os.Args[1] == "buffer" {
+		runBuffer(os.Args[2:])
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "capacity" {
 		runCapacity(os.Args[2:])
 		return
@@ -181,7 +185,7 @@ func main() {
 		current = track.Books[paper.BookStrategy].Holdings
 		daysToDue = track.DaysToNextRebalance()
 	}
-	sheet := paper.Pending(spec, all[len(all)-1], current, daysToDue)
+	sheet := paper.Pending(spec, all[len(all)-1], current, daysToDue, track.Members())
 	if account != nil {
 		latest := all[len(all)-1]
 		ratios, err := st.RawRatios(ctx, latest.Date)

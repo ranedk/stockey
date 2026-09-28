@@ -587,3 +587,111 @@ func checkBookBlendSpec(t *testing.T, s Spec) {
 		t.Error("not registered")
 	}
 }
+
+// --- Rank buffer (TODO A2) ---------------------------------------------------------------
+
+func ranked(syms ...string) []Obs {
+	out := make([]Obs, len(syms))
+	for i, s := range syms {
+		out[i] = Obs{Symbol: s}
+	}
+	return out
+}
+
+func TestPickTopKeepsHeldNamesInsideTheBufferAndFillsWithTheBest(t *testing.T) {
+	r := ranked("A", "B", "C", "D", "E", "F", "G", "H")
+	// n=2, buffer 2 -> keep held names ranked in the top 4.
+	got := pickTop(r, 2, 2, map[string]bool{"D": true, "G": true})
+	if fmt.Sprint(got) != "[D A]" {
+		t.Errorf("held D (rank 4) is kept, G (rank 7) is not, A fills the slot: got %v", got)
+	}
+	// Without a buffer it is plain top-n, whatever is held.
+	if fmt.Sprint(pickTop(r, 2, 0, map[string]bool{"D": true})) != "[A B]" {
+		t.Error("KeepMultiple 0 must be the original rule")
+	}
+	// More held names inside the buffer than slots: the best-ranked held names win.
+	if fmt.Sprint(pickTop(r, 2, 2, map[string]bool{"B": true, "C": true, "D": true})) != "[B C]" {
+		t.Error("when held names overflow the book, keep the best-ranked of them")
+	}
+}
+
+// rotatingDays: m names whose scores wobble by a few places every other day
+// (alternating +4), so names near the cut keep swapping in and out of a plain
+// top-n book -- the ranking "twitch" a buffer exists to ignore.
+func rotatingDays(n, m int) []Day {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var days []Day
+	for d := 0; d < n; d++ {
+		day := Day{Date: start.AddDate(0, 0, d)}
+		for i := 0; i < m; i++ {
+			day.Obs = append(day.Obs, Obs{
+				Symbol: fmt.Sprintf("S%02d", i), Open: 100, Close: 100, PrevClose: 100,
+				Forecast: float64(i) + 4*float64((i+d)%2), Turnover: 1e9, Eligible: true,
+			})
+		}
+		days = append(days, day)
+	}
+	return days
+}
+
+func totalTurnover(tr *Track) float64 {
+	var sum float64
+	for _, p := range tr.Books[BookStrategy].NAV {
+		sum += p.Turnover
+	}
+	return sum
+}
+
+func TestRankBufferCutsTurnoverWhenTheRankingTwitches(t *testing.T) {
+	s := spec()
+	s.Quantile = 5 // 20 names -> hold 4
+	s.RebalanceEvery = 1
+	days := rotatingDays(40, 20)
+	plain, err := Compute(s, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.KeepMultiple = 2
+	buffered, err := Compute(s, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !(totalTurnover(buffered) < totalTurnover(plain)*0.6) {
+		t.Errorf("buffer should cut turnover well below the plain book: plain %.2f buffered %.2f",
+			totalTurnover(plain), totalTurnover(buffered))
+	}
+	for _, p := range buffered.Books[BookStrategy].NAV {
+		if p.Holdings != 4 {
+			t.Fatalf("the buffered book must still hold exactly n names, got %d on %s", p.Holdings, p.Date)
+		}
+	}
+}
+
+func TestRankBufferIsPerVariantInABookBlend(t *testing.T) {
+	s := blendSpec()
+	s.KeepMultiple = 2
+	// Ten names, top fifth = 2 per variant. Previously a held S5, b held S0.
+	prev := []map[string]bool{{"S5": true}, {"S0": true}}
+	// a ranks S0..S9 best-first (S5 is rank 6, outside a's buffer of 4);
+	// b ranks S9..S0 (S0 is rank 10, outside b's buffer too) -- nothing carries over.
+	d := blendDay(func(i int) float64 { return float64(-i) }, func(i int) float64 { return float64(i) })
+	_, members := selectWeights(BookStrategy, s, d, prev)
+	if members[0]["S5"] || members[1]["S0"] {
+		t.Errorf("held names outside their own variant's buffer must leave: %v", members)
+	}
+	// Now a held S3 (rank 4, inside a's buffer): kept in a, and NOT carried into b.
+	prev = []map[string]bool{{"S3": true}, {}}
+	_, members = selectWeights(BookStrategy, s, d, prev)
+	if !members[0]["S3"] || members[1]["S3"] {
+		t.Errorf("S3 kept for variant a only: %v", members)
+	}
+}
+
+func TestRankBufferRejectsBlendMode(t *testing.T) {
+	s := spec()
+	s.Mode = ModeBlend
+	s.KeepMultiple = 2
+	if _, err := Compute(s, mkDays(5, 10, 0)); err == nil {
+		t.Error("ModeBlend with a rank buffer must be refused, not silently ignored")
+	}
+}

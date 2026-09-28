@@ -56,8 +56,14 @@ type Spec struct {
 	VariantWeights []float64
 	// Composite marks a track built from other registered tracks' variants:
 	// its qualifications duplicate theirs, so the cross-strategy view leaves it out.
-	Composite        bool
-	RebalanceEvery   int     // trading days between rebalances
+	Composite      bool
+	RebalanceEvery int // trading days between rebalances
+	// KeepMultiple is the rank buffer (TODO A2): when > 1, a name already held
+	// is kept until it falls outside the top N*KeepMultiple rather than the top
+	// N, and the free slots go to the best new names. 0 or 1 = no buffer, the
+	// original rule. Fewer trades means less cost and less short-term tax; a
+	// frozen strategy's buffer is part of its spec like any other field.
+	KeepMultiple     int
 	CostBpsRoundTrip float64 // charged as half per side on turnover
 	RandomSeed       int64   // for the random-ranking benchmark
 
@@ -551,6 +557,19 @@ type Book struct {
 	pendingExits map[string]bool
 	// Stopped counts exits taken by the stop rule rather than by a rebalance.
 	Stopped int
+	// members are the names each variant chose at the last rebalance (index 0
+	// for a single-signal book) -- what the rank buffer keeps. Per variant, so
+	// a name held for one variant is never carried into another's sleeve.
+	members []map[string]bool
+}
+
+// Members returns the strategy book's per-variant selection at its last
+// rebalance -- what Pending needs to apply the rank buffer to live orders.
+func (t *Track) Members() []map[string]bool {
+	if b, ok := t.Books[BookStrategy]; ok {
+		return b.members
+	}
+	return nil
 }
 
 // Track is the whole forward record.
@@ -571,6 +590,9 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 	}
 	if spec.Quantile < 2 {
 		return nil, fmt.Errorf("paper: Quantile must be at least 2")
+	}
+	if spec.KeepMultiple > 1 && spec.Mode == ModeBlend {
+		return nil, fmt.Errorf("paper: the rank buffer is not defined for ModeBlend (half the book from each signal)")
 	}
 	tr := &Track{Spec: spec, Books: map[string]*Book{}}
 	for _, n := range []string{BookStrategy, BookEqual, BookRandom} {
@@ -655,7 +677,11 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 			// checked EVERY day: a crash filter that waits nineteen days for
 			// the next rebalance is not a crash filter.
 			if rebalance {
-				target = targetWeights(name, spec, d)
+				if name == BookStrategy {
+					target, b.members = selectWeights(name, spec, d, b.members)
+				} else {
+					target = targetWeights(name, spec, d)
+				}
 			}
 			if name == BookStrategy {
 				target = rescale(target, exposure)
@@ -922,6 +948,14 @@ func changed(a, b map[string]float64) bool {
 
 // targetWeights is where the three books differ, and the only place they do.
 func targetWeights(book string, spec Spec, d Day) map[string]float64 {
+	w, _ := selectWeights(book, spec, d, nil)
+	return w
+}
+
+// selectWeights is targetWeights with the rank buffer: `prev` is the strategy
+// book's per-variant selection at its last rebalance (nil = none), and the new
+// selection is returned alongside the weights.
+func selectWeights(book string, spec Spec, d Day, prev []map[string]bool) (map[string]float64, []map[string]bool) {
 	var eligible []Obs
 	for _, o := range d.Obs {
 		if o.Eligible {
@@ -929,7 +963,7 @@ func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 		}
 	}
 	if len(eligible) < spec.Quantile {
-		return map[string]float64{}
+		return map[string]float64{}, nil
 	}
 	n := len(eligible) / spec.Quantile
 	if spec.HoldCount > 0 {
@@ -949,7 +983,7 @@ func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 		for _, o := range eligible {
 			out[o.Symbol] = w
 		}
-		return out
+		return out, nil
 	case BookRandom:
 		// A book of the same size picked by a fixed per-symbol key: same
 		// concentration, no information. The key is drawn once per symbol,
@@ -966,16 +1000,67 @@ func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 				sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
 			}
 		case ModeBlend:
-			return blendWeights(eligible, n)
+			return blendWeights(eligible, n), nil
 		case ModeBookBlend:
-			return bookBlendWeights(eligible, spec)
+			tops := variantTopsBuffered(eligible, spec, prev)
+			return weightsFromTops(tops, spec), membersOf(tops)
 		default:
 			sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
 		}
 	}
-	out := make(map[string]float64, n)
-	for _, o := range eligible[:n] {
-		out[o.Symbol] = 1 / float64(n)
+	var held map[string]bool
+	if book == BookStrategy && len(prev) > 0 {
+		held = prev[0]
+	}
+	chosen := pickTop(eligible, n, spec.KeepMultiple, held)
+	out := make(map[string]float64, len(chosen))
+	for _, sym := range chosen {
+		out[sym] = 1 / float64(len(chosen))
+	}
+	return out, membersOf([][]string{chosen})
+}
+
+// pickTop takes the first n names of an already-ranked list, applying the rank
+// buffer: names in `held` still ranked within n*keepMultiple are kept (best
+// first, at most n), and the rest of the n slots go to the best-ranked names
+// not already chosen. With keepMultiple <= 1 or nothing held it is plain top-n.
+func pickTop(ranked []Obs, n, keepMultiple int, held map[string]bool) []string {
+	if n > len(ranked) {
+		n = len(ranked)
+	}
+	out := make([]string, 0, n)
+	chosen := map[string]bool{}
+	if keepMultiple > 1 && len(held) > 0 {
+		limit := n * keepMultiple
+		if limit > len(ranked) {
+			limit = len(ranked)
+		}
+		for _, o := range ranked[:limit] {
+			if held[o.Symbol] && len(out) < n {
+				out = append(out, o.Symbol)
+				chosen[o.Symbol] = true
+			}
+		}
+	}
+	for _, o := range ranked {
+		if len(out) >= n {
+			break
+		}
+		if !chosen[o.Symbol] {
+			out = append(out, o.Symbol)
+			chosen[o.Symbol] = true
+		}
+	}
+	return out
+}
+
+func membersOf(tops [][]string) []map[string]bool {
+	out := make([]map[string]bool, len(tops))
+	for v, t := range tops {
+		out[v] = make(map[string]bool, len(t))
+		for _, s := range t {
+			out[v][s] = true
+		}
 	}
 	return out
 }
@@ -1167,8 +1252,15 @@ type PendingSheet struct {
 	Target    map[string]float64
 }
 
-func Pending(spec Spec, latest Day, current map[string]float64, daysToDue int) PendingSheet {
-	target := targetWeights(BookStrategy, spec, latest)
+// Pending takes the strategy book's last selection (Track.Members) so a
+// rank-buffered strategy's live orders follow the same rule as its record; a
+// strategy without a buffer ignores it.
+func Pending(spec Spec, latest Day, current map[string]float64, daysToDue int, members ...[]map[string]bool) PendingSheet {
+	var prev []map[string]bool
+	if len(members) > 0 {
+		prev = members[0]
+	}
+	target, _ := selectWeights(BookStrategy, spec, latest, prev)
 	prices := make(map[string]Obs, len(latest.Obs))
 	for _, o := range latest.Obs {
 		prices[o.Symbol] = o
@@ -1186,6 +1278,12 @@ func Pending(spec Spec, latest Day, current map[string]float64, daysToDue int) P
 // of the eligible names that variant can score. A variant with too few such
 // names that day has no book (nil).
 func variantTops(eligible []Obs, spec Spec) [][]string {
+	return variantTopsBuffered(eligible, spec, nil)
+}
+
+// variantTopsBuffered is variantTops with the rank buffer applied per variant,
+// against that variant's own previous selection.
+func variantTopsBuffered(eligible []Obs, spec Spec, prev []map[string]bool) [][]string {
 	out := make([][]string, len(spec.Variants))
 	for v := range spec.Variants {
 		var have []Obs
@@ -1207,9 +1305,11 @@ func variantTops(eligible []Obs, spec Spec) [][]string {
 		if n < 1 {
 			n = 1
 		}
-		for _, o := range have[:n] {
-			out[v] = append(out[v], o.Symbol)
+		var held map[string]bool
+		if v < len(prev) {
+			held = prev[v]
 		}
+		out[v] = pickTop(have, n, spec.KeepMultiple, held)
 	}
 	return out
 }
@@ -1219,7 +1319,10 @@ func variantTops(eligible []Obs, spec Spec) [][]string {
 // a variant with no book yet (warm-up) hands its share to the others rather
 // than to cash.
 func bookBlendWeights(eligible []Obs, spec Spec) map[string]float64 {
-	tops := variantTops(eligible, spec)
+	return weightsFromTops(variantTops(eligible, spec), spec)
+}
+
+func weightsFromTops(tops [][]string, spec Spec) map[string]float64 {
 	var wsum float64
 	for v, t := range tops {
 		if len(t) > 0 {
