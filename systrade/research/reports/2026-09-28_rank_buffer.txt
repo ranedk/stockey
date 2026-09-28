@@ -1,0 +1,28 @@
+RANK BUFFER — hold a name until it falls outside the top N x K (TODO A2; LEDGER, trials=0)
+decisions 2013-07-01..2021-12-31, each track's own spec otherwise; tax: A1 model at a Rs 10000000 book
+
+track                         K   turn/yr churn/reb  gross/yr    net/yr LT share    tax/yr after-tax
+trend-quintile                1      904%     35.9%    26.91%    24.07%     2.6%     4.69%    19.38%
+trend-quintile                2      528%     21.0%    28.67%    26.98%    20.8%     4.82%    22.16%
+trend-quintile                3      386%     15.3%    27.45%    26.23%    38.5%     4.33%    21.89%
+
+trend-speed-blend             1      903%     35.9%    28.88%    26.00%     2.6%     5.07%    20.93%
+trend-speed-blend             2      504%     20.0%    29.06%    27.45%    23.3%     4.85%    22.59%
+trend-speed-blend             3      364%     14.4%    27.01%    25.86%    42.1%     4.20%    21.66%
+
+momentum-lookback-blend       1      639%     26.7%    25.88%    23.89%    10.2%     4.44%    19.45%
+momentum-lookback-blend       2      417%     17.4%    24.56%    23.27%    31.1%     3.95%    19.31%
+momentum-lookback-blend       3      348%     14.5%    23.79%    22.72%    41.7%     3.68%    19.04%
+
+low-volatility-blend          1      345%     14.4%    15.91%    14.91%    42.2%     2.35%    12.56%
+low-volatility-blend          2      180%      7.5%    14.78%    14.27%    74.4%     1.90%    12.37%
+low-volatility-blend          3      160%      6.7%    14.31%    13.86%    78.5%     1.80%    12.06%
+
+momentum-lowvol-combination   1      485%     20.2%    21.58%    20.11%    22.8%     3.52%    16.59%
+momentum-lowvol-combination   2      307%     12.8%    20.48%    19.56%    49.1%     3.04%    16.53%
+momentum-lowvol-combination   3      265%     11.1%    19.80%    19.01%    57.0%     2.83%    16.18%
+
+turn/yr: one-way sum of weight changes a year. churn/reb: share of the book replaced per
+rebalance (turnover/2). LT share: the A1 model's long-term share of realised gains at that churn
+and clock. after-tax: net CAGR less tax on it as if realised yearly -- an upper bound on tax,
+since a lower-churn book also DEFERS gains, which this does not credit.

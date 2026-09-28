@@ -79,7 +79,11 @@ Inputs to everything below, not opinions. Each was measured, not assumed:
 - **Size:** small. Arithmetic, no market data, no LEDGER row.
 
 ### A2. Rank-buffer exits
-- [ ] **What:** hold a name until it falls out of the top 2N, not the top N.
+- [x] **Built 2026-09-28** (systrade `internal/paper` Spec.KeepMultiple, `paper buffer`, LEDGER 49).
+      In-sample 2013-2021: turnover halves at K=2 everywhere; the two TREND tracks gain ~2-3 points a
+      year after tax (the buffer also lifts gross -- winners were sold early); momentum, low-vol and the
+      combination are flat after tax. K=3 is no better. Frozen tracks untouched. Feeds A3.
+- **Was:** hold a name until it falls out of the top 2N, not the top N.
       Implement in `internal/sleeve` and `internal/paper` so research and the
       paper tracks can both run it.
 - **Why:** the cheapest turnover reduction available, and it compounds with
@@ -96,7 +100,7 @@ Inputs to everything below, not opinions. Each was measured, not assumed:
 - **Careful:** changing a frozen track's clock is a NEW spec and a NEW 12-month
   clock (Law 19). A survivor starts a sixth forward record; it does not edit
   the five.
-- **Size:** medium. **Blocked on A1 + A2.**
+- **Size:** medium. **Unblocked 2026-09-28** (A1 + A2 done; A2 says: test K=2 on the two trend tracks only).
 
 ---
 
