@@ -54,6 +54,21 @@ const DIRECTION_TONE: Record<string, 'good' | 'bad' | 'neutral'> = {
 function directionTone(direction: string | null): 'good' | 'bad' | 'neutral' {
   return direction ? DIRECTION_TONE[direction] || 'neutral' : 'neutral'
 }
+
+// Delivery % and price-band hits (TODO C5): descriptive, not signals. Band hits are blank for
+// stocks with futures -- NSE's band-hit file is inverted for them (checked 2026-09-28).
+const deliveryLabel = computed(() => {
+  const t = data.value?.technicals as Record<string, number | null> | undefined
+  if (t?.delivery_pct_20d == null) return '—'
+  const change = t.delivery_change_pp
+  return `${t.delivery_pct_20d}%` + (change == null ? '' : ` (${change > 0 ? '+' : ''}${change} pp)`)
+})
+const bandLabel = computed(() => {
+  const t = data.value?.technicals as Record<string, number | null> | undefined
+  if (!t || t.delivery_pct_20d == null) return '—'
+  if (t.upper_band_hits_60d == null) return 'n/a (F&O)'
+  return `${t.upper_band_hits_60d} / ${t.lower_band_hits_60d}`
+})
 </script>
 
 <template>
@@ -177,6 +192,8 @@ function directionTone(direction: string | null): 'good' | 'bad' | 'neutral' {
       <StatChip label="12m return" :value="formatPct(data.technicals?.return_12m_pct as any)" />
       <StatChip label="vs 200-DMA" :value="formatPct(data.technicals?.pct_vs_dma_200 as any)" />
       <StatChip label="Mean-reversion z" :value="data.technicals?.z_score_vs_200d_mean as any" />
+      <StatChip label="Delivery % (20d vs 1y)" :value="deliveryLabel" />
+      <StatChip label="Band hits 60d (up / down)" :value="bandLabel" />
     </section>
 
     <section v-if="data.sector_context" class="rounded-lg border border-slate-200 bg-white p-4">

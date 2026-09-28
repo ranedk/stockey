@@ -42,6 +42,7 @@ _DDL = f"""
         source TEXT NOT NULL, news_id TEXT NOT NULL, trigger_type TEXT NOT NULL,
         direction INTEGER, company_master_id TEXT, symbol TEXT,
         detected_at TIMESTAMPTZ, entry_date DATE, entry_price DOUBLE PRECISION,
+        delivery_change_pp DOUBLE PRECISION, upper_band_hits_20d INTEGER, lower_band_hits_20d INTEGER,
         load_ts TIMESTAMPTZ DEFAULT now(),
         PRIMARY KEY (source, news_id, trigger_type)
     )
@@ -51,6 +52,9 @@ _DDL = f"""
 def ensure_table() -> None:
     with db_session() as (_, cur):
         cur.execute(_DDL)
+        for col, typ in (("delivery_change_pp", "DOUBLE PRECISION"), ("upper_band_hits_20d", "INTEGER"),
+                         ("lower_band_hits_20d", "INTEGER")):
+            cur.execute(f"ALTER TABLE {RECORD_TABLE} ADD COLUMN IF NOT EXISTS {col} {typ}")
         cur.execute("ALTER TABLE fundamentals_events ADD COLUMN IF NOT EXISTS admission_cohort TEXT")
 
 
@@ -80,6 +84,13 @@ def record_new() -> int:
     df["symbol"] = df["company_master_id"].str.replace("nse:", "", regex=False)
     df["entry_date"] = None
     df["entry_price"] = None
+    # Market state when the alert is recorded (TODO C5) -- descriptive attributes the record
+    # can later be sliced on (RESEARCH_PROTOCOL: slicing on named attributes), never a filter.
+    from fundamentals.screens.technicals import load_market_state
+
+    state = load_market_state(df["symbol"].dropna().unique().tolist())
+    for field in ("delivery_change_pp", "upper_band_hits_20d", "lower_band_hits_20d"):
+        df[field] = df["symbol"].map(lambda sym: state.get(sym, {}).get(field))
     upsert_to_db(df, RECORD_TABLE, unique_keys=["source", "news_id", "trigger_type"])
     return len(df)
 

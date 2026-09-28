@@ -274,7 +274,15 @@ being popular, not for being weak.
 - **Size:** medium. **Before or alongside C6-C8, never after.**
 
 ### C5. Two signals the data already supports but nothing reads
-- [ ] **What:** add axes for **delivery %** (`nseindia_mto`, 6.07M rows, 2013+)
+- [x] **Built 2026-09-28 as DESCRIPTIVE state, not scored axes** (the boundary: stockey does not
+      author price signals). `technicals.py` stores delivery % (20d vs the stock's own 1y median)
+      and upper/lower band hits (20d/60d) for every universe/watchlist stock; the watchlist
+      page shows them; `event_drift` stores them on each record at entry, so whether they matter
+      is measured forward by slicing the C7 record. **Data finding:** NSE's band-hit file is
+      INVERTED for stocks with futures (60 days: F&O 'H' rows median close -2.5%, 18% up days;
+      non-F&O ~90% correct), so band hits are None for F&O stocks. **systrader: re-check LEDGER
+      rows 27-28** (the band-hit trait used this table unfiltered).
+- **Was:** add axes for **delivery %** (`nseindia_mto`, 6.07M rows, 2013+)
       and **price-band hits** (`nseindia_circuit_hit`, 758k rows, 2013+).
       Delivery % is conviction — stock actually taken, not churned intraday.
       Band hits are stress and crowding.

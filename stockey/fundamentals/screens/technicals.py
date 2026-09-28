@@ -338,6 +338,92 @@ def compute_technicals(history: pd.DataFrame) -> dict:
     return result
 
 
+# --- Delivery % and price-band hits (TODO C5, 2026-09-28) --------------------------------
+# DESCRIPTIVE state, like everything else here -- never a scored axis or an entry/exit input
+# (stockey does not author price signals; see the module docstring). Delivery % is the share
+# of traded volume actually taken into demat (conviction vs intraday churn); band hits are
+# days the stock hit its upper (H) or lower (L) price band (crowding / stress). Both were
+# found distinct from other traits in systrader's slicing (LEDGER rows 27-28). They are shown
+# on the watchlist and stored on each event-drift record at entry (fundamentals/screens/
+# event_drift.py), so whether they matter is measured forward, not assumed.
+DELIVERY_RECENT_SESSIONS = 20
+DELIVERY_BASELINE_SESSIONS = 252
+BAND_WINDOWS = (20, 60)
+MARKET_STATE_FIELDS = ("delivery_pct_20d", "delivery_pct_1y_median", "delivery_change_pp",
+                       "upper_band_hits_20d", "lower_band_hits_20d", "upper_band_hits_60d", "lower_band_hits_60d")
+
+
+def load_market_state(symbols: list[str]) -> dict[str, dict]:
+    """symbol -> delivery % (last 20 sessions vs the stock's own 1-year median) and
+    upper/lower band-hit counts over the last 20 and 60 sessions. NSE symbols only
+    (BSE-only companies get nothing here). Two bulk, date-bounded queries."""
+    if not symbols:
+        return {}
+    delivery = sql_to_df(
+        """
+        WITH d AS (
+            SELECT DISTINCT date FROM nseindia_mto
+             WHERE date >= now() - interval '400 days' AND series = 'EQ'
+        ), ranked AS (SELECT date, row_number() OVER (ORDER BY date DESC) AS k FROM d)
+        SELECT m.symbol,
+               avg(m.deliverable_percent) FILTER (WHERE r.k <= %s) AS delivery_pct_20d,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY m.deliverable_percent) AS delivery_pct_1y_median
+          FROM nseindia_mto m JOIN ranked r ON r.date = m.date AND r.k <= %s
+         WHERE m.date >= now() - interval '400 days' AND m.series = 'EQ' AND m.symbol = ANY(%s)
+         GROUP BY m.symbol
+        """,
+        params=(DELIVERY_RECENT_SESSIONS, DELIVERY_BASELINE_SESSIONS, symbols),
+    )
+    bands = sql_to_df(
+        """
+        WITH d AS (
+            SELECT DISTINCT date FROM nseindia_ohlcv
+             WHERE date >= now() - interval '120 days' AND series = 'EQ'
+        ), ranked AS (SELECT date, row_number() OVER (ORDER BY date DESC) AS k FROM d)
+        SELECT c.symbol,
+               count(*) FILTER (WHERE c.circuit_hit = 'H' AND r.k <= %s) AS upper_band_hits_20d,
+               count(*) FILTER (WHERE c.circuit_hit = 'L' AND r.k <= %s) AS lower_band_hits_20d,
+               count(*) FILTER (WHERE c.circuit_hit = 'H' AND r.k <= %s) AS upper_band_hits_60d,
+               count(*) FILTER (WHERE c.circuit_hit = 'L' AND r.k <= %s) AS lower_band_hits_60d
+          FROM nseindia_circuit_hit c JOIN ranked r ON r.date = c.date
+         WHERE c.date >= now() - interval '120 days' AND c.series = 'EQ' AND c.symbol = ANY(%s)
+         GROUP BY c.symbol
+        """,
+        params=(BAND_WINDOWS[0], BAND_WINDOWS[0], BAND_WINDOWS[1], BAND_WINDOWS[1], symbols),
+    )
+    out: dict[str, dict] = {}
+    for r in delivery.itertuples():
+        recent, base = r.delivery_pct_20d, r.delivery_pct_1y_median
+        out.setdefault(r.symbol, {}).update({
+            "delivery_pct_20d": None if pd.isna(recent) else round(float(recent), 2),
+            "delivery_pct_1y_median": None if pd.isna(base) else round(float(base), 2),
+            "delivery_change_pp": None if pd.isna(recent) or pd.isna(base) else round(float(recent - base), 2),
+        })
+    for r in bands.itertuples():
+        out.setdefault(r.symbol, {}).update({f: int(getattr(r, f)) for f in
+                                              ("upper_band_hits_20d", "lower_band_hits_20d", "upper_band_hits_60d", "lower_band_hits_60d")})
+    # A stock with delivery data but no band hits had zero band hits, not unknown -- EXCEPT
+    # stocks with futures. For them NSE's band-hit file is not a band hit in the usual sense:
+    # checked 2026-09-28 over 60 days, their "H" rows had a median close of -2.5% (18% up
+    # days) and "L" rows +3.2% -- inverted -- while non-F&O stocks matched ~90% (median
+    # +5.0% / -4.9%). F&O stocks have wide dynamic bands, so for them the counts are None.
+    fo = futures_underlyings()
+    for symbol, state in out.items():
+        for f in ("upper_band_hits_20d", "lower_band_hits_20d", "upper_band_hits_60d", "lower_band_hits_60d"):
+            if symbol in fo:
+                state[f] = None
+            else:
+                state.setdefault(f, 0)
+    return out
+
+
+def futures_underlyings() -> set[str]:
+    """NSE symbols with stock futures, from Dhan's instrument master."""
+    df = sql_to_df("SELECT DISTINCT underlying_symbol FROM master_dhan_instruments "
+                   "WHERE instrument = 'FUTSTK' AND valid_to IS NULL")
+    return set(df["underlying_symbol"].dropna().astype(str)) if not df.empty else set()
+
+
 def run_technicals_refresh() -> dict[str, object]:
     ensure_bse_view()  # self-heals bseindia_ohlcv/bseindia_adjustment_factors/the view -- see module docstring
     tickers = load_l1_tickers()
@@ -394,6 +480,7 @@ def run_technicals_refresh() -> dict[str, object]:
     rows = []
     no_history = 0
     stale_tickers: list[str] = []
+    market_state = load_market_state([str(t) for t in tickers["ticker"].dropna() if not str(t).isdigit()])
     for _, row in tickers.iterrows():
         ticker = row["ticker"]
         company_master_id = row["company_master_id"]
@@ -436,6 +523,7 @@ def run_technicals_refresh() -> dict[str, object]:
                 **{k: v for k, v in stats.items() if k != "data_points_available"},
                 "data_points_available": stats["data_points_available"],
                 "price_data_stale": price_data_stale,
+                **{f: market_state.get(str(ticker), {}).get(f) for f in MARKET_STATE_FIELDS},
                 "load_ts": pd.Timestamp.now(tz="UTC"),
             }
         )

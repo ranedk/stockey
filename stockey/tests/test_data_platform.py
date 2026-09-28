@@ -23873,6 +23873,14 @@ def test_missing_stage_read_fails_closed(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_market_state(monkeypatch):
+    """Delivery % / band hits (TODO C5) come from two bulk live queries; off unless a test turns it on."""
+    import fundamentals.screens.technicals as tech
+
+    monkeypatch.setattr(tech, "load_market_state", lambda symbols: {})
+
+
+@pytest.fixture(autouse=True)
 def _no_catchup_cohort(monkeypatch):
     """The catch-up cohort reads the live alert/event tables; off unless a test turns it on."""
     import fundamentals.screens.portfolio_runner as runner
