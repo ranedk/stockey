@@ -406,7 +406,8 @@ def load_market_state(symbols: list[str]) -> dict[str, dict]:
     # stocks with futures. For them NSE's band-hit file is not a band hit in the usual sense:
     # checked 2026-09-28 over 60 days, their "H" rows had a median close of -2.5% (18% up
     # days) and "L" rows +3.2% -- inverted -- while non-F&O stocks matched ~90% (median
-    # +5.0% / -4.9%). F&O stocks have wide dynamic bands, so for them the counts are None.
+    # +5.0% / -4.9%). The change starts August 2026 (2013-2025 labels for the same names are
+    # right), and these counts only look back 60 sessions, so for them the counts are None.
     fo = futures_underlyings()
     for symbol, state in out.items():
         for f in ("upper_band_hits_20d", "lower_band_hits_20d", "upper_band_hits_60d", "lower_band_hits_60d"):

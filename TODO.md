@@ -280,8 +280,9 @@ being popular, not for being weak.
       page shows them; `event_drift` stores them on each record at entry, so whether they matter
       is measured forward by slicing the C7 record. **Data finding:** NSE's band-hit file is
       INVERTED for stocks with futures (60 days: F&O 'H' rows median close -2.5%, 18% up days;
-      non-F&O ~90% correct), so band hits are None for F&O stocks. **systrader: re-check LEDGER
-      rows 27-28** (the band-hit trait used this table unfiltered).
+      non-F&O ~90% correct), so band hits are None for F&O stocks. **Re-checked 2026-09-28:** the
+      inversion starts August 2026 (2013-2025 labels are right), so systrader rows 28/29/39 stand;
+      `store.CircuitHits` drops futures stocks' hits from 2026-08-01 (LEDGER note under row 28).
 - **Was:** add axes for **delivery %** (`nseindia_mto`, 6.07M rows, 2013+)
       and **price-band hits** (`nseindia_circuit_hit`, 758k rows, 2013+).
       Delivery % is conviction — stock actually taken, not churned intraday.

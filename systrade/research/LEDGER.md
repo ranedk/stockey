@@ -80,6 +80,13 @@ self-deception.
 | 43 | 2026-09-23 | **EXPLORATION (trials=0) — does the same rule pay better on a longer cycle?** The operator's hypothesis after reading the speed-limit table: costs beat TA at short intervals, so look at longer cycles. Row 42's three grids re-read unchanged at **42 and 63-day** forward horizons beside the 20-day run (`slice explore -pairs ... -horizon 42|63`); reports `research/reports/2026-09-23_two_trait_grids_h{42,63}.txt` | If the trend premium accrues faster than it costs to harvest, a slower clock keeps more of it | NSE adjusted EQ, Rs 1 cr floor, decisions 2013-07-01 → 2021-12-31, 1,904 days, 27 cells per horizon, `ewmac32_128` | **The edge per YEAR is flat.** Unsliced yardstick: 20-day +1.106% gross / 33% churn / +0.943% net; 42-day +2.199% / 50% / +1.947%; 63-day +3.141% / 61% / +2.836%. Annualised that is gross 13.9 / 13.2 / 12.6%/yr and **net 11.9 / 11.7 / 11.3%/yr** — the gross edge scales almost exactly with holding period (a slow signal decaying slowly), churn rises to meet it, and cost drag falls 2.05 → 1.51 → 1.22%/yr. The grid SHAPE is unchanged at every horizon: within each liquidity third the edge still rises with volatility (63-day: 1.33/3.65/4.45, 2.22/3.56/3.61, 1.22/3.11/3.89) and the marked cells are still the calm ones, negative (Q1\|Q1 −3.5, Q3\|Q1 −2.9) | **Slowing down does not buy alpha here — it buys friction.** Going from a 20-day to a 63-day clock on this rule saves about 0.8%/yr of cost and gives up about 0.6%/yr of gross edge: a wash on costs alone. What it would also change is TAX, which nothing in this workspace models: at 20% short-term against 12.5% long-term, the holding period is worth more than the cost saving, and that is the open question row 42's cost work should be extended to. The grid shape's stability across three horizons is a consistency check, not a new finding |
 
 Notes:
+- Row 28 correction note (2026-09-28): NSE's band-hit file changed meaning for stocks with
+  futures from August 2026 -- they appear ~200-270 times a month (a handful before) and the
+  labels are inverted ('H' rows closed down on 75-92% of days; 2013-2025 rows for the same
+  names were right, H up-days 89-100%). Rows 28, 29 and 39 use data through 2021 or only a
+  few 2026 dates, so their findings stand. `store.CircuitHits` now drops futures stocks'
+  hits from 2026-08-01 (858 of 3,492 rows since then); stockey's descriptive band hits
+  leave them blank.
 - Row 29 re-run 2026-09-15 after two slicer fixes found in row 39 (stable
   symbol ids in `slice explore`'s builder, whose matched controls draw by
   position; buckets seen on fewer than 60 days left unscored). Its three ◆ all
