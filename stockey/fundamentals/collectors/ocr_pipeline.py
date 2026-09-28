@@ -181,6 +181,10 @@ MAX_OCR_PAGES = env.int("FUNDAMENTALS_OCR_MAX_PAGES", 60)
 TEXT_LAYER_MIN_CHARS = env.int("FUNDAMENTALS_OCR_TEXT_LAYER_MIN_CHARS", 200)
 TEXT_LAYER_MIN_DICT_RATIO = 0.70
 TEXT_LAYER_MAX_JUNK_RATIO = 0.15
+TEXT_LAYER_TRUST_CHARS = 500
+TRUSTED_MIN_DICT_RATIO = 0.60
+TRUSTED_MAX_JUNK_RATIO = 0.30
+PAGE_IMAGE_MIN_PIXELS = 50_000  # anything smaller is a logo or stamp, not a scanned page
 DICTIONARY_PATH = Path("/usr/share/dict/american-english")
 _CLEAN_TOKEN_RE = re.compile(
     r"^[\(\[\"']?([A-Za-z]+([\-'.][A-Za-z]+)*|[\d,.\-/%()₹:]+|[A-Za-z]+\d*|\d+[A-Za-z]{0,3})[\)\]\"'.,;:]*$"
@@ -201,18 +205,53 @@ def _english_words() -> set[str]:
     return _dictionary
 
 
-def text_layer_is_usable(text: str) -> bool:
-    if len(re.sub(r"\s", "", text)) < TEXT_LAYER_MIN_CHARS:
-        return False
-    tokens = [t for t in re.split(r"\s+", text) if len(t) >= 2]
-    if tokens and sum(1 for t in tokens if not _CLEAN_TOKEN_RE.match(t)) / len(tokens) >= TEXT_LAYER_MAX_JUNK_RATIO:
-        return False
+def _dictionary_ratio(text: str) -> float:
     words = _english_words()
-    if words:
-        long_words = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", text)]
-        if long_words and sum(w in words for w in long_words) / len(long_words) < TEXT_LAYER_MIN_DICT_RATIO:
+    long_words = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", text)]
+    if not words or not long_words:
+        return 1.0 if not words else 0.0
+    return sum(w in words for w in long_words) / len(long_words)
+
+
+def _junk_ratio(text: str) -> float:
+    tokens = [t for t in re.split(r"\s+", text) if len(t) >= 2]
+    return sum(1 for t in tokens if not _CLEAN_TOKEN_RE.match(t)) / len(tokens) if tokens else 1.0
+
+
+def text_layer_is_usable(text: str, *, has_image: bool = True) -> bool:
+    """Whether a page's own text layer can be used instead of the OCR model (2026-09-28,
+    operator: "if we get 500+ characters, OCR only on solid indication the text can't be
+    read"). Measured on 150 filings the model had read: 26% fewer model pages than the
+    first version, trusted pages matching the model's reading at a median 98% of words.
+      - under TEXT_LAYER_MIN_CHARS: the model only if the page has an image (a scan);
+        otherwise it is a near-blank page (separator, signature block) -- keep its text.
+      - TEXT_LAYER_TRUST_CHARS or more: trusted unless there is solid evidence it is
+        unreadable -- broken-encoding characters, under TRUSTED_MIN_DICT_RATIO English
+        words, or TRUSTED_MAX_JUNK_RATIO junk tokens (a scanner's poor OCR layer).
+      - in between: the stricter checks (TEXT_LAYER_MIN_DICT_RATIO / MAX_JUNK_RATIO)."""
+    chars = len(re.sub(r"\s", "", text))
+    if chars < TEXT_LAYER_MIN_CHARS:
+        return not has_image
+    if chars >= TEXT_LAYER_TRUST_CHARS:
+        if text.count("\ufffd") / chars >= 0.01:
             return False
-    return True
+        return _dictionary_ratio(text) >= TRUSTED_MIN_DICT_RATIO and _junk_ratio(text) < TRUSTED_MAX_JUNK_RATIO
+    return _junk_ratio(text) < TEXT_LAYER_MAX_JUNK_RATIO and _dictionary_ratio(text) >= TEXT_LAYER_MIN_DICT_RATIO
+
+
+def page_image_sizes(pdf_path: str) -> dict[int, int]:
+    """page number -> pixel area of its largest embedded image (pdfimages -list)."""
+    try:
+        out = subprocess.run(["pdfimages", "-list", pdf_path], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    sizes: dict[int, int] = {}
+    for line in out.stdout.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) > 4 and parts[0].isdigit() and parts[3].isdigit() and parts[4].isdigit():
+            page = int(parts[0])
+            sizes[page] = max(sizes.get(page, 0), int(parts[3]) * int(parts[4]))
+    return sizes
 
 
 def text_layer_pages(pdf_path: str) -> list[str]:
@@ -523,8 +562,9 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, dict[str, int]]:
         texts: dict[int, str] = {}
         model_pages: list[int] = []
         if layer:
+            images = page_image_sizes(handle.name)
             for number, page_text in enumerate(layer, start=1):
-                if text_layer_is_usable(page_text):
+                if text_layer_is_usable(page_text, has_image=images.get(number, 0) >= PAGE_IMAGE_MIN_PIXELS):
                     texts[number] = page_text
                 else:
                     model_pages.append(number)

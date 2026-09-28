@@ -15974,7 +15974,9 @@ def test_ocr_pdf_bytes_raises_on_document_timeout_between_pages(monkeypatch):
 def test_extract_pdf_text_uses_text_layer_and_sends_only_bad_pages_to_the_model(monkeypatch):
     good = "Board of Directors approved the audited financial results for the quarter ended June " * 5
     scanner = "#.4{,1,*,ffi :ff lqH,\".L,LP Chartered HO 6,02,.Floor il:? 3,'\",i;' il1ii il'iJ; |; " * 5
-    monkeypatch.setattr(fundamentals_ocr_pipeline, "text_layer_pages", lambda path: [good, "", scanner])
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "text_layer_pages", lambda path: [good, "", scanner, "  "])
+    # page 2 is a scanned image with no text; page 4 is blank with no image (kept, not modelled)
+    monkeypatch.setattr(fundamentals_ocr_pipeline, "page_image_sizes", lambda path: {2: 2_000_000})
     rendered = {}
 
     def fake_render(path, pages="all"):
@@ -15987,15 +15989,28 @@ def test_extract_pdf_text_uses_text_layer_and_sends_only_bad_pages_to_the_model(
     text, stats = fundamentals_ocr_pipeline.extract_pdf_text(b"%PDF-1.4 fake")
 
     assert rendered["pages"] == [2, 3]  # blank page and scanner-OCR page; the clean page is not rendered
-    assert text == f"{good}\n\nMODEL(image-2)\n\nMODEL(image-3)"
-    assert stats == {"pages_total": 3, "pages_model": 2}
+    assert text == f"{good}\n\nMODEL(image-2)\n\nMODEL(image-3)\n\n  "
+    assert stats == {"pages_total": 4, "pages_model": 2}
 
 
-def test_text_layer_is_usable_rejects_thin_and_garbled_pages():
+def test_text_layer_is_usable_rejects_thin_scans_and_garbled_pages():
     usable = fundamentals_ocr_pipeline.text_layer_is_usable
     assert usable("Revenue from operations increased to Rs 1,234 crore during the quarter. " * 5)
-    assert not usable("Page 1")
+    assert not usable("Page 1", has_image=True)          # a scan: read it with the model
+    assert usable("Page 1", has_image=False)             # near-blank page: keep its text, skip the model
     assert not usable("#.4{,1,*,ffi :ff lqH,.L,LP il:? 3,',i;' il1ii il'iJ; |; " * 10)
+    assert not usable("Broken font encoding here \ufffd\ufffd\ufffd " * 40)
+
+
+def test_text_layer_trusts_long_pages_unless_clearly_unreadable():
+    usable = fundamentals_ocr_pipeline.text_layer_is_usable
+    # a rating table and a contact list: 500+ chars, some brackets/emails -> trusted now
+    rating = "Instrument [ICRA]A+ (Stable); reaffirmed. Rating history for past three years, current rating. " * 8
+    contacts = ("The rating reflects the company's strong market position and healthy liquidity. "
+                "ANALYST CONTACTS Jitin Makkar +91 0124 4545 368 jitinm@icraindia.com ") * 6
+    assert usable(rating) and usable(contacts)
+    # a long page that is mostly non-words is still sent to the model
+    assert not usable("str{d fffi ftiltr EroHd orqtrq sf{d Errfllotl oit ds Ei. qwxz plmk zzqr " * 12)
 
 
 def test_ocr_pdf_bytes_truncates_when_page_count_exceeds_max(monkeypatch):
