@@ -108,6 +108,8 @@ STEPS: list[str] = [
     "fundamentals.screens.investor_classification",  # needs structured_extraction's + deal_flow's investor_names, runs right after both
     "fundamentals.screens.sector_cycle",
     "fundamentals.screens.l3_triggers",
+    # Event-drift forward record (TODO C7): records tonight's rule alerts, fills entry prices.
+    "fundamentals.screens.event_drift",
     "fundamentals.screens.llm_triage",
     # Watchlist sync BEFORE confluence (2026-09-24, audit item O2). It used to run only
     # inside notifications (last), so confluence scored the PREVIOUS run's watchlist and a
