@@ -161,6 +161,15 @@ being popular, not for being weak.
   announcements / L2 crawl scaling -- BEFORE removing .pause_fundamentals.
 - **Size:** large. Supersedes B1-B4 below (kept for their reasoning).
 
+### B6. Story-and-flaw scoring, event-driven re-evaluation, weighted portfolio (PRD agreed 2026-09-29)
+- [ ] **What:** `stockey/docs/FUNDAMENTAL_REEVALUATION_PRD.md` -- everything after the universe:
+      churn fixes first (ruleset v2), then a daily dated story/flaw score per company (change and
+      acceleration beside level; the market's price reactions decide what counts), results reading,
+      a re-evaluation queue driven by filings / peer filings / ET news / prices / macro, a structured
+      LLM story read, the watchlist on the score, and a conviction x risk weighted portfolio.
+- **Built so far:** Economic Times RSS collector, hourly (`fundamentals/collectors/et_news.py`).
+- **Next:** PRD build step 1 (churn fixes).
+
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,
       whether the screen hunts **neglect** or **quality**.
