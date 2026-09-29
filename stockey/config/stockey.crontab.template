@@ -230,6 +230,10 @@ LOG_DIR={{LOG_DIR}}
 # 16:30 UTC = 22:00 IST
 30 16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_portfolio_ruleset.lock ./all_portfolio_ruleset.sh >> "$LOG_DIR/portfolio_ruleset.log" 2>&1
 
+# Economic Times RSS news (fundamentals/collectors/et_news.py), hourly at :07 -- not gated on
+# .pause_fundamentals (feeds keep only 50 items; a skipped hour is lost news).
+7 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_news.lock ./all_fundamentals_news.sh >> "$LOG_DIR/fundamentals_news.log" 2>&1
+
 # OCR of filed documents (fundamentals/collectors/ocr_pipeline.py), its own continuous job
 # since 2026-09-25 -- see all_fundamentals_ocr.sh. Every 30 minutes, under a lock, so a
 # long catch-up run is never doubled; not gated on .pause_fundamentals.
