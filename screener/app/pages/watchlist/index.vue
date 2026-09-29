@@ -7,11 +7,13 @@ const STATUS_TABS: { value: WatchlistStatus | 'all'; label: string }[] = [
   { value: 'invalidated', label: 'Invalidated' },
   { value: 'price_flagged', label: 'Price flagged' },
   { value: 'no_thesis', label: 'No thesis' },
+  { value: 'flawed', label: 'Flawed' },
+  { value: 'faded', label: 'Story faded' },
   { value: 'all', label: 'All' },
 ]
 
 const selectedStatus = ref<WatchlistStatus | 'all'>('active')
-const minConfluence = ref(0)
+const minScore = ref(0)
 
 const api = useApi()
 const { data, status, error } = await useAsyncData(
@@ -21,8 +23,8 @@ const { data, status, error } = await useAsyncData(
 )
 
 const filteredData = computed(() => {
-  if (!data.value || minConfluence.value === 0) return data.value
-  return data.value.filter(item => (item.confluence_count ?? -1) >= minConfluence.value)
+  if (!data.value || minScore.value === 0) return data.value
+  return data.value.filter(item => (item.story_score ?? -1) >= minScore.value)
 })
 
 
@@ -58,9 +60,11 @@ const emptyStateMessage = computed(() => {
   <div>
     <h1 class="text-xl font-semibold">Watchlist</h1>
     <p class="mt-1 text-sm text-slate-600">
-      Every company with an active fundamental alert. Added automatically -- nothing
-      here has been reviewed by you yet, that's what the detail page is for.
-      Companies leave the default view on a timeout, a contradicting signal, or a
+      Companies with a strong fundamental story (story score 80+, no deal-breaker flaw), or a
+      recent positive event while their score is above the median. Added and removed
+      automatically, strongest story first. Companies leave the default view when a flaw
+      appears, the story fades below 65, or -- for event-only names -- on a timeout, a
+      contradicting signal, or a
     <PipelineNote layer="L2 × L3" title="Why a company appears here">
       <p>
         <strong>L2</strong> keeps a state vector for every L1 company — debt trajectory, capital
@@ -106,10 +110,10 @@ const emptyStateMessage = computed(() => {
         </button>
       </div>
       <label class="flex items-center gap-2 pb-2 text-sm text-slate-500">
-        Min confluence
-        <select v-model.number="minConfluence" class="rounded-md border border-slate-200 px-2 py-1 text-sm">
+        Min story score
+        <select v-model.number="minScore" class="rounded-md border border-slate-200 px-2 py-1 text-sm">
           <option :value="0">Any</option>
-          <option v-for="n in [1, 2, 3, 4, 5]" :key="n" :value="n">{{ n }}+</option>
+          <option v-for="n in [50, 65, 80, 90]" :key="n" :value="n">{{ n }}+</option>
         </select>
       </label>
     </div>
@@ -119,7 +123,7 @@ const emptyStateMessage = computed(() => {
     </div>
 
     <div v-else-if="filteredData && filteredData.length === 0" class="mt-6 text-sm text-slate-500">
-      {{ minConfluence > 0 ? `Nothing at ${minConfluence}+ confluence.` : emptyStateMessage }}
+      {{ minScore > 0 ? `Nothing scoring ${minScore}+.` : emptyStateMessage }}
     </div>
 
     <div v-else-if="filteredData" class="mt-4 grid gap-3">
@@ -134,6 +138,12 @@ const emptyStateMessage = computed(() => {
             <div class="flex items-center gap-2">
               <span class="font-semibold">{{ item.company_master_id.replace('nse:', '') }}</span>
               <span class="text-sm text-slate-500">{{ item.company_name }}</span>
+              <BadgePill
+                v-if="item.story_score !== null"
+                :label="`story ${Math.round(item.story_score)}${item.primary_dimension ? ' · ' + item.primary_dimension.replace('_', ' ') : ''}`"
+                :tone="item.story_score >= 80 ? 'good' : 'neutral'"
+              />
+              <BadgePill v-if="item.entry_basis && item.entry_basis !== 'none'" :label="`via ${item.entry_basis}`" tone="neutral" />
               <BadgePill :label="`${item.alert_count} event${item.alert_count === 1 ? '' : 's'}`" tone="neutral" />
               <BadgePill v-if="item.status !== 'active'" :label="WATCHLIST_STATUS_LABELS[item.status]" :tone="WATCHLIST_STATUS_TONE[item.status]" />
               <ConfluenceBadge

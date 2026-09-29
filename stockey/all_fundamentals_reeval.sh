@@ -31,4 +31,5 @@ run_step l3_triggers fundamentals.screens.l3_triggers
 run_step news_tagging fundamentals.screens.news_tagging
 run_step reeval fundamentals.screens.reeval
 run_step story_read fundamentals.screens.story_read
+run_step watchlist fundamentals.screens.watchlist
 exit "${failed}"

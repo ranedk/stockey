@@ -181,7 +181,9 @@ being popular, not for being weak.
 - **Step 5 built 2026-09-29:** LLM story read on material score changes and substantive filings;
   alerts `story_read_positive/negative` for the watchlist; triage retired from the nightly run;
   measured forward (LEDGER row 51).
-- **Next:** step 6, the watchlist on the story score (retire the confluence count).
+- **Step 6 built 2026-09-29:** watchlist on the story score (band or event-above-median, never
+  with a flaw; flawed / faded statuses). Confluence stays only as ruleset v2's entry filter until v3.
+- **Next:** step 7, weighted portfolio + v3 exits (retires confluence).
 
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,

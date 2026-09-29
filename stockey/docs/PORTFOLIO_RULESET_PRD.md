@@ -393,3 +393,8 @@ opened under v1 keep v1's exit rules until they close, so v1's record completes 
   a SOFT contradiction (any axis except valuation) on each of the last 3 scoring runs, after
   20 sessions held; or Weinstein stage 4 (declining), after 20 sessions. Valuation is never
   an exit reason. Stop-loss and target date unchanged; the adjudicator may still defer once.
+- **Candidates (2026-09-29, before v2's first live run):** the active watchlist, which is now
+  chosen on the story score (docs/FUNDAMENTAL_REEVALUATION_PRD.md step 6) instead of "any
+  positive alert ever". v2's entry filter above is unchanged and still reads confluence; the
+  confluence count is kept for exactly that and retires with v2 when ruleset v3 (on the story
+  score) replaces it. v2's record therefore starts at go-live on the new candidate list.

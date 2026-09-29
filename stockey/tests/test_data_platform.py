@@ -20297,7 +20297,7 @@ def test_run_watchlist_notification_pipeline_chains_its_steps_and_sends_nothing(
     call_order = []
     monkeypatch.setattr(
         fundamentals_notifications,
-        "sync_watchlist_from_alerts",
+        "sync_watchlist",
         lambda: call_order.append("sync") or {"companies": 5, "new_candidates": 2, "new_candidate_ids": ["nse:A", "nse:B"], "no_price_at_first_seen": 0},
     )
     narrative_events = [{"company_master_id": "nse:A", "narrative_changed": True, "is_new_candidate": True, "narrative_text": "n"}]
@@ -22561,7 +22561,8 @@ def test_run_watchlist_exit_evaluation_empty_watchlist(monkeypatch):
     monkeypatch.setattr(fundamentals_watchlist_exit, "_bootstrap_status_columns", lambda: None)
     monkeypatch.setattr(fundamentals_watchlist_exit, "load_watchlist_for_exit_evaluation", lambda: pd.DataFrame())
     result = fundamentals_watchlist_exit.run_watchlist_exit_evaluation()
-    assert result == {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "price_data_stale_skips": 0}
+    assert result == {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "flawed": 0, "faded": 0,
+                      "price_data_stale_skips": 0}
 
 
 def test_run_watchlist_exit_evaluation_upserts_status_per_company(monkeypatch):
@@ -23894,6 +23895,14 @@ def _no_market_state(monkeypatch):
     import fundamentals.screens.technicals as tech
 
     monkeypatch.setattr(tech, "load_market_state", lambda symbols: {})
+
+
+@pytest.fixture(autouse=True)
+def _no_watchlist_membership_ddl(monkeypatch):
+    """get_watchlist ensures the story-score membership columns (2026-09-29) -- a live ALTER."""
+    import fundamentals.screens.watchlist as wl
+
+    monkeypatch.setattr(wl, "_ensure_membership_columns", lambda: None)
 
 
 @pytest.fixture(autouse=True)

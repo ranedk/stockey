@@ -277,7 +277,22 @@ Exact multiples above are defaults, set from that evidence, never tuned on retur
    - Measured forward in event drift as its own family from 2026-09-30 (systrader LEDGER row 51).
    - First reads (5): UTTAMSUGAR's quarter-profit collapse read as deteriorating, materiality 4;
      routine rating filings read as materiality 2-3, no alert.
-6. **Watchlist on the score (4.3)**; retire the confluence count.
+6. **Watchlist on the score (4.3)**; retire the confluence count. **Built 2026-09-29**
+   (`fundamentals/screens/watchlist.py` + `watchlist_exit.py`, tests/test_watchlist_score.py):
+   - A company is watched while it qualifies: story score in the band (enter 80, stay to 65) with
+     no flaw, OR a positive alert in the last 60 days with its score at or above the day's median
+     and no flaw. New members are watched from the day they qualify, at that day's price.
+   - Statuses: `flawed` (a flaw appeared) and `faded` (no longer qualifies) come first and are
+     re-evaluated every run, so a name that qualifies again returns. The alert-era checks
+     (no_thesis, invalidated, stale narrative) apply only to event-only members; price_flagged to all.
+   - If live scores are missing or older than 3 days, the sync keeps the old alert rule and
+     records a fallback -- the watchlist is never emptied by a broken score step.
+   - Membership syncs in every 30-minute re-evaluation pass (entries immediate); statuses are
+     evaluated nightly, before the portfolio runs. The watchlist page sorts by story score.
+   - Confluence is NOT deleted yet: ruleset v2's entry filter reads it (PORTFOLIO_RULESET_PRD).
+     It retires with v2 when v3 lands (step 7).
+   - Dry run on 2026-09-29 (quarterly data one-third loaded): ~181 qualify; of 132 active names
+     only 23 still qualify, 158 are new. Final numbers once the quarterly backfill completes.
 7. **Weighted portfolio (5.2) and exits (5.3)** -- ruleset v3: trailing stop, valuation trim,
    replacement, tax guard, counterfactual tracking; story-fading exit once step 2 exists.
 8. **Price-reaction learning (3.3)** once enough filings have accumulated; then **6**.

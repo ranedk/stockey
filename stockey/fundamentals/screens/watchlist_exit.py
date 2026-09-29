@@ -153,6 +153,7 @@ def load_watchlist_for_exit_evaluation() -> pd.DataFrame:
     return sql_to_df(
         """
         SELECT w.company_master_id, w.first_seen_price, w.first_seen_at, w.last_alert_at,
+               w.entry_basis, w.flaws, w.story_score,
                w.suggested_watch_until, w.narrative_generated_at,
                w.status AS previous_status, w.status_reason AS previous_status_reason,
                tech.close AS current_price, tech.price_data_stale, tech.as_of_date AS technicals_as_of_date,
@@ -328,10 +329,26 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
     _price_data_is_effectively_stale) -- surfaced so the batch caller can record
     fallback telemetry for a condition that used to be entirely silent (re-audit
     2026-08-18)."""
-    if trigger_history and all(t.get("trigger_type") in NEGATIVE_TRIGGER_TYPES for t in trigger_history):
+    # Membership on the story score (2026-09-29, watchlist.py): a flaw or a lost qualification
+    # decides first. The alert-era checks (no_thesis, invalidated, stale narrative) judge the
+    # ALERT that admitted a name, so they apply only where an event is the whole basis --
+    # an in-band story does not depend on the filing that happened to surface it.
+    basis = row.get("entry_basis")
+    score_based = isinstance(basis, str) and basis != ""
+    if score_based:
+        flaws = row.get("flaws")
+        if isinstance(flaws, str) and flaws.strip():
+            return "flawed", f"flaw: {flaws}", False
+        if basis == "none":
+            score = row.get("story_score")
+            score_txt = f"{float(score):.0f}" if score is not None and not pd.isna(score) else "n/a"
+            return "faded", (f"story score {score_txt} is below the band and there is no positive event in the last "
+                             "60 days with the score above the median"), False
+    event_only = not score_based or basis == "event"
+    if event_only and trigger_history and all(t.get("trigger_type") in NEGATIVE_TRIGGER_TYPES for t in trigger_history):
         # Only evidence against, nothing that makes it worth watching (2026-09-24).
         return "no_thesis", "only negative alerts -- no positive signal ever justified watching it", False
-    invalidated_reason = _check_invalidated(trigger_history)
+    invalidated_reason = _check_invalidated(trigger_history) if event_only else None
     if invalidated_reason:
         return "invalidated", invalidated_reason, False
 
@@ -346,7 +363,8 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
         # once prices refreshed. No fresh price, no change.
         return "price_flagged", row.get("previous_status_reason"), True
 
-    stale_reason = _check_stale(row.get("suggested_watch_until"), row.get("latest_alert_load_ts"), row.get("narrative_generated_at"), today=today)
+    stale_reason = _check_stale(row.get("suggested_watch_until"), row.get("latest_alert_load_ts"),
+                                row.get("narrative_generated_at"), today=today) if event_only else None
     if stale_reason:
         return "stale", stale_reason, price_data_stale
 
@@ -358,14 +376,15 @@ def run_watchlist_exit_evaluation() -> dict[str, object]:
 
     watchlist = load_watchlist_for_exit_evaluation()
     if watchlist.empty:
-        return {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "price_data_stale_skips": 0}
+        return {"companies": 0, "active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "flawed": 0, "faded": 0,
+                "price_data_stale_skips": 0}
 
     trigger_history_by_company = load_trigger_type_history_by_company()
     today = pd.Timestamp.now(tz="UTC").date()
     load_ts = pd.Timestamp.now(tz="UTC")
 
     rows = []
-    counts = {"active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "no_thesis": 0}
+    counts = {"active": 0, "invalidated": 0, "price_flagged": 0, "stale": 0, "no_thesis": 0, "flawed": 0, "faded": 0}
     price_data_stale_skips: list[str] = []
     for _, row in watchlist.iterrows():
         row_dict = row.to_dict()
@@ -428,6 +447,8 @@ def main() -> int:
         "invalidated": result["invalidated"],
         "price_flagged": result["price_flagged"],
         "stale": result["stale"],
+        "flawed": result.get("flawed", 0),
+        "faded": result.get("faded", 0),
         # BUG FOUND LIVE 2026-08-18 (re-audit): hardcoded False regardless of what
         # actually happened this run -- stale-price skips are the one real fallback
         # condition this module can hit, and it was invisible both at the per-row

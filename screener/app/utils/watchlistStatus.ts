@@ -11,6 +11,9 @@ export const WATCHLIST_STATUS_LABELS: Record<WatchlistStatus, string> = {
   price_flagged: 'Price flagged',
   // Only negative alerts ever put it here -- nothing positive justified watching it (2026-09-24).
   no_thesis: 'No thesis',
+  // Story-score membership (2026-09-29): a deal-breaker flaw appeared, or it no longer qualifies.
+  flawed: 'Flawed',
+  faded: 'Story faded',
 }
 
 export const WATCHLIST_STATUS_TONE: Record<WatchlistStatus, 'good' | 'bad' | 'neutral' | 'warn'> = {
@@ -19,4 +22,6 @@ export const WATCHLIST_STATUS_TONE: Record<WatchlistStatus, 'good' | 'bad' | 'ne
   invalidated: 'bad',
   price_flagged: 'warn',
   no_thesis: 'neutral',
+  flawed: 'bad',
+  faded: 'neutral',
 }

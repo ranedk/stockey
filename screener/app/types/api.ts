@@ -6,7 +6,7 @@
 // specific value) to /api/watchlist to see the others. See fundamentals/screens/
 // watchlist_exit.py: nothing is ever deleted, this is a soft-status/visibility
 // filter, not a destructive removal.
-export type WatchlistStatus = 'active' | 'stale' | 'invalidated' | 'price_flagged' | 'no_thesis'
+export type WatchlistStatus = 'active' | 'stale' | 'invalidated' | 'price_flagged' | 'no_thesis' | 'flawed' | 'faded'
 
 export interface WatchlistItem {
   company_master_id: string
@@ -39,6 +39,13 @@ export interface WatchlistItem {
   strategies: string[]
   status: WatchlistStatus
   status_reason: string | null
+  // 2026-09-29 (reevaluation PRD step 6): membership on the story score. entry_basis is
+  // 'story' (in the band, no flaw), 'event' (recent positive event, score above median),
+  // 'story+event', 'none' (no longer qualifies), or null on rows the new rule has not seen.
+  story_score: number | null
+  primary_dimension: string | null
+  entry_basis: string | null
+  flaws: string | null
 }
 
 // GET /api/watchlist/summary -- equal-weight average return across the current

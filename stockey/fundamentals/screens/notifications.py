@@ -60,7 +60,7 @@ from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 from fundamentals.screens.l4_thesis_draft import load_current_drafts_by_company, run_l4_thesis_drafting
 from fundamentals.screens.signal_pointers import load_satisfied_strategies_by_company
 from fundamentals.screens.watch_summary import run_watch_summary_refresh
-from fundamentals.screens.watchlist import sync_watchlist_from_alerts
+from fundamentals.screens.watchlist import sync_watchlist
 from fundamentals.screens.watchlist_exit import run_watchlist_exit_evaluation
 from utils.db import sql_to_df
 from utils.fallback_telemetry import record_local_fallback_event
@@ -713,7 +713,7 @@ def run_watchlist_notification_pipeline() -> dict[str, object]:
     still runs after both either way -- while letting the active-company filter see
     this run's real status instead of last run's.
     """
-    sync_result = sync_watchlist_from_alerts()
+    sync_result = sync_watchlist()
     summary_result = run_watch_summary_refresh()
     exit_result = run_watchlist_exit_evaluation()
     draft_result = run_l4_thesis_drafting()

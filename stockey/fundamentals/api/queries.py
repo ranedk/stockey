@@ -136,6 +136,9 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     class _load_draft_theses_by_company already hit and fixed 2026-08-18 for
     fundamentals_l4_thesis_draft; same fix here."""
     _ensure_confluence_score_table()
+    from fundamentals.screens.watchlist import _ensure_membership_columns
+
+    _ensure_membership_columns()  # read before the first story-score sync must not 500
     params: tuple = ()
     where_clause = ""
     if status is not None:
@@ -147,7 +150,8 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
                w.alert_count, w.narrative_text, w.suggested_watch_until, w.narrative_generated_at,
                w.status, w.status_reason, l1.company_name, tech.close AS current_price,
                tech.price_data_stale, tech.as_of_date AS current_price_as_of,
-               conf.confluence_count, conf.contradicting_count, conf.evaluable_count
+               conf.confluence_count, conf.contradicting_count, conf.evaluable_count,
+               w.story_score, w.primary_dimension, w.entry_basis, w.flaws
         FROM fundamentals_watchlist w
         LEFT JOIN LATERAL (
             SELECT company_name FROM fundamentals_l1_universe
@@ -178,7 +182,8 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
             ORDER BY run_date DESC, score_version DESC LIMIT 1
         ) conf ON TRUE
         {where_clause}
-        ORDER BY w.last_alert_at DESC NULLS LAST
+        -- strongest story first (step 6, 2026-09-29); the alert date only breaks ties
+        ORDER BY w.story_score DESC NULLS LAST, w.last_alert_at DESC NULLS LAST
         """,  # noqa: S608 -- where_clause is a fixed internal string, params are parameterized
         params=params,
     )

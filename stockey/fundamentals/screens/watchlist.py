@@ -111,6 +111,68 @@ NEGATIVE_TRIGGER_TYPES = frozenset({
 })
 
 
+# --- membership on the story score (reevaluation PRD 4.3, build step 6, 2026-09-29) -------------
+# A company is watched when it QUALIFIES today, on either basis:
+#   story -- its live story score is in the band (reeval: enter at 80, stay until below 65) and
+#            it has no flaw;
+#   event -- a positive alert detected in the last EVENT_ENTRY_DAYS while its score is at or above
+#            the day's median, and no flaw.
+# Before, any positive alert ever added a name for good; 109 of 132 active names on 2026-09-29
+# had weak stories (median-or-lower scores) and were there only because something was filed.
+# watchlist_exit turns a flaw into 'flawed' and a lost qualification into 'faded'; both are
+# re-evaluated every run, so a name that qualifies again comes back.
+EVENT_ENTRY_DAYS = 60
+# live scores older than this are not a basis for membership: fall back to the alert rules
+LIVE_SCORE_MAX_AGE_DAYS = 3
+MEMBERSHIP_VERSION = 2
+
+
+def load_story_qualification() -> pd.DataFrame | None:
+    """Per company: story_score, primary_dimension, flaws, entry_basis ('story', 'event',
+    'story+event' or 'none'). None when live scores are missing or stale -- callers then keep
+    the alert rules and the fallback is recorded, never an empty watchlist."""
+    try:
+        live = sql_to_df(
+            "SELECT company_master_id, story_score, primary_dimension, flaws, in_band, scored_at "
+            "FROM fundamentals_story_score_live WHERE scored_at >= now() - make_interval(days => %s)",
+            params=(LIVE_SCORE_MAX_AGE_DAYS,))
+    except Exception as exc:  # noqa: BLE001 -- table not created yet on a fresh DB
+        live = pd.DataFrame()
+        _record_fallback("watchlist_story_scores_unreadable", reason="Live story scores could not be read; the watchlist keeps the alert rules this run.", error=exc)
+        return None
+    if live.empty:
+        _record_fallback("watchlist_story_scores_stale", reason=f"No live story score newer than {LIVE_SCORE_MAX_AGE_DAYS} days; the watchlist keeps the alert rules this run.", error="stale or empty fundamentals_story_score_live")
+        return None
+    positive = sql_to_df(
+        """
+        SELECT DISTINCT company_master_id FROM fundamentals_l3_alerts
+         WHERE load_ts >= now() - make_interval(days => %s) AND company_master_id IS NOT NULL
+           AND trigger_type <> ALL(%s) AND status NOT LIKE 'superseded%%'
+        """, params=(EVENT_ENTRY_DAYS, sorted(NEGATIVE_TRIGGER_TYPES)))
+    return qualify(live, set(positive["company_master_id"]))
+
+
+def qualify(live: pd.DataFrame, recent_positive: set[str]) -> pd.DataFrame:
+    q = live.copy()
+    clean = q["flaws"].isna() | (q["flaws"].astype(str).str.strip() == "")
+    median = float(q["story_score"].median())
+    story = q["in_band"].fillna(False).astype(bool) & clean
+    event = q["company_master_id"].isin(recent_positive) & (q["story_score"] >= median) & clean
+    q["entry_basis"] = [("story+event" if s and e else "story" if s else "event" if e else "none")
+                        for s, e in zip(story, event)]
+    return q[["company_master_id", "story_score", "primary_dimension", "flaws", "entry_basis"]]
+
+
+def _ensure_membership_columns() -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            for col, typ in (("entry_basis", "TEXT"), ("story_score", "DOUBLE PRECISION"),
+                             ("primary_dimension", "TEXT"), ("flaws", "TEXT"), ("membership_version", "INTEGER")):
+                cur.execute(f"ALTER TABLE fundamentals_watchlist ADD COLUMN IF NOT EXISTS {col} {typ}")
+
+    execute_db_operation(_op, operation_name="fundamentals_watchlist:ensure_membership_columns")
+
+
 def load_l3_alert_summary_by_company() -> pd.DataFrame:
     """first/last DETECTED date -- MIN/MAX(load_ts), not alert_date. alert_date is
     the underlying disclosed event's own date and can predate detection by months
@@ -249,7 +311,56 @@ def load_price_near(company_master_id: str, as_of_date) -> float | None:
     return None
 
 
+def sync_watchlist() -> dict[str, object]:
+    """Membership on the story score (see EVENT_ENTRY_DAYS above); the alert rules only when
+    live scores are unavailable."""
+    _ensure_watchlist_table()
+    _ensure_membership_columns()
+    qualification = load_story_qualification()
+    if qualification is None:
+        return {**sync_watchlist_from_alerts(), "membership": "alerts (live story scores unavailable)"}
+
+    alert_summary = load_l3_alert_summary_by_company().set_index("company_master_id")
+    existing_df = load_existing_watchlist()
+    existing = set(existing_df["company_master_id"]) if not existing_df.empty else set()
+    qualified = qualification[qualification["entry_basis"] != "none"]
+    load_ts = pd.Timestamp.now(tz="UTC")
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    rows, new_candidates, no_price = [], [], 0
+    for q in qualification.to_dict("records"):
+        cid = q["company_master_id"]
+        if cid not in existing and q["entry_basis"] == "none":
+            continue
+        row = {"company_master_id": cid, "entry_basis": q["entry_basis"], "story_score": q["story_score"],
+               "primary_dimension": q["primary_dimension"], "flaws": q["flaws"], "load_ts": load_ts}
+        if cid in alert_summary.index:
+            row["last_alert_at"] = alert_summary.at[cid, "last_detected_date"]
+            row["alert_count"] = int(alert_summary.at[cid, "alert_count"])
+        if cid not in existing:
+            # watched from the day it first qualified, at that day's price
+            price = load_price_near(cid, today)
+            row.update({"first_seen_at": today, "first_seen_price": price, "membership_version": MEMBERSHIP_VERSION,
+                        "last_alert_at": row.get("last_alert_at"), "alert_count": row.get("alert_count", 0)})
+            new_candidates.append(cid)
+            if price is None:
+                no_price += 1
+        rows.append(row)
+    # existing members with no live score today (left the universe) are no longer qualified
+    for cid in existing - set(qualification["company_master_id"]):
+        rows.append({"company_master_id": cid, "entry_basis": "none", "load_ts": load_ts})
+    if rows:
+        df = pd.DataFrame(rows)
+        for col in ("story_score", "primary_dimension", "flaws"):
+            if col not in df:
+                df[col] = None
+        upsert_to_db(df, RESULTS_TABLE, unique_keys=["company_master_id"])
+    return {"companies": len(rows), "qualified": int(len(qualified)), "new_candidates": len(new_candidates),
+            "new_candidate_ids": new_candidates, "no_price_at_first_seen": no_price, "membership": "story score"}
+
+
 def sync_watchlist_from_alerts() -> dict[str, object]:
+    """The pre-2026-09-29 rule (any positive alert ever adds a name), kept as the fallback
+    when live story scores are unavailable."""
     _ensure_watchlist_table()
 
     alert_summary = load_l3_alert_summary_by_company()
@@ -329,7 +440,7 @@ def sync_watchlist_from_alerts() -> dict[str, object]:
 
 def main() -> int:
     global STOCKEY_RUN_STATE
-    result = sync_watchlist_from_alerts()
+    result = sync_watchlist()
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "rows": result["companies"],
