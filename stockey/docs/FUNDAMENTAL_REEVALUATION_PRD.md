@@ -160,6 +160,28 @@ daily refresh. The same holds for every dimension, not only sector.
 - **The LLM adjudicator keeps its role** (may only veto / defer), and the paired accepted vs
   vetoed comparison continues.
 
+### 5.3 Exits (ruleset v3, with 5.2)
+
+Exit checks run daily. Through v2 the stop LEVEL is set once at entry (a fixed percentage
+below the entry price) and never moves. v3 separates the reasons to sell, each with its own
+rule (agreed with the operator 2026-09-29):
+
+| # | Reason | Rule | Status |
+|---|---|---|---|
+| 1 | Thesis broken | a flaw appears, or a hard negative event since entry: exit at once | built (v2) |
+| 2 | Story fading | story score below its band on 3 consecutive runs: exit after adjudicator review | needs the story score (step 2) |
+| 3 | Wrong early | initial volatility-scaled stop, 10-25% | built (v2) |
+| 4 | Protect a winner | once in profit, a TRAILING stop: highest close since entry minus ~3x the stock's normal (20-day, vol-scaled) move, only ratchets up; after a gain of 2x the initial stop it never sits below break-even. Generous on purpose -- systrader found tight price stops hurt its momentum books | v3 |
+| 5 | Too expensive | never a full exit: when valuation is ~2x the stock's own history (e.g. P/E vs 5-year) and the story is not strengthening, trim a third; keep the rest while the story holds | v3 |
+| 6 | Something better | replace the weakest holding only when a candidate scores clearly higher (5.2) | v3 |
+| 7 | Time | target date passed without the thesis confirming: adjudicator review, may defer once | built |
+| 8 | Tax guard | a NON-urgent exit (2, 5, 6, 7) within ~30 days of the 1-year mark waits until the gain is long-term; hard exits (1, 3, 4) never wait | v3 |
+
+**Counterfactual tracking (v3):** every exit and trim records what the stock did over the next
+60 sessions as if held, so each rule's worth is measured (did it save money or cut winners?).
+Stop variants (fixed vs trailing) can run side by side on shadow positions before one is fixed.
+Exact multiples above are defaults, set from that evidence, never tuned on returns in advance.
+
 ## 6. Measurement
 
 - Forward records by score band and by component, and by **story type** (growth inflection,
@@ -179,7 +201,8 @@ daily refresh. The same holds for every dimension, not only sector.
 4. **Re-evaluation queue + scorer job (4.2)**, intraday filings, news tagging.
 5. **LLM story read (3.4)**, replacing yes/no triage; into event-drift.
 6. **Watchlist on the score (4.3)**; retire the confluence count.
-7. **Weighted portfolio (5.2)** -- ruleset v3.
+7. **Weighted portfolio (5.2) and exits (5.3)** -- ruleset v3: trailing stop, valuation trim,
+   replacement, tax guard, counterfactual tracking; story-fading exit once step 2 exists.
 8. **Price-reaction learning (3.3)** once enough filings have accumulated; then **6**.
 
 ## 8. Decided / open
@@ -188,7 +211,7 @@ Decided (operator, 2026-09-29): story-and-flaw scoring instead of a weighted ave
 change and acceleration beside level; learn what the market pays for from price reactions;
 LLM story read; event-driven re-evaluation for every dimension; Economic Times RSS hourly
 as the news source (built: `fundamentals/collectors/et_news.py`); weighted portfolio; churn
-fixes first.
+fixes first; the v3 exit framework (5.3).
 
 Open: intraday cadence for scoring (hourly target, portfolio stays daily); exact caps and
 bands in 5.2; how long the price-reaction model needs before it replaces the defaults.
