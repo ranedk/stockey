@@ -21102,7 +21102,7 @@ def test_run_pipeline_isolates_one_failure_and_continues(monkeypatch):
 
 def test_run_pipeline_default_steps_matches_module_list():
     assert fundamentals_run_pipeline.run_pipeline.__defaults__ or True  # sanity: run_pipeline() with no args uses STEPS
-    assert len(fundamentals_run_pipeline.STEPS) == 21  # +1 2026-09-28 (event_drift); +1 2026-09-28 (forward_tracks); +1 2026-09-27 (fundamentals_snapshot); +2 2026-08-29 (deal_flow, confluence_score); +1 2026-09-24 (watchlist); +2 2026-09-25 (industry_classification, rbi_nbfc_registry); -1 2026-09-25 (ocr_pipeline -> its own job)
+    assert len(fundamentals_run_pipeline.STEPS) == 22  # +1 2026-09-29 (story_score); +1 2026-09-28 (event_drift); +1 2026-09-28 (forward_tracks); +1 2026-09-27 (fundamentals_snapshot); +2 2026-08-29 (deal_flow, confluence_score); +1 2026-09-24 (watchlist); +2 2026-09-25 (industry_classification, rbi_nbfc_registry); -1 2026-09-25 (ocr_pipeline -> its own job)
     assert "fundamentals.collectors.ocr_pipeline" not in fundamentals_run_pipeline.STEPS
     # O2 (2026-09-24): the portfolio enters from THIS run's confluence, so tonight's alerts
     # must reach the watchlist before confluence scores it.

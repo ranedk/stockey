@@ -170,7 +170,9 @@ being popular, not for being weak.
 - **Built so far:** Economic Times RSS collector, hourly (`fundamentals/collectors/et_news.py`).
 - **Step 1 done 2026-09-29:** ruleset v2 (2-axis entry, wider stops, exits only on hard
   contradictions / 3-run soft ones / stage 4, 20-session minimum hold, valuation never exits).
-- **Next:** step 2, dimension readings + story/flaw score.
+- **Step 2 done 2026-09-29:** daily dated story/flaw score (`fundamentals/screens/story_score.py`,
+  table `fundamentals_story_score`); a record until step 6 puts the watchlist on it.
+- **Next:** step 3, results reading (growth vs own trend, margin change, exceptional items out).
 
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,

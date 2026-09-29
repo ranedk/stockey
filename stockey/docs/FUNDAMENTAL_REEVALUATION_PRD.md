@@ -196,7 +196,25 @@ Exact multiples above are defaults, set from that evidence, never tuned on retur
 ## 7. Build order
 
 1. **5.1 churn fixes** -- ruleset v2, recorded beside v1. **Done 2026-09-29** (portfolio_ruleset / portfolio_exit, tests/test_portfolio_v2.py).
-2. **Dimension readings (3.1) + story / flaw score (3.2)** with defaults, dated, daily.
+2. **Dimension readings (3.1) + story / flaw score (3.2)** with defaults, dated, daily. **Done 2026-09-29** --
+   `fundamentals/screens/story_score.py`, daily pipeline step after llm_triage, table
+   `fundamentals_story_score` (tests/test_story_score.py). As built:
+   - Readings: growth (5y sales/profit level; quarter-YoY minus 5y as acceleration),
+     profitability (5y ROCE/ROE level; now minus 5y as change), balance sheet (low D/E,
+     interest cover, FCF yield), value (earnings yield, low positive EV/EBIT, cheap vs own
+     history; low P/B for financials only), events (decayed net), plus categorical ownership /
+     governance strengths. Margins and sector have no reading yet (step 3 / step 4).
+   - Percentile within group is the midpoint (rank - 1/2)/N, so topping a small group reads
+     below 100. Story = 100 x p_best^n (n = the company's reading count: net of the luck of
+     many tries), and a second story closes 25% of the remaining gap -- no clamp at 100.
+   - Guards: returns above 100% are one-offs and void the 5y average that contains them;
+     acceleration needs quarterly sales >= Rs 50 cr.
+   - Flaws cap at 40: cash burn with losses, 2 loss years (both waived for Layer 2's
+     scaling-growth / turnaround admits), leverage >= group p90 with cover < 2, auditor change
+     or RPT flag in 365 days, pledge >= 50% or rising in 180 days.
+   - First run: 1,295 scored, median 35, 47 at >= 95, 40 capped by a flaw. A record only
+     until the watchlist moves onto it (step 6). Known limit: one-off gains inside profit
+     growth are not stripped until results reading (step 3).
 3. **Results reading (3.5)** feeding Growth / Margins.
 4. **Re-evaluation queue + scorer job (4.2)**, intraday filings, news tagging.
 5. **LLM story read (3.4)**, replacing yes/no triage; into event-drift.

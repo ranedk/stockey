@@ -111,6 +111,9 @@ STEPS: list[str] = [
     # Event-drift forward record (TODO C7): records tonight's rule alerts, fills entry prices.
     "fundamentals.screens.event_drift",
     "fundamentals.screens.llm_triage",
+    # Story-and-flaw score (reevaluation PRD step 2): needs tonight's snapshot, L2 and events.
+    # A record for now -- nothing downstream reads it until the watchlist step moves onto it.
+    "fundamentals.screens.story_score",
     # Watchlist sync BEFORE confluence (2026-09-24, audit item O2). It used to run only
     # inside notifications (last), so confluence scored the PREVIOUS run's watchlist and a
     # name added tonight had no score until tomorrow. That was defended as "a READ, not a
