@@ -234,6 +234,12 @@ LOG_DIR={{LOG_DIR}}
 # .pause_fundamentals (feeds keep only 50 items; a skipped hour is lost news).
 7 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_news.lock ./all_fundamentals_news.sh >> "$LOG_DIR/fundamentals_news.log" 2>&1
 
+# Event-driven re-evaluation (all_fundamentals_reeval.sh; FUNDAMENTAL_REEVALUATION_PRD 4.2):
+# today's new BSE filings -> extraction -> rule triggers -> news tagging -> re-score, at :17
+# and :47 (off the OCR, news and API minutes). Gated on .pause_fundamentals, and stands aside
+# while the nightly screener runs.
+17,47 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_reeval.lock ./all_fundamentals_reeval.sh >> "$LOG_DIR/fundamentals_reeval.log" 2>&1
+
 # OCR of filed documents (fundamentals/collectors/ocr_pipeline.py), its own continuous job
 # since 2026-09-25 -- see all_fundamentals_ocr.sh. Every 30 minutes, under a lock, so a
 # long catch-up run is never doubled; not gated on .pause_fundamentals.

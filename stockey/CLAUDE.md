@@ -122,6 +122,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 22:00 | Mon–Fri | `all_portfolio_ruleset.sh` — exits → entries → forecast resolution → **action email** |
 | 23:15 | Mon–Fri | `all_ohlcv_reconcile.sh` — Dhan publishes staggered through the evening |
 | 23:40 | Mon–Fri | `all_dhan_intraday_sync.sh` |
+| :17 / :47 | daily | `all_fundamentals_reeval.sh` — intraday filings + news tagging -> re-score touched companies (gated on `.pause_fundamentals`) |
 | every 5 min | daily | `all_fundamentals_api.sh` (respawn-under-lock; no-ops when healthy) |
 
 Ordering is load-bearing: the gate and both monitoring jobs sit AFTER the morning

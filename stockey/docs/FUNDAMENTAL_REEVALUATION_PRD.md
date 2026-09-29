@@ -232,7 +232,31 @@ Exact multiples above are defaults, set from that evidence, never tuned on retur
    - Story score v2 reads these in place of v1's "quarter YoY minus 5-year" acceleration, and
      gains a Margins dimension. A reading needs quarterly sales >= Rs 50 cr and a quarter no
      older than 200 days.
-4. **Re-evaluation queue + scorer job (4.2)**, intraday filings, news tagging.
+4. **Re-evaluation queue + scorer job (4.2)**, intraday filings, news tagging. **Built 2026-09-29** (tests/test_reeval.py); scheduled
+   in the crontab template, live once the fundamentals pause lifts. As built:
+   - `all_fundamentals_reeval.sh`, :17 and :47 every hour: intraday BSE pass -> structured
+     extraction -> rule triggers -> news tagging -> `fundamentals.screens.reeval`. Gated on
+     `.pause_fundamentals`; stands aside while the nightly screener runs.
+   - Intraday BSE (`bse_announcements --intraday`): today only, paging stops once it reaches
+     filings older than the newest stored for today (minus 15 min overlap) -- usually one
+     request. The day is not marked fetched; the nightly pass still reads it whole.
+   - News tagging (`fundamentals/screens/news_tagging.py`, `fundamentals_news_tag`): a
+     name/ticker match to universe companies plus the feed's sector hint picks candidates
+     (~75% of items: no candidate, no call); a model reads candidates in batches of 15 and
+     may only keep candidate companies, choose a sector, direction, dimension and materiality
+     1-5. First run: 795 items -> 588 read. Only directional tags of materiality >= 3 count.
+   - Queue by watermark, not by collector writes: new filings, new alerts (OCR is
+     asynchronous), new quarters and material news tags enqueue their company; a peer's
+     results filing or a sector news tag enqueues sector companies only where the sector (or
+     the tag's dimension) is their primary story.
+   - The story score (whole universe, ~2 s) is applied to queued companies only;
+     `fundamentals_story_score_live` holds each company's current score and
+     `fundamentals_story_score_change` records material moves: band entry at 80 / exit
+     below 65, moves of 15+ points, a new primary story at 65+, a flaw appearing or clearing.
+     The nightly story_score step applies all companies with cause `daily`.
+   - Story score inputs now include news: company tags join the events dimension (a
+     materiality-3 item weighs like one filing alert), and a sector's decayed net news of
+     1.5+ is a "sector news tailwind" story (75).
 5. **LLM story read (3.4)**, replacing yes/no triage; into event-drift.
 6. **Watchlist on the score (4.3)**; retire the confluence count.
 7. **Weighted portfolio (5.2) and exits (5.3)** -- ruleset v3: trailing stop, valuation trim,

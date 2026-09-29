@@ -50,6 +50,11 @@ STORY_SECOND_BONUS = 0.25
 FLAW_CAP = 40.0
 EVENT_LOOKBACK_DAYS = 90
 EVENT_HALF_LIFE_DAYS = 30
+# News (news_tagging.py): only directional tags of materiality >= NEWS_MIN_MATERIALITY count;
+# a materiality-3 item weighs like one filing alert, a 5 like 5/3 of one.
+NEWS_MIN_MATERIALITY = 3
+# A sector's decayed net news at or above this is a tailwind story for its companies.
+SECTOR_NEWS_TAILWIND = 1.5
 FINANCIAL_GROUPS = frozenset({"lender", "other_financial"})
 
 POSITIVE_TRIGGERS = frozenset({"rating_confirms_deleveraging", "results_confirm_turnaround", "insider_buy",
@@ -137,21 +142,53 @@ def load_inputs(as_of) -> pd.DataFrame:
          WHERE e.detected_at < %s::date + 1 AND e.detected_at >= %s::date - %s
         """, params=(d, d, 400))
     df = df.merge(event_features(alerts, as_of), on="company_master_id", how="left")
+    news = sql_to_df(
+        """
+        SELECT target_type, target_id, direction, materiality, first_seen_at
+          FROM fundamentals_news_tag
+         WHERE first_seen_at < %s::date + 1 AND first_seen_at >= %s::date - %s
+           AND materiality >= %s AND direction IN ('positive', 'negative')
+        """, params=(d, d, EVENT_LOOKBACK_DAYS, NEWS_MIN_MATERIALITY)) if _table_exists("fundamentals_news_tag") else pd.DataFrame()
+    company_news, sector_news = news_features(news, as_of)
+    df = df.merge(company_news, on="company_master_id", how="left")
+    df["event_net"] = df[["event_net", "news_net"]].sum(axis=1, min_count=1)
     sectors = sql_to_df(
         """
-        SELECT cs.company_master_id, sc.phase
+        SELECT cs.company_master_id, cs.sector_code, sc.phase
           FROM fundamentals_company_sector cs
           LEFT JOIN LATERAL (SELECT phase FROM fundamentals_sector_cycle s
                               WHERE s.sector_code = cs.sector_code AND s.run_date::date <= %s
                               ORDER BY s.run_date DESC LIMIT 1) sc ON true
         """, params=(d,))
-    df = df.merge(sectors, on="company_master_id", how="left")
+    sectors = sectors.merge(sector_news, on="sector_code", how="left") if "sector_code" in sectors else sectors
+    df = df.merge(sectors.drop(columns=["sector_code"], errors="ignore"), on="company_master_id", how="left")
     rr = results_reading.readings(as_of)
     if not rr.empty:
         rr = rr.drop(columns=["ticker"]).rename(columns=lambda c: c if c == "company_id" else f"rr_{c}")
         df["screener_company_id"] = pd.to_numeric(df["screener_company_id"], errors="coerce")
         df = df.merge(rr.rename(columns={"company_id": "screener_company_id"}), on="screener_company_id", how="left")
     return df
+
+
+def _table_exists(name: str) -> bool:
+    return not sql_to_df("SELECT 1 FROM information_schema.tables WHERE table_name = %s", params=(name,)).empty
+
+
+def news_features(news: pd.DataFrame, as_of) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Decayed net of material, directional news: per company (joins the events dimension)
+    and per sector (a tailwind story for the sector's companies)."""
+    empty = (pd.DataFrame(columns=["company_master_id", "news_net"]), pd.DataFrame(columns=["sector_code", "sector_news_net"]))
+    if news.empty:
+        return empty
+    n = news.copy()
+    now = pd.Timestamp(str(pd.Timestamp(as_of).date()), tz="Asia/Kolkata") + pd.Timedelta(days=1)
+    age = (now - pd.to_datetime(n["first_seen_at"], utc=True)).dt.total_seconds() / 86400
+    sign = np.where(n["direction"] == "positive", 1.0, -1.0)
+    n["w"] = sign * (n["materiality"].astype(float) / NEWS_MIN_MATERIALITY) * 0.5 ** (age / EVENT_HALF_LIFE_DAYS)
+    comp = n[n["target_type"] == "company"].groupby("target_id")["w"].sum()
+    sect = n[n["target_type"] == "sector"].groupby("target_id")["w"].sum()
+    return (pd.DataFrame({"company_master_id": comp.index, "news_net": comp.to_numpy()}),
+            pd.DataFrame({"sector_code": sect.index, "sector_news_net": sect.to_numpy()}))
 
 
 def event_features(alerts: pd.DataFrame, as_of) -> pd.DataFrame:
@@ -216,6 +253,9 @@ def _categorical(row) -> dict[str, float]:
     sector = {}
     if row.get("phase") == "capacity_discipline":
         sector["capacity_discipline"] = 80.0
+    sector_news = row.get("sector_news_net")
+    if pd.notna(sector_news) and sector_news >= SECTOR_NEWS_TAILWIND:
+        sector["sector_news_tailwind"] = 75.0
     debt = row.get("net_debt_trend_direction")
     balance = {}
     if isinstance(debt, str) and "decline" in debt and row.get("group") not in FINANCIAL_GROUPS:
@@ -328,6 +368,9 @@ def run(as_of=None, *, store: bool = True) -> pd.DataFrame:
     out["load_ts"] = pd.Timestamp.now(tz="UTC")
     if store and not out.empty:
         upsert_to_db(out, RESULTS_TABLE, unique_keys=["as_of_date", "company_master_id", "score_version"])
+        # the nightly full run refreshes every company's live score and records what moved
+        from fundamentals.screens import reeval
+        reeval.apply_scores(out, causes="daily", score_version=SCORE_VERSION)
         from utils.schema_migrations import apply_schema_migration
         apply_schema_migration(
             migration_id="20260929_fundamentals_story_score_as_of_date_date",

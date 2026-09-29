@@ -512,8 +512,10 @@ def _ensure_market_days_table() -> None:
     execute_db_operation(_op, operation_name=f"{MARKET_DAYS_TABLE}:ensure_table")
 
 
-def fetch_market_announcements(day) -> list[dict]:
-    """Every company's BSE announcements disseminated on `day`, all pages."""
+def fetch_market_announcements(day, *, stop_before=None) -> list[dict]:
+    """Every company's BSE announcements disseminated on `day`, all pages. BSE lists newest
+    first; with stop_before (a tz-aware timestamp) paging stops once a page reaches filings
+    older than it -- the intraday pass reads only what is new since its last run."""
     params = {"pageno": 1, "strCat": "-1", "subcategory": "-1", "strPrevDate": day.strftime("%Y%m%d"),
               "strToDate": day.strftime("%Y%m%d"), "strSearch": "P", "strscrip": "", "strType": "C"}
     payload = _bse_get(ANNOUNCEMENTS_URL, params)
@@ -524,6 +526,10 @@ def fetch_market_announcements(day) -> list[dict]:
     row_count = int(table1[0]["ROWCNT"]) if table1 and isinstance(table1, list) and "ROWCNT" in table1[0] else None
     page = 1
     while row_count is not None and len(rows) < row_count and page < BSE_MARKET_MAX_PAGES:
+        if stop_before is not None and rows:
+            oldest = _parse_bse_timestamp(rows[-1].get("DissemDT") or rows[-1].get("NEWS_DT") or rows[-1].get("DT_TM"))
+            if oldest is not None and oldest < stop_before:
+                break
         page += 1
         next_payload = _bse_get(ANNOUNCEMENTS_URL, {**params, "pageno": page})
         next_rows = next_payload.get("Table") or []
@@ -659,7 +665,27 @@ def build_result_calendar_row(scrip_code: str, company_master_id: str, isin: str
     }
 
 
-def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None = None) -> dict[str, object]:
+# Intraday pass (reevaluation PRD 4.2): re-reads today back to this long before the newest
+# filing already stored for today. The overlap covers filings BSE disseminates slightly out
+# of order; the upsert dedups what is read twice.
+INTRADAY_OVERLAP_MINUTES = 15
+
+
+def intraday_stop_before(today):
+    latest = sql_to_df(
+        "SELECT max(announcement_timestamp) AS ts FROM fundamentals_events "
+        "WHERE source = 'bse' AND detection_source = 'bse_announcements' AND disclosure_date = %s",
+        params=(str(today),))
+    ts = latest["ts"].iloc[0] if not latest.empty else None
+    if ts is None or pd.isna(ts):
+        return None
+    return pd.Timestamp(ts) - pd.Timedelta(minutes=INTRADAY_OVERLAP_MINUTES)
+
+
+def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None = None,
+                         intraday: bool = False) -> dict[str, object]:
+    """intraday=True: today only, only the pages newer than what is stored, no result
+    calendar, and the day is NOT marked fetched -- the nightly pass still reads it whole."""
     universe = load_l1_universe_tickers()
     if limit:
         universe = universe.head(limit)
@@ -693,7 +719,10 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
         for code, cmid, isin in zip(universe["bse_scrip_code"], universe["company_master_id"], universe["isin"])
     }
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    days = days_to_fetch(today=today, lookback_days=lookback_days if lookback_days is not None else LOOKBACK_DAYS)
+    if intraday:
+        days, stop_before = [today], intraday_stop_before(today)
+    else:
+        days, stop_before = days_to_fetch(today=today, lookback_days=lookback_days if lookback_days is not None else LOOKBACK_DAYS), None
 
     rows: list[dict] = []
     failed_days: list[str] = []
@@ -703,7 +732,7 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
 
     for day in days:
         try:
-            raw_rows = fetch_market_announcements(day)
+            raw_rows = fetch_market_announcements(day, stop_before=stop_before) if intraday else fetch_market_announcements(day)
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
             failed_days.append(str(day))
@@ -740,10 +769,11 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
             if row is not None:
                 rows.append(row)
                 in_scope += 1
-        _mark_market_day(day, rows_total=len(raw_rows), rows_in_scope=in_scope)
+        if not intraday:
+            _mark_market_day(day, rows_total=len(raw_rows), rows_in_scope=in_scope)
 
     result_calendar_rows: list[dict] = []
-    if not blocked:
+    if not blocked and not intraday:
         try:
             calendar_identity = {
                 str(int(v)): (cmid, isin)
@@ -1100,7 +1130,13 @@ if __name__ == "__main__":
     parser.add_argument("--backfill", action="store_true", help="Run the one-time 3yr auditor/RPT backfill instead of the daily 7-day crawl.")
     parser.add_argument("--limit", type=int, default=20, help="Companies to backfill this invocation (bounded, resumable next invocation). 0 = unbounded.")
     parser.add_argument("--lookback-days", type=int, default=BACKFILL_LOOKBACK_DAYS)
+    parser.add_argument("--intraday", action="store_true", help="Today only, newest pages only (all_fundamentals_reeval.sh).")
     args = parser.parse_args()
+
+    if args.intraday:
+        intraday_result = run_bse_l3_detection(intraday=True)
+        print(json.dumps({"source": f"{SYNC_SOURCE_NAME}:intraday", **intraday_result}, ensure_ascii=False, default=str), flush=True)
+        sys.exit(0)
 
     if args.backfill:
         backfill_result = run_auditor_rpt_backfill(limit=args.limit or None, lookback_days=args.lookback_days)

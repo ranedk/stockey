@@ -175,7 +175,10 @@ being popular, not for being weak.
 - **Step 3 done 2026-09-29:** results reading from screener.in's quarterly table (stored by
   the L2 crawl), growth and margin against each company's own trend, one-offs stripped; story
   score v2 reads it.
-- **Next:** step 4, re-evaluation queue + scorer job, intraday filings, news tagging.
+- **Step 4 built 2026-09-29:** every 30 minutes, today's filings and tagged ET news re-score
+  the touched companies; material score changes recorded (`all_fundamentals_reeval.sh`, in the
+  crontab template -- live at go-live with the crontab regeneration).
+- **Next:** step 5, the LLM story read (replacing yes/no triage).
 
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,
