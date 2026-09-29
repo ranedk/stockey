@@ -378,3 +378,18 @@ Shadow positions are marked and never counted as real P&L.
   away. It does NOT evict a weaker existing position to make room, because that needs a
   comparable strength score across positions and the whole premise here is that we do not
   have one. The turned-away log is the evidence that will say whether this matters.
+
+
+## Ruleset v2 (2026-09-29) -- stop the churn
+
+From docs/FUNDAMENTAL_REEVALUATION_PRD.md section 5.1, after v1 averaged 10-day holds (9 of 11
+closes "thesis invalidation") against 60-365 day forecasts. New entries are v2; positions
+opened under v1 keep v1's exit rules until they close, so v1's record completes as recorded.
+
+- **Entry:** confluence_count >= 2 (was: evaluable >= 1), no contradicting axis, stage 2.
+- **Stop:** 2.5x the 10-day one-sigma move, clamped to 10-25% (was 1.5x, 5-15%).
+- **Exit on thesis only for:** a HARD contradiction since entry (results_decline,
+  rating_downgrade, pledge_increase, auditor_change, insider_sell_surprise) -- immediately;
+  a SOFT contradiction (any axis except valuation) on each of the last 3 scoring runs, after
+  20 sessions held; or Weinstein stage 4 (declining), after 20 sessions. Valuation is never
+  an exit reason. Stop-loss and target date unchanged; the adjudicator may still defer once.

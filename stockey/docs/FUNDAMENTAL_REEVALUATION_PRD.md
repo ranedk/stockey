@@ -173,7 +173,7 @@ daily refresh. The same holds for every dimension, not only sector.
 
 ## 7. Build order
 
-1. **5.1 churn fixes** -- ruleset v2, recorded beside v1.
+1. **5.1 churn fixes** -- ruleset v2, recorded beside v1. **Done 2026-09-29** (portfolio_ruleset / portfolio_exit, tests/test_portfolio_v2.py).
 2. **Dimension readings (3.1) + story / flaw score (3.2)** with defaults, dated, daily.
 3. **Results reading (3.5)** feeding Growth / Margins.
 4. **Re-evaluation queue + scorer job (4.2)**, intraday filings, news tagging.

@@ -31,7 +31,13 @@ SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_ruleset"
 
 # Bump on ANY change to the rule below. Positions record it, so a later review can ask
 # "how did v1 do" without the answer being contaminated by v2's behaviour.
-RULESET_VERSION = 1
+# v2 (2026-09-29, docs/FUNDAMENTAL_REEVALUATION_PRD.md 5.1 -- stop the churn): entry needs at
+# least ENTRY_MIN_SUPPORTING supporting axes (v1: one known axis was enough -- 11 of 34
+# positions entered on a single fact), and stops are wider for a 1-2 year holding (v1: 1.5x
+# the 10-day move clamped to 5-15% -- noise stop-outs). Exits in portfolio_exit.py. Positions
+# opened under v1 keep v1's exit rules until they close, so v1's record completes as recorded.
+RULESET_VERSION = 2
+ENTRY_MIN_SUPPORTING = 2
 
 SYSTRADER_API = os.getenv("SYSTRADER_API_BASE", "http://127.0.0.1:8090")
 
@@ -46,11 +52,11 @@ SYSTRADER_API = os.getenv("SYSTRADER_API_BASE", "http://127.0.0.1:8090")
 # So the stop is scaled by the name's own realised volatility and then CLAMPED into the
 # operator's band. Every position gets roughly the same probability of a noise-triggered
 # exit, which is what a stop is for.
-STOP_PCT_MIN = float(os.getenv("PORTFOLIO_STOP_PCT_MIN", "5"))
-STOP_PCT_MAX = float(os.getenv("PORTFOLIO_STOP_PCT_MAX", "15"))
+STOP_PCT_MIN = float(os.getenv("PORTFOLIO_STOP_PCT_MIN", "10"))  # v1: 5
+STOP_PCT_MAX = float(os.getenv("PORTFOLIO_STOP_PCT_MAX", "25"))  # v1: 15
 # Multiple of the 10-day one-sigma move. 1.5 puts the stop outside ordinary noise
 # without being so wide it stops being a stop.
-STOP_VOL_MULTIPLE = float(os.getenv("PORTFOLIO_STOP_VOL_MULTIPLE", "1.5"))
+STOP_VOL_MULTIPLE = float(os.getenv("PORTFOLIO_STOP_VOL_MULTIPLE", "2.5"))  # v1: 1.5
 VOL_LOOKBACK_DAYS = int(os.getenv("PORTFOLIO_STOP_VOL_LOOKBACK_DAYS", "60"))
 
 ENTRY_STAGE = 2  # Weinstein stage 2 = advancing
@@ -221,9 +227,10 @@ def compute_stop_pct(symbols: list[str]) -> dict[str, dict]:
 
 
 def evaluate_entry_candidates() -> dict[str, object]:
-    """Run ruleset v1 over the active watchlist. Pure: no writes, no side effects.
+    """Run the ruleset over the active watchlist. Pure: no writes, no side effects.
 
     v1:  evaluable_count >= 1  AND  contradicting_count == 0  AND  stage == 2
+    v2:  confluence_count >= ENTRY_MIN_SUPPORTING  AND  contradicting_count == 0  AND  stage == 2
     """
     from fundamentals.screens.confluence_score import _ensure_confluence_score_table
 
@@ -267,6 +274,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
         # a boolean. This is what makes a later "why was X not taken" answerable.
         checks = {
             "has_evaluable_axis": bool(r.evaluable_count and r.evaluable_count >= 1),
+            "min_supporting_axes": bool(r.confluence_count and r.confluence_count >= ENTRY_MIN_SUPPORTING),
             "no_contradicting_axis": r.contradicting_count == 0,
             "stage_is_advancing": stage == ENTRY_STAGE,
         }

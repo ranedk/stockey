@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 from fundamentals.screens.portfolio_adjudicator import (
@@ -76,7 +77,7 @@ def _open_positions() -> pd.DataFrame:
                opened_at, deferral_count, confluence_count, contradicting_count,
                evaluable_count, stage_at_entry, target_date, prediction_text,
                invalidation_criteria, score_version, baseline_score_version,
-               baseline_contradicting_count
+               baseline_contradicting_count, ruleset_version
           FROM fundamentals_portfolio_position
          WHERE status = 'open'
         """
@@ -130,6 +131,96 @@ def _current_scores(company_ids: list[str]) -> dict[str, dict]:
 # Every position opened before the 2026-09-23 audit was entered on confluence v1.
 LEGACY_SCORE_VERSION = 1
 
+# --- Ruleset v2 exits (2026-09-29, docs/FUNDAMENTAL_REEVALUATION_PRD.md 5.1) -----------------
+# v1 closed a position the moment ANY axis flipped to contradicting, and the axes flicker:
+# 11 closes after an average of 10 days held, 9 of them "thesis invalidation", against
+# 60-365 day forecasts; the valuation axis flips when a stock rises ~10%, closing winners for
+# winning. v2 exits a thesis only on:
+#   - a HARD contradiction: a new alert of one of HARD_NEGATIVE_TRIGGERS since entry --
+#     immediately, no minimum hold;
+#   - a SOFT contradiction (an axis other than valuation) above baseline on each of the last
+#     SOFT_PERSIST_RUNS scoring runs, and only after MIN_HOLD_SESSIONS;
+#   - the Weinstein stage reaching EXIT_STAGE (declining), also after MIN_HOLD_SESSIONS --
+#     not merely "no longer stage 2".
+# Valuation is never an exit reason (an entry filter only). Stop and target date unchanged.
+HARD_NEGATIVE_TRIGGERS = frozenset({"results_decline", "rating_downgrade", "pledge_increase",
+                                    "auditor_change", "insider_sell_surprise"})
+SOFT_PERSIST_RUNS = 3
+MIN_HOLD_SESSIONS = 20
+EXIT_STAGE = 4
+EXIT_AXES = ("fundamentals_trajectory", "event_corroboration", "sector_cycle", "ownership")  # not valuation
+
+
+def soft_contradicting(axes: dict) -> int:
+    return sum(1 for a in EXIT_AXES if axes.get(a) is False)
+
+
+def sessions_held(opened_at, today) -> int:
+    start = pd.Timestamp(opened_at)
+    start = (start.tz_convert("Asia/Kolkata") if start.tzinfo else start).date()
+    return int(np.busday_count(start, pd.Timestamp(today).date()))
+
+
+def _hard_events(company_ids: list[str]) -> dict[str, list[dict]]:
+    if not company_ids:
+        return {}
+    df = sql_to_df(
+        "SELECT company_master_id, trigger_type, load_ts, alert_date FROM fundamentals_l3_alerts "
+        "WHERE company_master_id = ANY(%s) AND trigger_type = ANY(%s) AND load_ts >= now() - interval '400 days'",
+        params=(list(company_ids), list(HARD_NEGATIVE_TRIGGERS)),
+    )
+    out: dict[str, list[dict]] = {}
+    for r in df.itertuples():
+        out.setdefault(str(r.company_master_id), []).append(
+            {"trigger_type": r.trigger_type, "load_ts": r.load_ts, "alert_date": r.alert_date})
+    return out
+
+
+def _recent_scores(company_ids: list[str], runs: int = SOFT_PERSIST_RUNS) -> dict[str, list[dict]]:
+    """The last `runs` scoring runs per company, newest first."""
+    if not company_ids:
+        return {}
+    df = sql_to_df(
+        """
+        SELECT * FROM (
+          SELECT company_master_id, run_date, score_version,
+                 axis_fundamentals_trajectory, axis_event_corroboration, axis_sector_cycle,
+                 axis_ownership, axis_valuation,
+                 row_number() OVER (PARTITION BY company_master_id ORDER BY run_date DESC, score_version DESC) AS k
+            FROM fundamentals_confluence_score
+           WHERE company_master_id = ANY(%s) AND run_date >= now() - interval '60 days'
+        ) x WHERE k <= %s ORDER BY company_master_id, k
+        """,
+        params=(list(company_ids), runs),
+    )
+    out: dict[str, list[dict]] = {}
+    for r in df.itertuples():
+        out.setdefault(str(r.company_master_id), []).append({
+            "run_date": r.run_date, "score_version": int(r.score_version),
+            "axes": {"fundamentals_trajectory": r.axis_fundamentals_trajectory,
+                     "event_corroboration": r.axis_event_corroboration, "sector_cycle": r.axis_sector_cycle,
+                     "ownership": r.axis_ownership, "valuation": r.axis_valuation}})
+    return out
+
+
+def v2_thesis_exit(position, *, hard_events: list[dict], recent: list[dict], stage_now, today) -> str | None:
+    """The v2 thesis-invalidation decision for one position: a reason string, or None."""
+    opened = pd.Timestamp(position.opened_at)
+    for ev in hard_events:
+        seen = pd.Timestamp(ev["load_ts"])
+        if (seen.tz_localize("UTC") if seen.tzinfo is None else seen) > (opened.tz_localize("UTC") if opened.tzinfo is None else opened):
+            return f"hard contradiction since entry: {ev['trigger_type']} (alert {ev['alert_date']})"
+    if sessions_held(position.opened_at, today) < MIN_HOLD_SESSIONS:
+        return None
+    if len(recent) >= SOFT_PERSIST_RUNS and len({r["score_version"] for r in recent}) == 1:
+        # v2 entries require zero contradicting axes, so the soft baseline is zero.
+        if all(soft_contradicting(r["axes"]) > 0 for r in recent):
+            names = sorted(a for a in EXIT_AXES if recent[0]["axes"].get(a) is False)
+            return f"soft contradiction on {', '.join(names)} for {SOFT_PERSIST_RUNS} consecutive runs"
+    if stage_now is not None and int(stage_now) == EXIT_STAGE:
+        return f"Weinstein stage {EXIT_STAGE} (declining)"
+    return None
+
 
 def _baseline(position) -> tuple[int, int]:
     """(scorer version, contradicting count) the exit compares against. Pre-audit rows have
@@ -166,6 +257,10 @@ def evaluate_exit_triggers() -> dict[str, object]:
     company_ids = sorted({str(c) for c in positions["company_master_id"]})
     prices = _latest_prices(tickers)
     scores = _current_scores(company_ids)
+    v2_ids = sorted({str(r.company_master_id) for r in positions.itertuples()
+                     if int(getattr(r, "ruleset_version", 1) or 1) >= 2})
+    hard = _hard_events(v2_ids)
+    recent = _recent_scores(v2_ids)
     stages = load_stage_reads()
     stage_keys = load_stage_keys([str(c) for c in positions["company_master_id"]])
     # IST, not the server's clock: between 18:30 UTC and midnight the two are different
@@ -198,7 +293,23 @@ def evaluate_exit_triggers() -> dict[str, object]:
                                      f"({p.stop_pct}% below entry {float(p.entry_price):.2f})"))
             continue
 
-        # 2. Thesis invalidation. POSITIVE evidence only: a contradicting axis that is
+        # 2v2. Ruleset v2 positions: hard contradictions, persistent soft ones, stage 4.
+        if int(getattr(p, "ruleset_version", 1) or 1) >= 2:
+            stage_now = stage_for(p.company_master_id, stages, stage_keys)
+            score = scores.get(str(p.company_master_id)) or {}
+            reason = v2_thesis_exit(p, hard_events=hard.get(str(p.company_master_id), []),
+                                    recent=recent.get(str(p.company_master_id), []), stage_now=stage_now, today=today)
+            if reason:
+                triggers.append(_trigger(p, "thesis_invalidation", price, reason, score=score, stage_now=stage_now))
+                continue
+            target = getattr(p, "target_date", None)
+            if target is not None and pd.notna(target) and pd.Timestamp(target).normalize() <= today:
+                triggers.append(_trigger(p, "target_date", price,
+                                         f"target date {pd.Timestamp(target).date()} has passed without the thesis resolving",
+                                         score=score, stage_now=stage_now))
+            continue
+
+        # 2. Thesis invalidation (ruleset v1). POSITIVE evidence only: a contradicting axis that is
         #    actually present, or a stage read that exists and is no longer advancing.
         #
         #    Compared WITHIN one scorer version (2026-09-23 audit). The check used to be
