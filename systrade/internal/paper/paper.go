@@ -419,9 +419,25 @@ func MomentumLowVolCombinationSpec() Spec {
 	return s
 }
 
+// SpeedBlendBufferedSpec is the configuration frozen on 2026-09-29 (TODO A3):
+// trend-speed-blend in every respect but one -- a rank buffer (KeepMultiple 2),
+// a held name kept until it falls outside the top two quintiles. LEDGER row 49
+// measured it in-sample (turnover 903 -> 504%/yr, after tax 20.9 -> 22.6%/yr);
+// this forward record is what decides. trend-speed-blend's own record is untouched.
+func SpeedBlendBufferedSpec() Spec {
+	s := SpeedBlendSpec()
+	s.Name = "trend-speed-blend-buffered"
+	s.Start = time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	s.SignalLabel = "EWMAC 16/64, 32/128 and 64/256 blended 40/16/44, FDM 1.10 — top quintile, held until outside the top two quintiles (rank buffer), long-only"
+	s.Doc = "docs/strategies/2026-09-30_trend_speed_blend_buffered.md"
+	s.KeepMultiple = 2
+	return s
+}
+
 // Specs lists every strategy with a forward record, in the order they began.
 func Specs() []Spec {
-	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(), MomentumLowVolCombinationSpec()}
+	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
+		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec()}
 }
 
 // SpecFor finds a registered strategy by name.

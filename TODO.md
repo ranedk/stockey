@@ -93,7 +93,11 @@ Inputs to everything below, not opinions. Each was measured, not assumed:
 - **Size:** medium.
 
 ### A3. Re-price the live tracks' clock
-- [ ] **What:** with A1 and A2 built, compare monthly vs quarterly rebalancing
+- [x] **Done 2026-09-29.** Monthly vs quarterly with/without the buffer measured on the trend tracks:
+      the clock effect is inconsistent (quintile quarterly better, speed-blend quarterly worse); the
+      buffer is the consistent gain. New forward track `trend-speed-blend-buffered` (K=2, monthly)
+      frozen, starts 2026-09-30, LEDGER 50; judged vs trend-speed-blend from 2027-09-30.
+- **Was:** with A1 and A2 built, compare monthly vs quarterly rebalancing
       with and without the buffer, after costs AND tax, on the five frozen
       tracks.
 - **Why:** row 43 says the alpha is a wash; A1 says tax probably is not.

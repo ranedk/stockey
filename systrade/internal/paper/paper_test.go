@@ -695,3 +695,19 @@ func TestRankBufferRejectsBlendMode(t *testing.T) {
 		t.Error("ModeBlend with a rank buffer must be refused, not silently ignored")
 	}
 }
+
+func TestBufferedSpeedBlendDiffersFromSpeedBlendOnlyInTheBuffer(t *testing.T) {
+	base, buf := SpeedBlendSpec(), SpeedBlendBufferedSpec()
+	if buf.KeepMultiple != 2 || base.KeepMultiple != 0 {
+		t.Fatalf("buffer: base %d, buffered %d", base.KeepMultiple, buf.KeepMultiple)
+	}
+	// Everything that defines the strategy other than the buffer, its name,
+	// its clock start and its documents must be identical.
+	base.KeepMultiple, base.Name, base.Start, base.SignalLabel, base.Doc = buf.KeepMultiple, buf.Name, buf.Start, buf.SignalLabel, buf.Doc
+	if fmt.Sprintf("%+v", base) != fmt.Sprintf("%+v", buf) {
+		t.Errorf("the buffered track must be trend-speed-blend plus the buffer only:\n%+v\n%+v", base, buf)
+	}
+	if _, ok := SpecFor("trend-speed-blend-buffered"); !ok {
+		t.Error("not registered")
+	}
+}

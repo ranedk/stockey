@@ -41,6 +41,9 @@ go run ./cmd/paper run -strategy low-volatility-blend
 # (docs/strategies/2026-09-12_momentum_lowvol_combination.md). No reference track.
 go run ./cmd/paper run -strategy momentum-lowvol-combination
 
+# TODO A3 (2026-09-29): trend-speed-blend with a rank buffer -- a separate record, own clock.
+go run ./cmd/paper run -strategy trend-speed-blend-buffered
+
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate
 # evidence (docs/RESEARCH_PROTOCOL.md, S2 and S5). Never sends — no -live.

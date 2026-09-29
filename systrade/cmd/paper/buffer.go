@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ranedk/systrader/internal/costs"
@@ -23,6 +25,8 @@ func runBuffer(args []string) {
 	fromS := fs.String("from", "2013-07-01", "first decision day")
 	toS := fs.String("to", "2021-12-31", "last decision day (2022+ is the confirmation period: leave it alone)")
 	book := fs.Float64("book", 1e7, "book size in rupees, for the long-term-gains exemption")
+	clocksS := fs.String("clocks", "", "comma-separated rebalance intervals in trading days to compare (default: each spec's own)")
+	keepsS := fs.String("keeps", "1,2,3", "comma-separated buffer multiples K to compare")
 	fatalIf(fs.Parse(args))
 	from, err := time.Parse("2006-01-02", *fromS)
 	fatalIf(err)
@@ -44,7 +48,11 @@ func runBuffer(args []string) {
 
 	fmt.Printf("RANK BUFFER — hold a name until it falls outside the top N x K (TODO A2; LEDGER, trials=0)\n")
 	fmt.Printf("decisions %s..%s, each track's own spec otherwise; tax: A1 model at a Rs %.0f book\n\n", *fromS, *toS, *book)
-	fmt.Printf("%-28s %2s %9s %9s %9s %9s %8s %9s %9s\n", "track", "K", "turn/yr", "churn/reb", "gross/yr", "net/yr", "LT share", "tax/yr", "after-tax")
+	clocks, err := intList(*clocksS)
+	fatalIf(err)
+	keeps, err := intList(*keepsS)
+	fatalIf(err)
+	fmt.Printf("%-28s %4s %2s %9s %9s %9s %9s %8s %9s %9s\n", "track", "reb", "K", "turn/yr", "churn/reb", "gross/yr", "net/yr", "LT share", "tax/yr", "after-tax")
 	for _, spec := range specs {
 		spec.Start = from
 		sig, err := parseSignal(spec.Signal)
@@ -64,19 +72,26 @@ func runBuffer(args []string) {
 		}
 		days, err := buildDays(ctx, st, spec, sig, sig2, variants, load, to, false)
 		fatalIf(err)
-		for _, k := range []int{1, 2, 3} {
-			s := spec
-			s.KeepMultiple = k
-			net, err := paper.Compute(s, days)
-			fatalIf(err)
-			g := s
-			g.CostBpsRoundTrip = 0
-			gross, err := paper.Compute(g, days)
-			fatalIf(err)
-			m := bufferMetrics(net, gross, s.RebalanceEvery, *book)
-			fmt.Printf("%-28s %2d %8.0f%% %8.1f%% %8.2f%% %8.2f%% %7.1f%% %8.2f%% %8.2f%%\n",
-				spec.Name, k, 100*m.turnPerYear, 100*m.churn, 100*m.grossCAGR, 100*m.netCAGR,
-				100*m.longTerm, 100*m.taxPerYear, 100*m.afterTax)
+		specClocks := clocks
+		if len(specClocks) == 0 {
+			specClocks = []int{spec.RebalanceEvery}
+		}
+		for _, reb := range specClocks {
+			for _, k := range keeps {
+				s := spec
+				s.RebalanceEvery = reb
+				s.KeepMultiple = k
+				net, err := paper.Compute(s, days)
+				fatalIf(err)
+				g := s
+				g.CostBpsRoundTrip = 0
+				gross, err := paper.Compute(g, days)
+				fatalIf(err)
+				m := bufferMetrics(net, gross, s.RebalanceEvery, *book)
+				fmt.Printf("%-28s %4d %2d %8.0f%% %8.1f%% %8.2f%% %8.2f%% %7.1f%% %8.2f%% %8.2f%%\n",
+					spec.Name, reb, k, 100*m.turnPerYear, 100*m.churn, 100*m.grossCAGR, 100*m.netCAGR,
+					100*m.longTerm, 100*m.taxPerYear, 100*m.afterTax)
+			}
 		}
 		fmt.Println()
 	}
@@ -84,6 +99,22 @@ func runBuffer(args []string) {
 	fmt.Println("rebalance (turnover/2). LT share: the A1 model's long-term share of realised gains at that churn")
 	fmt.Println("and clock. after-tax: net CAGR less tax on it as if realised yearly -- an upper bound on tax,")
 	fmt.Println("since a lower-churn book also DEFERS gains, which this does not credit.")
+}
+
+func intList(s string) ([]int, error) {
+	var out []int
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("bad list %q: %w", s, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 type bufferResult struct {
