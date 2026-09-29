@@ -35,6 +35,11 @@ DIRECTION = {
     "rating_confirms_deleveraging": 1, "capital_raise": 1,
     "bulk_deal_sell": -1, "results_decline": -1, "auditor_change": -1, "insider_sell_surprise": -1,
 }
+# Second family (systrader LEDGER row 51, pre-registered 2026-09-29): the LLM story read's
+# alerts (story_read.py), same entry clock and horizons, judged separately from the nine rule
+# triggers. Detection time is the read's own time (the alert's load_ts).
+STORY_READ_START = "2026-09-30"
+STORY_READ_DIRECTION = {"story_read_positive": 1, "story_read_negative": -1}
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 _DDL = f"""
@@ -53,7 +58,7 @@ def ensure_table() -> None:
     with db_session() as (_, cur):
         cur.execute(_DDL)
         for col, typ in (("delivery_change_pp", "DOUBLE PRECISION"), ("upper_band_hits_20d", "INTEGER"),
-                         ("lower_band_hits_20d", "INTEGER")):
+                         ("lower_band_hits_20d", "INTEGER"), ("family", "TEXT")):
             cur.execute(f"ALTER TABLE {RECORD_TABLE} ADD COLUMN IF NOT EXISTS {col} {typ}")
         cur.execute("ALTER TABLE fundamentals_events ADD COLUMN IF NOT EXISTS admission_cohort TEXT")
 
@@ -76,11 +81,27 @@ def new_alerts() -> pd.DataFrame:
     )
 
 
+def new_story_reads() -> pd.DataFrame:
+    return sql_to_df(
+        f"""
+        SELECT a.source, a.news_id, a.trigger_type, a.company_master_id, a.load_ts AS detected_at
+          FROM fundamentals_l3_alerts a
+         WHERE a.source = 'story_read' AND a.trigger_type = ANY(%s)
+           AND a.load_ts >= %s::timestamptz
+           AND NOT EXISTS (SELECT 1 FROM {RECORD_TABLE} r
+                            WHERE r.source = a.source AND r.news_id = a.news_id AND r.trigger_type = a.trigger_type)
+        """,
+        params=(list(STORY_READ_DIRECTION), f"{STORY_READ_START} 00:00:00+05:30"),
+    )
+
+
 def record_new() -> int:
-    df = new_alerts()
-    if df.empty:
+    frames = [f for f in (new_alerts().assign(family="rule_triggers"), new_story_reads().assign(family="story_read"))
+              if not f.empty]
+    if not frames:
         return 0
-    df["direction"] = df["trigger_type"].map(DIRECTION)
+    df = pd.concat(frames, ignore_index=True)
+    df["direction"] = df["trigger_type"].map({**DIRECTION, **STORY_READ_DIRECTION})
     df["symbol"] = df["company_master_id"].str.replace("nse:", "", regex=False)
     df["entry_date"] = None
     df["entry_price"] = None
@@ -153,7 +174,8 @@ def report() -> dict[str, object]:
     cache: dict = {}
     out = {}
     for trigger, g in rows.groupby("trigger_type") if not rows.empty else []:
-        entry = {"events": int(len(g)), "direction": int(DIRECTION.get(trigger, 0))}
+        entry = {"events": int(len(g)), "direction": int({**DIRECTION, **STORY_READ_DIRECTION}.get(trigger, 0)),
+                 "family": "story_read" if trigger in STORY_READ_DIRECTION else "rule_triggers"}
         for h in HORIZONS:
             excess = []
             for r in g.itertuples():
@@ -164,7 +186,7 @@ def report() -> dict[str, object]:
             entry[f"{h}d"] = {"n": len(excess),
                               "mean_excess_pct": round(100 * sum(excess) / len(excess), 2) if excess else None}
         out[trigger] = entry
-    return {"record_start": RECORD_START, "by_trigger": out}
+    return {"record_start": RECORD_START, "story_read_start": STORY_READ_START, "by_trigger": out}
 
 
 def main(argv: list[str] | None = None) -> int:

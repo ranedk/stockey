@@ -257,7 +257,26 @@ Exact multiples above are defaults, set from that evidence, never tuned on retur
    - Story score inputs now include news: company tags join the events dimension (a
      materiality-3 item weighs like one filing alert), and a sector's decayed net news of
      1.5+ is a "sector news tailwind" story (75).
-5. **LLM story read (3.4)**, replacing yes/no triage; into event-drift.
+5. **LLM story read (3.4)**, replacing yes/no triage; into event-drift. **Built 2026-09-29**
+   (`fundamentals/screens/story_read.py`, tests/test_story_read.py). As built:
+   - Who: a company with a material score change or a substantive filing of its own (results,
+     capital raise, rating action, auditor change, related-party transaction) not yet covered by
+     a read (`fundamentals_story_read_seen`); a filing waits for its extraction, at most 12 hours.
+     Capped at 60 companies a run, results filings and band entries first. Runs nightly after
+     story_score and in every 30-minute re-evaluation pass.
+   - The model sees the score and its strongest readings, flaws, the latest quarter against its own
+     trend, ownership / debt / valuation, recent filings with extracted fields and material news.
+     It returns the one story, the one deal-breaker, direction, materiality 1-5, horizon, key
+     numbers, what the numbers miss, and confidence; stored with the evidence
+     (`fundamentals_story_read`).
+   - Materiality >= 4 becomes an alert: `story_read_positive` (improving, no deal-breaker) or
+     `story_read_negative` (deteriorating). The watchlist admits on the positive one and counts the
+     negative one against a name, as it did with `llm_flagged`. The alerts do NOT feed the story
+     score (no loop), confluence or the portfolio ruleset (frozen v2 inputs).
+   - `llm_triage` left the nightly run; it stays in the one-time catch-up chain.
+   - Measured forward in event drift as its own family from 2026-09-30 (systrader LEDGER row 51).
+   - First reads (5): UTTAMSUGAR's quarter-profit collapse read as deteriorating, materiality 4;
+     routine rating filings read as materiality 2-3, no alert.
 6. **Watchlist on the score (4.3)**; retire the confluence count.
 7. **Weighted portfolio (5.2) and exits (5.3)** -- ruleset v3: trailing stop, valuation trim,
    replacement, tax guard, counterfactual tracking; story-fading exit once step 2 exists.

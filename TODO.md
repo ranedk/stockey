@@ -178,7 +178,10 @@ being popular, not for being weak.
 - **Step 4 built 2026-09-29:** every 30 minutes, today's filings and tagged ET news re-score
   the touched companies; material score changes recorded (`all_fundamentals_reeval.sh`, in the
   crontab template -- live at go-live with the crontab regeneration).
-- **Next:** step 5, the LLM story read (replacing yes/no triage).
+- **Step 5 built 2026-09-29:** LLM story read on material score changes and substantive filings;
+  alerts `story_read_positive/negative` for the watchlist; triage retired from the nightly run;
+  measured forward (LEDGER row 51).
+- **Next:** step 6, the watchlist on the story score (retire the confluence count).
 
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,

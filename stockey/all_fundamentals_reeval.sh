@@ -7,7 +7,7 @@ PYTHON_BIN="$("${SCRIPT_DIR}/scripts/resolve_python.sh")"
 
 # Event-driven re-evaluation (docs/FUNDAMENTAL_REEVALUATION_PRD.md 4.2), every 30 minutes:
 # today's new BSE filings -> structured extraction -> rule triggers -> news tagging ->
-# re-score the touched companies. Each step is incremental (pending rows / watermarks), so
+# re-score the touched companies -> story read of material changes and substantive filings. Each step is incremental (pending rows / watermarks), so
 # a quiet half hour costs a couple of requests. One step failing does not stop the next.
 if [[ -f "${SCRIPT_DIR}/.pause_fundamentals" ]]; then
   echo "[stockey.pause] $(basename "$0") skipped: ${SCRIPT_DIR}/.pause_fundamentals exists ($(head -c 200 "${SCRIPT_DIR}/.pause_fundamentals"))"
@@ -30,4 +30,5 @@ run_step structured_extraction fundamentals.collectors.structured_extraction
 run_step l3_triggers fundamentals.screens.l3_triggers
 run_step news_tagging fundamentals.screens.news_tagging
 run_step reeval fundamentals.screens.reeval
+run_step story_read fundamentals.screens.story_read
 exit "${failed}"

@@ -13,7 +13,7 @@ trail, so there's nothing else to translate here.
 Steps run in dependency order (docs/FUNDAMENTAL_SCREENER_PRD.md sec 8's numbered
 steps): sector reference -> L1 universe -> L2 state -> event collectors -> OCR ->
 structured extraction -> deal flow -> investor classification -> sector
-capital-cycle -> L3 rule triggers -> L3 LLM triage -> descriptive technicals ->
+capital-cycle -> L3 rule triggers -> story score -> story read -> descriptive technicals ->
 watchlist/narrative/email pipeline. investor_classification runs right after
 structured_extraction AND deal_flow (needs both their investor_names output).
 l3_triggers's capital_raise/bulk_deal_buy/bulk_deal_sell triggers still fire
@@ -112,15 +112,19 @@ STEPS: list[str] = [
     "fundamentals.screens.l3_triggers",
     # Event-drift forward record (TODO C7): records tonight's rule alerts, fills entry prices.
     "fundamentals.screens.event_drift",
-    "fundamentals.screens.llm_triage",
-    # Story-and-flaw score (reevaluation PRD step 2): needs tonight's snapshot, L2 and events.
-    # A record for now -- nothing downstream reads it until the watchlist step moves onto it.
+    # llm_triage (per-filing yes/no) retired from the nightly run 2026-09-29: the story read
+    # below replaces it (reevaluation PRD step 5). It stays in catchup_admission's one-time chain.
+    # Story-and-flaw score (reevaluation PRD step 2): needs tonight's snapshot, L2 and events;
+    # it also refreshes the live score and records material changes (reeval.apply_scores).
     "fundamentals.screens.story_score",
+    # LLM story read (step 5) on tonight's material changes and substantive filings; its
+    # story_read_* alerts must exist before the watchlist step below.
+    "fundamentals.screens.story_read",
     # Watchlist sync BEFORE confluence (2026-09-24, audit item O2). It used to run only
     # inside notifications (last), so confluence scored the PREVIOUS run's watchlist and a
     # name added tonight had no score until tomorrow. That was defended as "a READ, not a
     # decision" -- no longer true: the 22:00 IST portfolio ruleset enters from THIS run's
-    # confluence. After llm_triage, the last step that writes alerts; notifications still
+    # confluence. After story_read, the last step that writes alerts; notifications still
     # re-runs the (idempotent) sync before narratives and exit evaluation.
     "fundamentals.screens.watchlist",
     # Needs sector_cycle's fresh phases, this run's alerts and this run's watchlist.

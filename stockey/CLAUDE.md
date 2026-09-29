@@ -122,7 +122,6 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 22:00 | Mon–Fri | `all_portfolio_ruleset.sh` — exits → entries → forecast resolution → **action email** |
 | 23:15 | Mon–Fri | `all_ohlcv_reconcile.sh` — Dhan publishes staggered through the evening |
 | 23:40 | Mon–Fri | `all_dhan_intraday_sync.sh` |
-| :17 / :47 | daily | `all_fundamentals_reeval.sh` — intraday filings + news tagging -> re-score touched companies (gated on `.pause_fundamentals`) |
 | every 5 min | daily | `all_fundamentals_api.sh` (respawn-under-lock; no-ops when healthy) |
 
 Ordering is load-bearing: the gate and both monitoring jobs sit AFTER the morning
@@ -131,6 +130,11 @@ Friday-evening miss otherwise had no catch-up until Monday — that is exactly w
 on 2026-09-04, when NSE had not published when the 19:15 run asked and Friday's bhavcopy
 then sat missing all weekend. The evening chain stays Mon–Fri: Saturday is not a trading
 day, so there is no session to collect.
+
+**Pending go-live (2026-09-29):** `all_fundamentals_reeval.sh` (:17 / :47 hourly — intraday filings,
+news tagging, re-score touched companies, story read; gated on `.pause_fundamentals`) is in the
+template but not yet in the generated crontab. Move it into the table above when `builder.py`
+regenerates the crontab — `test_claude_md_cron_table_matches_the_actual_crontab` enforces that.
 
 What each job does, and the reasoning behind the times, is in the per-job comments in
 `config/stockey.crontab.template` — including why the EOD run moved off 17:30 (NSE had not

@@ -12,6 +12,7 @@ def test_record_new_labels_direction_and_leaves_entry_for_the_next_session(monke
     alerts = pd.DataFrame([{"source": "bse", "news_id": "n1", "trigger_type": "insider_buy",
                             "company_master_id": "nse:ABC", "detected_at": pd.Timestamp("2026-10-05 18:00", tz="Asia/Kolkata")}])
     monkeypatch.setattr(ed, "new_alerts", lambda: alerts)
+    monkeypatch.setattr(ed, "new_story_reads", lambda: pd.DataFrame())
     import fundamentals.screens.technicals as tech
     monkeypatch.setattr(tech, "load_market_state", lambda syms: {"ABC": {"delivery_change_pp": 6.5,
                                                                          "upper_band_hits_20d": 2, "lower_band_hits_20d": 0}})
@@ -47,3 +48,18 @@ def test_market_state_blanks_band_hits_for_futures_stocks(monkeypatch):
     out = tech.load_market_state(["SMALL", "BIGFO"])
     assert out["SMALL"]["delivery_change_pp"] == 10.0 and out["SMALL"]["upper_band_hits_60d"] == 0
     assert out["BIGFO"]["upper_band_hits_20d"] is None and out["BIGFO"]["delivery_change_pp"] == -5.0
+
+
+def test_story_reads_are_recorded_as_their_own_family(monkeypatch):
+    reads = pd.DataFrame([{"source": "story_read", "news_id": "nse:ABC:t", "trigger_type": "story_read_negative",
+                           "company_master_id": "nse:ABC", "detected_at": pd.Timestamp("2026-10-05 12:00", tz="UTC")}])
+    monkeypatch.setattr(ed, "new_alerts", lambda: pd.DataFrame())
+    monkeypatch.setattr(ed, "new_story_reads", lambda: reads)
+    import fundamentals.screens.technicals as tech
+    monkeypatch.setattr(tech, "load_market_state", lambda syms: {})
+    written = []
+    monkeypatch.setattr(ed, "upsert_to_db", lambda df, table, **k: written.append(df))
+    assert ed.record_new() == 1
+    row = written[0].iloc[0]
+    assert (row["family"], row["direction"]) == ("story_read", -1)
+    assert set(ed.STORY_READ_DIRECTION).isdisjoint(ed.DIRECTION)  # row 48's nine stay frozen

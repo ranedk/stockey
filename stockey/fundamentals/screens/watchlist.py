@@ -107,6 +107,7 @@ def _record_fallback(fallback_type: str, *, reason: str, error, severity: str = 
 NEGATIVE_TRIGGER_TYPES = frozenset({
     "rating_downgrade", "results_decline", "insider_sell_surprise", "pledge_increase",
     "bulk_deal_sell", "auditor_change", "related_party_transaction", "results_delayed",
+    "story_read_negative",  # the story read's deteriorating verdict (2026-09-29)
 })
 
 

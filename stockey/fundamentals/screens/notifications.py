@@ -485,6 +485,8 @@ STRATEGY_LABELS = {
     "capital_raise": "Capital raise",
     "institutional_first_entry": "First institutional entry",
     "llm_flagged": "LLM-flagged",
+    "story_read_positive": "Story read: improving",
+    "story_read_negative": "Story read: deteriorating",
     # Added 2026-08-13 alongside the L3 results trigger + auditor_change/RPT gap fix
     # -- these existed for a full test-suite cycle before being added here, same
     # oversight this whole audit pass was checking for.
