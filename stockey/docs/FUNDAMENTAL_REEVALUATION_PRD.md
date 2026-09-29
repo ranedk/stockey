@@ -215,7 +215,23 @@ Exact multiples above are defaults, set from that evidence, never tuned on retur
    - First run: 1,295 scored, median 35, 47 at >= 95, 40 capped by a flaw. A record only
      until the watchlist moves onto it (step 6). Known limit: one-off gains inside profit
      growth are not stripped until results reading (step 3).
-3. **Results reading (3.5)** feeding Growth / Margins.
+3. **Results reading (3.5)** feeding Growth / Margins. **Done 2026-09-29** -- `fundamentals/screens/results_reading.py`
+   (tests/test_results_reading.py), story score version 2. As built:
+   - Source: screener.in's 13-quarter Quarterly Results table, which the L2 crawl already
+     fetched and discarded; now stored per (company, quarter) with first-seen values kept
+     (`fundamentals_quarterly_results`). A results filing pulls the crawl forward, so a new
+     quarter lands within a night or two. One-time backfill for the universe 2026-09-29.
+     The filing extraction (RESULTS_SCHEMA) covers one filing per company -- no trend -- and
+     stays for the filing-day read.
+   - Per company, latest quarter, all YoY: sales growth and growth minus the median of the 4
+     prior quarters' growth ("accelerating / steady / slowing", 5 pp band); the same for
+     underlying profit; margin change (pp vs a year ago) and that change against its own trend.
+   - One-offs: screener nets exceptional items into Other Income, so underlying PBT swaps the
+     quarter's other income for its median over the prior 4 quarters (lenders' fee income is
+     kept by the same median). `one_off_share` records how much of reported PBT was the jump.
+   - Story score v2 reads these in place of v1's "quarter YoY minus 5-year" acceleration, and
+     gains a Margins dimension. A reading needs quarterly sales >= Rs 50 cr and a quarter no
+     older than 200 days.
 4. **Re-evaluation queue + scorer job (4.2)**, intraday filings, news tagging.
 5. **LLM story read (3.4)**, replacing yes/no triage; into event-drift.
 6. **Watchlist on the score (4.3)**; retire the confluence count.

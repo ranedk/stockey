@@ -34,12 +34,16 @@ import json
 import numpy as np
 import pandas as pd
 
+from fundamentals.screens import results_reading
 from utils.company_master import map_company_master_ids_nse_or_bse
 from utils.db import sql_to_df, upsert_to_db
 
 SYNC_SOURCE_NAME = "fundamentals.screens.story_score"
 RESULTS_TABLE = "fundamentals_story_score"
-SCORE_VERSION = 1
+# 2 (2026-09-29, PRD step 3): growth change/acceleration and a new margins dimension read from
+# the quarterly results table against each company's own trend, one-offs stripped; version 1's
+# snapshot-based "quarter YoY minus 5y" acceleration is gone.
+SCORE_VERSION = 2
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 STORY_SECOND_BONUS = 0.25
@@ -57,8 +61,13 @@ NEGATIVE_TRIGGERS = frozenset({"rating_downgrade", "results_decline", "insider_s
 PERCENTILE_READINGS = [
     ("growth", "sales_growth_5y", "sales_growth_5y_pct", True, "level"),
     ("growth", "profit_growth_5y", "profit_growth_5y_pct", True, "level"),
-    ("growth", "sales_acceleration", "sales_acceleration", True, "acceleration"),
-    ("growth", "profit_acceleration", "profit_acceleration", True, "acceleration"),
+    # results reading (results_reading.py): the latest quarter against the company's own trend
+    ("growth", "sales_yoy", "rr_sales_yoy_pct", True, "change"),
+    ("growth", "sales_vs_trend", "rr_sales_vs_trend_pp", True, "acceleration"),
+    ("growth", "profit_yoy", "rr_profit_yoy_pct", True, "change"),
+    ("growth", "profit_vs_trend", "rr_profit_vs_trend_pp", True, "acceleration"),
+    ("margins", "margin_change", "rr_margin_change_pp", True, "change"),
+    ("margins", "margin_vs_trend", "rr_margin_vs_trend_pp", True, "acceleration"),
     # Levels on the 5-year averages: a single freak year (a demerger or asset-sale gain) must
     # not be a company's whole story. The latest year counts only as improvement (change).
     ("profitability", "roce_5y", "roce_5y_avg_pct", True, "level"),
@@ -81,7 +90,7 @@ NOT_FOR_FINANCIALS = frozenset({"low_debt", "interest_cover", "fcf_yield", "low_
 ONLY_FOR_FINANCIALS = frozenset({"low_price_to_book"})
 # Returns above this are almost always one-off gains or a near-zero base, not a business.
 PLAUSIBLE_RETURN_PCT = 100.0
-# A quarter's YoY jump off less revenue than this (Rs cr, about the universe's 5th pct) is
+# A quarter's YoY reading off less revenue than this (Rs cr, about the universe's 5th pct) is
 # lumpy licence/order income, not acceleration (SPARC: +314% on Rs 40 cr).
 MIN_ACCELERATION_SALES_Q_CR = 50.0
 
@@ -136,7 +145,13 @@ def load_inputs(as_of) -> pd.DataFrame:
                               WHERE s.sector_code = cs.sector_code AND s.run_date::date <= %s
                               ORDER BY s.run_date DESC LIMIT 1) sc ON true
         """, params=(d,))
-    return df.merge(sectors, on="company_master_id", how="left")
+    df = df.merge(sectors, on="company_master_id", how="left")
+    rr = results_reading.readings(as_of)
+    if not rr.empty:
+        rr = rr.drop(columns=["ticker"]).rename(columns=lambda c: c if c == "company_id" else f"rr_{c}")
+        df["screener_company_id"] = pd.to_numeric(df["screener_company_id"], errors="coerce")
+        df = df.merge(rr.rename(columns={"company_id": "screener_company_id"}), on="screener_company_id", how="left")
+    return df
 
 
 def event_features(alerts: pd.DataFrame, as_of) -> pd.DataFrame:
@@ -165,9 +180,9 @@ def event_features(alerts: pd.DataFrame, as_of) -> pd.DataFrame:
 def derive(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     num = lambda c: pd.to_numeric(x.get(c), errors="coerce")
-    base_ok = num("sales_q") >= MIN_ACCELERATION_SALES_Q_CR
-    x["sales_acceleration"] = (num("sales_growth_q_pct") - num("sales_growth_5y_pct")).where(base_ok)
-    x["profit_acceleration"] = (num("profit_growth_q_pct") - num("profit_growth_5y_pct")).where(base_ok)
+    base_ok = num("rr_sales_q_cr") >= MIN_ACCELERATION_SALES_Q_CR
+    for c in ("rr_sales_yoy_pct", "rr_sales_vs_trend_pp", "rr_profit_yoy_pct", "rr_profit_vs_trend_pp"):
+        x[c] = num(c).where(base_ok)
     plausible = lambda c: num(c).abs() <= PLAUSIBLE_RETURN_PCT
     for now, avg in (("roce_pct", "roce_5y_avg_pct"), ("roe_pct", "roe_5y_avg_pct")):
         # the year that makes today's return implausible also sits inside the 5-year average

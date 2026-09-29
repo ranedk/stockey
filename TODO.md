@@ -172,7 +172,10 @@ being popular, not for being weak.
   contradictions / 3-run soft ones / stage 4, 20-session minimum hold, valuation never exits).
 - **Step 2 done 2026-09-29:** daily dated story/flaw score (`fundamentals/screens/story_score.py`,
   table `fundamentals_story_score`); a record until step 6 puts the watchlist on it.
-- **Next:** step 3, results reading (growth vs own trend, margin change, exceptional items out).
+- **Step 3 done 2026-09-29:** results reading from screener.in's quarterly table (stored by
+  the L2 crawl), growth and margin against each company's own trend, one-offs stripped; story
+  score v2 reads it.
+- **Next:** step 4, re-evaluation queue + scorer job, intraday filings, news tagging.
 
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,

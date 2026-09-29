@@ -122,6 +122,7 @@ from fundamentals.collectors.events_store import _ensure_events_schema
 from fundamentals.collectors.screenerin import build_authenticated_session, clean_text, run_query
 from fundamentals.collectors.screenerin import to_number as _screenerin_to_number
 from fundamentals.screens.l1_universe import load_l1_universe_tickers
+from fundamentals.screens import results_reading
 from utils.company_master import build_l1_ticker_by_company_master_id, map_company_master_ids_nse_or_bse
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.exchange_rate_limiter import exchange_request_gate
@@ -736,6 +737,8 @@ def fetch_company_detail(session, ticker: str) -> dict[str, object]:
         "balance_sheet": _parse_period_table(soup.select_one("#balance-sheet table")),
         "profit_loss": _parse_period_table(soup.select_one("#profit-loss table")),
         "shareholding": _parse_period_table(soup.select_one("#shareholding table")),
+        # kept for results_reading (reevaluation PRD step 3); L2's own fields do not read it
+        "quarters": _parse_period_table(soup.select_one("#quarters table")),
     }
 
 
@@ -1275,6 +1278,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     failed_companies: list[str] = []
     institutional_entry_events: list[dict[str, object]] = []
     crawled: list[tuple] = []
+    quarter_rows: list[dict[str, object]] = []
     for _, company in universe.iterrows():
         ticker = company["ticker"]
         if not ticker:
@@ -1287,6 +1291,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             continue
         row = build_l2_state_row(company, pledge_levels, valuation_levels, detail, prior_pledge_levels,
                                  pledge_data_available=pledge_ok)
+        quarter_rows.extend(results_reading.quarter_rows(company["company_id"], ticker, detail.get("quarters") or {}))
         # Market-wide fields on the detail row are the same day's snapshot values, so the
         # two tables can never disagree about what was known on run_date.
         snap = snapshot_by_company.get(int(company["company_id"])) or {}
@@ -1323,6 +1328,11 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         # THIS cycle is confirmed durably written -- see the loop above for why.
         for company_id, ticker in crawled:
             _mark_crawled(company_id, ticker)
+    try:
+        quarters_stored = results_reading.store_quarters(quarter_rows)
+    except Exception as exc:  # noqa: BLE001 -- the quarterly history is a side output; L2 state is already written
+        quarters_stored = 0
+        _record_market_wide_query_fallback("quarterly_results_store", exc)
     if institutional_entry_events or pledge_increase_events:
         _ensure_events_schema()
         if institutional_entry_events:
@@ -1339,6 +1349,7 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
         "pledge_increases": len(pledge_increase_events),
         "companies_due": int(len(universe)),
         "market_snapshot_rows": len(snapshot_rows),
+        "quarter_rows": quarters_stored,
         "pledge_fetch_ok": pledge_ok,
         "valuation_fetch_ok": valuation_ok,
     }
