@@ -459,6 +459,33 @@ def readmit_bse_sast_failures() -> None:
     )
 
 
+# Operator, 2026-09-30: no OCR for an announcement older than this. Nothing downstream reads an
+# old filing's text -- history is marked 'historical' and never alerts, the story read and the
+# catch-up look back 3 and 60 days -- and 3,500 of 4,100 queued documents were 2 months to 3
+# years old. Older rows get the visible terminal status below, never a silent skip.
+OCR_MAX_AGE_DAYS = env.int("FUNDAMENTALS_OCR_MAX_AGE_DAYS", 183)
+SKIPPED_TOO_OLD = "skipped_too_old"
+_FILING_DATE_SQL = "COALESCE(disclosure_date::date, (announcement_timestamp AT TIME ZONE 'Asia/Kolkata')::date)"
+
+
+def mark_too_old_skipped() -> int:
+    """Close out queued documents older than OCR_MAX_AGE_DAYS. Returns how many."""
+    def _op() -> int:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE fundamentals_events SET ocr_status = %s
+                 WHERE (ocr_status IS NULL OR ocr_status = 'pending')
+                   AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
+                   AND {_FILING_DATE_SQL} < current_date - %s
+                """,
+                (SKIPPED_TOO_OLD, OCR_MAX_AGE_DAYS),
+            )
+            return cur.rowcount
+
+    return int(execute_db_operation(_op, operation_name=f"{RESULTS_TABLE}:ocr_skip_too_old") or 0)
+
+
 def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
     # BUG FOUND LIVE 2026-08-17: plain load_ts ASC processes strictly oldest-inserted-
     # first, with no regard for how old the FILING itself is. bse_announcements.py's
@@ -477,6 +504,7 @@ def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
         FROM fundamentals_events
         WHERE (ocr_status IS NULL OR ocr_status = 'pending')
           AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
+          AND """ + _FILING_DATE_SQL + """ >= current_date - """ + str(int(OCR_MAX_AGE_DAYS)) + """
         -- Documents that already timed out go to the BACK (2026-09-23 audit): they used
         -- to lead every run in the same order, tripping the timeout breaker before any
         -- fresh filing was reached.
@@ -497,6 +525,7 @@ def count_pending_ocr_targets() -> int:
         FROM fundamentals_events
         WHERE (ocr_status IS NULL OR ocr_status = 'pending')
           AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
+          AND """ + _FILING_DATE_SQL + """ >= current_date - """ + str(int(OCR_MAX_AGE_DAYS)) + """
         """
     )
     return int(df.iloc[0]["n"]) if not df.empty else 0
@@ -629,10 +658,12 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
     _ensure_events_schema()
     _bootstrap_ocr_columns()
 
+    skipped_too_old = mark_too_old_skipped()
     effective_limit = limit or DEFAULT_BATCH_LIMIT
     pending = load_pending_ocr_targets(effective_limit)
     if pending.empty:
-        return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False, "backlog_remaining": 0}
+        return {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False,
+                "backlog_remaining": 0, "skipped_too_old": skipped_too_old}
 
     counts = {"ocred": 0, "failed": 0, "no_document": 0}
     consecutive_failures_by_domain: dict[str, int] = {}
@@ -747,7 +778,8 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
             metadata={"backlog_remaining": backlog_remaining, "effective_limit": effective_limit, "ocred_this_run": counts["ocred"], "failed_this_run": counts["failed"]},
         )
 
-    return {**counts, "blocked": bool(blocked_domains), "time_budget_exceeded": time_budget_exceeded, "backlog_remaining": backlog_remaining}
+    return {**counts, "blocked": bool(blocked_domains), "time_budget_exceeded": time_budget_exceeded, "backlog_remaining": backlog_remaining,
+            "skipped_too_old": skipped_too_old}
 
 
 def main() -> int:
@@ -765,6 +797,7 @@ def main() -> int:
         "blocked": result["blocked"],
         "time_budget_exceeded": result["time_budget_exceeded"],
         "backlog_remaining": result["backlog_remaining"],
+        "skipped_too_old": result.get("skipped_too_old", 0),
         "fallback_used": bool(result["failed"] or result["blocked"]),
         "state_advanced": result["ocred"] > 0,
         "status": "blocked" if result["blocked"] else "ok",

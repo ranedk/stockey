@@ -145,7 +145,7 @@ def load_candidate_events_for_triage(limit: int | None = None) -> pd.DataFrame:
              -- cannot strand one. A failed or document-less row has nothing to wait for.
              OR (ocr_status = 'done' AND structured_extraction_status IS NOT NULL
                  AND structured_extraction_status != 'pending')
-             OR ocr_status IN ('failed', 'no_document', 'timeout_exhausted')
+             OR ocr_status IN ('failed', 'no_document', 'timeout_exhausted', 'skipped_too_old')
           )
         ORDER BY load_ts ASC NULLS LAST
     """

@@ -16108,7 +16108,8 @@ def test_run_ocr_pipeline_returns_early_when_nothing_pending(monkeypatch):
 
     result = fundamentals_ocr_pipeline.run_ocr_pipeline()
 
-    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False, "backlog_remaining": 0}
+    assert result == {"ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False, "backlog_remaining": 0,
+                      "skipped_too_old": 0}
 
 
 def test_run_ocr_pipeline_marks_rows_with_no_document_reference(monkeypatch):
@@ -17599,7 +17600,7 @@ def test_load_candidate_events_gates_on_enrichment_readiness(monkeypatch):
     assert "attachment_name IS NULL AND rationale_pdf_url IS NULL" in query
     # OCR concluded one way or another AND extraction also concluded (or was
     # never attempted because OCR itself never produced text to extract from).
-    assert "ocr_status IN ('failed', 'no_document', 'timeout_exhausted')" in query
+    assert "ocr_status IN ('failed', 'no_document', 'timeout_exhausted', 'skipped_too_old')" in query
     # an OCR'd row waits for extraction to finish -- NULL is not finished (2026-09-23)
     assert "structured_extraction_status IS NOT NULL" in query
     assert "structured_extraction_status != 'pending'" in query
@@ -18517,7 +18518,7 @@ def test_load_candidate_events_for_triage_queries_expected_filters(monkeypatch):
     # detected, before OCR/extraction had run -- results events (which need
     # structured_extraction_json entirely for the evidence bundle) got LLM-judged
     # on category alone. Pins the readiness gate is actually in the query.
-    assert "ocr_status IN ('failed', 'no_document', 'timeout_exhausted')" in captured["query"]
+    assert "ocr_status IN ('failed', 'no_document', 'timeout_exhausted', 'skipped_too_old')" in captured["query"]
     assert "structured_extraction_status IS NOT NULL" in captured["query"]
     assert "structured_extraction_status != 'pending'" in captured["query"]
 
@@ -23895,6 +23896,14 @@ def _no_market_state(monkeypatch):
     import fundamentals.screens.technicals as tech
 
     monkeypatch.setattr(tech, "load_market_state", lambda symbols: {})
+
+
+@pytest.fixture(autouse=True)
+def _no_ocr_age_cleanup(monkeypatch):
+    """run_ocr_pipeline closes out too-old queued documents first (2026-09-30) -- a live UPDATE."""
+    import fundamentals.collectors.ocr_pipeline as ocr
+
+    monkeypatch.setattr(ocr, "mark_too_old_skipped", lambda: 0)
 
 
 @pytest.fixture(autouse=True)
