@@ -295,6 +295,9 @@ Exact multiples above are defaults, set from that evidence, never tuned on retur
      only 23 still qualify, 158 are new. Final numbers once the quarterly backfill completes.
 7. **Weighted portfolio (5.2) and exits (5.3)** -- ruleset v3: trailing stop, valuation trim,
    replacement, tax guard, counterfactual tracking; story-fading exit once step 2 exists.
+   **Built 2026-09-30** (`fundamentals/screens/portfolio_v3.py`, tests/test_portfolio_v3.py;
+   PORTFOLIO_RULESET_PRD "Ruleset v3"; systrader LEDGER row 52). v3 replaces v2 for new entries
+   (operator). Not built from 5.3: stop variants side by side on shadow positions.
 8. **Price-reaction learning (3.3)** once enough filings have accumulated; then **6**.
 
 ## 8. Decided / open

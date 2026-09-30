@@ -36,7 +36,10 @@ SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_ruleset"
 # positions entered on a single fact), and stops are wider for a 1-2 year holding (v1: 1.5x
 # the 10-day move clamped to 5-15% -- noise stop-outs). Exits in portfolio_exit.py. Positions
 # opened under v1 keep v1's exit rules until they close, so v1's record completes as recorded.
-RULESET_VERSION = 2
+# 3 from go-live (2026-09-30, operator): entries on the story score, weighted
+# (portfolio_v3.py). v2 never opened a position; its code stays for the record and its tests.
+RULESET_VERSION = 3
+V2_RULESET_VERSION = 2
 ENTRY_MIN_SUPPORTING = 2
 
 SYSTRADER_API = os.getenv("SYSTRADER_API_BASE", "http://127.0.0.1:8090")
@@ -227,6 +230,15 @@ def compute_stop_pct(symbols: list[str]) -> dict[str, dict]:
 
 
 def evaluate_entry_candidates() -> dict[str, object]:
+    """The active ruleset's entry candidates (v3: portfolio_v3.evaluate_entry_candidates)."""
+    if RULESET_VERSION >= 3:
+        from fundamentals.screens import portfolio_v3
+
+        return portfolio_v3.evaluate_entry_candidates()
+    return evaluate_entry_candidates_v2()
+
+
+def evaluate_entry_candidates_v2() -> dict[str, object]:
     """Run the ruleset over the active watchlist. Pure: no writes, no side effects.
 
     v1:  evaluable_count >= 1  AND  contradicting_count == 0  AND  stage == 2
@@ -257,7 +269,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
         """
     )
     if rows.empty:
-        return {"ruleset_version": RULESET_VERSION, "evaluated": 0, "candidates": [], "stage_reads": 0}
+        return {"ruleset_version": V2_RULESET_VERSION, "evaluated": 0, "candidates": [], "stage_reads": 0}
 
     stages = load_stage_reads()
     stage_keys = load_stage_keys(rows["company_master_id"].astype(str).tolist())
@@ -313,7 +325,7 @@ def evaluate_entry_candidates() -> dict[str, object]:
         c["available_l2_metrics"] = metrics
 
     return {
-        "ruleset_version": RULESET_VERSION,
+        "ruleset_version": V2_RULESET_VERSION,
         "evaluated": int(len(rows)),
         "stage_reads": len(stages),
         # Surfaced, not swallowed: zero stage reads means systrader's API is down and

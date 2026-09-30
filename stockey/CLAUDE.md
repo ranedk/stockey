@@ -206,7 +206,9 @@ screener/watchlist/narrative/portfolio — not technicals/trading;
    target date has passed. That step is not optional: with the human register gone
    there is no other resolver, and if it stops running the scoring reports
    "0 resolved" forever without anything failing.
-   Sizing is a flat Rs 1,00,000 per position, capped at 100 names (Rs 1 crore max
+   Ruleset v3 (2026-09-30) sizes by weight -- story score / volatility, 2-8% per name, sector <= 25%, 25
+   names on the longterm bucket's Rs 1 crore (`fundamentals/screens/portfolio_v3.py`). Before v3:
+   sizing was a flat Rs 1,00,000 per position, capped at 100 names (Rs 1 crore max
    deployed) -- a CAPITAL constraint, so a full book stops entering and names what it
    turned away rather than truncating the candidate list.
 

@@ -42,7 +42,9 @@ env.read_env()
 
 SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_adjudicator"
 DEFAULT_MODEL = env("PORTFOLIO_ADJUDICATOR_MODEL", "gpt-5.4-mini")
-PROMPT_VERSION = 3
+# 4 (2026-09-30): ruleset v3 candidates carry the story score, its strongest readings and the
+# latest LLM story read instead of confluence axes; the prompt names both kinds of evidence.
+PROMPT_VERSION = 4
 
 # The adjudicator writes the thesis (prediction, target date, invalidation criteria) for
 # every name it accepts -- the PRD's architecture step "L4 thesis written". It does NOT go
@@ -79,8 +81,10 @@ def numeric_l2_metrics() -> list[str]:
     return [c for c in df["column_name"] if c not in skip]
 
 
-DEFERRABLE_EXIT_REASONS = ("thesis_invalidation", "target_date")
-UNCONDITIONAL_EXIT_REASONS = ("stop_loss",)
+DEFERRABLE_EXIT_REASONS = ("thesis_invalidation", "target_date", "story_fading")
+# v3 (2026-09-30): a trailing stop is a stop, and a broken thesis (a flaw on the live score or a
+# hard negative alert since entry) exits at once -- PRD 5.3 rows 1, 3, 4.
+UNCONDITIONAL_EXIT_REASONS = ("stop_loss", "trailing_stop", "thesis_broken")
 MAX_DEFERRALS = 1  # "defer, not cancel" -- a veto that persists silently IS no exit rule
 
 ENTRY_SYSTEM_PROMPT = """You review candidates a mechanical ruleset has ALREADY passed for a \
@@ -89,12 +93,14 @@ fundamental swing/long-term portfolio.
 Your only power is to REJECT. You cannot add companies, change position sizes, or set \
 stop-losses -- those are decided mechanically and are not yours to influence.
 
-Reject only when the signal DETAIL contradicts what the rule inferred from the counts. \
-Legitimate reasons: the supporting axes are technically true but driven by a one-off \
-(an asset sale flattering the debt trajectory), the narrative describes a situation the \
-axes cannot see (pending litigation, promoter exit, an accounting concern), or the \
-evidence is so thin that "nothing contradicts" reflects absence of data rather than \
-genuine health.
+Reject only when the signal DETAIL contradicts what the rule inferred. The rule passed the \
+name either on its story score (how exceptional its best fundamental reading is within its \
+peer group, with no deal-breaker flaw) or on confluence axes. Legitimate reasons: the \
+supporting reading or axis is technically true but driven by a one-off (an asset sale \
+flattering the debt trajectory, a single lumpy quarter), the narrative or the story read \
+describes a situation the numbers cannot see (pending litigation, promoter exit, an \
+accounting concern), or the evidence is so thin that "nothing contradicts" reflects absence \
+of data rather than genuine health.
 
 Do NOT reject because you would prefer a different rule, because you dislike the sector, \
 or because you would rather wait for a better price. The ruleset already made those \
@@ -277,7 +283,14 @@ def _ensure_tables() -> None:
                                 ("score_version", "integer"),
                                 ("baseline_score_version", "integer"),
                                 ("baseline_contradicting_count", "integer"),
-                                ("entry_price_date", "date")):
+                                ("entry_price_date", "date"),
+                                # ruleset v3 (portfolio_v3.py, 2026-09-30): the weight and story
+                                # the entry was sized on, and the state its exits ratchet.
+                                ("target_weight", "double precision"),
+                                ("story_score_at_entry", "double precision"),
+                                ("primary_dimension_at_entry", "text"), ("sector_code", "text"),
+                                ("daily_vol_pct", "double precision"), ("trail_high", "double precision"),
+                                ("trim_count", "integer")):
             cur.execute(
                 "ALTER TABLE fundamentals_portfolio_position "
                 "ADD COLUMN IF NOT EXISTS " + column + " " + coltype
@@ -410,10 +423,14 @@ def adjudicate_entry(candidate: dict, *, model: str = DEFAULT_MODEL) -> dict:
     passed this name and the LLM is only ever a filter on top of it."""
     payload = {
         "ticker": candidate["ticker"],
-        "axes": candidate["axes"],
-        "confluence_count": candidate["confluence_count"],
-        "contradicting_count": candidate["contradicting_count"],
-        "evaluable_count": candidate["evaluable_count"],
+        "axes": candidate.get("axes"),
+        "confluence_count": candidate.get("confluence_count"),
+        "contradicting_count": candidate.get("contradicting_count"),
+        "evaluable_count": candidate.get("evaluable_count"),
+        # ruleset v3: the story the rule passed the name on
+        "story_score": candidate.get("story_score"),
+        "primary_story": candidate.get("primary_dimension"),
+        "story_read": candidate.get("story_read"),
         "stage": candidate["stage"],
         "narrative": (candidate.get("narrative_text") or "")[:4000],
         "stop": candidate.get("stop"),
@@ -505,7 +522,8 @@ def adjudicate_exit(position: dict, exit_reason: str, *, model: str = DEFAULT_MO
                ("ticker", "opened_at", "entry_price", "stop_pct", "confluence_count",
                 "contradicting_count", "evaluable_count", "stage_at_entry", "deferral_count",
                 "detail", "price", "score_version_at_entry", "current_score",
-                "stage_now", "prediction_text", "invalidation_criteria", "target_date")}
+                "stage_now", "prediction_text", "invalidation_criteria", "target_date",
+                "current_story", "story_score_at_entry")}
     payload["exit_reason"] = exit_reason
     try:
         client = OpenAI(api_key=env("OPENAI_API_KEY"))

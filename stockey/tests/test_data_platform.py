@@ -23884,7 +23884,7 @@ def test_missing_stage_read_fails_closed(monkeypatch):
         "axis_ownership": None, "axis_valuation": None, "scored_on": None,
     }]))
     monkeypatch.setattr("fundamentals.screens.confluence_score._ensure_confluence_score_table", lambda: None)
-    out = pr.evaluate_entry_candidates()
+    out = pr.evaluate_entry_candidates_v2()
     assert out["candidates"] == []
     assert out["stage_api_available"] is False
 
@@ -24858,7 +24858,7 @@ def test_stale_stage_reads_block_entry_rather_than_passing_silently(monkeypatch)
         "axis_ownership": None, "axis_valuation": None, "scored_on": None,
     }]))
     monkeypatch.setattr("fundamentals.screens.confluence_score._ensure_confluence_score_table", lambda: None)
-    out = pr.evaluate_entry_candidates()
+    out = pr.evaluate_entry_candidates_v2()
     assert out["stage_api_available"] is False and out["candidates"] == []
 
 

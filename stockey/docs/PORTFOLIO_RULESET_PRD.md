@@ -398,3 +398,35 @@ opened under v1 keep v1's exit rules until they close, so v1's record completes 
   positive alert ever". v2's entry filter above is unchanged and still reads confluence; the
   confluence count is kept for exactly that and retires with v2 when ruleset v3 (on the story
   score) replaces it. v2's record therefore starts at go-live on the new candidate list.
+
+## Ruleset v3 (2026-09-30) -- the portfolio on the story score
+
+Replaces v2 for new entries from go-live (operator decision 2026-09-30: v3 replaces v2 rather
+than running beside it; v2 never opened a position). v1 positions keep v1's exits until they
+close. Code: `fundamentals/screens/portfolio_v3.py`, dispatched from portfolio_ruleset /
+portfolio_runner / portfolio_exit by each candidate's or position's `ruleset_version`.
+Pre-registered as systrader LEDGER row 52. Full rules: docs/FUNDAMENTAL_REEVALUATION_PRD.md
+5.2-5.3; as built:
+
+- **Entry:** active watchlist name, live story score in the band (enter 80, stay to 65), no
+  flaw, Weinstein stage 2. The adjudicator may veto (prompt v4 shows it the story score,
+  primary story and the latest story read instead of confluence axes). Candidates outside the
+  book's best 25 by score are not adjudicated (`outside_top_by_score`).
+- **Weight:** story score / daily volatility, normalised so an average name is 1/25 of the
+  bucket, clipped to 2-8%, sector <= 25%, then the 10%-of-ADV cap. Recorded as
+  `target_weight` on the position; weights never sum past 100%, the rest is cash.
+- **Replacement when full:** the weakest holding, only if the candidate scores 15+ points
+  higher, the holding is 20+ sessions old and not waiting on the tax guard; closed as
+  `replaced` with a counterfactual row.
+- **Exits:** `stop_loss` / `trailing_stop` (trail 3x the 20-session move, 15-35%, ratchets via
+  `trail_high`, never below entry after a 2x-stop gain) and `thesis_broken` (flaw, or hard
+  negative alert since entry) are unconditional; `story_fading` (daily score below 65 on 3 runs)
+  and `target_date` may be deferred once; a valuation trim (>= 2x own history, story not
+  strengthening) cuts a third once. Non-urgent exits and trims in profit wait inside the 30 days
+  before the first anniversary (tax guard).
+- **Records:** `fundamentals_portfolio_counterfactual` -- 20/40/60-session returns after every
+  exit and trim, as if held; `fundamentals_portfolio_adjustment` -- trims and rebalance signals
+  (a position 50% away from its target value, at most one per 20 days). The book is
+  record-only, so trims and rebalances are records; `position_size_rs` stays the entry size.
+- **Confluence** is no longer read by the active ruleset. It is still computed nightly (the
+  frontend shows it and v1/v2 code paths read it); removing the step is a separate cleanup.

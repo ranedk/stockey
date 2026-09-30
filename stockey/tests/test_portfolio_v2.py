@@ -53,7 +53,7 @@ def test_trend_exit_only_on_stage_four_after_the_minimum_hold():
 
 
 def test_v2_entry_bar_and_wider_stop(monkeypatch):
-    assert pr.RULESET_VERSION == 2 and pr.ENTRY_MIN_SUPPORTING == 2
+    assert pr.V2_RULESET_VERSION == 2 and pr.ENTRY_MIN_SUPPORTING == 2 and pr.RULESET_VERSION == 3
     monkeypatch.setattr(pr, "sql_to_df", lambda *a, **k: pd.DataFrame([{"symbol": "CALM", "daily_vol": 0.005},
                                                                          {"symbol": "WILD", "daily_vol": 0.06}]))
     stops = pr.compute_stop_pct(["CALM", "WILD", "NEW"])
@@ -77,5 +77,5 @@ def test_v2_entry_needs_two_supporting_axes(monkeypatch):
     monkeypatch.setattr(pr, "load_stage_keys", lambda ids: {i: [i.replace("nse:", "")] for i in ids})
     monkeypatch.setattr(pr, "compute_stop_pct", lambda syms: {s: {"stop_pct": 15.0, "basis": "t"} for s in syms})
     monkeypatch.setattr(pr, "numeric_l2_metrics", lambda: [])
-    out = pr.evaluate_entry_candidates()
+    out = pr.evaluate_entry_candidates_v2()
     assert [c["ticker"] for c in out["candidates"]] == ["TWO"]

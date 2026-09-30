@@ -53,7 +53,7 @@ from fundamentals.screens.portfolio_buckets import (
     capital_per_position_rs,
 )
 from fundamentals.screens.portfolio_exit import PRICE_LOOKBACK_DAYS
-from fundamentals.screens.portfolio_ruleset import RULESET_VERSION, evaluate_entry_candidates
+from fundamentals.screens.portfolio_ruleset import RULESET_VERSION, V2_RULESET_VERSION, evaluate_entry_candidates
 from utils.db import db_session, sql_to_df
 
 SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_runner"
@@ -178,9 +178,21 @@ def _evidence_moved_since(candidate: dict, vetoed_at) -> bool:
 EVIDENCE_KEYS = ("score_version", "confluence_count", "contradicting_count", "evaluable_count", "stage")
 
 
+# v3 (story score): the score in 10-point steps, its primary story, the stage and the latest
+# story read's verdict. A continuous score moves a little every day; only a step counts as news.
+V3_EVIDENCE_KEYS = ("score_version", "stage")
+
+
 def evidence_fingerprint(candidate: dict) -> str | None:
     """Stable hash of the evidence a veto was given. None when the payload predates the
     fields (a pre-audit decision row), which the caller treats as "cannot show a change"."""
+    if candidate.get("story_score") is not None:
+        read = candidate.get("story_read") or {}
+        material = {k: _as_int(candidate.get(k)) for k in V3_EVIDENCE_KEYS}
+        material.update({"score_step": _as_int(float(candidate["story_score"]) // 10),
+                         "primary": candidate.get("primary_dimension"),
+                         "read": [read.get("direction"), _as_int(read.get("materiality"))]})
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:16]
     if any(candidate.get(k) is None for k in ("confluence_count", "contradicting_count", "evaluable_count")):
         return None
     axes = candidate.get("axes") or {}
@@ -271,7 +283,7 @@ def _latest_price(ticker: str) -> tuple[float | None, object]:
     return float(df.iloc[0]["adj_close"]), pd.Timestamp(df.iloc[0]["date"]).date()
 
 
-def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET) -> dict:
+def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET, weight: float | None = None) -> dict:
     """L5 sizing for a name about to be opened.
 
     get_position_size_recommendation() gates on an ALREADY-OPEN position, which this one
@@ -286,21 +298,25 @@ def _size_for(candidate: dict, bucket: str = DEFAULT_BUCKET) -> dict:
         # The bucket's own share, not the flat per-position figure: a sleeve is a capital
         # envelope, so what one position may take is that envelope divided by how many
         # positions the sleeve is meant to hold.
-        target_capital_rs=capital_per_position_rs(bucket),
+        # v3: the name's target weight of the bucket (portfolio_v3.target_weights).
+        target_capital_rs=(weight * float(bucket_config(bucket)["capital_rs"]) if weight
+                           else capital_per_position_rs(bucket)),
         adv_value_rs=adv["adv_value_rs"] if adv else None,
     )
 
 
 def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
-                   bucket: str = DEFAULT_BUCKET, entry_cohort: str | None = None) -> dict:
+                   bucket: str = DEFAULT_BUCKET, entry_cohort: str | None = None,
+                   ruleset_version: int | None = None, weight: float | None = None) -> dict:
+    ruleset_version = V2_RULESET_VERSION if ruleset_version is None else ruleset_version
     price, price_date = _latest_price(candidate["ticker"])
     stop = candidate.get("stop") or {}
-    sizing = _size_for(candidate, bucket)
+    sizing = _size_for(candidate, bucket, weight) if weight else _size_for(candidate, bucket)
     row = {
         "position_id": f"pos:{uuid.uuid4().hex[:16]}",
         "company_master_id": candidate["company_master_id"],
         "ticker": candidate["ticker"],
-        "ruleset_version": RULESET_VERSION,
+        "ruleset_version": ruleset_version,
         "kind": kind,
         # Which sleeve's capital this position spends. Recorded per position rather than
         # inferred from the engine that opened it, so a later review can ask "what did the
@@ -338,6 +354,11 @@ def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
         "target_date_basis": verdict.get("target_date_basis"),
         "entry_cohort": entry_cohort,
     }
+    if ruleset_version >= 3:
+        row.update({"target_weight": weight, "story_score_at_entry": candidate.get("story_score"),
+                    "primary_dimension_at_entry": candidate.get("primary_dimension"),
+                    "sector_code": candidate.get("sector_code"), "daily_vol_pct": candidate.get("daily_vol_pct"),
+                    "trail_high": price, "trim_count": 0})
     if dry_run:
         return row
     cols = ", ".join(row)
@@ -349,6 +370,15 @@ def _open_position(candidate: dict, verdict: dict, *, kind: str, dry_run: bool,
             tuple(row.values()),
         )
     return row
+
+
+def _close_replaced(position_id: str, exit_price: float | None) -> None:
+    with db_session() as (_conn, cur):
+        cur.execute(
+            "UPDATE fundamentals_portfolio_position SET status = 'closed', closed_at = now(), "
+            "       close_reason = 'replaced', exit_price = %s WHERE position_id = %s AND status = 'open'",
+            (exit_price, position_id),
+        )
 
 
 def _close_superseded_veto(ticker: str, *, dry_run: bool) -> None:
@@ -368,6 +398,9 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     _ensure_tables()
     _ensure_cohort_columns()
     evaluation = evaluate_entry_candidates()
+    # An evaluation without a version is the pre-v3 contract (v1/v2 candidates, confluence).
+    version = int(evaluation.get("ruleset_version") or V2_RULESET_VERSION)
+    v3 = version >= 3
 
     # A dead stage API rejects EVERY candidate for a reason that has nothing to do with
     # the companies. Refuse the run rather than record a day of spurious zero-entries
@@ -395,7 +428,7 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     fingerprints = _last_entry_fingerprints() if vetoed_at_by_ticker else {}
     kind = "real" if live else "shadow"
     entered, rejected, skipped, turned_away, re_vetoed, veto_stands = [], [], [], [], [], []
-    stopped_out, superseded, below_liquidity_floor = [], [], []
+    stopped_out, superseded, below_liquidity_floor, outside_top = [], [], [], []
 
     # Only accepted positions consume capital, so only they fill the book, and the book
     # is the BUCKET's, not a global one: 100 x the old flat Rs 1 lakh happened to equal a
@@ -407,7 +440,25 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     catchup_open = _open_catchup_count() if catchup_signal else 0
     catchup_entered, catchup_cap_reached, catchup_price_ran = [], [], []
     # Strongest evidence first, so when a cap or the book binds it keeps the best names.
-    candidates = sorted(evaluation["candidates"], key=lambda c: -int(c.get("confluence_count") or 0))
+    if v3:
+        candidates = sorted(evaluation["candidates"], key=lambda c: -float(c.get("story_score") or 0))
+    else:
+        candidates = sorted(evaluation["candidates"], key=lambda c: -int(c.get("confluence_count") or 0))
+    weights: dict[str, float] = {}
+    replaced: list[dict] = []
+    v3_book = None
+    if v3:
+        from fundamentals.screens import portfolio_v3
+
+        # Weights over the book as it could be today: holdings (live score) and candidates.
+        v3_book = portfolio_v3.open_v3_book()
+        pool = [{"company_master_id": r.company_master_id, "story_score": r.story_score,
+                 "daily_vol_pct": r.daily_vol_pct, "sector_code": r.sector_code} for r in v3_book.itertuples()]
+        held = {p["company_master_id"] for p in pool}
+        pool += [{k: c.get(k) for k in ("company_master_id", "story_score", "daily_vol_pct", "sector_code")}
+                 for c in candidates if c["company_master_id"] not in held]
+        weights = portfolio_v3.target_weights(pool, book_capacity)
+        today_ist = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5, minutes=30)).normalize().tz_localize(None)
 
     for candidate in candidates:
         if candidate["ticker"] in already_accepted:
@@ -446,6 +497,10 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
             # _evidence_moved_since. Skipping BEFORE adjudication also saves the call.
             veto_stands.append(candidate["ticker"])
             continue
+        if v3 and candidate["company_master_id"] not in weights:
+            # Not among the book's best `book_capacity` names by score: no weight, no call.
+            outside_top.append(candidate["ticker"])
+            continue
         verdict = adjudicate_entry(candidate)
         # Recorded BEFORE any book/duplicate branch: the adjudication happened and cost a
         # call, so the reasoning is kept even when no position follows from it.
@@ -453,13 +508,34 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
             _record_decision(
                 phase="entry",
                 company_master_id=candidate["company_master_id"],
-                ruleset_version=RULESET_VERSION,
+                ruleset_version=version,
                 decision=verdict["decision"],
                 reason=verdict.get("reason"),
                 model=verdict.get("model"),
                 payload={k: v for k, v in candidate.items() if k != "_previous_fingerprint"},
             )
         if verdict["decision"] == "accept":
+            if book_used >= book_capacity and v3:
+                # v3 replacement (PRD 5.2): only for a clearly stronger story, never churning a
+                # young holding or one waiting on the tax guard.
+                weakest = portfolio_v3.weakest_replaceable(
+                    v3_book[~v3_book["position_id"].isin([r["position_id"] for r in replaced])],
+                    float(candidate["story_score"]), today_ist)
+                if weakest is None:
+                    turned_away.append(candidate["ticker"])
+                    continue
+                price_w, _ = _latest_price(weakest["ticker"])
+                if not dry_run:
+                    _close_replaced(weakest["position_id"], price_w)
+                    portfolio_v3.record_counterfactual(weakest["position_id"], "replaced", weakest["ticker"], price_w)
+                    _record_decision(phase="exit", company_master_id=weakest["company_master_id"],
+                                     ruleset_version=version, decision="exit",
+                                     reason=(f"[replaced] by {candidate['ticker']} (story {candidate['story_score']:.0f} vs "
+                                             f"{float(weakest['score']):.0f}, margin {portfolio_v3.REPLACE_MARGIN:g})"),
+                                     model=None, payload={"replaced_by": candidate["company_master_id"]})
+                replaced.append({"position_id": weakest["position_id"], "ticker": weakest["ticker"],
+                                 "by": candidate["ticker"]})
+                book_used -= 1
             if book_used >= book_capacity:
                 # Named, not silent. "The book was full" and "the rule found nothing" look
                 # identical in a position count and mean opposite things.
@@ -472,7 +548,9 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 # and it stops accruing the accepted arm's future.
                 _close_superseded_veto(candidate["ticker"], dry_run=dry_run)
                 superseded.append(candidate["ticker"])
-            _open_position(candidate, verdict, kind=kind, dry_run=dry_run, **({"entry_cohort": cohort} if cohort else {}))
+            _open_position(candidate, verdict, kind=kind, dry_run=dry_run,
+                           **({"ruleset_version": version, "weight": weights.get(candidate["company_master_id"])} if v3 else {}),
+                           **({"entry_cohort": cohort} if cohort else {}))
             entered.append(candidate["ticker"])
             book_used += 1
             if cohort:
@@ -486,7 +564,9 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
                 re_vetoed.append(candidate["ticker"])
                 continue
             # Rejected -> shadow, always. This is the measurement, not bookkeeping.
-            _open_position(candidate, verdict, kind="shadow", dry_run=dry_run, **({"entry_cohort": cohort} if cohort else {}))
+            _open_position(candidate, verdict, kind="shadow", dry_run=dry_run,
+                           **({"ruleset_version": version, "weight": weights.get(candidate["company_master_id"])} if v3 else {}),
+                           **({"entry_cohort": cohort} if cohort else {}))
             rejected.append(candidate["ticker"])
             vetoed_at_by_ticker[candidate["ticker"]] = pd.Timestamp.now(tz="UTC")
 
@@ -495,7 +575,7 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         "status": "ok",
         "mode": "live" if live else "record-only",
         "dry_run": dry_run,
-        "ruleset_version": RULESET_VERSION,
+        "ruleset_version": version,
         "evaluated": evaluation["evaluated"],
         "candidates": len(evaluation["candidates"]),
         "entered": len(entered),
@@ -521,6 +601,11 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         "catchup_entered": catchup_entered,
         "catchup_cap_reached": catchup_cap_reached,
         "catchup_price_already_ran": catchup_price_ran,
+        # v3: holdings closed to make room for a clearly stronger story, and candidates outside
+        # the book's best names by score (never adjudicated).
+        "replaced": replaced,
+        "outside_top_by_score": outside_top,
+        "target_weights": weights,
     }
 
 

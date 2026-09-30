@@ -41,6 +41,11 @@ EXIT_REASON_LABEL = {
     "stop_loss": "STOP HIT",
     "thesis_invalidation": "thesis invalidated",
     "target_date": "target date reached",
+    # ruleset v3 (2026-09-30)
+    "trailing_stop": "TRAILING STOP HIT",
+    "thesis_broken": "thesis broken (flaw or hard negative event)",
+    "story_fading": "story faded",
+    "replaced": "replaced by a stronger story",
 }
 
 _STYLE = (

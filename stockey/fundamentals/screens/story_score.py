@@ -218,7 +218,10 @@ def derive(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     num = lambda c: pd.to_numeric(x.get(c), errors="coerce")
     base_ok = num("rr_sales_q_cr") >= MIN_ACCELERATION_SALES_Q_CR
-    for c in ("rr_sales_yoy_pct", "rr_sales_vs_trend_pp", "rr_profit_yoy_pct", "rr_profit_vs_trend_pp"):
+    # margins too: an operating margin on near-zero sales swings by hundreds of points
+    # (SPARC -400% -> +57% on Rs 40 cr; RPOWER -3,205 pp on Rs 0.2 cr)
+    for c in ("rr_sales_yoy_pct", "rr_sales_vs_trend_pp", "rr_profit_yoy_pct", "rr_profit_vs_trend_pp",
+              "rr_margin_change_pp", "rr_margin_vs_trend_pp"):
         x[c] = num(c).where(base_ok)
     plausible = lambda c: num(c).abs() <= PLAUSIBLE_RETURN_PCT
     for now, avg in (("roce_pct", "roce_5y_avg_pct"), ("roe_pct", "roe_5y_avg_pct")):

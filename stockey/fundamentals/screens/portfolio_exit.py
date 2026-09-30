@@ -77,7 +77,8 @@ def _open_positions() -> pd.DataFrame:
                opened_at, deferral_count, confluence_count, contradicting_count,
                evaluable_count, stage_at_entry, target_date, prediction_text,
                invalidation_criteria, score_version, baseline_score_version,
-               baseline_contradicting_count, ruleset_version
+               baseline_contradicting_count, ruleset_version, position_size_rs,
+               target_weight, story_score_at_entry, sector_code, daily_vol_pct, trail_high, trim_count
           FROM fundamentals_portfolio_position
          WHERE status = 'open'
         """
@@ -222,6 +223,59 @@ def v2_thesis_exit(position, *, hard_events: list[dict], recent: list[dict], sta
     return None
 
 
+def _v3_state(positions: pd.DataFrame) -> dict[str, dict]:
+    """Per v3 position: live story score/flaws, the last FADE_RUNS daily scores (newest first),
+    valuation vs own history, and the highest close since entry (for the trailing stop)."""
+    from fundamentals.screens import portfolio_v3
+    from fundamentals.screens.story_score import SCORE_VERSION
+
+    if positions.empty:
+        return {}
+    ids = sorted({str(c) for c in positions["company_master_id"]})
+    live = sql_to_df("SELECT company_master_id, story_score, flaws FROM fundamentals_story_score_live "
+                     "WHERE company_master_id = ANY(%s)", params=(ids,))
+    daily = sql_to_df(
+        """
+        SELECT company_master_id, story_score FROM (
+          SELECT company_master_id, story_score,
+                 row_number() OVER (PARTITION BY company_master_id ORDER BY as_of_date DESC) AS k
+            FROM fundamentals_story_score
+           WHERE company_master_id = ANY(%s) AND score_version = %s
+             AND as_of_date >= now()::date - 30) x
+         WHERE k <= %s ORDER BY company_master_id, k
+        """, params=(ids, SCORE_VERSION, portfolio_v3.FADE_RUNS))
+    valuation = sql_to_df(
+        """
+        SELECT DISTINCT ON (company_id) cm.company_master_id, s.valuation_vs_own_history_ratio
+          FROM fundamentals_l2_state s
+          JOIN (SELECT DISTINCT ON (screener_company_id) screener_company_id, company_master_id
+                  FROM fundamentals_snapshot_daily ORDER BY screener_company_id, as_of_date DESC) cm
+            ON cm.screener_company_id::bigint = s.company_id
+         WHERE cm.company_master_id = ANY(%s)
+         ORDER BY company_id, run_date DESC
+        """, params=(ids,))
+    highs = {}
+    for r in positions.itertuples():
+        opened = pd.Timestamp(r.opened_at)
+        df = sql_to_df("SELECT max(adj_close) AS hi FROM advisory_adjusted_ohlcv_daily "
+                       "WHERE symbol = %s AND date >= greatest(%s::date, now()::date - interval '800 days') "
+                       "AND date <= now()::date",
+                       params=(str(r.ticker), str(opened.date())))
+        hi = None if df.empty or pd.isna(df.iloc[0]["hi"]) else float(df.iloc[0]["hi"])
+        stored = r.trail_high if r.trail_high is not None and not pd.isna(r.trail_high) else None
+        highs[str(r.position_id)] = max([x for x in (hi, stored) if x is not None], default=None)
+    live_by = {str(r.company_master_id): {"story_score": r.story_score, "flaws": r.flaws} for r in live.itertuples()}
+    daily_by: dict[str, list[float]] = {}
+    for r in daily.itertuples():
+        daily_by.setdefault(str(r.company_master_id), []).append(float(r.story_score))
+    val_by = {str(r.company_master_id): r.valuation_vs_own_history_ratio for r in valuation.itertuples()}
+    return {str(r.position_id): {"live": live_by.get(str(r.company_master_id)),
+                                 "recent": daily_by.get(str(r.company_master_id), []),
+                                 "valuation_ratio": val_by.get(str(r.company_master_id)),
+                                 "trail_high": highs.get(str(r.position_id))}
+            for r in positions.itertuples()}
+
+
 def _baseline(position) -> tuple[int, int]:
     """(scorer version, contradicting count) the exit compares against. Pre-audit rows have
     no baseline columns: their entry counts are the baseline, on v1."""
@@ -251,7 +305,7 @@ def evaluate_exit_triggers() -> dict[str, object]:
     positions = _open_positions()
     if positions.empty:
         return {"ruleset_version": RULESET_VERSION, "open": 0, "triggers": [],
-                "stage_api_available": True}
+                "stage_api_available": True, "trims": [], "tax_guard_waits": [], "trail_updates": []}
 
     tickers = sorted({str(t) for t in positions["ticker"]})
     company_ids = sorted({str(c) for c in positions["company_master_id"]})
@@ -271,8 +325,39 @@ def evaluate_exit_triggers() -> dict[str, object]:
     score_cutoff = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=CONFLUENCE_MAX_AGE_DAYS)
     triggers = []
     unpriced, stop_unchecked, stale_scores, rebaselines = [], [], [], []
+    trims, tax_waits, trail_updates = [], [], []
+    v3_mask = positions["ruleset_version"].fillna(1).astype(int) >= 3 if "ruleset_version" in positions else None
+    v3_state = _v3_state(positions[v3_mask]) if v3_mask is not None and v3_mask.any() else {}
     for p in positions.itertuples():
         price = prices.get(str(p.ticker))
+        if int(getattr(p, "ruleset_version", 1) or 1) >= 3:
+            # Ruleset v3 (portfolio_v3.py): stops incl. trailing, thesis broken, story fading,
+            # valuation trim, target date, tax guard.
+            from fundamentals.screens import portfolio_v3
+
+            if price is None:
+                unpriced.append(str(p.ticker))
+            st = v3_state.get(str(p.position_id), {})
+            if st.get("trail_high") is not None and st["trail_high"] != getattr(p, "trail_high", None):
+                trail_updates.append({"position_id": p.position_id, "trail_high": st["trail_high"]})
+            act = portfolio_v3.v3_exit_action(
+                p, price=price, trail_high=st.get("trail_high"), live=st.get("live"),
+                hard_events=hard.get(str(p.company_master_id), []), recent_scores=st.get("recent", []),
+                valuation_ratio=st.get("valuation_ratio"), today=today)
+            if act is None:
+                continue
+            if act["action"] == "exit":
+                trig = _trigger(p, act["reason"], price, act["detail"])
+                trig["current_story"] = st.get("live")
+                trig["story_score_at_entry"] = getattr(p, "story_score_at_entry", None)
+                triggers.append(trig)
+            elif act["action"] == "trim":
+                trims.append({"position_id": p.position_id, "ticker": str(p.ticker), "price": price,
+                              "detail": act["detail"], "position_size_rs": getattr(p, "position_size_rs", None),
+                              "entry_price": p.entry_price, "trim_count": getattr(p, "trim_count", None)})
+            else:
+                tax_waits.append({"ticker": str(p.ticker), "reason": act["reason"], "detail": act["detail"]})
+            continue
         if price is None:
             # No trade in PRICE_LOOKBACK_DAYS. The stop CANNOT be evaluated for this
             # position, and a stop nobody is checking must never be silently assumed safe
@@ -362,6 +447,9 @@ def evaluate_exit_triggers() -> dict[str, object]:
         "stage_reads": len(stages),
         "stage_api_available": bool(stages),
         "triggers": triggers,
+        "trims": trims,
+        "tax_guard_waits": tax_waits,
+        "trail_updates": trail_updates,
     }
 
 
@@ -402,6 +490,58 @@ def _close(position_id: str, reason: str, exit_price: float | None) -> None:
         )
 
 
+def _set_trail_high(position_id: str, value: float) -> None:
+    with db_session() as (_conn, cur):
+        cur.execute("UPDATE fundamentals_portfolio_position SET trail_high = %s "
+                    "WHERE position_id = %s AND status = 'open' AND (trail_high IS NULL OR trail_high < %s)",
+                    (value, position_id, value))
+
+
+def _increment_trim(position_id: str) -> None:
+    with db_session() as (_conn, cur):
+        cur.execute("UPDATE fundamentals_portfolio_position SET trim_count = COALESCE(trim_count, 0) + 1 "
+                    "WHERE position_id = %s AND status = 'open'", (position_id,))
+
+
+def _record_rebalances() -> list[dict]:
+    """v3 rebalance bands (PRD 5.2): record a signal when a position drifts 50% from target."""
+    from fundamentals.screens import portfolio_v3
+    from fundamentals.screens.portfolio_buckets import DEFAULT_BUCKET, bucket_config
+
+    try:
+        book = portfolio_v3.open_v3_book()
+        if book.empty:
+            return []
+        cfg = bucket_config(DEFAULT_BUCKET)
+        prices = _latest_prices(sorted({str(t) for t in book["ticker"]}))
+        signals = portfolio_v3.rebalance_signals(book, prices, float(cfg["capital_rs"]), int(cfg["target_positions"]))
+        quiet = portfolio_v3.recent_rebalanced([s["position_id"] for s in signals])
+        fresh = [s for s in signals if s["position_id"] not in quiet]
+        for s in fresh:
+            portfolio_v3.record_adjustment(s["position_id"], s["kind"], s["ticker"], s["price"], s["value_rs"],
+                                           s["target_rs"], s["target_rs"], "drifted 50% from target weight")
+        return fresh
+    except Exception as exc:  # noqa: BLE001 -- a signal record must not block exits
+        from utils.fallback_telemetry import record_local_fallback_event
+
+        record_local_fallback_event(module=SYNC_SOURCE_NAME, source="db", fallback_type="rebalance_signals_failed",
+                                    severity="warn", reason="rebalance signals not recorded this run", error=repr(exc))
+        return []
+
+
+def _fill_counterfactuals() -> int:
+    from fundamentals.screens import portfolio_v3
+
+    try:
+        return portfolio_v3.fill_counterfactuals()
+    except Exception as exc:  # noqa: BLE001 -- measurement must not block exits
+        from utils.fallback_telemetry import record_local_fallback_event
+
+        record_local_fallback_event(module=SYNC_SOURCE_NAME, source="db", fallback_type="counterfactual_fill_failed",
+                                    severity="warn", reason="counterfactual returns not filled this run", error=repr(exc))
+        return 0
+
+
 def _defer(position_id: str) -> None:
     with db_session() as (_conn, cur):
         cur.execute(
@@ -419,6 +559,23 @@ def run_exits(*, dry_run: bool = False) -> dict[str, object]:
     if not dry_run:
         for rb in evaluation.get("rebaselines", []):
             _rebaseline(rb["position_id"], rb["to_version"], rb["contradicting_count"])
+        for tu in evaluation.get("trail_updates", []):
+            _set_trail_high(tu["position_id"], tu["trail_high"])
+    trimmed = []
+    for t in evaluation.get("trims", []):
+        trimmed.append({"ticker": t["ticker"], "detail": t["detail"]})
+        if dry_run:
+            continue
+        from fundamentals.screens import portfolio_v3
+
+        size = t.get("position_size_rs")
+        value = (float(size) * float(t["price"]) / float(t["entry_price"])
+                 if size and t.get("price") and t.get("entry_price") else None)
+        portfolio_v3.record_adjustment(t["position_id"], "trim", t["ticker"], t.get("price"), value,
+                                       None if value is None else value * (1 - portfolio_v3.TRIM_FRACTION),
+                                       None, t["detail"])
+        portfolio_v3.record_counterfactual(t["position_id"], "trim", t["ticker"], t.get("price"))
+        _increment_trim(t["position_id"])
 
     for trigger in evaluation["triggers"]:
         reason = trigger["exit_reason"]
@@ -441,6 +598,11 @@ def run_exits(*, dry_run: bool = False) -> dict[str, object]:
         if verdict["decision"] == "exit":
             if not dry_run:
                 _close(trigger["position_id"], reason, trigger.get("price"))
+                from fundamentals.screens import portfolio_v3
+
+                # what the stock did after we left, per exit rule (PRD 5.3 counterfactuals)
+                portfolio_v3.record_counterfactual(trigger["position_id"], reason, str(trigger["ticker"]),
+                                                   trigger.get("price"))
             closed.append({"ticker": trigger["ticker"], "kind": trigger["kind"], "reason": reason})
         else:
             if not dry_run:
@@ -465,6 +627,10 @@ def run_exits(*, dry_run: bool = False) -> dict[str, object]:
         "deferred": len(deferred),
         "closed_detail": closed,
         "deferred_detail": deferred,
+        "trimmed": trimmed,
+        "rebalance_signals": [] if dry_run else _record_rebalances(),
+        "tax_guard_waits": evaluation.get("tax_guard_waits", []),
+        "counterfactuals_filled": 0 if dry_run else _fill_counterfactuals(),
     }
 
 

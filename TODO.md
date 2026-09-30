@@ -183,7 +183,11 @@ being popular, not for being weak.
   measured forward (LEDGER row 51).
 - **Step 6 built 2026-09-29:** watchlist on the story score (band or event-above-median, never
   with a flaw; flawed / faded statuses). Confluence stays only as ruleset v2's entry filter until v3.
-- **Next:** step 7, weighted portfolio + v3 exits (retires confluence).
+- **Step 7 built 2026-09-30:** ruleset v3 -- weighted by story score / volatility with caps,
+  replacement, trailing stop, thesis-broken / story-fading exits, valuation trim, tax guard,
+  counterfactuals (LEDGER row 52). Replaces v2 for new entries.
+- **Next:** go-live (OCR catch-up, crontab regeneration, unpause); then step 8, price-reaction
+  learning, once filings accumulate. Cleanup: drop the nightly confluence step once nothing reads it.
 
 ### B1. Name the anomaly the screen is for
 - [x] **Folded into B5 (2026-09-25).** **What:** decide, and record in `stockey/docs/FUNDAMENTAL_SCREENER_PRD.md`,
