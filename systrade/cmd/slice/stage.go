@@ -27,6 +27,7 @@ import (
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/evidence"
 	"github.com/ranedk/systrader/internal/explore"
+	"github.com/ranedk/systrader/internal/rotation"
 	"github.com/ranedk/systrader/internal/sleeve"
 	"github.com/ranedk/systrader/internal/stage"
 	"github.com/ranedk/systrader/internal/store"
@@ -277,6 +278,7 @@ func runStage(args []string) {
 	seed := fs.Int64("seed", 1, "bootstrap seed — declared, never drawn")
 	q := fs.Float64("fdr", 0.10, "false-discovery rate within the family")
 	readConfirm := fs.Bool("include-confirmation-years", false, "let -to reach 2022 onward")
+	noCap := fs.Bool("rotation-no-cap", false, "for -part rotation: the pre-registered sensitivity without the +-50% weekly return cap")
 	event := fs.String("event", "stage2", "for -part explore: stage2 (every Stage 2 name) | breakout (the Stage 1->2 breakout day)")
 	horizon := fs.Int("horizon", 20, "for -part explore: forward holding period in trading days")
 	quantiles := fs.Int("quantiles", 5, "for -part explore: buckets per continuous dimension")
@@ -424,6 +426,10 @@ func runStage(args []string) {
 		fmt.Printf("PRE-REGISTERED VERDICT: (d) %s; (e) %s.\n", dVerdict, eVerdict)
 
 	case "rotation":
+		if *noCap {
+			rotation.WeeklyReturnCap = math.Inf(1)
+			fmt.Println("SENSITIVITY: no weekly return cap on index members (reported, not deciding)")
+		}
 		runRotationPart(*cache, mustDate(*from), mustDate(*to), *floor, *costBps, boot, *q, cfg, minBars)
 
 	default:

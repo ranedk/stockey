@@ -461,3 +461,12 @@ Everything here was open in a repo README or PRD before this file existed.
 - [-] **Worrying about the crawl/LLM bill while choosing the universe.**
   Operator, 2026-09-23: get it right first. Revisit only if a run actually
   fails on cost or rate limits.
+
+### A4. Industry rotation, RS and early Stage 2 (systrader, 2026-10-01)
+- [x] **Rotation view** replaces the screener's /stages page (`internal/rotation`, `cmd/rotation snapshot`
+      daily, `/api/rotation`; stockey `/api/story-scores` for the fundamental filter column).
+- [x] **Pre-registered test FAILED** (LEDGER row 53): restricting Stage 2 to RS-leading industries made
+      the book calmer (maxDD −30% vs −47%) but poorer than plain Stage 2 (−0.69%/month, p 0.96). No paper track.
+- Idea only (post-hoc, not tested): plain Stage 2 top 20 by RS26, monthly, buffered -- 22.1%/yr as a
+  reference in row 53.
+

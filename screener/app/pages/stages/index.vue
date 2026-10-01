@@ -67,8 +67,9 @@ const FILTER_TONE = { pass: 'good', fail: 'bad', unknown: 'neutral' } as const
     <p class="mt-1 max-w-3xl text-sm text-slate-600">
       Top-down, weekly: is the market healthy, which industries lead on relative strength (26-week
       return against the market) while their own index is in Weinstein Stage 2, and which liquid
-      Stage 2 stocks lead inside them. Reporting only -- the strategy built on this is
-      pre-registered and has to pass its test before anything trades on it.
+      Stage 2 stocks lead inside them. Reporting only: the strategy built on this failed its
+      pre-registered test (LEDGER row 53, 2013-2021) -- buying only inside the leading industries was
+      calmer but earned less than plain Stage 2 -- so nothing trades on this page.
     </p>
 
     <div v-if="error" class="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
@@ -91,7 +92,7 @@ const FILTER_TONE = { pass: 'good', fail: 'bad', unknown: 'neutral' } as const
         and a tenth run {{ weeks(data.stats.stage2_weeks.p90) }}+ ({{ data.stats.stage2_runs }} runs) ·
         an industry stays in the top fifth {{ weeks(data.stats.top_fifth_weeks.p50) }} at the median, {{ weeks(data.stats.top_fifth_weeks.mean) }} on average,
         a tenth {{ weeks(data.stats.top_fifth_weeks.p90) }}+ · about {{ data.stats.new_leaders_per_quarter?.toFixed(0) }} new leaders a quarter.
-        Most moves are short; a few run long -- which is why the strategy trades monthly with a buffer.
+        Most moves are short; a few run long -- weekly trading on this would mostly chase noise.
       </div>
 
       <div class="mt-6 flex flex-wrap items-center gap-3">
