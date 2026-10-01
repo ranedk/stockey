@@ -32,21 +32,22 @@ price/TA strategy, so it lives in systrader; stockey's fundamentals enter only a
 4. **Fundamental filter (forward only)** -- no stockey flaw and story score at or above the
    median. There is no point-in-time history of the story score before 2026-09-29, so this layer
    can only be tested forward on paper, never in the backtest.
-5. **Book** -- 20 names, equal weight, at most 4 per industry. Monthly rebalance (20 sessions)
-   with a 2x rank buffer (keep a holding while it ranks inside the top 40). Between rebalances,
-   exit only on a weekly close below the 30-week average.
+5. **Book** -- 20 names, equal weight, at most 4 per industry. Rebalance every 4 weeks with a
+   2x buffer (keep a holding while its industry is in the top two fifths and it ranks in the
+   top 40). Between rebalances, exit only on a weekly close below the 30-week average.
 
-How long things take (to be MEASURED by the view, not assumed): a stock's Stage 2 run, an
-industry's stay in the top fifth, and how often leadership changes. The view reports all three
-from history so the monthly clock can be checked against reality.
+How long things take (MEASURED 2013-07 -> 2026-09 by the view): a Stage 2 run lasts 5 weeks at
+the median but 12.6 on average (a tenth run 34+ weeks); an industry stays in the RS top fifth
+3 weeks at the median, 7 on average (a tenth 22+); about 7 industries newly lead each quarter.
+Most moves are short and a few run long -- so a monthly clock with a buffer, not weekly trading.
 
 ## 3. Definitions (fixed now; a change is a new version)
 
 | Item | Definition |
 |---|---|
 | Prices | `advisory_adjusted_ohlcv_daily`, EQ series, weekly = last close of the week |
-| Market index | equal-weight daily return of names with median 63-day traded value >= Rs 10 cr |
-| Industry index | equal-weight daily return of an industry's members (same floor, >= 3 members) |
+| Market index | equal-weight WEEKLY return of names with 60-bar median traded value >= Rs 10 cr at the previous week's end, each capped at +-50% |
+| Industry index | the same over an industry's members; ranked only with >= 5 eligible members (3 let one stock make a whole 'industry' #1) |
 | RS26 | 26-week total return of the index minus the market's |
 | RS rank | RS26 rank among industries, 1 = strongest; reported now, 4 and 13 weeks ago |
 | Stage | `internal/stage` (30-week SMA, 4-week slope, +-1% flat band; row 10) |
@@ -71,7 +72,8 @@ Reporting only; no ledger trial (exploration, trials=0).
 
 ## 5. The test (pre-registered before any run)
 
-Family "industry rotation", trials=2, 2013-07-01 -> 2021-12-31 (new family: the industry
+Pre-registered in full: `research/preregistrations/2026-10-01_industry_rotation.md` (it
+supersedes the summary below where they differ). Family "industry rotation", trials=2, 2013-07-01 -> 2021-12-31 (new family: the industry
 layer has not been tested on these years), weekly decisions on the last completed week,
 next-open fills, 50 bps round trip (100 bps sensitivity):
 - **R1** -- the book in section 2 (steps 1-3, 5), always invested.
