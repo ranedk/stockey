@@ -7,6 +7,7 @@ package main
 //	                             same-size random group (kill screen)
 //	slice stage -part strategy   step 2: three trading versions, and their
 //	                             overlap with the momentum lookback blend
+//	slice stage -part rotation   industry rotation (row 53, 2026-10-01 pre-registration)
 //	slice stage -part followups  the two follow-ups from row 39's map: early
 //	                             Stage 2 and a faithful breakout (row 40)
 //	slice stage -part explore -event stage2|breakout
@@ -422,8 +423,11 @@ func runStage(args []string) {
 		}
 		fmt.Printf("PRE-REGISTERED VERDICT: (d) %s; (e) %s.\n", dVerdict, eVerdict)
 
+	case "rotation":
+		runRotationPart(*cache, mustDate(*from), mustDate(*to), *floor, *costBps, boot, *q, cfg, minBars)
+
 	default:
-		fatal(fmt.Errorf("unknown -part %q (buckets | strategy | followups | explore)", *part))
+		fatal(fmt.Errorf("unknown -part %q (buckets | strategy | followups | rotation | explore)", *part))
 	}
 }
 

@@ -253,6 +253,9 @@ type scorer struct {
 	Name   string
 	Score  func(b []bars.Bar) []float64
 	Direct bool
+	// ScoreSym, when set, is used instead of Score: for books decided across the
+	// cross-section (industry rotation), where a symbol's value is looked up by name.
+	ScoreSym func(sym string, b []bars.Bar) []float64
 }
 
 // windowScorer is a trailing-return signal as a scorer.
@@ -302,7 +305,11 @@ func buildScores(cache string, scs []scorer, from, to time.Time, floor float64, 
 		turn := bars.MedianTurnover(b, turnoverWin)
 		arrays := make([][]float64, len(scs))
 		for j, sc := range scs {
-			arrays[j] = sc.Score(b)
+			if sc.ScoreSym != nil {
+				arrays[j] = sc.ScoreSym(ser.Symbol, b)
+			} else {
+				arrays[j] = sc.Score(b)
+			}
 		}
 		type row struct {
 			d time.Time

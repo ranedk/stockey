@@ -33,9 +33,12 @@ const (
 	TurnoverWindow  = 60
 	RSWeeks         = 26
 	MinMembers      = 5 // 3 let one stock be a whole 'industry' (Telecom Equipment ranked #1 on 3 names)
-	WeeklyReturnCap = 0.5
 	LeadingFraction = 0.2
 )
+
+// WeeklyReturnCap bounds one name's weekly return inside an index; a var only so the
+// pre-registered no-cap sensitivity can be run.
+var WeeklyReturnCap = 0.5
 
 // Membership is one symbol's classification.
 type Membership struct {
@@ -52,8 +55,22 @@ type Stock struct {
 
 // Panel is the weekly universe.
 type Panel struct {
-	Weeks  []time.Time // last trading date seen in each ISO week, ascending
-	Stocks map[string]*Stock
+	Weeks   []time.Time // last trading date seen in each ISO week, ascending
+	Stocks  map[string]*Stock
+	weekIdx map[int]int
+}
+
+// CompletedWeek is the index of the last week COMPLETED at the close of day t: t's own
+// week if t is that week's last trading day, else the week before. -1 if none.
+func (p *Panel) CompletedWeek(t time.Time) int {
+	k, ok := p.weekIdx[WeekKey(t)]
+	if !ok {
+		return -1
+	}
+	if t.Before(p.Weeks[k]) {
+		return k - 1
+	}
+	return k
 }
 
 // WeekKey identifies an ISO week.
@@ -102,7 +119,7 @@ func (b *Builder) Panel() *Panel {
 		keys = append(keys, k)
 	}
 	sort.Ints(keys)
-	p := &Panel{Weeks: make([]time.Time, len(keys)), Stocks: map[string]*Stock{}}
+	p := &Panel{Weeks: make([]time.Time, len(keys)), Stocks: map[string]*Stock{}, weekIdx: b.weekIndex}
 	for i, k := range keys {
 		b.weekIndex[k] = i
 		p.Weeks[i] = b.weekDate[k]

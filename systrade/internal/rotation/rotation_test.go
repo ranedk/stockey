@@ -95,3 +95,25 @@ func TestStatsAndWeeksInStage2(t *testing.T) {
 		t.Fatalf("no completed Stage 2 runs expected, got %d", st.Stage2Runs)
 	}
 }
+
+func TestRotationBookBuysOnlyInLeadersAndRespectsTheCap(t *testing.T) {
+	u := universe(t)
+	start := 60
+	weeks := u.Holdings(BookRule{Industry: true}, start)
+	last := weeks[len(weeks)-1]
+	if len(last.Held) == 0 || len(last.Held) > PerIndustryCap {
+		t.Fatalf("expected up to %d FAST names, got %v", PerIndustryCap, last.Held)
+	}
+	for _, s := range last.Held {
+		if u.Membership[s].Industry != "FAST" {
+			t.Fatalf("held %s outside the leading industry", s)
+		}
+	}
+	if !weeks[start].Rebalanced || weeks[start+1].Rebalanced || !weeks[start+RebalanceWeeks].Rebalanced {
+		t.Fatal("rebalance every 4 weeks from the start")
+	}
+	plain := u.Holdings(BookRule{}, start)
+	if len(plain[len(plain)-1].Held) <= len(last.Held) {
+		t.Fatal("plain Stage 2 has no industry condition, so it can hold more of the universe")
+	}
+}
