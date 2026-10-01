@@ -467,6 +467,7 @@ Everything here was open in a repo README or PRD before this file existed.
       daily, `/api/rotation`; stockey `/api/story-scores` for the fundamental filter column).
 - [x] **Pre-registered test FAILED** (LEDGER row 53): restricting Stage 2 to RS-leading industries made
       the book calmer (maxDD −30% vs −47%) but poorer than plain Stage 2 (−0.69%/month, p 0.96). No paper track.
-- Idea only (post-hoc, not tested): plain Stage 2 top 20 by RS26, monthly, buffered -- 22.1%/yr as a
-  reference in row 53.
+- [x] **stage2-rs-leaders forward paper track** (LEDGER row 54, from 2026-10-01): row 53's plain Stage 2
+      reference book, frozen. In-sample 22.1%/yr seen first, so only the forward record counts; judged
+      from 2027-10-01 against both controls.
 
