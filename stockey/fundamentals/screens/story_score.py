@@ -360,6 +360,26 @@ def score(inputs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# Slim, dated read of the daily score for systrader's fundamentals-filtered paper track
+# (systrade docs/strategies/2026-10-01_stage2_rs_leaders_clean.md). A VIEW with a `date`
+# column so systrader's incremental sync can copy it; stockey owns it, systrader only reads.
+FILTER_VIEW = "fundamentals_story_filter_daily"
+_FILTER_VIEW_SQL = f"""
+    CREATE OR REPLACE VIEW {FILTER_VIEW} AS
+    SELECT s.as_of_date AS date, s.company_master_id, cm.nse_ticker AS symbol, s.story_score,
+           (s.flaws IS NOT NULL AND btrim(s.flaws) <> '') AS has_flaw, s.score_version
+      FROM {RESULTS_TABLE} s
+      LEFT JOIN company_master cm ON cm.company_master_id = s.company_master_id
+"""
+
+
+def ensure_filter_view() -> None:
+    from utils.db import db_session
+
+    with db_session() as (_, cur):
+        cur.execute(_FILTER_VIEW_SQL)
+
+
 def run(as_of=None, *, store: bool = True) -> pd.DataFrame:
     as_of = pd.Timestamp(as_of).date() if as_of else pd.Timestamp.now(tz="Asia/Kolkata").date()
     inputs = load_inputs(as_of)
@@ -374,6 +394,7 @@ def run(as_of=None, *, store: bool = True) -> pd.DataFrame:
         # the nightly full run refreshes every company's live score and records what moved
         from fundamentals.screens import reeval
         reeval.apply_scores(out, causes="daily", score_version=SCORE_VERSION)
+        ensure_filter_view()
         from utils.schema_migrations import apply_schema_migration
         apply_schema_migration(
             migration_id="20260929_fundamentals_story_score_as_of_date_date",

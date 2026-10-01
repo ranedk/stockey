@@ -46,6 +46,8 @@ go run ./cmd/paper run -strategy trend-speed-blend-buffered
 
 # Stage 2 relative-strength leaders (LEDGER row 54, 2026-10-01)
 go run ./cmd/paper run -strategy stage2-rs-leaders
+# its fundamentals-filtered pair (LEDGER row 55)
+go run ./cmd/paper run -strategy stage2-rs-leaders-clean
 
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate

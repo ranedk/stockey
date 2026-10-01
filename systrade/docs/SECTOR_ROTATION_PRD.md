@@ -98,7 +98,13 @@ restriction made the book calmer but held only ~13 names and gave up more return
 risk earned back. No paper track follows; the Rotation page stays a reporting tool. Plain
 Stage 2 by RS26 (P) was a reference only -- testing it now would be post-hoc on mined years.
 
-## 6. Build order
+## 5b. Forward tracks (2026-10-01)
+
+- `stage2-rs-leaders` (LEDGER row 54): the plain Stage 2 reference book of row 53, frozen.
+- `stage2-rs-leaders-clean` (row 55): the same plus stockey's fundamental filter -- the
+  strategy's step 4, testable only forward. Both judged from 2027-10-01.
+
+## 6. Build order (all done 2026-10-01)
 
 1. Sync `master_sharpely_equity` and `fundamentals_sector_reference` into the local DB (small
    full-copy tables; DATA_CONTRACT updated on both copies).

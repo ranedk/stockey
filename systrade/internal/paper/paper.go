@@ -122,6 +122,10 @@ type Spec struct {
 	// MaxPerGroup caps the strategy book's names per Obs.Group (the Sharpely/NSE industry);
 	// 0 = no cap.
 	MaxPerGroup int
+	// FundamentalFilter also excludes, from the strategy's buying list only, names that fail
+	// stockey's filter on the decision day (FundamentalPass: a flaw, a story score below that
+	// day's median, or no score). Zero value = off.
+	FundamentalFilter bool
 }
 
 // StopKind is the per-position exit rule.
@@ -474,10 +478,25 @@ func Stage2RSLeadersSpec() Spec {
 	return s
 }
 
+// Stage2RSLeadersCleanSpec is stage2-rs-leaders plus stockey's fundamental filter, frozen
+// 2026-10-01 as its paired variant (LEDGER row 55): a name may be bought only if, on the
+// decision day, it has no flaw and a story score at or above the median. Same start, clock,
+// costs and random seed as stage2-rs-leaders, so the two records differ ONLY by the filter.
+// Held names are not sold on the filter between rebalances; at a rebalance a held name that
+// fails it is not kept.
+func Stage2RSLeadersCleanSpec() Spec {
+	s := Stage2RSLeadersSpec()
+	s.Name = "stage2-rs-leaders-clean"
+	s.SignalLabel = s.SignalLabel + "; only names with no stockey flaw and a story score at or above the median"
+	s.Doc = "docs/strategies/2026-10-01_stage2_rs_leaders_clean.md"
+	s.FundamentalFilter = true
+	return s
+}
+
 // Specs lists every strategy with a forward record, in the order they began.
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
-		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec()}
+		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec()}
 }
 
 // SpecFor finds a registered strategy by name.
@@ -1075,7 +1094,7 @@ func selectWeights(book string, spec Spec, d Day, prev []map[string]bool) (map[s
 			tops := variantTopsBuffered(eligible, spec, prev)
 			return weightsFromTops(tops, spec), membersOf(tops)
 		default:
-			if spec.Stage2Only {
+			if spec.Stage2Only || spec.FundamentalFilter {
 				// deterministic tie-break here only: the frozen tracks keep their original sort
 				eligible = rankable(eligible)
 				sort.Slice(eligible, func(i, j int) bool {

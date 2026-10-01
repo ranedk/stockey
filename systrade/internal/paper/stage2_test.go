@@ -56,8 +56,39 @@ func TestFrozenSpecsAreUntouched(t *testing.T) {
 		if s.Name == "stage2-rs-leaders" {
 			continue
 		}
-		if s.Stage2Only || s.MaxPerGroup != 0 || s.Stop == StopSignal {
+		if s.Name == "stage2-rs-leaders-clean" {
+			continue
+		}
+		if s.Stage2Only || s.MaxPerGroup != 0 || s.Stop == StopSignal || s.FundamentalFilter {
 			t.Fatalf("%s picked up a new field", s.Name)
 		}
+	}
+}
+
+func TestFundamentalPassUsesTheDaysMedianNewestVersionAndNoLookAhead(t *testing.T) {
+	d1 := time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC)
+	d2 := d1.AddDate(0, 0, 1)
+	f := NewFundamentalPass([]FilterRow{
+		{d1, "A", 90, false, 1}, {d1, "B", 10, false, 1}, {d1, "C", 50, false, 1},
+		{d2, "A", 90, true, 2}, {d2, "B", 80, false, 2}, {d2, "C", 50, false, 2}, {d2, "A", 99, false, 1},
+	})
+	if ok, _ := f.Passes("A", d1.AddDate(0, 0, -1)); ok {
+		t.Fatal("no score before the first date: nothing passes")
+	}
+	if ok, _ := f.Passes("A", d1); !ok {
+		t.Fatal("A is above the median with no flaw on d1")
+	}
+	if ok, _ := f.Passes("B", d1); ok {
+		t.Fatal("B is below the median on d1")
+	}
+	// on d2 only version 2 counts: A has a flaw, B passes, an unscored name never does
+	if ok, _ := f.Passes("A", d2.AddDate(0, 0, 3)); ok {
+		t.Fatal("A's flaw on d2 must fail it")
+	}
+	if ok, _ := f.Passes("B", d2); !ok {
+		t.Fatal("B passes on d2")
+	}
+	if ok, _ := f.Passes("ZZZ", d2); ok {
+		t.Fatal("no score -> fails")
 	}
 }

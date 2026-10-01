@@ -85,3 +85,33 @@ func (s *Store) LatestRotationSnapshot(ctx context.Context) ([]byte, time.Time, 
 		SELECT payload, as_of FROM systrader_rotation_snapshot ORDER BY as_of DESC LIMIT 1`).Scan(&b, &asOf)
 	return b, asOf, err
 }
+
+// StoryFilterRow is one company's stockey story score on one date (fundamentals_story_filter_daily,
+// a stockey-owned view synced since 2026-10-01).
+type StoryFilterRow struct {
+	Date         time.Time
+	Symbol       string
+	Score        float64
+	HasFlaw      bool
+	ScoreVersion int
+}
+
+// StoryFilter returns every synced row with an NSE symbol, ascending by date.
+func (s *Store) StoryFilter(ctx context.Context) ([]StoryFilterRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT date, symbol, story_score, has_flaw, score_version FROM fundamentals_story_filter_daily
+		 WHERE symbol IS NOT NULL AND story_score IS NOT NULL ORDER BY date`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StoryFilterRow
+	for rows.Next() {
+		var r StoryFilterRow
+		if err := rows.Scan(&r.Date, &r.Symbol, &r.Score, &r.HasFlaw, &r.ScoreVersion); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

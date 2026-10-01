@@ -477,6 +477,23 @@ func ruleSignal(r rules.Rule) signalFn {
 
 func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, variants []signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
 	byDate := map[time.Time][]paper.Obs{}
+	var fundamentals *paper.FundamentalPass
+	if spec.FundamentalFilter {
+		rows, err := st.StoryFilter(ctx)
+		if err != nil {
+			return nil, err
+		}
+		in := make([]paper.FilterRow, len(rows))
+		for i, r := range rows {
+			in[i] = paper.FilterRow{Date: r.Date, Symbol: r.Symbol, Score: r.Score, HasFlaw: r.HasFlaw, Version: r.ScoreVersion}
+		}
+		fundamentals = paper.NewFundamentalPass(in)
+		if latest := fundamentals.Latest(); latest.IsZero() || to.Sub(latest) > 7*24*time.Hour {
+			// Carried forward, never silently: a stale filter keeps yesterday's verdicts.
+			fmt.Fprintf(os.Stderr, "paper: WARNING %s: newest stockey story score is %s (> 7 days before %s) -- filter carried forward\n",
+				spec.Name, latest.Format("2006-01-02"), to.Format("2006-01-02"))
+		}
+	}
 	var groups map[string][2]string
 	if spec.MaxPerGroup > 0 {
 		var err error
@@ -569,6 +586,11 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				w := weekly[i-1] // the last week completed by yesterday's close
 				o.Excluded = w.Stage != stage.Stage2Advancing
 				o.ExitSignal = w.Stage != stage.StageUnknown && w.Close < w.MA30
+			}
+			if fundamentals != nil {
+				if ok, _ := fundamentals.Passes(ser.Symbol, times[i-1]); !ok {
+					o.Excluded = true
+				}
 			}
 			byDate[d] = append(byDate[d], o)
 		}

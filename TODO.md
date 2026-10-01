@@ -470,4 +470,6 @@ Everything here was open in a repo README or PRD before this file existed.
 - [x] **stage2-rs-leaders forward paper track** (LEDGER row 54, from 2026-10-01): row 53's plain Stage 2
       reference book, frozen. In-sample 22.1%/yr seen first, so only the forward record counts; judged
       from 2027-10-01 against both controls.
+- [x] **stage2-rs-leaders-clean** (row 55): the same book with stockey's fundamental filter (no flaw, story
+      score >= median); stockey publishes `fundamentals_story_filter_daily`, synced nightly. Paired with row 54.
 
