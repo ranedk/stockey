@@ -44,6 +44,9 @@ go run ./cmd/paper run -strategy momentum-lowvol-combination
 # TODO A3 (2026-09-29): trend-speed-blend with a rank buffer -- a separate record, own clock.
 go run ./cmd/paper run -strategy trend-speed-blend-buffered
 
+# Stage 2 relative-strength leaders (LEDGER row 54, 2026-10-01)
+go run ./cmd/paper run -strategy stage2-rs-leaders
+
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate
 # evidence (docs/RESEARCH_PROTOCOL.md, S2 and S5). Never sends — no -live.

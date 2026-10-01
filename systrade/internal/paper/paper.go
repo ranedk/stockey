@@ -114,6 +114,14 @@ type Spec struct {
 	// benefit. The published volatility-scaling work rescales monthly, so
 	// daily is the deviation, not the default.
 	ExposureDaily bool
+	// Stage2Only ranks only names whose last completed week is Weinstein Stage 2
+	// (internal/stage); everything else stays in the universe -- the equal-weight and
+	// random benchmarks still hold it -- but the strategy may not buy it. buildDays sets
+	// Obs.Excluded and Obs.ExitSignal from it. Zero value = off, so frozen specs are untouched.
+	Stage2Only bool
+	// MaxPerGroup caps the strategy book's names per Obs.Group (the Sharpely/NSE industry);
+	// 0 = no cap.
+	MaxPerGroup int
 }
 
 // StopKind is the per-position exit rule.
@@ -136,6 +144,10 @@ const (
 	// StopRandom exits positions at RandomExitRate per position per day,
 	// chosen by a fixed hash rather than by price. The control.
 	StopRandom
+	// StopSignal exits on the strategy's own exit signal, Obs.ExitSignal (for a Stage2Only
+	// book: a weekly close below the 30-week average). Sold at the next open; the slot
+	// stays in cash until the next rebalance, like every other stop.
+	StopSignal
 )
 
 func (s StopKind) String() string {
@@ -150,6 +162,8 @@ func (s StopKind) String() string {
 		return "vol-scaled trailing"
 	case StopRandom:
 		return "random exits (control)"
+	case StopSignal:
+		return "exit signal (weekly close below the 30-week average)"
 	default:
 		return "none"
 	}
@@ -170,6 +184,8 @@ func ParseStop(s string) (StopKind, error) {
 		return StopVolTrailing, nil
 	case "random":
 		return StopRandom, nil
+	case "signal":
+		return StopSignal, nil
 	}
 	return StopNone, fmt.Errorf("paper: unknown stop %q (none|fixed|trailing|volfixed|voltrailing|random)", s)
 }
@@ -434,10 +450,34 @@ func SpeedBlendBufferedSpec() Spec {
 	return s
 }
 
+// Stage2RSLeadersSpec is the configuration frozen on 2026-10-01: the plain Stage 2
+// reference book of LEDGER row 53 -- the 20 liquid Stage 2 names with the highest 6-month
+// return (the same order as RS26: subtracting the market's return changes no rank), at most
+// 4 per industry, rebalanced every 20 sessions with the 2x rank buffer, and sold at the next
+// open on a weekly close below the 30-week average (that slot waits in cash for the next
+// rebalance). Its 22.1%/yr in row 53 is IN-SAMPLE and was seen before this spec was written:
+// it motivates the track, it does not count as evidence. Only this forward record decides.
+func Stage2RSLeadersSpec() Spec {
+	s := FrozenSpec()
+	s.Name = "stage2-rs-leaders"
+	s.Start = time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	s.Signal = "stage2-rs26"
+	s.SignalLabel = "Weinstein Stage 2 names only, top 20 by 6-month return (relative strength), max 4 per industry, " +
+		"rank buffer 2x, exit on a weekly close below the 30-week average, monthly"
+	s.Doc = "docs/strategies/2026-10-01_stage2_rs_leaders.md"
+	s.HoldCount = 20
+	s.KeepMultiple = 2
+	s.RebalanceEvery = 20
+	s.Stage2Only = true
+	s.MaxPerGroup = 4
+	s.Stop = StopSignal
+	return s
+}
+
 // Specs lists every strategy with a forward record, in the order they began.
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
-		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec()}
+		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec()}
 }
 
 // SpecFor finds a registered strategy by name.
@@ -477,6 +517,14 @@ type Obs struct {
 	Forecast  float64
 	Turnover  float64
 	Eligible  bool
+	// Group is the symbol's industry (Sharpely/NSE), for Spec.MaxPerGroup; "" = none.
+	Group string
+	// Excluded: the strategy may not buy this name today (Spec.Stage2Only: its last
+	// completed week is not Stage 2). Benchmarks ignore it.
+	Excluded bool
+	// ExitSignal: the strategy's own exit fired at the previous close (Spec.Stage2Only:
+	// the last completed week closed below its 30-week average). Read by StopSignal.
+	ExitSignal bool
 	// AnnVol is the symbol's annualised volatility at the previous close, used
 	// only by the vol-scaled stops: a jumpy stock needs more room than a quiet
 	// one before a fall means anything.
@@ -803,6 +851,12 @@ func breachedStops(spec Spec, b *Book, prices map[string]Obs, dayIndex int) map[
 		if !ok || e.LastPrice <= 0 {
 			continue
 		}
+		if spec.Stop == StopSignal {
+			if prices[sym].ExitSignal {
+				out[sym] = true
+			}
+			continue
+		}
 		if spec.Stop == StopRandom {
 			// Deterministic pseudo-random exits at the configured rate: the
 			// control for "would exiting ANYTHING this often have helped?"
@@ -1021,14 +1075,30 @@ func selectWeights(book string, spec Spec, d Day, prev []map[string]bool) (map[s
 			tops := variantTopsBuffered(eligible, spec, prev)
 			return weightsFromTops(tops, spec), membersOf(tops)
 		default:
-			sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
+			if spec.Stage2Only {
+				// deterministic tie-break here only: the frozen tracks keep their original sort
+				eligible = rankable(eligible)
+				sort.Slice(eligible, func(i, j int) bool {
+					if eligible[i].Forecast != eligible[j].Forecast {
+						return eligible[i].Forecast > eligible[j].Forecast
+					}
+					return eligible[i].Symbol < eligible[j].Symbol
+				})
+			} else {
+				sort.Slice(eligible, func(i, j int) bool { return eligible[i].Forecast > eligible[j].Forecast })
+			}
 		}
 	}
 	var held map[string]bool
 	if book == BookStrategy && len(prev) > 0 {
 		held = prev[0]
 	}
-	chosen := pickTop(eligible, n, spec.KeepMultiple, held)
+	var chosen []string
+	if book == BookStrategy && spec.MaxPerGroup > 0 {
+		chosen = pickTopCapped(eligible, n, spec.KeepMultiple, held, spec.MaxPerGroup)
+	} else {
+		chosen = pickTop(eligible, n, spec.KeepMultiple, held)
+	}
 	out := make(map[string]float64, len(chosen))
 	for _, sym := range chosen {
 		out[sym] = 1 / float64(len(chosen))
@@ -1065,6 +1135,60 @@ func pickTop(ranked []Obs, n, keepMultiple int, held map[string]bool) []string {
 		if !chosen[o.Symbol] {
 			out = append(out, o.Symbol)
 			chosen[o.Symbol] = true
+		}
+	}
+	return out
+}
+
+// rankable drops the names a Stage2Only book may not buy.
+func rankable(obs []Obs) []Obs {
+	out := make([]Obs, 0, len(obs))
+	for _, o := range obs {
+		if !o.Excluded {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// pickTopCapped is pickTop with at most maxPerGroup names per Obs.Group (an empty group
+// is uncapped): kept names count against their group first, then new names fill the
+// free slots in rank order, skipping a full group.
+func pickTopCapped(ranked []Obs, n, keepMultiple int, held map[string]bool, maxPerGroup int) []string {
+	if n > len(ranked) {
+		n = len(ranked)
+	}
+	out := make([]string, 0, n)
+	chosen := map[string]bool{}
+	per := map[string]int{}
+	take := func(o Obs) bool {
+		if o.Group != "" && per[o.Group] >= maxPerGroup {
+			return false
+		}
+		out = append(out, o.Symbol)
+		chosen[o.Symbol] = true
+		if o.Group != "" {
+			per[o.Group]++
+		}
+		return true
+	}
+	if keepMultiple > 1 && len(held) > 0 {
+		limit := n * keepMultiple
+		if limit > len(ranked) {
+			limit = len(ranked)
+		}
+		for _, o := range ranked[:limit] {
+			if held[o.Symbol] && len(out) < n {
+				take(o)
+			}
+		}
+	}
+	for _, o := range ranked {
+		if len(out) >= n {
+			break
+		}
+		if !chosen[o.Symbol] {
+			take(o)
 		}
 	}
 	return out

@@ -217,3 +217,25 @@ func TestStageString_CoversEveryValue(t *testing.T) {
 		}
 	}
 }
+
+func TestDailyViewUsesOnlyCompletedWeeks(t *testing.T) {
+	var times []time.Time
+	var closes []float64
+	d := time.Date(2020, 1, 6, 0, 0, 0, 0, time.UTC) // a Monday
+	for w := 0; w < 60; w++ {
+		for k := 0; k < 5; k++ {
+			times = append(times, d)
+			closes = append(closes, 100*math.Pow(1.01, float64(w)))
+			d = d.AddDate(0, 0, 1)
+		}
+		d = d.AddDate(0, 0, 2)
+	}
+	v := DailyView(times, closes, nil)
+	// the first week's Monday sees no completed week; its Friday sees week 0
+	if v[0].Time != (time.Time{}) || !v[4].Time.Equal(times[4]) || !v[5].Time.Equal(times[4]) {
+		t.Fatalf("day view must carry the last COMPLETED week: %v %v %v", v[0].Time, v[4].Time, v[5].Time)
+	}
+	if v[len(v)-1].Stage != Stage2Advancing {
+		t.Fatalf("steady riser ends in Stage 2, got %v", v[len(v)-1].Stage)
+	}
+}

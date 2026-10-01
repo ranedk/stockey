@@ -30,6 +30,7 @@ import (
 	"github.com/ranedk/systrader/internal/data"
 	"github.com/ranedk/systrader/internal/paper"
 	"github.com/ranedk/systrader/internal/rules"
+	"github.com/ranedk/systrader/internal/stage"
 	"github.com/ranedk/systrader/internal/store"
 	"github.com/ranedk/systrader/internal/traits"
 )
@@ -333,6 +334,9 @@ func parseSignal(name string) (signalFn, error) {
 		return ruleSignal(rules.SpeedBlend()), nil
 	case "mom6":
 		return windowReturn(6*month, 0), nil
+	case "stage2-rs26":
+		// Ranked by 6-month return; the Stage 2 filter and exit come from Spec.Stage2Only.
+		return windowReturn(6*month, 0), nil
 	case "mom9":
 		return windowReturn(9*month, 0), nil
 	case "mom12":
@@ -473,6 +477,13 @@ func ruleSignal(r rules.Rule) signalFn {
 
 func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, variants []signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
 	byDate := map[time.Time][]paper.Obs{}
+	var groups map[string][2]string
+	if spec.MaxPerGroup > 0 {
+		var err error
+		if groups, err = st.RotationMembership(ctx); err != nil {
+			return nil, err
+		}
+	}
 	err := st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
 		n := len(ser.Bars)
 		if n < 150 {
@@ -493,6 +504,18 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 		}
 		sma := core.SMA(prices, 200).Values
 		turnover := bars.MedianTurnover(ser.Bars, spec.TurnoverWindow)
+		var weekly []stage.Classification
+		if spec.Stage2Only {
+			vols := make([]float64, n)
+			for i, b := range ser.Bars {
+				vols[i] = b.Vol
+			}
+			weekly = stage.DailyView(times, closes, vols)
+		}
+		group := ""
+		if groups != nil {
+			group = groups[ser.Symbol][1]
+		}
 
 		// Bars before the start date are kept when `all` is set: the order
 		// sheet needs the latest close even when the tracked record has not
@@ -534,13 +557,20 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 			if v := vol.Values[i-1]; !math.IsNaN(v) && closes[i-1] > 0 {
 				annVol = v / closes[i-1] * 16 // daily price vol -> annualised fraction
 			}
-			byDate[d] = append(byDate[d], paper.Obs{
+			o := paper.Obs{
 				Symbol: ser.Symbol, Open: b.Open, Close: b.Close, PrevClose: closes[i-1],
 				Forecast: f, Turnover: t60, Eligible: eligible, AnnVol: annVol,
 				Forecast2: fc2[i-1],
 				Signals:   sigs,
 				AboveSMA:  !math.IsNaN(sma[i-1]) && closes[i-1] > sma[i-1],
-			})
+				Group:     group,
+			}
+			if weekly != nil {
+				w := weekly[i-1] // the last week completed by yesterday's close
+				o.Excluded = w.Stage != stage.Stage2Advancing
+				o.ExitSignal = w.Stage != stage.StageUnknown && w.Close < w.MA30
+			}
+			byDate[d] = append(byDate[d], o)
 		}
 		return nil
 	})

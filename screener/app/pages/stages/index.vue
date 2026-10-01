@@ -69,7 +69,9 @@ const FILTER_TONE = { pass: 'good', fail: 'bad', unknown: 'neutral' } as const
       return against the market) while their own index is in Weinstein Stage 2, and which liquid
       Stage 2 stocks lead inside them. Reporting only: the strategy built on this failed its
       pre-registered test (LEDGER row 53, 2013-2021) -- buying only inside the leading industries was
-      calmer but earned less than plain Stage 2 -- so nothing trades on this page.
+      calmer but earned less than plain Stage 2 -- so nothing trades on this page. Plain Stage 2
+      ranked by relative strength runs as its own forward paper track:
+      <NuxtLink to="/paper/stage2-rs-leaders" class="font-medium text-slate-900 underline">stage2-rs-leaders</NuxtLink>.
     </p>
 
     <div v-if="error" class="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">

@@ -178,3 +178,51 @@ func Latest(cs []Classification) (Classification, bool) {
 	}
 	return cs[len(cs)-1], true
 }
+
+// DailyView classifies a daily series on weekly bars (last close, summed volume per ISO
+// week) and returns, for each DAY, the classification of the last week completed at
+// that day's close -- the day's own week only on its last bar in the series. Days before
+// any classified week carry the zero value (StageUnknown). Used by the paper engine's
+// Stage 2 filter (docs/strategies/2026-10-01_stage2_rs_leaders.md).
+func DailyView(times []time.Time, closes, vols []float64) []Classification {
+	n := len(times)
+	out := make([]Classification, n)
+	var wt []time.Time
+	var wc, wv []float64
+	var ends []int
+	vol := 0.0
+	for i := 0; i < n; i++ {
+		if vols != nil && !math.IsNaN(vols[i]) {
+			vol += vols[i]
+		}
+		last := i+1 >= n
+		if !last {
+			y, k := times[i].ISOWeek()
+			y2, k2 := times[i+1].ISOWeek()
+			last = y != y2 || k != k2
+		}
+		if last {
+			wt, wc, wv, ends = append(wt, times[i]), append(wc, closes[i]), append(wv, vol), append(ends, i)
+			vol = 0
+		}
+	}
+	if len(wt) == 0 {
+		return out
+	}
+	var vp *core.Series
+	if vols != nil {
+		v := core.New(wt, wv)
+		vp = &v
+	}
+	cls := Classify(core.New(wt, wc), vp)
+	k := -1
+	for i := 0; i < n; i++ {
+		for k+1 < len(ends) && ends[k+1] <= i {
+			k++
+		}
+		if k >= 0 {
+			out[i] = cls[k]
+		}
+	}
+	return out
+}
