@@ -436,6 +436,26 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
     }
 
 
+def get_story_scores() -> list[dict]:
+    """symbol, story score, primary story, flaws, in-band and watchlist status for every
+    company with a live score. Empty (not an error) before the first story-score run."""
+    exists = sql_to_df("SELECT 1 FROM information_schema.tables WHERE table_name = 'fundamentals_story_score_live'")
+    if exists.empty:
+        return []
+    df = sql_to_df(
+        """
+        SELECT coalesce(cm.nse_ticker, replace(l.company_master_id, 'nse:', '')) AS symbol,
+               l.company_master_id, l.story_score, l.primary_dimension, l.flaws, l.in_band,
+               w.status AS watchlist_status
+          FROM fundamentals_story_score_live l
+          LEFT JOIN company_master cm ON cm.company_master_id = l.company_master_id
+          LEFT JOIN fundamentals_watchlist w ON w.company_master_id = l.company_master_id
+         WHERE l.scored_at >= now() - interval '7 days'
+        """
+    )
+    return _clean_records(df)
+
+
 def get_sectors() -> list[dict]:
     sector_df = sql_to_df(
         """

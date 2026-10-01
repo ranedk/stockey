@@ -140,3 +140,84 @@ export interface QualMatrix {
 export interface PaperListResponse {
   strategies: PaperStrategy[]
 }
+
+// GET /api/rotation (systrade/docs/SECTOR_ROTATION_PRD.md): industry rotation, relative
+// strength and stages on a weekly clock. Reporting only.
+export interface RotationMarket {
+  stage: number
+  stage_label: string
+  breadth_pct: number
+  eligible_count: number
+  return_26w_pct: number | null
+}
+
+export interface RotationIndustry {
+  code: string
+  name: string
+  sector_code: string
+  sector_name: string
+  members: number
+  eligible_members: number
+  rs26_pct: number | null
+  rank: number // 0 = not ranked (fewer than 5 liquid members)
+  rank_4w: number
+  rank_13w: number
+  rank_history: number[]
+  stage: number
+  stage2_pct: number
+  leading: boolean
+  weeks_leading: number
+}
+
+export interface RotationStock {
+  symbol: string
+  industry_code: string
+  close: number
+  stage: number
+  weeks_in_stage2: number
+  rs26_pct: number | null
+  rank_in_industry: number
+  above_ma30_pct: number | null
+  slope_pct: number | null
+  volume_ratio: number | null
+  eligible: boolean
+  candidate: boolean
+}
+
+export interface RotationQuantiles { p50: number | null; p75: number | null; p90: number | null; mean: number | null }
+
+export interface RotationStats {
+  stage2_weeks: RotationQuantiles
+  stage2_runs: number
+  leadership_weeks: RotationQuantiles
+  leadership_runs: number
+  top_fifth_weeks: RotationQuantiles
+  new_leaders_per_quarter: number | null
+  from: string
+}
+
+export interface RotationResponse {
+  as_of: string
+  market: RotationMarket
+  industries: RotationIndustry[]
+  stocks: RotationStock[] | null
+  stats: RotationStats
+}
+
+export interface RotationIndustryResponse {
+  as_of: string
+  market: RotationMarket
+  industry: RotationIndustry
+  stocks: RotationStock[] | null
+}
+
+// stockey GET /api/story-scores: the fundamental filter shown beside price candidates.
+export interface StoryScoreRow {
+  symbol: string
+  company_master_id: string
+  story_score: number | null
+  primary_dimension: string | null
+  flaws: string | null
+  in_band: boolean | null
+  watchlist_status: string | null
+}

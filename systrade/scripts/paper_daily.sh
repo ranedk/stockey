@@ -47,6 +47,10 @@ go run ./cmd/paper run -strategy trend-speed-blend-buffered
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate
 # evidence (docs/RESEARCH_PROTOCOL.md, S2 and S5). Never sends — no -live.
+# Industry rotation snapshot for the screener's Rotation page (docs/SECTOR_ROTATION_PRD.md);
+# reporting only, ~20 s. Recomputed daily so the current week stays fresh.
+go run ./cmd/rotation snapshot
+
 go run ./cmd/dhan orders -strategy all
 
 echo "=== paper_daily done ==="

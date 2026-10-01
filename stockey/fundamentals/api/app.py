@@ -119,6 +119,13 @@ def sectors() -> list[dict]:
     return queries.get_sectors()
 
 
+@app.get("/api/story-scores")
+def story_scores() -> list[dict]:
+    """Live story score per company, keyed by NSE symbol -- the fundamental filter systrader's
+    rotation page shows next to its price candidates (systrade/docs/SECTOR_ROTATION_PRD.md)."""
+    return queries.get_story_scores()
+
+
 @app.get("/api/portfolio")
 def portfolio() -> list[dict]:
     """The machine portfolio (fundamentals_portfolio_position).

@@ -53,6 +53,8 @@ FULL_TABLES=(
   dim_trading_days
   company_master            # NSE<->BSE identity for the stage API's BSE series (2026-09-24)
   company_master_nse_alias  # NSE renames: current symbol -> existing company (2026-09-24)
+  master_sharpely_equity    # sector / industry / basic-industry codes per stock (rotation view, 2026-10-01)
+  fundamentals_sector_reference  # code -> name for those levels (rotation view, 2026-10-01)
 )
 
 INCR_TABLES=(               # incremental on the "date" column + reconciliation

@@ -12,6 +12,9 @@
 //	GET /api/paper         every tracked paper strategy, forward record first
 //	GET /api/paper/{name}  one strategy: order sheet, book, NAV vs benchmarks
 //	GET /api/paper/qualifiers  every stock qualifying for any strategy variant, and which
+//	GET /api/rotation      industry rotation: market, industries by RS, candidates, run stats
+//	                       (latest weekly snapshot from `cmd/rotation snapshot`; reporting only)
+//	GET /api/rotation/industry/{code}  one industry and every member
 //
 // NOT hardened for public exposure -- no auth, permissive CORS. Personal
 // single-user tool meant to run on localhost/trusted network next to the
@@ -35,6 +38,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/ranedk/systrader/internal/paperapi"
+	"github.com/ranedk/systrader/internal/rotation"
 	"github.com/ranedk/systrader/internal/stageapi"
 	"github.com/ranedk/systrader/internal/store"
 )
@@ -56,6 +60,8 @@ func main() {
 	mux.HandleFunc("GET /api/paper", handlePaperList(st))
 	mux.HandleFunc("GET /api/paper/qualifiers", handlePaperQualifiers(st))
 	mux.HandleFunc("GET /api/paper/{name}", handlePaperDetail(st))
+	mux.HandleFunc("GET /api/rotation", handleRotation(st))
+	mux.HandleFunc("GET /api/rotation/industry/{code}", handleRotationIndustry(st))
 
 	addr := ":" + port
 	log.Printf("systrader api listening on %s", addr)
@@ -178,4 +184,67 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// handleRotation serves the latest rotation snapshot as computed by `cmd/rotation snapshot`
+// (docs/SECTOR_ROTATION_PRD.md). The full stock list is ~2,000 rows; ?all=1 returns it,
+// otherwise only candidates are sent and the industry page fetches its own members.
+func handleRotation(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		snap, ok := loadRotation(w, r, st)
+		if !ok {
+			return
+		}
+		if r.URL.Query().Get("all") != "1" {
+			var cands []rotation.StockView
+			for _, s := range snap.Stocks {
+				if s.Candidate {
+					cands = append(cands, s)
+				}
+			}
+			snap.Stocks = cands
+		}
+		writeJSON(w, http.StatusOK, snap)
+	}
+}
+
+func handleRotationIndustry(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		snap, ok := loadRotation(w, r, st)
+		if !ok {
+			return
+		}
+		code := r.PathValue("code")
+		var ind *rotation.IndustryView
+		for i := range snap.Industries {
+			if snap.Industries[i].Code == code {
+				ind = &snap.Industries[i]
+			}
+		}
+		if ind == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown industry " + code})
+			return
+		}
+		var members []rotation.StockView
+		for _, s := range snap.Stocks {
+			if s.IndustryCode == code {
+				members = append(members, s)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"as_of": snap.AsOf, "market": snap.Market, "industry": ind, "stocks": members})
+	}
+}
+
+func loadRotation(w http.ResponseWriter, r *http.Request, st *store.Store) (rotation.Snapshot, bool) {
+	var snap rotation.Snapshot
+	raw, _, err := st.LatestRotationSnapshot(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no rotation snapshot yet: run `go run ./cmd/rotation snapshot` (" + err.Error() + ")"})
+		return snap, false
+	}
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return snap, false
+	}
+	return snap, true
 }
