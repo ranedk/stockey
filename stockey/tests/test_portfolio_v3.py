@@ -65,6 +65,8 @@ def test_exit_order_stop_then_thesis_then_fading():
 
 def test_valuation_trims_once_and_only_when_the_story_is_not_strengthening():
     assert _act(valuation_ratio=2.3)["action"] == "trim"
+    young = _pos(opened_at=TODAY.tz_localize("UTC") - pd.Timedelta(days=5))
+    assert _act(p=young, valuation_ratio=8.6) is None, "never trimmed inside its first 20 sessions"
     assert _act(valuation_ratio=2.3, live={"story_score": 92.0, "flaws": None}) is None
     assert _act(p=_pos(trim_count=1), valuation_ratio=2.3) is None
 

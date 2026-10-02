@@ -409,7 +409,8 @@ Pre-registered as systrader LEDGER row 52. Full rules: docs/FUNDAMENTAL_REEVALUA
 5.2-5.3; as built:
 
 - **Entry:** active watchlist name, live story score in the band (enter 80, stay to 65), no
-  flaw, Weinstein stage 2. The adjudicator may veto (prompt v4 shows it the story score,
+  flaw, Weinstein stage 2. Not at or above 2x its own valuation history (amendment 2026-10-02: v3 bought
+  IDEAFORGE at 8.6x and would have trimmed it the same night). The adjudicator may veto (prompt v4 shows it the story score,
   primary story and the latest story read instead of confluence axes). Candidates outside the
   book's best 25 by score are not adjudicated (`outside_top_by_score`).
 - **Weight:** story score / daily volatility, normalised so an average name is 1/25 of the
@@ -422,7 +423,7 @@ Pre-registered as systrader LEDGER row 52. Full rules: docs/FUNDAMENTAL_REEVALUA
   `trail_high`, never below entry after a 2x-stop gain) and `thesis_broken` (flaw, or hard
   negative alert since entry) are unconditional; `story_fading` (daily score below 65 on 3 runs)
   and `target_date` may be deferred once; a valuation trim (>= 2x own history, story not
-  strengthening) cuts a third once. Non-urgent exits and trims in profit wait inside the 30 days
+  strengthening) cuts a third once, after at least 20 sessions held (amendment 2026-10-02). Non-urgent exits and trims in profit wait inside the 30 days
   before the first anniversary (tax guard).
 - **Records:** `fundamentals_portfolio_counterfactual` -- 20/40/60-session returns after every
   exit and trim, as if held; `fundamentals_portfolio_adjustment` -- trims and rebalance signals

@@ -118,7 +118,7 @@ def load_candidates() -> pd.DataFrame:
                l.story_score, l.primary_dimension, l.score_version, l.scored_at,
                cs.sector_code,
                r.story AS read_story, r.deal_breaker AS read_deal_breaker, r.direction AS read_direction,
-               r.materiality AS read_materiality, r.read_at
+               r.materiality AS read_materiality, r.read_at, val.valuation_vs_own_history_ratio
           FROM fundamentals_watchlist w
           JOIN fundamentals_story_score_live l USING (company_master_id)
           LEFT JOIN fundamentals_company_sector cs USING (company_master_id)
@@ -127,6 +127,16 @@ def load_candidates() -> pd.DataFrame:
                               WHERE sr.company_master_id = w.company_master_id
                                 AND sr.read_at >= now() - interval '30 days'
                               ORDER BY read_at DESC LIMIT 1) r ON TRUE
+          -- latest L2 valuation vs own history, through the screener id the snapshot maps
+          LEFT JOIN LATERAL (SELECT s.valuation_vs_own_history_ratio
+                               FROM fundamentals_l2_state s
+                               JOIN (SELECT DISTINCT ON (screener_company_id) screener_company_id, company_master_id
+                                       FROM fundamentals_snapshot_daily
+                                      WHERE as_of_date >= now()::date - 10
+                                      ORDER BY screener_company_id, as_of_date DESC) m
+                                 ON m.screener_company_id::bigint = s.company_id
+                              WHERE m.company_master_id = w.company_master_id
+                              ORDER BY s.run_date DESC LIMIT 1) val ON TRUE
          WHERE w.status = 'active' AND l.in_band AND coalesce(l.flaws, '') = ''
            AND l.scored_at >= now() - make_interval(days => %s)
            -- a hard negative alert in the cooldown window blocks a NEW entry, as it would force an exit
@@ -153,7 +163,12 @@ def evaluate_entry_candidates() -> dict[str, object]:
     candidates = []
     for r in rows.itertuples():
         stage = stage_for(r.company_master_id, stages, stage_keys)
-        checks = {"in_story_band": True, "no_flaw": True, "stage_is_advancing": stage == ENTRY_STAGE}
+        # Valuation is an ENTRY filter (PRD 5.1): never buy at or above the level that would trim
+        # it, or the book buys at 8.6x its own history and trims a third the same night
+        # (IDEAFORGE, 2026-10-02 -- amendment to LEDGER row 52, before any v3 exit ran).
+        vr = r.valuation_vs_own_history_ratio
+        checks = {"in_story_band": True, "no_flaw": True, "stage_is_advancing": stage == ENTRY_STAGE,
+                  "valuation_below_trim": vr is None or pd.isna(vr) or float(vr) < TRIM_VALUATION_RATIO}
         if not all(checks.values()):
             continue
         candidates.append({
@@ -335,7 +350,10 @@ def v3_exit_action(p, *, price, trail_high, live: dict | None, hard_events: list
     trims = int(p.trim_count or 0) if getattr(p, "trim_count", None) is not None and not pd.isna(p.trim_count) else 0
     score_now = (live or {}).get("story_score")
     at_entry = p.story_score_at_entry
-    if (trims == 0 and valuation_ratio is not None and not pd.isna(valuation_ratio)
+    from fundamentals.screens.portfolio_exit import sessions_held
+
+    # a trim needs MIN_HOLD_SESSIONS held, like a replacement: not on the entry night (amendment 2026-10-02)
+    if (trims == 0 and sessions_held(p.opened_at, today) >= MIN_HOLD_SESSIONS and valuation_ratio is not None and not pd.isna(valuation_ratio)
             and float(valuation_ratio) >= TRIM_VALUATION_RATIO
             and (score_now is None or at_entry is None or pd.isna(at_entry) or float(score_now) <= float(at_entry))):
         detail = (f"valuation {float(valuation_ratio):.2f}x its own history and the story is not strengthening "
