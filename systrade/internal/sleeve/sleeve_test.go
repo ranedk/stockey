@@ -188,3 +188,19 @@ func TestRebalanceScheduleActuallyHolds(t *testing.T) {
 		}
 	}
 }
+
+func TestCashLineIsNeitherShuffledNorTraded(t *testing.T) {
+	syms := []int32{0, 1, 2, 3, 4}
+	w := []float64{0.6, 0.1, 0.1, 0.1, 0.1} // 60% cash
+	p := stablePermuteExceptCash(w, syms, 7, 0)
+	if p[0] != 0.6 {
+		t.Fatalf("cash weight must stay on cash, got %v", p)
+	}
+	cfg := Config{CostBpsRoundTrip: 50, HasCash: true, CashSym: 0}
+	var b Book
+	prev := weights{0: 0.5, 1: 0.5}
+	step(&b, time.Now(), []int32{0, 2}, []float64{0.5, 0.5}, []float64{0, 0}, prev, cfg)
+	if b.Turnover[0] != 1.0 { // sold 1 (0.5) and bought 2 (0.5); cash unchanged and never counted
+		t.Fatalf("turnover should count only the stock legs, got %v", b.Turnover[0])
+	}
+}

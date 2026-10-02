@@ -58,6 +58,14 @@ type Config struct {
 	// included, follows the same schedule — a control that trades on a
 	// different clock is not a control.
 	RebalanceEvery int
+	// A book that can sit partly in cash
+	// carries a synthetic zero-return line with symbol CashSym (the industry-rotation books,
+	// cmd/slice/rotation.go). With HasCash set, that line is never charged turnover (moving
+	// money to or from cash is not a trade) and the shuffle controls permute only the STOCK
+	// weights, leaving the cash weight on cash -- otherwise a same-size random book put its
+	// largest weight, the cash, on one fixed stock (review 2026-10-02).
+	HasCash bool
+	CashSym int32
 }
 
 // Book is one traded book's daily record.
@@ -149,7 +157,11 @@ func Run(days []Day, ruleNames []string, cfg Config) ([]RuleResult, error) {
 			var gross, net, turn float64
 			for s := range cfg.Seeds {
 				sw := append([]float64(nil), normalize(u)...)
-				rngs[s].Shuffle(len(sw), func(a, b int) { sw[a], sw[b] = sw[b], sw[a] })
+				if cfg.HasCash {
+					sw = shuffleExceptCash(sw, syms, cfg.CashSym, rngs[s])
+				} else {
+					rngs[s].Shuffle(len(sw), func(a, b int) { sw[a], sw[b] = sw[b], sw[a] })
+				}
 				if hold {
 					sw = carry(syms, prevShuffled[s])
 				}
@@ -167,7 +179,12 @@ func Run(days []Day, ruleNames []string, cfg Config) ([]RuleResult, error) {
 
 			var sGross, sNet, sTurn float64
 			for s, seed := range cfg.Seeds {
-				sw := stablePermute(normalize(u), syms, seed)
+				var sw []float64
+				if cfg.HasCash {
+					sw = stablePermuteExceptCash(normalize(u), syms, seed, cfg.CashSym)
+				} else {
+					sw = stablePermute(normalize(u), syms, seed)
+				}
 				if hold {
 					sw = carry(syms, prevStable[s])
 				}
@@ -211,6 +228,38 @@ func stablePermute(w []float64, syms []int32, seed int64) []float64 {
 	for rank, idx := range order {
 		out[idx] = sorted[rank]
 	}
+	return out
+}
+
+// stablePermuteExceptCash is stablePermute over the stock lines only; the cash line keeps its
+// own weight.
+func stablePermuteExceptCash(w []float64, syms []int32, seed int64, cash int32) []float64 {
+	var idx []int
+	var sw []float64
+	var ss []int32
+	for i, s := range syms {
+		if s != cash {
+			idx, sw, ss = append(idx, i), append(sw, w[i]), append(ss, s)
+		}
+	}
+	p := stablePermute(sw, ss, seed)
+	out := append([]float64(nil), w...)
+	for k, i := range idx {
+		out[i] = p[k]
+	}
+	return out
+}
+
+// shuffleExceptCash shuffles the stock lines' weights among themselves; cash stays put.
+func shuffleExceptCash(w []float64, syms []int32, cash int32, rng *rand.Rand) []float64 {
+	var idx []int
+	for i, s := range syms {
+		if s != cash {
+			idx = append(idx, i)
+		}
+	}
+	out := append([]float64(nil), w...)
+	rng.Shuffle(len(idx), func(a, b int) { out[idx[a]], out[idx[b]] = out[idx[b]], out[idx[a]] })
 	return out
 }
 
@@ -296,10 +345,13 @@ func step(b *Book, date time.Time, syms []int32, w, rets []float64, prev weights
 	held := make(map[int32]bool, len(syms))
 	for i, s := range syms {
 		held[s] = true
+		if cfg.HasCash && s == cfg.CashSym {
+			continue // cash is not traded
+		}
 		turn += math.Abs(w[i] - prev[s])
 	}
 	for s, pw := range prev {
-		if !held[s] {
+		if !held[s] && !(cfg.HasCash && s == cfg.CashSym) {
 			turn += math.Abs(pw) // liquidated
 		}
 	}

@@ -187,6 +187,21 @@ func main() {
 		daysToDue = track.DaysToNextRebalance()
 	}
 	sheet := paper.Pending(spec, all[len(all)-1], current, daysToDue, track.Members())
+	if track != nil && !sheet.Due {
+		// Not a rebalance: the sheet would show only "if it were due" orders, so a stop exit
+		// queued for the next open is listed explicitly (review 2026-10-02).
+		latest := all[len(all)-1]
+		closes := map[string]float64{}
+		for _, o := range latest.Obs {
+			closes[o.Symbol] = o.Close
+		}
+		var exits []paper.Order
+		for _, sym := range track.PendingExits() {
+			exits = append(exits, paper.Order{Date: latest.Date, Book: paper.BookStrategy, Symbol: sym, Side: "EXIT",
+				FromWeight: current[sym], ToWeight: 0, FillPrice: closes[sym]})
+		}
+		sheet.Orders = append(exits, sheet.Orders...)
+	}
 	if account != nil {
 		latest := all[len(all)-1]
 		ratios, err := st.RawRatios(ctx, latest.Date)
@@ -583,9 +598,14 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				Group:     group,
 			}
 			if weekly != nil {
-				w := weekly[i-1] // the last week completed by yesterday's close
+				w := weekly[i-1] // buying: the last week completed by yesterday's close
 				o.Excluded = w.Stage != stage.Stage2Advancing
-				o.ExitSignal = w.Stage != stage.StageUnknown && w.Close < w.MA30
+				// Exiting: the week completed at TODAY's close. The stop check runs after this
+				// close and sells at the next open, so a Friday break sells Monday -- with
+				// weekly[i-1] it sold a session late (review 2026-10-02). No look-ahead: it is
+				// only read after day i's close.
+				x := weekly[i]
+				o.ExitSignal = x.Stage != stage.StageUnknown && x.Close < x.MA30
 			}
 			if fundamentals != nil {
 				if ok, _ := fundamentals.Passes(ser.Symbol, times[i-1]); !ok {

@@ -195,8 +195,10 @@ func DailyView(times []time.Time, closes, vols []float64) []Classification {
 		if vols != nil && !math.IsNaN(vols[i]) {
 			vol += vols[i]
 		}
-		last := i+1 >= n
-		if !last {
+		// The series' final bar ends its week only on a Friday: a Wednesday's close is not a
+		// completed week (holiday Fridays wait one session -- conservative).
+		last := i+1 >= n && times[i].Weekday() == time.Friday
+		if i+1 < n {
 			y, k := times[i].ISOWeek()
 			y2, k2 := times[i+1].ISOWeek()
 			last = y != y2 || k != k2

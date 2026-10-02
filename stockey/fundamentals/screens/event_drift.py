@@ -40,6 +40,10 @@ DIRECTION = {
 # triggers. Detection time is the read's own time (the alert's load_ts).
 STORY_READ_START = "2026-09-30"
 STORY_READ_DIRECTION = {"story_read_positive": 1, "story_read_negative": -1}
+# One record per company per direction per window: each new piece of evidence can raise another
+# alert on the same company, and counting them all would put overlapping samples of ONE price
+# move into the family (review 2026-10-02, before the family's first record).
+STORY_READ_DEDUP_DAYS = 90
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 _DDL = f"""
@@ -82,7 +86,7 @@ def new_alerts() -> pd.DataFrame:
 
 
 def new_story_reads() -> pd.DataFrame:
-    return sql_to_df(
+    df = sql_to_df(
         f"""
         SELECT a.source, a.news_id, a.trigger_type, a.company_master_id, a.load_ts AS detected_at
           FROM fundamentals_l3_alerts a
@@ -90,9 +94,30 @@ def new_story_reads() -> pd.DataFrame:
            AND a.load_ts >= %s::timestamptz
            AND NOT EXISTS (SELECT 1 FROM {RECORD_TABLE} r
                             WHERE r.source = a.source AND r.news_id = a.news_id AND r.trigger_type = a.trigger_type)
+           AND NOT EXISTS (SELECT 1 FROM {RECORD_TABLE} r
+                            WHERE r.family = 'story_read' AND r.company_master_id = a.company_master_id
+                              AND r.trigger_type = a.trigger_type
+                              AND r.detected_at > a.load_ts - make_interval(days => %s))
+         ORDER BY a.load_ts
         """,
-        params=(list(STORY_READ_DIRECTION), f"{STORY_READ_START} 00:00:00+05:30"),
+        params=(list(STORY_READ_DIRECTION), f"{STORY_READ_START} 00:00:00+05:30", STORY_READ_DEDUP_DAYS),
     )
+    return dedupe_story_reads(df)
+
+
+def dedupe_story_reads(df: pd.DataFrame) -> pd.DataFrame:
+    """Within one batch too: keep the first alert per company and direction per window."""
+    if df.empty:
+        return df
+    keep, last = [], {}
+    for r in df.sort_values("detected_at").itertuples():
+        key = (r.company_master_id, r.trigger_type)
+        t = pd.Timestamp(r.detected_at)
+        if key in last and t - last[key] < pd.Timedelta(days=STORY_READ_DEDUP_DAYS):
+            continue
+        last[key] = t
+        keep.append(r.Index)
+    return df.loc[keep]
 
 
 def record_new() -> int:

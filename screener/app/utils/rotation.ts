@@ -14,7 +14,7 @@ export function rankMove(now: number, before: number): number | null {
 // above the median of all scored companies.
 export function storyFilter(row: StoryScoreRow | undefined, median: number | null): 'pass' | 'fail' | 'unknown' {
   if (!row || row.story_score === null || median === null) return 'unknown'
-  if (row.flaws) return 'fail'
+  if (row.flaws && row.flaws.trim()) return 'fail'
   return row.story_score >= median ? 'pass' : 'fail'
 }
 

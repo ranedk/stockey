@@ -41,7 +41,8 @@ from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 SYNC_SOURCE_NAME = "fundamentals.screens.results_reading"
 QUARTERS_TABLE = "fundamentals_quarterly_results"
 RESULTS_TABLE = "fundamentals_results_reading"
-READING_VERSION = 1
+# 2 (2026-10-02): profit base guard, trend window by date, quarters filled not frozen blank
+READING_VERSION = 2
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 # screener.in row label -> field. Lenders' layout uses the second label of each pair.
@@ -59,13 +60,18 @@ LABELS = {
     "EPS in Rs": "eps",
 }
 FIELDS = sorted(set(LABELS.values()))
-TREND_QUARTERS = 4
+# the trend window: the quarters in the 12 months before the latest one, chosen by date (prior_window)
 # a latest quarter older than this is not "the latest results" any more
 MAX_QUARTER_AGE_DAYS = 200
 # a turn in pace smaller than this (pp of YoY growth) is noise, not a change of direction
 DIRECTION_BAND_PP = 5.0
 # one-off share of reported PBT worth naming
 ONE_OFF_NOTABLE_SHARE = 0.25
+# Profit growth is read only off a real base: the year-ago underlying profit must be at least
+# this many Rs cr AND this share of year-ago sales. Below it, +36,600% (PPLPHARMA, Rs 0.5 cr ->
+# 183 cr, review 2026-10-02) is a turnaround, not growth, and topped every group's ranking.
+PROFIT_BASE_MIN_CR = 5.0
+PROFIT_BASE_MIN_SHARE_OF_SALES = 0.05
 
 _QUARTERS_DDL = f"""
     CREATE TABLE IF NOT EXISTS {QUARTERS_TABLE} (
@@ -122,9 +128,12 @@ def ensure_tables() -> None:
 def period_end(label: str | None):
     """'Jun 2026' -> 2026-06-30; anything else -> None."""
     try:
-        return (pd.Timestamp(pd.to_datetime(label, format="%b %Y")) + pd.offsets.MonthEnd(0)).date()
+        ts = pd.to_datetime(label, format="%b %Y")
     except (TypeError, ValueError):
         return None
+    if pd.isna(ts):  # None / "" parse to NaT, which would break the NOT NULL key
+        return None
+    return (pd.Timestamp(ts) + pd.offsets.MonthEnd(0)).date()
 
 
 def quarter_rows(company_id, ticker, table: dict) -> list[dict]:
@@ -146,16 +155,28 @@ def quarter_rows(company_id, ticker, table: dict) -> list[dict]:
 
 
 def store_quarters(rows: list[dict]) -> int:
-    """Insert new (company, quarter) rows only -- first-seen values are kept (point in time)."""
+    """Insert new (company, quarter) rows; on an existing row only FILL fields still NULL
+    (a quarter first seen with blank cells is completed later) -- a value once seen is never
+    rewritten, so restatements do not change history. Returns rows inserted or filled."""
     if not rows:
         return 0
     ensure_tables()
-    df = pd.DataFrame(rows)
-    for f in FIELDS:
-        if f not in df:
-            df[f] = np.nan
-    upsert_to_db(df, QUARTERS_TABLE, unique_keys=["company_id", "period_end"], on_conflict="nothing")
-    return len(df)
+    cols = ["company_id", "period_end", "period_label", "ticker", "layout", *FIELDS]
+    values = [tuple(None if (isinstance(r.get(c), float) and np.isnan(r.get(c))) else r.get(c) for c in cols) for r in rows]
+    fill = ", ".join(f"{f} = COALESCE({QUARTERS_TABLE}.{f}, EXCLUDED.{f})" for f in FIELDS)
+    changed_if = " OR ".join(f"({QUARTERS_TABLE}.{f} IS NULL AND EXCLUDED.{f} IS NOT NULL)" for f in FIELDS)
+    sql = (f"INSERT INTO {QUARTERS_TABLE} ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "  # noqa: S608
+           f"ON CONFLICT (company_id, period_end) DO UPDATE SET {fill} WHERE {changed_if}")
+
+    def _op() -> int:
+        n = 0
+        with db_session() as (_, cur):
+            for v in values:
+                cur.execute(sql, v)
+                n += cur.rowcount
+        return n
+
+    return int(execute_db_operation(_op, operation_name=f"{QUARTERS_TABLE}:store") or 0)
 
 
 # --- the reading --------------------------------------------------------------------------
@@ -186,12 +207,18 @@ def read_company(q: pd.DataFrame, as_of) -> dict | None:
     def year_ago(i):
         return idx.get(ends[i] - pd.offsets.MonthEnd(12))
 
+    def prior_window(i):
+        """Quarters in the 12 months before quarter i, by DATE (a missing quarter must not
+        stretch the window back in time)."""
+        start = ends[i] - pd.offsets.MonthEnd(12)
+        return [k for k in range(i) if ends[k] >= start]
+
     # underlying PBT: this quarter's other income swapped for its recent median
     oi = q.get("other_income", pd.Series(np.nan, index=q.index))
     pbt = q.get("pbt", pd.Series(np.nan, index=q.index))
 
     def normal_other_income(i):
-        prior = oi.iloc[max(0, i - TREND_QUARTERS):i].dropna()
+        prior = oi.iloc[prior_window(i)].dropna()
         return float(prior.median()) if len(prior) >= 2 else np.nan
 
     def underlying(i):
@@ -208,15 +235,25 @@ def read_company(q: pd.DataFrame, as_of) -> dict | None:
                 out[i] = _yoy(value_at(i), value_at(j))
         return out
 
-    sales_yoy = series_yoy(lambda i: q["sales"].iloc[i] if "sales" in q else np.nan)
-    profit_yoy = series_yoy(underlying)
+    sales = q["sales"] if "sales" in q else pd.Series(np.nan, index=q.index)
+    sales_yoy = series_yoy(lambda i: sales.iloc[i])
+
+    def profit_yoy_at(i):
+        j = year_ago(i)
+        base, then_sales = underlying(j), sales.iloc[j]
+        if pd.isna(base) or base < PROFIT_BASE_MIN_CR or pd.isna(then_sales) or then_sales <= 0 \
+                or base < PROFIT_BASE_MIN_SHARE_OF_SALES * then_sales:
+            return np.nan
+        return _yoy(underlying(i), base)
+
+    profit_yoy = {i: profit_yoy_at(i) for i in range(len(q)) if year_ago(i) is not None}
     opm = q.get("opm_pct", pd.Series(np.nan, index=q.index))
     margin_chg = {i: (opm.iloc[i] - opm.iloc[j]) for i in range(len(q)) if (j := year_ago(i)) is not None
                   and pd.notna(opm.iloc[i]) and pd.notna(opm.iloc[j])}
 
     def now_and_trend(series: dict):
         now = series.get(latest, np.nan)
-        prior = [series[i] for i in range(latest - TREND_QUARTERS, latest) if i in series and pd.notna(series[i])]
+        prior = [series[i] for i in prior_window(latest) if i in series and pd.notna(series[i])]
         trend = float(np.median(prior)) if len(prior) >= 2 else np.nan
         return now, trend, (now - trend) if pd.notna(now) and pd.notna(trend) else np.nan
 
@@ -227,7 +264,7 @@ def read_company(q: pd.DataFrame, as_of) -> dict | None:
     one_off = float(oi.iloc[latest] - n_oi) if pd.notna(oi.iloc[latest]) and pd.notna(n_oi) else np.nan
     reported = pbt.iloc[latest]
     share = abs(one_off) / abs(reported) if pd.notna(one_off) and pd.notna(reported) and reported != 0 else np.nan
-    sales_q = q["sales"].iloc[latest] if "sales" in q else np.nan
+    sales_q = sales.iloc[latest]
     return {
         "latest_period_end": ends[latest].date(), "quarters_seen": len(q),
         "sales_q_cr": sales_q, "sales_yoy_pct": s_now, "sales_trend_yoy_pct": s_trend,

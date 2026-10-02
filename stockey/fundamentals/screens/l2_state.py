@@ -1318,6 +1318,15 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
     # (pledge_increase events and the sector percentile now come from the daily
     # market snapshot above -- see MARKET_SNAPSHOT_TABLE.)
 
+    # Quarterly history first (results_reading): if it cannot be stored, the crawl is NOT
+    # marked done, so these companies are fetched again next run rather than losing their
+    # quarters until the 75-day cooldown expires (review 2026-10-02).
+    quarters_ok = True
+    try:
+        quarters_stored = results_reading.store_quarters(quarter_rows)
+    except Exception as exc:  # noqa: BLE001 -- L2 state below is still written; only the cooldown waits
+        quarters_stored, quarters_ok = 0, False
+        _record_market_wide_query_fallback("quarterly_results_store", exc)
     if rows:
         upsert_to_db(
             pd.DataFrame(rows),
@@ -1325,14 +1334,11 @@ def run_l2_state_refresh(session=None, *, limit: int | None = None) -> dict[str,
             unique_keys=["company_id", "run_date", "state_vector_version"],
         )
         # Only advance a company's crawl-state cooldown once its L2 state row for
-        # THIS cycle is confirmed durably written -- see the loop above for why.
-        for company_id, ticker in crawled:
-            _mark_crawled(company_id, ticker)
-    try:
-        quarters_stored = results_reading.store_quarters(quarter_rows)
-    except Exception as exc:  # noqa: BLE001 -- the quarterly history is a side output; L2 state is already written
-        quarters_stored = 0
-        _record_market_wide_query_fallback("quarterly_results_store", exc)
+        # THIS cycle is confirmed durably written -- see the loop above for why --
+        # and its quarterly table too.
+        if quarters_ok:
+            for company_id, ticker in crawled:
+                _mark_crawled(company_id, ticker)
     if institutional_entry_events or pledge_increase_events:
         _ensure_events_schema()
         if institutional_entry_events:

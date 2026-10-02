@@ -357,6 +357,9 @@ func quantiles(v []float64) Quantiles {
 func (u *Universe) Stats(from time.Time) RunStats {
 	p := u.Panel
 	start := sort.Search(len(p.Weeks), func(i int) bool { return !p.Weeks[i].Before(from) })
+	// Only COMPLETED runs observed whole: a run already under way at `start` (left-censored),
+	// one cut short by a data gap or delisting, or still open at the end is not counted --
+	// all three would bias the lengths short (review 2026-10-02).
 	var s2 []float64
 	for sym, cls := range u.StockCls {
 		st := p.Stocks[sym]
@@ -369,7 +372,9 @@ func (u *Universe) Stats(from time.Time) RunStats {
 				run++
 				continue
 			}
-			if run > 0 && began > 0 && st.Eligible[began-1] {
+			ended := cls[i].Stage != stage.StageUnknown && !math.IsNaN(st.Close[i])
+			leftCensored := began == start && start > 0 && cls[start-1].Stage == stage.Stage2Advancing
+			if run > 0 && ended && !leftCensored && began > 0 && st.Eligible[began-1] {
 				s2 = append(s2, float64(run))
 			}
 			run = 0
@@ -379,6 +384,9 @@ func (u *Universe) Stats(from time.Time) RunStats {
 	entries := 0
 	for _, ind := range u.Industries {
 		run, trun := 0, 0
+		// runs already under way at the start are left-censored: skip their first stretch
+		skipLead := start > 0 && ind.Leading[start-1]
+		skipTop := start > 0 && ind.Rank[start-1] > 0 && ind.Rank[start-1] <= u.industryCut(start-1, LeadingFraction)
 		for i := start; i < len(p.Weeks); i++ {
 			ranked := 0
 			for _, o := range u.Industries {
@@ -390,8 +398,12 @@ func (u *Universe) Stats(from time.Time) RunStats {
 			if inTop {
 				trun++
 			} else if trun > 0 {
-				top = append(top, float64(trun))
-				trun = 0
+				if !skipTop {
+					top = append(top, float64(trun))
+				}
+				trun, skipTop = 0, false
+			} else {
+				skipTop = false
 			}
 			if ind.Leading[i] {
 				if run == 0 && i > start {
@@ -400,10 +412,10 @@ func (u *Universe) Stats(from time.Time) RunStats {
 				run++
 				continue
 			}
-			if run > 0 {
+			if run > 0 && !skipLead {
 				lead = append(lead, float64(run))
 			}
-			run = 0
+			run, skipLead = 0, false
 		}
 	}
 	weeks := float64(len(p.Weeks) - start)

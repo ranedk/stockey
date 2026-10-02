@@ -64,11 +64,11 @@ INCR_TABLES=(               # incremental on the "date" column + reconciliation
   nseindia_circuit_hit      # price-band hits, 2013+ — trait library, revived 2026-09-11
   nseindia_indices          # index OHLCV + PE/PB/divyield (carry inputs)
   advisory_adjusted_ohlcv_daily  # ADJUSTED closes 2013+, incl. delisted — primary backtest series.
-  bse_advisory_adjusted_ohlcv_daily  # BSE adjusted series (2025-08+) — stage API only: BSE-only names + pre-NSE history (2026-09-24)
-  fundamentals_story_filter_daily    # stockey's daily story score + flaw flag (2026-09-29+), for stage2-rs-leaders-clean (2026-10-01)
                                   # A view on the source side since 2026-08-14 (was a written table);
                                   # now also carries tr_adj_open/high/low/close (total-return-adjusted,
                                   # dividend-reinvested) -- previously only in the removed nseindia_ohlcv_adjusted.
+  bse_advisory_adjusted_ohlcv_daily  # BSE adjusted series (2025-08+) — stage API only: BSE-only names + pre-NSE history (2026-09-24)
+  fundamentals_story_filter_daily    # stockey's daily story score + flaw flag (2026-09-29+), for stage2-rs-leaders-clean (2026-10-01)
 )
 
 # Atomic full copy: spool source rows to disk first, then swap the table

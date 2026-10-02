@@ -62,6 +62,10 @@ REBALANCE_BAND = 0.5          # act only when a position is 50% away from its ta
 COUNTERFACTUAL_HORIZONS = (20, 40, 60)
 LIVE_MAX_AGE_DAYS = 3
 URGENT_REASONS = ("stop_loss", "trailing_stop", "thesis_broken")
+HARD_ALERT_COOLDOWN_DAYS = 14  # = portfolio_runner.STOP_COOLDOWN_DAYS's default
+# the hard contradictions of portfolio_exit (kept in step by a test)
+HARD_NEGATIVE_TRIGGERS = ("results_decline", "rating_downgrade", "pledge_increase", "auditor_change",
+                          "insider_sell_surprise")
 
 ADJUSTMENT_TABLE = "fundamentals_portfolio_adjustment"
 COUNTERFACTUAL_TABLE = "fundamentals_portfolio_counterfactual"
@@ -125,7 +129,11 @@ def load_candidates() -> pd.DataFrame:
                               ORDER BY read_at DESC LIMIT 1) r ON TRUE
          WHERE w.status = 'active' AND l.in_band AND coalesce(l.flaws, '') = ''
            AND l.scored_at >= now() - make_interval(days => %s)
-        """, params=(LIVE_MAX_AGE_DAYS,))
+           -- a hard negative alert in the cooldown window blocks a NEW entry, as it would force an exit
+           AND NOT EXISTS (SELECT 1 FROM fundamentals_l3_alerts a
+                            WHERE a.company_master_id = w.company_master_id AND a.trigger_type = ANY(%s)
+                              AND a.load_ts >= now() - make_interval(days => %s))
+        """, params=(LIVE_MAX_AGE_DAYS, list(HARD_NEGATIVE_TRIGGERS), HARD_ALERT_COOLDOWN_DAYS))
 
 
 def evaluate_entry_candidates() -> dict[str, object]:
@@ -273,7 +281,8 @@ def tax_guard_holds(opened_at, entry_price, price, today) -> bool:
     """A non-urgent exit waits while held in the last TAX_GUARD_DAYS before the first
     anniversary with a gain (a loss gains nothing by waiting). Unknown price -> assume a gain."""
     held = days_held(opened_at, today)
-    if not (LONG_TERM_DAYS - TAX_GUARD_DAYS <= held < LONG_TERM_DAYS):
+    # long-term needs MORE than 12 months: a sale on the anniversary itself is still short-term
+    if not (LONG_TERM_DAYS - TAX_GUARD_DAYS <= held <= LONG_TERM_DAYS):
         return False
     if price is None or entry_price is None or pd.isna(entry_price):
         return True
@@ -285,11 +294,13 @@ def fading(recent_scores: list[float]) -> bool:
 
 
 def v3_exit_action(p, *, price, trail_high, live: dict | None, hard_events: list[dict],
-                   recent_scores: list[float], valuation_ratio, today) -> dict | None:
+                   recent_scores: list[float], valuation_ratio, today, entry_adjusted=None) -> dict | None:
     """One v3 position's action today: {'action': 'exit'|'trim'|'wait', 'reason', 'detail'}
     or None. `p` needs entry_price, stop_pct, opened_at, daily_vol_pct, story_score_at_entry,
     trim_count, target_date."""
-    entry = float(p.entry_price) if p.entry_price is not None and not pd.isna(p.entry_price) else None
+    # entry on today's adjusted basis when known (a split since entry rescales it), else as stored
+    entry = float(entry_adjusted) if entry_adjusted is not None and not pd.isna(entry_adjusted) else (
+        float(p.entry_price) if p.entry_price is not None and not pd.isna(p.entry_price) else None)
     if entry and price is not None:
         lv = stop_levels(entry, p.stop_pct, trail_high, p.daily_vol_pct)
         if lv["effective"] is not None and price <= lv["effective"]:

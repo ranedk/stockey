@@ -63,3 +63,39 @@ PRE-REGISTERED VERDICT R2-rotation-mkt: survives=false, beats P=false, not below
   
   PRE-REGISTERED VERDICT R1-rotation: survives=false, beats P=false, not below momentum=true -> FAILS
   PRE-REGISTERED VERDICT R2-rotation-mkt: survives=false, beats P=false, not below momentum=false -> FAILS
+
+----- CORRECTED RUN 2026-10-02 (after code review; same pre-registered rules, decisive) -----
+Fixes: the cash line is no longer charged turnover nor shuffled onto a stock by the random controls; names-held and
+flat-week counts stop at 2021-12-31. Verdicts unchanged.
+  INDUSTRY ROTATION — pre-registered, research/preregistrations/2026-10-01_industry_rotation.md
+  NSE adjusted EQ, Rs 10 cr floor, 2013-07-01..2021-12-31; weekly decisions on the last completed week, fill at the next open;
+  20 names, max 4 per industry, rebalance every 4 weeks, 2x buffer, 30-week-MA exits to cash; 50 bps round trip.
+  R1 = Stage 2 names in LEADING industries (RS26 top fifth + industry Stage 2), by RS26. R2 = R1, flat while the
+  market index is in Stage 4. P = plain Stage 2 by RS26, same machinery (reference, not a trial).
+  Industry membership: today's classification applied to all history (named caveat). The cash line is one
+  zero-return name in the equal-weight control's universe of ~800 (negligible); it is never charged turnover and
+  the random controls shuffle only the stock weights (fixed 2026-10-02 after review; first run reported below).
+  
+                        the book: ret / vol / maxDD  turnover               equal-weight           same-size random
+    R1-rotation               15.1% / 17.3% / -29%      595%       12.5% / 22.2% / -58%        9.0% / 13.5% / -35%
+    R2-rotation-mkt           11.9% / 17.0% / -32%      620%       12.5% / 22.2% / -58%        7.4% / 13.1% / -38%
+  
+    %/month              raw vs EW  matched vs EW (p) matched vs rnd (p)   100 bps   FDR q    DSR corr w/ mom  verdict
+    R1-rotation              +0.05     +0.39 (0.224)     +0.20 (0.196)     +0.20   0.397  0.717        0.34  does not survive
+    R2-rotation-mkt          -0.18     +0.12 (0.397)     +0.13 (0.283)     +0.04   0.397  0.509        0.32  does not survive
+  
+  Deciding: matched-risk edge over the tougher control; survive = beats both, FDR discovery within the family,
+  100-bps edge not negative. 'corr w/ mom' = daily gross excess (book - equal-weight) vs the momentum lookback
+  blend's, run here on the same days (weekly rebalanced); >= 0.8 means the same bet.
+  plain Stage 2 (P): 23.3% / 26.7% / -46%, turnover 999%/yr
+  
+  R1-rotation vs P (net, paired monthly): -0.72%/month, p = 0.960  [criterion 2: positive with p < 0.10]
+  R1-rotation vs momentum blend at matched risk: +0.30%/month (p = 0.244)  [criterion 3: not below zero]
+  R1-rotation mean names held 10.6; weeks flat on the market filter 0 of 444
+  
+  R2-rotation-mkt vs P (net, paired monthly): -0.94%/month, p = 0.992  [criterion 2: positive with p < 0.10]
+  R2-rotation-mkt vs momentum blend at matched risk: -0.02%/month (p = 0.507)  [criterion 3: not below zero]
+  R2-rotation-mkt mean names held 9.8; weeks flat on the market filter 79 of 444
+  
+  PRE-REGISTERED VERDICT R1-rotation: survives=false, beats P=false, not below momentum=true -> FAILS
+  PRE-REGISTERED VERDICT R2-rotation-mkt: survives=false, beats P=false, not below momentum=false -> FAILS

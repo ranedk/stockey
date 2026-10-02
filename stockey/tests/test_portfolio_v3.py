@@ -127,3 +127,22 @@ def test_rebalance_signals_only_outside_the_band():
     # both targets are 4% of 1 crore = 4 lakh; A doubled (8 lakh, >150%), B up 20% (inside the band)
     out = v3.rebalance_signals(book, {"A": 200.0, "B": 120.0}, 1e7, 25)
     assert [(s["ticker"], s["kind"]) for s in out] == [("A", "rebalance_down")]
+
+
+def test_tax_guard_holds_through_the_anniversary_day():
+    opened = pd.Timestamp("2025-12-01", tz="UTC")
+    assert v3.tax_guard_holds(opened, 100, 120, pd.Timestamp("2026-12-01"))       # day 365: still short-term
+    assert not v3.tax_guard_holds(opened, 100, 120, pd.Timestamp("2026-12-02"))   # day 366: long-term
+
+
+def test_a_split_since_entry_does_not_fire_a_false_stop():
+    # stored raw entry 1,000 before a 1:2 split; the adjusted series now says entry 500, price 480
+    p = _pos(entry_price=1000.0, stop_pct=15.0)
+    assert _act(p=p, price=480.0, trail_high=None, entry_adjusted=500.0) is None
+    assert _act(p=p, price=480.0, trail_high=None)["reason"] == "stop_loss"   # the bug without it
+
+
+def test_hard_negative_lists_stay_in_step():
+    from fundamentals.screens.portfolio_exit import HARD_NEGATIVE_TRIGGERS
+
+    assert set(v3.HARD_NEGATIVE_TRIGGERS) == set(HARD_NEGATIVE_TRIGGERS)

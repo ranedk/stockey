@@ -78,6 +78,12 @@ func runSnapshot(ctx context.Context, st *store.Store) error {
 	if last < 0 {
 		return fmt.Errorf("no weekly data")
 	}
+	// The current week is unfinished until its Friday: report the last COMPLETED week, the one
+	// the paper tracks act on, rather than a mid-week reading (review 2026-10-02).
+	ist := time.Now().In(time.FixedZone("IST", 5*3600+1800))
+	if w := u.Panel.Weeks[last]; w.Weekday() != time.Friday && rotation.WeekKey(w) == rotation.WeekKey(ist) && last > 0 {
+		last--
+	}
 	snap := u.Snapshot(last, names)
 	if err := st.EnsureRotationTables(ctx); err != nil {
 		return err

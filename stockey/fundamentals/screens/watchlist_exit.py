@@ -353,10 +353,14 @@ def evaluate_exit_status(row: dict, trigger_history: list[dict], *, today) -> tu
         return "invalidated", invalidated_reason, False
 
     price_data_stale = _price_data_is_effectively_stale(row.get("price_data_stale"), row.get("technicals_as_of_date"), today=today)
-    price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"), price_data_stale=price_data_stale)
+    # The "look again" price flag judges the move since an ALERT admitted the name; a member
+    # held on its story is judged by the story, not by a price set in the alert era -- a
+    # strong story up 50% would otherwise be flagged out of the portfolio's reach (review 2026-10-02).
+    price_reason = _check_price_flagged(row.get("first_seen_price"), row.get("current_price"),
+                                        price_data_stale=price_data_stale) if event_only else None
     if price_reason:
         return "price_flagged", price_reason, False
-    if price_data_stale and row.get("previous_status") == "price_flagged":
+    if event_only and price_data_stale and row.get("previous_status") == "price_flagged":
         # A stale price cannot UN-flag a name (2026-09-23 audit): skipping the check used
         # to fall through to 'active', so a flagged name flipped active for a day on
         # frozen data -- where the portfolio ruleset could enter it -- and flagged again

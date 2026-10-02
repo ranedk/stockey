@@ -122,6 +122,11 @@ type Spec struct {
 	// MaxPerGroup caps the strategy book's names per Obs.Group (the Sharpely/NSE industry);
 	// 0 = no cap.
 	MaxPerGroup int
+	// StoppedSlotsToCash keeps a stopped-out name's weight in cash until the next rebalance.
+	// Without it the daily exposure rescale spreads that weight over the remaining names the
+	// same day -- the behaviour every earlier stop experiment was measured with, so it stays
+	// the default (review 2026-10-02).
+	StoppedSlotsToCash bool
 	// FundamentalFilter also excludes, from the strategy's buying list only, names that fail
 	// stockey's filter on the decision day (FundamentalPass: a flaw, a story score below that
 	// day's median, or no score). Zero value = off.
@@ -475,6 +480,7 @@ func Stage2RSLeadersSpec() Spec {
 	s.Stage2Only = true
 	s.MaxPerGroup = 4
 	s.Stop = StopSignal
+	s.StoppedSlotsToCash = true
 	return s
 }
 
@@ -766,7 +772,7 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 					target = targetWeights(name, spec, d)
 				}
 			}
-			if name == BookStrategy {
+			if name == BookStrategy && !(spec.StoppedSlotsToCash && !rebalance && spec.Overlay == OverlayNone) {
 				target = rescale(target, exposure)
 			}
 			if changed(held, target) {
@@ -1383,6 +1389,21 @@ func nextRebalanceIndexDate(days []Day, every int) time.Time {
 
 // DaysToNextRebalance counts trading days from the last computed day to the
 // next scheduled rebalance.
+// PendingExits are the strategy positions whose stop (or exit signal) fired at the last close,
+// to be sold at the next open -- for the order sheet on a day that is not a rebalance.
+func (t *Track) PendingExits() []string {
+	b := t.Books[BookStrategy]
+	if b == nil {
+		return nil
+	}
+	out := make([]string, 0, len(b.pendingExits))
+	for s := range b.pendingExits {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (t *Track) DaysToNextRebalance() int {
 	if len(t.Dates) == 0 {
 		return 0

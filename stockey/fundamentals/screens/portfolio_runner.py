@@ -65,6 +65,10 @@ SYNC_SOURCE_NAME = "fundamentals.screens.portfolio_runner"
 # was sized on (1.5x the 10-day sigma), so re-entry needs the price to have done something
 # other than sit where the stop fired.
 STOP_COOLDOWN_DAYS = int(os.getenv("PORTFOLIO_STOP_COOLDOWN_DAYS", "14"))
+# Price exits only. A thesis exit (v1/v2 thesis_invalidation, v3 thesis_broken) is a statement
+# about the company and keeps no cooldown; v3 cannot re-buy one anyway -- a flaw removes it
+# from the candidates and a hard alert blocks entry for 14 days (portfolio_v3.load_candidates).
+COOLDOWN_CLOSE_REASONS = ("stop_loss", "trailing_stop")
 
 # One-time catch-up admission (operator, 2026-09-26; fundamentals/screens/catchup_admission.py).
 # Companies new to the universe whose signals from the last 60 days were stored as history
@@ -257,13 +261,16 @@ def _open_accepted_tickers() -> set[str]:
 
 
 def _recently_stopped_tickers() -> dict:
-    """Names stopped out inside the cooldown, mapped to WHEN the stop fired."""
+    """Names stopped out inside the cooldown, mapped to WHEN the stop fired. Ruleset v3's
+    trailing stop counts too: exits run before entries, so without it a name sold at 22:00 was
+    re-bought minutes later at the same price while its score was still in band (review
+    2026-10-02 -- the CHEMBOND pattern)."""
     df = sql_to_df(
         "SELECT ticker, max(closed_at) AS stopped_at FROM fundamentals_portfolio_position "
-        "  WHERE status = 'closed' AND close_reason = 'stop_loss' "
+        "  WHERE status = 'closed' AND close_reason = ANY(%s) "
         "    AND closed_at >= now() - make_interval(days => %s) "
         "  GROUP BY ticker",
-        params=(STOP_COOLDOWN_DAYS,),
+        params=(list(COOLDOWN_CLOSE_REASONS), STOP_COOLDOWN_DAYS),
     )
     return {} if df.empty else dict(zip(df["ticker"], df["stopped_at"]))
 
@@ -455,8 +462,10 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         pool = [{"company_master_id": r.company_master_id, "story_score": r.story_score,
                  "daily_vol_pct": r.daily_vol_pct, "sector_code": r.sector_code} for r in v3_book.itertuples()]
         held = {p["company_master_id"] for p in pool}
+        # candidates already held under ANY ruleset (v1 names still open) are skipped below, so
+        # they must not take top-N places or sector budget in the weights either
         pool += [{k: c.get(k) for k in ("company_master_id", "story_score", "daily_vol_pct", "sector_code")}
-                 for c in candidates if c["company_master_id"] not in held]
+                 for c in candidates if c["company_master_id"] not in held and c["ticker"] not in already_accepted]
         weights = portfolio_v3.target_weights(pool, book_capacity)
         today_ist = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5, minutes=30)).normalize().tz_localize(None)
 
@@ -500,6 +509,14 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
         if v3 and candidate["company_master_id"] not in weights:
             # Not among the book's best `book_capacity` names by score: no weight, no call.
             outside_top.append(candidate["ticker"])
+            continue
+        if v3 and book_used >= book_capacity and portfolio_v3.weakest_replaceable(
+                v3_book[~v3_book["position_id"].isin([r["position_id"] for r in replaced])],
+                float(candidate["story_score"]), today_ist) is None:
+            # Full, and nothing it could replace: decided BEFORE the adjudicator, so a name the
+            # book has no room for is never asked -- re-asking it nightly would eventually draw
+            # a veto and fill the vetoed arm with names that were never buyable (review 2026-10-02).
+            turned_away.append(candidate["ticker"])
             continue
         verdict = adjudicate_entry(candidate)
         # Recorded BEFORE any book/duplicate branch: the adjudication happened and cost a

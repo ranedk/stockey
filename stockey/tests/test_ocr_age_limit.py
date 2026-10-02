@@ -8,7 +8,7 @@ def test_queue_and_backlog_count_both_stop_at_six_months(monkeypatch):
     ocr.load_pending_ocr_targets(10)
     ocr.count_pending_ocr_targets()
     assert ocr.OCR_MAX_AGE_DAYS == 183
-    assert all(f">= current_date - {ocr.OCR_MAX_AGE_DAYS}" in q and "disclosure_date" in q for q in seen)
+    assert all(f"AT TIME ZONE 'Asia/Kolkata')::date - {ocr.OCR_MAX_AGE_DAYS}" in q and "disclosure_date ~" in q for q in seen)
 
 
 def test_too_old_is_a_finished_status_for_the_rule_pass():

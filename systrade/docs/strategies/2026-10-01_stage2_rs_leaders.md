@@ -23,7 +23,7 @@
 ## 2. Why
 
 LEDGER row 53 tested restricting Stage 2 to RS-leading industries; it failed. Its plain
-Stage 2 REFERENCE book -- this rule -- returned 22.1%/yr (vol 26.6%, max drawdown −47%) against
+Stage 2 REFERENCE book -- this rule -- returned 22.1%/yr (23.3% in the 2026-10-02 corrected run; vol 26.6%, max drawdown −47%) against
 13.5% for the equal-weight universe, 2013-07 → 2021-12. That number is IN-SAMPLE and was seen
 before this spec was written: the rule was not a pre-registered trial, the Weinstein family's
 exploration years are spent (rows 37-40), and row 38's (a) — every Stage 2 name, no ranking —

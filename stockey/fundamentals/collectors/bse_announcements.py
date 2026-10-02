@@ -668,7 +668,7 @@ def build_result_calendar_row(scrip_code: str, company_master_id: str, isin: str
 # Intraday pass (reevaluation PRD 4.2): re-reads today back to this long before the newest
 # filing already stored for today. The overlap covers filings BSE disseminates slightly out
 # of order; the upsert dedups what is read twice.
-INTRADAY_OVERLAP_MINUTES = 15
+INTRADAY_OVERLAP_MINUTES = 60  # was 15; a filing disseminated late within the hour is still read
 
 
 def intraday_stop_before(today):
@@ -719,10 +719,13 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
         for code, cmid, isin in zip(universe["bse_scrip_code"], universe["company_master_id"], universe["isin"])
     }
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    stops: dict = {}
     if intraday:
-        days, stop_before = [today], intraday_stop_before(today)
+        # just after midnight IST the previous day's last filings (23:47-24:00) are read too
+        days = ([today - timedelta(days=1)] if pd.Timestamp.now(tz="Asia/Kolkata").hour == 0 else []) + [today]
+        stops = {d: intraday_stop_before(d) for d in days}
     else:
-        days, stop_before = days_to_fetch(today=today, lookback_days=lookback_days if lookback_days is not None else LOOKBACK_DAYS), None
+        days = days_to_fetch(today=today, lookback_days=lookback_days if lookback_days is not None else LOOKBACK_DAYS)
 
     rows: list[dict] = []
     failed_days: list[str] = []
@@ -732,7 +735,7 @@ def run_bse_l3_detection(*, limit: int | None = None, lookback_days: int | None 
 
     for day in days:
         try:
-            raw_rows = fetch_market_announcements(day, stop_before=stop_before) if intraday else fetch_market_announcements(day)
+            raw_rows = fetch_market_announcements(day, stop_before=stops.get(day)) if intraday else fetch_market_announcements(day)
         except Exception as exc:  # noqa: BLE001 -- classified as a failure either way
             consecutive_failures += 1
             failed_days.append(str(day))
@@ -1136,7 +1139,7 @@ if __name__ == "__main__":
     if args.intraday:
         intraday_result = run_bse_l3_detection(intraday=True)
         print(json.dumps({"source": f"{SYNC_SOURCE_NAME}:intraday", **intraday_result}, ensure_ascii=False, default=str), flush=True)
-        sys.exit(0)
+        sys.exit(1 if intraday_result.get("blocked") or intraday_result.get("failed_days") else 0)
 
     if args.backfill:
         backfill_result = run_auditor_rpt_backfill(limit=args.limit or None, lookback_days=args.lookback_days)

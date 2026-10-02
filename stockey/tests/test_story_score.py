@@ -61,3 +61,10 @@ def test_one_off_return_voids_its_five_year_average_and_tiny_bases_do_not_accele
     x = ss.derive(pd.DataFrame(rows)).set_index("ticker")
     assert pd.isna(x.at["C70", "roe_5y_avg_pct"]) and pd.isna(x.at["C70", "roe_pct"])
     assert pd.isna(x.at["C71", "rr_sales_vs_trend_pp"]) and pd.notna(x.at["C1", "rr_sales_vs_trend_pp"])
+
+
+def test_no_results_reading_is_missing_data_not_a_crash():
+    rows = [_company(i) for i in range(10)]
+    df = pd.DataFrame(rows).drop(columns=[c for c in rows[0] if c.startswith("rr_")])
+    out = ss.score(df)
+    assert len(out) == 10 and out["story_score"].notna().all()

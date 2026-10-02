@@ -465,7 +465,12 @@ def readmit_bse_sast_failures() -> None:
 # years old. Older rows get the visible terminal status below, never a silent skip.
 OCR_MAX_AGE_DAYS = env.int("FUNDAMENTALS_OCR_MAX_AGE_DAYS", 183)
 SKIPPED_TOO_OLD = "skipped_too_old"
-_FILING_DATE_SQL = "COALESCE(disclosure_date::date, (announcement_timestamp AT TIME ZONE 'Asia/Kolkata')::date)"
+# A malformed disclosure_date must not make the cast throw and stop OCR, and a row with no
+# date at all counts as too old rather than waiting unqueued forever (review 2026-10-02).
+_FILING_DATE_SQL = ("COALESCE(CASE WHEN disclosure_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+                    "THEN substr(disclosure_date, 1, 10)::date END, "
+                    "(announcement_timestamp AT TIME ZONE 'Asia/Kolkata')::date, DATE '1900-01-01')")
+_IST_TODAY_SQL = "(now() AT TIME ZONE 'Asia/Kolkata')::date"
 
 
 def mark_too_old_skipped() -> int:
@@ -477,7 +482,7 @@ def mark_too_old_skipped() -> int:
                 UPDATE fundamentals_events SET ocr_status = %s
                  WHERE (ocr_status IS NULL OR ocr_status = 'pending')
                    AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
-                   AND {_FILING_DATE_SQL} < current_date - %s
+                   AND {_FILING_DATE_SQL} < {_IST_TODAY_SQL} - %s
                 """,
                 (SKIPPED_TOO_OLD, OCR_MAX_AGE_DAYS),
             )
@@ -504,7 +509,7 @@ def load_pending_ocr_targets(limit: int | None = None) -> pd.DataFrame:
         FROM fundamentals_events
         WHERE (ocr_status IS NULL OR ocr_status = 'pending')
           AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
-          AND """ + _FILING_DATE_SQL + """ >= current_date - """ + str(int(OCR_MAX_AGE_DAYS)) + """
+          AND """ + _FILING_DATE_SQL + " >= " + _IST_TODAY_SQL + """ - """ + str(int(OCR_MAX_AGE_DAYS)) + """
         -- Documents that already timed out go to the BACK (2026-09-23 audit): they used
         -- to lead every run in the same order, tripping the timeout breaker before any
         -- fresh filing was reached.
@@ -525,7 +530,7 @@ def count_pending_ocr_targets() -> int:
         FROM fundamentals_events
         WHERE (ocr_status IS NULL OR ocr_status = 'pending')
           AND (attachment_name IS NOT NULL OR rationale_pdf_url IS NOT NULL)
-          AND """ + _FILING_DATE_SQL + """ >= current_date - """ + str(int(OCR_MAX_AGE_DAYS)) + """
+          AND """ + _FILING_DATE_SQL + " >= " + _IST_TODAY_SQL + """ - """ + str(int(OCR_MAX_AGE_DAYS)) + """
         """
     )
     return int(df.iloc[0]["n"]) if not df.empty else 0

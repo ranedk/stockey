@@ -120,6 +120,7 @@ func runRotationPart(cache string, from, to time.Time, floor, costBps float64, b
 	scs = append(scs, memberScorers(momNames, nil)...)
 	days := withCash(buildScores(cache, scs, from, to, floor, minBars), len(rotationBooks))
 	names := scorerNames(scs)
+	cfg.HasCash, cfg.CashSym = true, cashSym // cash is not traded and is not shuffled onto a stock
 	res, err := sleeve.Run(days, names, cfg)
 	fatalIf(err)
 
@@ -171,7 +172,8 @@ func runRotationPart(cache string, from, to time.Time, floor, costBps float64, b
 	fmt.Println("R1 = Stage 2 names in LEADING industries (RS26 top fifth + industry Stage 2), by RS26. R2 = R1, flat while the")
 	fmt.Println("market index is in Stage 4. P = plain Stage 2 by RS26, same machinery (reference, not a trial).")
 	fmt.Println("Industry membership: today's classification applied to all history (named caveat). The cash line is one")
-	fmt.Println("zero-return name in the equal-weight control's universe of ~800 (negligible).")
+	fmt.Println("zero-return name in the equal-weight control's universe of ~800 (negligible); it is never charged turnover and")
+	fmt.Println("the random controls shuffle only the stock weights (fixed 2026-10-02 after review; first run reported below).")
 	fmt.Println()
 	printVersions(vs)
 	fmt.Printf("plain Stage 2 (P): %.1f%% / %.1f%% / %.0f%%, turnover %.0f%%/yr\n\n",
@@ -179,7 +181,10 @@ func runRotationPart(cache string, from, to time.Time, floor, costBps float64, b
 	for k, bk := range rotationBooks[1:] {
 		pe, me := plainEdges[k], momEdges[k]
 		heldSum, weeksN, off := 0, 0, 0
-		for _, w := range weeksByBook[k+1][start:] {
+		for wi, w := range weeksByBook[k+1][start:] {
+			if u.Panel.Weeks[start+wi].After(to) {
+				break // the 2022+ confirmation years stay unread, in the counts too
+			}
 			heldSum += len(w.Held)
 			weeksN++
 			if w.MarketOff {

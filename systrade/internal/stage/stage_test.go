@@ -239,3 +239,23 @@ func TestDailyViewUsesOnlyCompletedWeeks(t *testing.T) {
 		t.Fatalf("steady riser ends in Stage 2, got %v", v[len(v)-1].Stage)
 	}
 }
+
+func TestDailyViewDoesNotTreatAnUnfinishedWeekAsComplete(t *testing.T) {
+	var times []time.Time
+	var closes []float64
+	d := time.Date(2020, 1, 6, 0, 0, 0, 0, time.UTC)
+	for w := 0; w < 40; w++ {
+		for k := 0; k < 5; k++ {
+			times = append(times, d)
+			closes = append(closes, 100*math.Pow(1.01, float64(w)))
+			d = d.AddDate(0, 0, 1)
+		}
+		d = d.AddDate(0, 0, 2)
+	}
+	times, closes = times[:len(times)-2], closes[:len(closes)-2] // series ends on a Wednesday
+	v := DailyView(times, closes, nil)
+	last := v[len(v)-1]
+	if last.Time.Weekday() != time.Friday || !last.Time.Before(times[len(times)-1]) {
+		t.Fatalf("a Wednesday close must not count as a completed week, got %v", last.Time)
+	}
+}

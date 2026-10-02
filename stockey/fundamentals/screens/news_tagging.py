@@ -42,6 +42,7 @@ NEWS_TABLE = "fundamentals_news_item"
 TAGS_TABLE = "fundamentals_news_tag"
 DEFAULT_MODEL = env("NEWS_TAGGING_MODEL", "gpt-5.4-mini")
 BATCH_SIZE = 15
+MAX_TAG_ATTEMPTS = 3
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 DIMENSIONS = ["growth", "margins", "balance_sheet", "value", "ownership", "sector", "governance", "events", "none"]
@@ -90,7 +91,7 @@ candidate sector. Decide:
   governance, events, none.
 - materiality 1-5 for a long-term holder: 1 trivial / routine, 3 worth knowing, 5 changes the
   investment case.
-Return one entry per item, same order, echoing its link."""
+Return one entry per item, echoing its numeric id."""
 
 # Sharpely/NSE sector codes (fundamentals_company_sector's scheme).
 SECTORS = {
@@ -111,14 +112,14 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "link": {"type": "string"},
+                    "id": {"type": "integer"},
                     "companies": {"type": "array", "items": {"type": "string"}},
                     "sector_code": {"type": ["string", "null"], "enum": [*SECTORS, None]},
                     "direction": {"type": "string", "enum": ["positive", "negative", "neutral"]},
                     "dimension": {"type": "string", "enum": DIMENSIONS},
                     "materiality": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
                 },
-                "required": ["link", "companies", "sector_code", "direction", "dimension", "materiality"],
+                "required": ["id", "companies", "sector_code", "direction", "dimension", "materiality"],
                 "additionalProperties": False,
             },
         },
@@ -134,6 +135,7 @@ def ensure_tables() -> None:
             cur.execute(_DDL)
             cur.execute(f"ALTER TABLE {NEWS_TABLE} ADD COLUMN IF NOT EXISTS tag_status TEXT")
             cur.execute(f"ALTER TABLE {NEWS_TABLE} ADD COLUMN IF NOT EXISTS tagged_at TIMESTAMPTZ")
+            cur.execute(f"ALTER TABLE {NEWS_TABLE} ADD COLUMN IF NOT EXISTS tag_attempts INTEGER")
 
     execute_db_operation(_op, operation_name=f"{TAGS_TABLE}:ensure_tables")
 
@@ -150,6 +152,11 @@ def load_companies() -> pd.DataFrame:
     if u.empty:
         return u
     u["company_master_id"] = map_company_master_ids_nse_or_bse(u["ticker"].astype("string")).to_numpy()
+    # screener.in's names are cut at 16 characters or abbreviated ("Amara Raja Ener.") -- about
+    # a third of the universe never matched a headline (review 2026-10-02). The full legal
+    # name from company_master is matched too, and the NSE symbol as the ticker.
+    full = sql_to_df("SELECT company_master_id, company_name AS full_name, nse_ticker FROM company_master")
+    u = u.merge(full, on="company_master_id", how="left")
     sectors = sql_to_df("SELECT company_master_id, sector_code FROM fundamentals_company_sector")
     return u.dropna(subset=["company_master_id"]).merge(sectors, on="company_master_id", how="left")
 
@@ -167,31 +174,43 @@ def match_text(value) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def build_matchers(companies: pd.DataFrame) -> list[tuple[re.Pattern, re.Pattern | None, str, str]]:
+def _name_rx(name) -> re.Pattern | None:
+    words = match_text(name).split()
+    while words and words[-1] in ("of", "and", "co", "company"):
+        words = words[:-1]
+    if not words or " ".join(words) in PHRASE_NAMES:
+        return None
+    if not (len(words) >= 2 or (len(words) == 1 and len(words[0]) >= 6 and words[0] not in GENERIC_WORDS)):
+        return None
+    # "reserve / state bank of india" is never the listed Bank of India
+    return re.compile(r"(?<!reserve )(?<!state )\b" + r"\s+".join(map(re.escape, words)) + r"\b")
+
+
+def _ticker_rx(ticker) -> re.Pattern | None:
+    t = str(ticker or "").strip()
+    if t.lower() in ("nan", "none") or len(t) < 4 or not re.fullmatch(r"[A-Z][A-Z0-9&-]+", t):
+        return None
+    return re.compile(r"(?<![A-Za-z0-9&-])" + re.escape(t) + r"(?![A-Za-z0-9&-])")
+
+
+def build_matchers(companies: pd.DataFrame) -> list[tuple[list[re.Pattern], list[re.Pattern], str, str]]:
     out = []
     for r in companies.itertuples():
-        words = match_text(r.company_name).split()
-        while words and words[-1] in ("of", "and", "co", "company"):
-            words = words[:-1]
-        name_rx = None
-        if " ".join(words) in PHRASE_NAMES:
-            pass
-        elif len(words) >= 2 or (len(words) == 1 and len(words[0]) >= 6 and words[0] not in GENERIC_WORDS):
-            # "reserve / state bank of india" is never the listed Bank of India
-            name_rx = re.compile(r"(?<!reserve )(?<!state )\b" + r"\s+".join(map(re.escape, words)) + r"\b")
-        ticker = str(r.ticker or "")
-        ticker_rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(ticker) + r"(?![A-Za-z0-9])") \
-            if len(ticker) >= 4 and ticker.isalpha() else None
-        if name_rx or ticker_rx:
-            out.append((name_rx, ticker_rx, r.company_master_id, r.company_name))
+        names = [x for x in (getattr(r, "full_name", None), r.company_name) if isinstance(x, str) and x.strip()]
+        name_rxs = [rx for rx in {match_text(n): _name_rx(n) for n in names}.values() if rx is not None]
+        ticker_rxs = [rx for rx in (_ticker_rx(r.ticker), _ticker_rx(getattr(r, "nse_ticker", None))) if rx is not None]
+        if name_rxs or ticker_rxs:
+            label = names[0] if names else str(r.ticker)
+            out.append((name_rxs, ticker_rxs, r.company_master_id, label))
     return out
 
 
 def candidates_for(title: str, description: str, matchers) -> list[tuple[str, str]]:
     text = match_text(f"{title} {description}")
     found = {}
-    for name_rx, ticker_rx, cmid, cname in matchers:
-        if (name_rx is not None and name_rx.search(text)) or (ticker_rx is not None and ticker_rx.search(title or "")):
+    raw_title = (title or "").replace("&amp;", "&")
+    for name_rxs, ticker_rxs, cmid, cname in matchers:
+        if any(rx.search(text) for rx in name_rxs) or any(rx.search(raw_title) for rx in ticker_rxs):
             found[cmid] = cname
     return list(found.items())
 
@@ -210,7 +229,9 @@ def classify(batch: list[dict], *, model: str = DEFAULT_MODEL) -> list[dict]:
 
 
 def tag_rows(item: dict, verdict: dict, *, model: str) -> list[dict]:
-    """Keep only what the item's candidates allow -- the model cannot add a company or sector."""
+    """The model cannot add a company: only the item's candidates are kept. It MAY name a
+    sector the feed did not hint at (oil news in the commodities feed belongs to Oil & Gas),
+    as long as it is a real sector code."""
     allowed = {c["id"]: c["name"] for c in item["candidate_companies"]}
     base = {"link": item["link"], "direction": verdict["direction"], "dimension": verdict["dimension"],
             "materiality": int(verdict["materiality"]), "first_seen_at": item["first_seen_at"], "model": model}
@@ -223,13 +244,21 @@ def tag_rows(item: dict, verdict: dict, *, model: str) -> list[dict]:
 
 
 def _set_status(links: list[str], status: str) -> None:
+    """A 'failed' item is retried until MAX_TAG_ATTEMPTS, then becomes 'failed_final' --
+    visible, and no longer padding every batch (review 2026-10-02)."""
     if not links:
         return
 
     def _op() -> None:
         with db_session() as (_, cur):
-            cur.execute(f"UPDATE {NEWS_TABLE} SET tag_status = %s, tagged_at = now() WHERE link = ANY(%s)",  # noqa: S608
-                        (status, links))
+            if status == "failed":
+                cur.execute(
+                    f"UPDATE {NEWS_TABLE} SET tag_attempts = coalesce(tag_attempts, 0) + 1, tagged_at = now(), "  # noqa: S608
+                    "tag_status = CASE WHEN coalesce(tag_attempts, 0) + 1 >= %s THEN 'failed_final' ELSE 'failed' END "
+                    "WHERE link = ANY(%s)", (MAX_TAG_ATTEMPTS, links))
+            else:
+                cur.execute(f"UPDATE {NEWS_TABLE} SET tag_status = %s, tagged_at = now() WHERE link = ANY(%s)",  # noqa: S608
+                            (status, links))
 
     execute_db_operation(_op, operation_name=f"{NEWS_TABLE}:tag_status")
 
@@ -238,8 +267,9 @@ def run(limit: int | None = None, *, model: str = DEFAULT_MODEL) -> dict[str, ob
     ensure_tables()
     items = sql_to_df(
         f"SELECT link, feed, sector_hint, title, description, first_seen_at FROM {NEWS_TABLE} "  # noqa: S608
-        "WHERE tag_status IS NULL OR tag_status = 'failed' ORDER BY first_seen_at LIMIT %s",
-        params=(limit or 100000,))
+        "WHERE tag_status IS NULL OR (tag_status = 'failed' AND coalesce(tag_attempts, 0) < %s) "
+        "ORDER BY first_seen_at LIMIT %s",
+        params=(MAX_TAG_ATTEMPTS, limit or 100000))
     if items.empty:
         return {"items": 0, "matched": 0, "tags": 0, "failed_batches": 0}
     matchers = build_matchers(load_companies())
@@ -258,9 +288,12 @@ def run(limit: int | None = None, *, model: str = DEFAULT_MODEL) -> dict[str, ob
     tags, failed = 0, 0
     for i in range(0, len(matched), BATCH_SIZE):
         batch = matched[i:i + BATCH_SIZE]
-        prompt_batch = [{k: v for k, v in m.items() if k != "first_seen_at"} for m in batch]
+        # items are addressed by a small id, not by echoing the (long) link back
+        prompt_batch = [{"id": k, **{x: v for x, v in m.items() if x not in ("first_seen_at", "link")}}
+                        for k, m in enumerate(batch)]
         try:
-            verdicts = {v["link"]: v for v in classify(prompt_batch, model=model)}
+            verdicts = {batch[v["id"]]["link"]: v for v in classify(prompt_batch, model=model)
+                        if isinstance(v.get("id"), int) and 0 <= v["id"] < len(batch)}
         except Exception as exc:  # noqa: BLE001 -- a failed batch is retried next run
             failed += 1
             _set_status([m["link"] for m in batch], "failed")

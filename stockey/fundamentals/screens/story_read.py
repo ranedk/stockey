@@ -304,9 +304,9 @@ def run(limit: int | None = None, *, model: str = DEFAULT_MODEL, dry_run: bool =
     reads, alerts, seen = [], [], []
     failed = consecutive = 0
     for cid, refs, kinds in picks:
-        evidence = evidence_for(cid, scored.loc[cid] if cid in scored.index else None,
-                                inputs.loc[cid] if cid in inputs.index else None, kinds)
         try:
+            evidence = evidence_for(cid, scored.loc[cid] if cid in scored.index else None,
+                                    inputs.loc[cid] if cid in inputs.index else None, kinds)
             read = read_company(evidence, model=model)
         except Exception as exc:  # noqa: BLE001 -- unread evidence stays pending for the next run
             failed += 1
@@ -329,20 +329,49 @@ def run(limit: int | None = None, *, model: str = DEFAULT_MODEL, dry_run: bool =
                       "confidence": read["confidence"], "alert_trigger_type": trig,
                       "story_score": evidence["story_score"]["score"], "model": model, "prompt_version": PROMPT_VERSION,
                       "evidence_json": dumps_strict(evidence)})
-        seen.extend({"company_master_id": cid, "ref": r, "read_at": now} for r in refs)
+        company_seen = [{"company_master_id": cid, "ref": r, "read_at": now} for r in refs]
+        alert = None
         if trig:
-            alerts.append({"source": "story_read", "news_id": f"{cid}:{now.isoformat()}", "trigger_type": trig,
-                           "origin": "llm_story_read", "company_master_id": cid, "alert_date": as_of,
-                           "reasoning": read["story"] if trig == "story_read_positive" else (read["deal_breaker"] or read["story"]),
-                           "status": "new", "model": model, "prompt_version": PROMPT_VERSION,
-                           "evidence_bundle_json": dumps_strict(evidence), "load_ts": now})
-    if reads:
-        upsert_to_db(pd.DataFrame(reads), READ_TABLE, unique_keys=["company_master_id", "read_at"])
-        if alerts:
-            upsert_to_db(pd.DataFrame(alerts), ALERTS_TABLE, unique_keys=["source", "news_id", "trigger_type"])
-        # evidence counts as read only once the read itself is stored
-        upsert_to_db(pd.DataFrame(seen), SEEN_TABLE, unique_keys=["company_master_id", "ref"], on_conflict="nothing")
+            alert = {"source": "story_read", "news_id": f"{cid}:{now.isoformat()}", "trigger_type": trig,
+                     "origin": "llm_story_read", "company_master_id": cid, "alert_date": as_of,
+                     "reasoning": read["story"] if trig == "story_read_positive" else (read["deal_breaker"] or read["story"]),
+                     "status": "new", "model": model, "prompt_version": PROMPT_VERSION,
+                     "evidence_bundle_json": dumps_strict(evidence), "load_ts": now}
+        # The read, its alert and the evidence it covered are stored TOGETHER, per company, as
+        # soon as the read returns: a later failure loses nothing already paid for, and the
+        # evidence can never be marked unread while its alert exists (a re-read would write a
+        # second alert) -- review 2026-10-02.
+        try:
+            _store_read(reads[-1], alert, company_seen)
+        except Exception as exc:  # noqa: BLE001 -- nothing of this company was written; read again next run
+            reads.pop()
+            failed += 1
+            record_local_fallback_event(module=SYNC_SOURCE_NAME, source="db", fallback_type="story_read_store_failed",
+                                        severity="warn", reason="story read could not be stored; re-read next run",
+                                        error=repr(exc), metadata={"company_master_id": cid})
+            continue
+        seen.extend(company_seen)
+        if alert:
+            alerts.append(alert)
     return {"candidates": len(picks), "read": len(reads), "alerts": len(alerts), "failed": failed}
+
+
+def _insert_sql(table: str, row: dict, conflict: str) -> tuple[str, tuple]:
+    cols = list(row)
+    return (f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) {conflict}",  # noqa: S608
+            tuple(row[c] for c in cols))
+
+
+def _store_read(read_row: dict, alert: dict | None, seen_rows: list[dict]) -> None:
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(*_insert_sql(READ_TABLE, read_row, "ON CONFLICT (company_master_id, read_at) DO NOTHING"))
+            if alert:
+                cur.execute(*_insert_sql(ALERTS_TABLE, alert, "ON CONFLICT (source, news_id, trigger_type) DO NOTHING"))
+            for s in seen_rows:
+                cur.execute(*_insert_sql(SEEN_TABLE, s, "ON CONFLICT (company_master_id, ref) DO NOTHING"))
+
+    execute_db_operation(_op, operation_name=f"{READ_TABLE}:store")
 
 
 def main(argv: list[str] | None = None) -> int:

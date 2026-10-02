@@ -59,7 +59,7 @@ func TestFrozenSpecsAreUntouched(t *testing.T) {
 		if s.Name == "stage2-rs-leaders-clean" {
 			continue
 		}
-		if s.Stage2Only || s.MaxPerGroup != 0 || s.Stop == StopSignal || s.FundamentalFilter {
+		if s.Stage2Only || s.MaxPerGroup != 0 || s.Stop == StopSignal || s.FundamentalFilter || s.StoppedSlotsToCash {
 			t.Fatalf("%s picked up a new field", s.Name)
 		}
 	}
@@ -90,5 +90,37 @@ func TestFundamentalPassUsesTheDaysMedianNewestVersionAndNoLookAhead(t *testing.
 	}
 	if ok, _ := f.Passes("ZZZ", d2); ok {
 		t.Fatal("no score -> fails")
+	}
+}
+
+func TestStoppedSlotStaysInCashUntilTheNextRebalance(t *testing.T) {
+	spec := Stage2RSLeadersSpec()
+	spec.HoldCount = 4
+	spec.RebalanceEvery = 10
+	spec.MaxPerGroup = 0
+	day := func(d int, exitA bool) Day {
+		var obs []Obs
+		for k, s := range []string{"A", "B", "C", "D", "E"} {
+			obs = append(obs, Obs{Symbol: s, Open: 100, Close: 100, PrevClose: 100, Forecast: float64(10 - k),
+				Eligible: true, ExitSignal: exitA && s == "A"})
+		}
+		return Day{Date: time.Date(2026, 10, 1+d, 0, 0, 0, 0, time.UTC), Obs: obs}
+	}
+	days := []Day{day(0, false), day(1, true), day(2, false), day(3, false)}
+	tr, err := Compute(spec, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := tr.Books[BookStrategy]
+	// day 1's close fires A's exit; day 2 sells it at the open; the 25% stays in cash after
+	sum := 0.0
+	for _, w := range b.Holdings {
+		sum += w
+	}
+	if _, held := b.Holdings["A"]; held || sum > 0.76 || sum < 0.74 {
+		t.Fatalf("A sold and its quarter left in cash; holdings %v (sum %.3f)", b.Holdings, sum)
+	}
+	if b.NAV[3].Turnover != 0 {
+		t.Fatalf("no reinvestment the day after the exit, turnover %v", b.NAV[3].Turnover)
 	}
 }

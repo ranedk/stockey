@@ -74,8 +74,38 @@ def test_sync_adds_only_qualified_newcomers_and_marks_leavers(monkeypatch):
     written = []
     monkeypatch.setattr(wl, "upsert_to_db", lambda df, table, **k: written.append(df))
     result = wl.sync_watchlist()
-    rows = written[0].set_index("company_master_id")
     assert result["new_candidate_ids"] == ["nse:NEW"]
+    # no frame may carry first-seen columns for an EXISTING member (they would be overwritten)
+    for df in written:
+        if "first_seen_at" in df:
+            assert set(df["company_master_id"]) == {"nse:NEW"}
+    rows = pd.concat([d.set_index("company_master_id") for d in written])
     assert "nse:NOPE" not in rows.index
     assert rows.at["nse:NEW", "membership_version"] == wl.MEMBERSHIP_VERSION and rows.at["nse:NEW", "first_seen_price"] == 123.0
     assert rows.at["nse:OLD", "entry_basis"] == "none" and rows.at["nse:GONE", "entry_basis"] == "none"
+
+
+def test_a_stale_company_score_leaves_its_row_alone(monkeypatch):
+    monkeypatch.setattr(wl, "_ensure_watchlist_table", lambda: None)
+    monkeypatch.setattr(wl, "_ensure_membership_columns", lambda: None)
+    q = pd.DataFrame([
+        {"company_master_id": "nse:OLD", "story_score": 10.0, "primary_dimension": "value", "flaws": None,
+         "entry_basis": "none", "fresh": False},
+        {"company_master_id": "nse:NEW", "story_score": 88.0, "primary_dimension": "growth", "flaws": None,
+         "entry_basis": "story", "fresh": True},
+    ])
+    monkeypatch.setattr(wl, "load_story_qualification", lambda: q)
+    monkeypatch.setattr(wl, "load_l3_alert_summary_by_company", lambda: pd.DataFrame(
+        columns=["company_master_id", "positive_alerts", "first_detected_date", "last_detected_date", "alert_count"]))
+    monkeypatch.setattr(wl, "load_existing_watchlist", lambda: pd.DataFrame([{"company_master_id": "nse:OLD"}]))
+    monkeypatch.setattr(wl, "load_price_near", lambda cid, d: 1.0)
+    written = []
+    monkeypatch.setattr(wl, "upsert_to_db", lambda df, table, **k: written.append(df))
+    wl.sync_watchlist()
+    assert all("nse:OLD" not in set(df["company_master_id"]) for df in written)
+
+
+def test_price_flag_only_for_event_members():
+    big_move = {"first_seen_price": 100.0, "current_price": 170.0}
+    assert _status({"entry_basis": "story", "flaws": None, "story_score": 90, **big_move}) == "active"
+    assert _status({"entry_basis": "event", "flaws": None, "story_score": 60, **big_move}) == "price_flagged"

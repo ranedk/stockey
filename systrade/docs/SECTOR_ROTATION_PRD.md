@@ -92,7 +92,7 @@ stays as a reporting tool.
 ## 5a. Result (2026-10-01, LEDGER row 53)
 
 **Both books FAIL.** R1 returned 14.2%/yr (vol 17.3%, max drawdown −30%) against plain Stage 2's
-22.1% (26.6%, −47%): −0.69%/month vs P (p = 0.96), and no significant edge over the equal-weight
+22.1% (26.6%, −47%): −0.69%/month vs P (p = 0.96); corrected run 2026-10-02: 15.1% vs 23.3%, −0.72%/month, and no significant edge over the equal-weight
 or random controls at matched risk. R2 (market filter) did worse. The leading-industry
 restriction made the book calmer but held only ~13 names and gave up more return than its lower
 risk earned back. No paper track follows; the Rotation page stays a reporting tool. Plain

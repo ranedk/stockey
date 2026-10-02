@@ -15,44 +15,44 @@ var StatsFrom = time.Date(2013, 7, 1, 0, 0, 0, 0, time.UTC)
 const HistoryWeeks = 26
 
 type MarketView struct {
-	Stage          int     `json:"stage"`
-	StageLabel     string  `json:"stage_label"`
-	BreadthPct     float64 `json:"breadth_pct"` // eligible names in Stage 2
-	EligibleCount  int     `json:"eligible_count"`
-	Return26Pct    *float64 `json:"return_26w_pct"`
+	Stage         int      `json:"stage"`
+	StageLabel    string   `json:"stage_label"`
+	BreadthPct    float64  `json:"breadth_pct"` // eligible names in Stage 2
+	EligibleCount int      `json:"eligible_count"`
+	Return26Pct   *float64 `json:"return_26w_pct"`
 }
 
 type IndustryView struct {
-	Code            string  `json:"code"`
-	Name            string  `json:"name"`
-	SectorCode      string  `json:"sector_code"`
-	SectorName      string  `json:"sector_name"`
-	Members         int     `json:"members"`
-	EligibleMembers int     `json:"eligible_members"`
+	Code            string   `json:"code"`
+	Name            string   `json:"name"`
+	SectorCode      string   `json:"sector_code"`
+	SectorName      string   `json:"sector_name"`
+	Members         int      `json:"members"`
+	EligibleMembers int      `json:"eligible_members"`
 	RS26Pct         *float64 `json:"rs26_pct"`
-	Rank            int     `json:"rank"`      // 0 = not ranked (thin)
-	Rank4w          int     `json:"rank_4w"`
-	Rank13w         int     `json:"rank_13w"`
-	RankHistory     []int   `json:"rank_history"` // oldest first, HistoryWeeks long
-	Stage           int     `json:"stage"`
-	Stage2Pct       float64 `json:"stage2_pct"` // eligible members in Stage 2
-	Leading         bool    `json:"leading"`
-	WeeksLeading    int     `json:"weeks_leading"`
+	Rank            int      `json:"rank"` // 0 = not ranked (thin)
+	Rank4w          int      `json:"rank_4w"`
+	Rank13w         int      `json:"rank_13w"`
+	RankHistory     []int    `json:"rank_history"` // oldest first, HistoryWeeks long
+	Stage           int      `json:"stage"`
+	Stage2Pct       float64  `json:"stage2_pct"` // eligible members in Stage 2
+	Leading         bool     `json:"leading"`
+	WeeksLeading    int      `json:"weeks_leading"`
 }
 
 type StockView struct {
-	Symbol        string   `json:"symbol"`
-	IndustryCode  string   `json:"industry_code"`
-	Close         float64  `json:"close"`
-	Stage         int      `json:"stage"`
-	WeeksInStage2 int      `json:"weeks_in_stage2"`
-	RS26Pct       *float64 `json:"rs26_pct"`
-	RankInIndustry int     `json:"rank_in_industry"` // by RS26 among eligible members
-	AboveMA30Pct  *float64 `json:"above_ma30_pct"`
-	SlopePct      *float64 `json:"slope_pct"`
-	VolumeRatio   *float64 `json:"volume_ratio"`
-	Eligible      bool     `json:"eligible"`
-	Candidate     bool     `json:"candidate"` // eligible, Stage 2, in a leading industry
+	Symbol         string   `json:"symbol"`
+	IndustryCode   string   `json:"industry_code"`
+	Close          float64  `json:"close"`
+	Stage          int      `json:"stage"`
+	WeeksInStage2  int      `json:"weeks_in_stage2"`
+	RS26Pct        *float64 `json:"rs26_pct"`
+	RankInIndustry int      `json:"rank_in_industry"` // by RS26 among eligible members
+	AboveMA30Pct   *float64 `json:"above_ma30_pct"`
+	SlopePct       *float64 `json:"slope_pct"`
+	VolumeRatio    *float64 `json:"volume_ratio"`
+	Eligible       bool     `json:"eligible"`
+	Candidate      bool     `json:"candidate"` // eligible, Stage 2, in a leading industry
 }
 
 type QuantilesView struct {
@@ -62,7 +62,9 @@ type QuantilesView struct {
 	Mean *float64 `json:"mean"`
 }
 
-func qview(q Quantiles) QuantilesView { return QuantilesView{ptr(q.P50), ptr(q.P75), ptr(q.P90), ptr(q.Mean)} }
+func qview(q Quantiles) QuantilesView {
+	return QuantilesView{ptr(q.P50), ptr(q.P75), ptr(q.P90), ptr(q.Mean)}
+}
 
 type StatsView struct {
 	Stage2Weeks          QuantilesView `json:"stage2_weeks"`

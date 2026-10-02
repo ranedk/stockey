@@ -13,12 +13,15 @@ if [[ -f "${SCRIPT_DIR}/.pause_fundamentals" ]]; then
   echo "[stockey.pause] $(basename "$0") skipped: ${SCRIPT_DIR}/.pause_fundamentals exists ($(head -c 200 "${SCRIPT_DIR}/.pause_fundamentals"))"
   exit 0
 fi
-# The nightly screener runs the same steps over the same pending rows; stand aside for it.
-SCREENER_PID_FILE="/tmp/stockey_fundamentals_screener.lock.d/pid"
-if [[ -f "${SCREENER_PID_FILE}" ]] && kill -0 "$(cat "${SCREENER_PID_FILE}" 2>/dev/null)" 2>/dev/null; then
-  echo "[stockey.reeval] skipped: the fundamentals screener is running"
-  exit 0
-fi
+# The nightly screener runs the same steps over the same pending rows, and the portfolio job
+# reads the watchlist this pass edits: stand aside while either holds its lock.
+for lock in /tmp/stockey_fundamentals_screener.lock /tmp/stockey_portfolio_ruleset.lock; do
+  pid_file="${lock}.d/pid"
+  if [[ -f "${pid_file}" ]] && kill -0 "$(cat "${pid_file}" 2>/dev/null)" 2>/dev/null; then
+    echo "[stockey.reeval] skipped: $(basename "${lock}" .lock) is running"
+    exit 0
+  fi
+done
 
 cd "${SCRIPT_DIR}"
 failed=0

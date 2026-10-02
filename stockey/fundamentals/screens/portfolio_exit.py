@@ -78,7 +78,8 @@ def _open_positions() -> pd.DataFrame:
                evaluable_count, stage_at_entry, target_date, prediction_text,
                invalidation_criteria, score_version, baseline_score_version,
                baseline_contradicting_count, ruleset_version, position_size_rs,
-               target_weight, story_score_at_entry, sector_code, daily_vol_pct, trail_high, trim_count
+               target_weight, story_score_at_entry, sector_code, daily_vol_pct, trail_high, trim_count,
+               entry_price_date
           FROM fundamentals_portfolio_position
          WHERE status = 'open'
         """
@@ -254,16 +255,26 @@ def _v3_state(positions: pd.DataFrame) -> dict[str, dict]:
          WHERE cm.company_master_id = ANY(%s)
          ORDER BY company_id, run_date DESC
         """, params=(ids,))
-    highs = {}
+    # Highest close since entry AND the entry price, both re-read from the ADJUSTED series every
+    # run: a split or bonus rescales history, so a stored high (or a stored raw entry price) set
+    # before it would sit far above today's adjusted price and fire a false stop (review
+    # 2026-10-02). Same reason watchlist_exit re-derives first_seen_price live.
+    highs, entries = {}, {}
     for r in positions.itertuples():
         opened = pd.Timestamp(r.opened_at)
-        df = sql_to_df("SELECT max(adj_close) AS hi FROM advisory_adjusted_ohlcv_daily "
-                       "WHERE symbol = %s AND date >= greatest(%s::date, now()::date - interval '800 days') "
-                       "AND date <= now()::date",
-                       params=(str(r.ticker), str(opened.date())))
+        entry_day = getattr(r, "entry_price_date", None)
+        entry_day = str(pd.Timestamp(entry_day).date()) if entry_day is not None and not pd.isna(entry_day) else str(opened.date())
+        df = sql_to_df(
+            "SELECT max(adj_close) AS hi, "
+            "       (array_agg(adj_close ORDER BY date) FILTER (WHERE date <= %s::date))[1] AS at_entry "
+            "  FROM advisory_adjusted_ohlcv_daily "
+            " WHERE symbol = %s AND date >= greatest(%s::date - 10, now()::date - interval '800 days') "
+            "   AND date <= now()::date",
+            params=(entry_day, str(r.ticker), entry_day))
         hi = None if df.empty or pd.isna(df.iloc[0]["hi"]) else float(df.iloc[0]["hi"])
-        stored = r.trail_high if r.trail_high is not None and not pd.isna(r.trail_high) else None
-        highs[str(r.position_id)] = max([x for x in (hi, stored) if x is not None], default=None)
+        highs[str(r.position_id)] = hi
+        at_entry = None if df.empty or pd.isna(df.iloc[0]["at_entry"]) else float(df.iloc[0]["at_entry"])
+        entries[str(r.position_id)] = at_entry
     live_by = {str(r.company_master_id): {"story_score": r.story_score, "flaws": r.flaws} for r in live.itertuples()}
     daily_by: dict[str, list[float]] = {}
     for r in daily.itertuples():
@@ -272,7 +283,8 @@ def _v3_state(positions: pd.DataFrame) -> dict[str, dict]:
     return {str(r.position_id): {"live": live_by.get(str(r.company_master_id)),
                                  "recent": daily_by.get(str(r.company_master_id), []),
                                  "valuation_ratio": val_by.get(str(r.company_master_id)),
-                                 "trail_high": highs.get(str(r.position_id))}
+                                 "trail_high": highs.get(str(r.position_id)),
+                                 "entry_adjusted": entries.get(str(r.position_id))}
             for r in positions.itertuples()}
 
 
@@ -340,8 +352,11 @@ def evaluate_exit_triggers() -> dict[str, object]:
             st = v3_state.get(str(p.position_id), {})
             if st.get("trail_high") is not None and st["trail_high"] != getattr(p, "trail_high", None):
                 trail_updates.append({"position_id": p.position_id, "trail_high": st["trail_high"]})
+            if p.entry_price is None or pd.isna(p.entry_price) or not p.stop_pct or pd.isna(p.stop_pct):
+                stop_unchecked.append(str(p.ticker))  # reported, as the v1 path does
             act = portfolio_v3.v3_exit_action(
                 p, price=price, trail_high=st.get("trail_high"), live=st.get("live"),
+                entry_adjusted=st.get("entry_adjusted"),
                 hard_events=hard.get(str(p.company_master_id), []), recent_scores=st.get("recent", []),
                 valuation_ratio=st.get("valuation_ratio"), today=today)
             if act is None:
@@ -491,10 +506,10 @@ def _close(position_id: str, reason: str, exit_price: float | None) -> None:
 
 
 def _set_trail_high(position_id: str, value: float) -> None:
+    # a record of the adjusted high, re-derived each run (not ratcheted: a split rescales it)
     with db_session() as (_conn, cur):
         cur.execute("UPDATE fundamentals_portfolio_position SET trail_high = %s "
-                    "WHERE position_id = %s AND status = 'open' AND (trail_high IS NULL OR trail_high < %s)",
-                    (value, position_id, value))
+                    "WHERE position_id = %s AND status = 'open'", (value, position_id))
 
 
 def _increment_trim(position_id: str) -> None:

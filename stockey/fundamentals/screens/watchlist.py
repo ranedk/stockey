@@ -124,6 +124,8 @@ NEGATIVE_TRIGGER_TYPES = frozenset({
 EVENT_ENTRY_DAYS = 60
 # live scores older than this are not a basis for membership: fall back to the alert rules
 LIVE_SCORE_MAX_AGE_DAYS = 3
+# below this share of fresh live scores the score step is down: keep the alert rules
+MIN_FRESH_SHARE = 0.5
 MEMBERSHIP_VERSION = 2
 
 
@@ -133,15 +135,23 @@ def load_story_qualification() -> pd.DataFrame | None:
     the alert rules and the fallback is recorded, never an empty watchlist."""
     try:
         live = sql_to_df(
-            "SELECT company_master_id, story_score, primary_dimension, flaws, in_band, scored_at "
-            "FROM fundamentals_story_score_live WHERE scored_at >= now() - make_interval(days => %s)",
+            "SELECT company_master_id, story_score, primary_dimension, flaws, in_band, scored_at, "
+            "       scored_at >= now() - make_interval(days => %s) AS fresh "
+            "FROM fundamentals_story_score_live",
             params=(LIVE_SCORE_MAX_AGE_DAYS,))
     except Exception as exc:  # noqa: BLE001 -- table not created yet on a fresh DB
         live = pd.DataFrame()
         _record_fallback("watchlist_story_scores_unreadable", reason="Live story scores could not be read; the watchlist keeps the alert rules this run.", error=exc)
         return None
-    if live.empty:
-        _record_fallback("watchlist_story_scores_stale", reason=f"No live story score newer than {LIVE_SCORE_MAX_AGE_DAYS} days; the watchlist keeps the alert rules this run.", error="stale or empty fundamentals_story_score_live")
+    # Staleness is judged per company, and the whole sync stands down unless most scores are
+    # fresh: the 30-minute pass re-scores a few companies while the nightly step may be down,
+    # and treating everyone else's old row as "unscored" would fade the watchlist (review
+    # 2026-10-02). A stale company's row is left as it was (see sync_watchlist).
+    fresh_share = float(live["fresh"].mean()) if not live.empty else 0.0
+    if live.empty or fresh_share < MIN_FRESH_SHARE:
+        _record_fallback("watchlist_story_scores_stale",
+                         reason=f"Only {fresh_share:.0%} of live story scores are newer than {LIVE_SCORE_MAX_AGE_DAYS} days; the watchlist keeps the alert rules this run.",
+                         error="stale or empty fundamentals_story_score_live")
         return None
     positive = sql_to_df(
         """
@@ -149,7 +159,9 @@ def load_story_qualification() -> pd.DataFrame | None:
          WHERE load_ts >= now() - make_interval(days => %s) AND company_master_id IS NOT NULL
            AND trigger_type <> ALL(%s) AND status NOT LIKE 'superseded%%'
         """, params=(EVENT_ENTRY_DAYS, sorted(NEGATIVE_TRIGGER_TYPES)))
-    return qualify(live, set(positive["company_master_id"]))
+    q = qualify(live, set(positive["company_master_id"]))
+    q["fresh"] = live["fresh"].astype(bool).to_numpy()
+    return q
 
 
 def qualify(live: pd.DataFrame, recent_positive: set[str]) -> pd.DataFrame:
@@ -329,6 +341,8 @@ def sync_watchlist() -> dict[str, object]:
     rows, new_candidates, no_price = [], [], 0
     for q in qualification.to_dict("records"):
         cid = q["company_master_id"]
+        if not q.get("fresh", True):
+            continue  # stale score: leave this company's row exactly as it is
         if cid not in existing and q["entry_basis"] == "none":
             continue
         row = {"company_master_id": cid, "entry_basis": q["entry_basis"], "story_score": q["story_score"],
@@ -348,12 +362,14 @@ def sync_watchlist() -> dict[str, object]:
     # existing members with no live score today (left the universe) are no longer qualified
     for cid in existing - set(qualification["company_master_id"]):
         rows.append({"company_master_id": cid, "entry_basis": "none", "load_ts": load_ts})
-    if rows:
-        df = pd.DataFrame(rows)
-        for col in ("story_score", "primary_dimension", "flaws"):
-            if col not in df:
-                df[col] = None
-        upsert_to_db(df, RESULTS_TABLE, unique_keys=["company_master_id"])
+    # One upsert per set of fields: a single frame would give every existing member NaN for the
+    # columns only new members carry (first_seen_at/price, membership_version), and the upsert
+    # would write those NaNs over the stored values (review 2026-10-02).
+    by_fields: dict[tuple, list[dict]] = {}
+    for r in rows:
+        by_fields.setdefault(tuple(sorted(r)), []).append(r)
+    for fields, group in by_fields.items():
+        upsert_to_db(pd.DataFrame(group, columns=list(fields)), RESULTS_TABLE, unique_keys=["company_master_id"])
     return {"companies": len(rows), "qualified": int(len(qualified)), "new_candidates": len(new_candidates),
             "new_candidate_ids": new_candidates, "no_price_at_first_seen": no_price, "membership": "story score"}
 

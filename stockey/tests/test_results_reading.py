@@ -58,3 +58,25 @@ def test_quarter_rows_map_the_lender_layout():
     assert [r["period_end"] for r in rows] == [dt.date(2026, 3, 31), dt.date(2026, 6, 30)]
     assert rows[1]["layout"] == "lender" and rows[1]["sales"] == 12.0 and rows[1]["opm_pct"] == 33.0
     assert "other_income" not in rows[1]
+
+
+def test_profit_growth_needs_a_real_year_ago_base():
+    q = _quarters()
+    # year-ago quarter (index 8): a near-zero profit; latest a normal one
+    q.loc[8, "pbt"] = q.loc[8, "other_income"] - 3.0 + 0.5   # underlying ~0.5 cr on ~sales 127
+    r = rr.read_company(q, AS_OF)
+    assert pd.isna(r["profit_yoy_pct"]), "growth off a 0.5 cr base must not be read"
+    assert not pd.isna(rr.read_company(_quarters(), AS_OF)["sales_yoy_pct"])
+
+
+def test_blank_period_labels_are_skipped_not_stored_as_nat():
+    assert rr.period_end(None) is None and rr.period_end("") is None and rr.period_end("TTM") is None
+    rows = rr.quarter_rows(1, "X", {"periods": ["", "Jun 2026"], "rows": {"Sales": [1.0, 2.0]}})
+    assert [r["period_end"] for r in rows] == [dt.date(2026, 6, 30)]
+
+
+def test_trend_window_is_by_date_when_a_quarter_is_missing():
+    q = _quarters()
+    q = q.drop(index=10).reset_index(drop=True)   # one quarter missing inside the last year
+    r = rr.read_company(q, AS_OF)
+    assert abs(r["sales_vs_trend_pp"]) < 1e-6   # steady 10% growth still reads steady

@@ -63,3 +63,15 @@ def test_story_reads_are_recorded_as_their_own_family(monkeypatch):
     row = written[0].iloc[0]
     assert (row["family"], row["direction"]) == ("story_read", -1)
     assert set(ed.STORY_READ_DIRECTION).isdisjoint(ed.DIRECTION)  # row 48's nine stay frozen
+
+
+def test_story_reads_count_once_per_company_and_direction():
+    t = pd.Timestamp("2026-10-05 12:00", tz="UTC")
+    df = pd.DataFrame([
+        {"company_master_id": "nse:A", "trigger_type": "story_read_negative", "detected_at": t},
+        {"company_master_id": "nse:A", "trigger_type": "story_read_negative", "detected_at": t + pd.Timedelta(hours=5)},
+        {"company_master_id": "nse:A", "trigger_type": "story_read_positive", "detected_at": t + pd.Timedelta(days=1)},
+        {"company_master_id": "nse:A", "trigger_type": "story_read_negative", "detected_at": t + pd.Timedelta(days=120)},
+    ])
+    out = ed.dedupe_story_reads(df)
+    assert len(out) == 3

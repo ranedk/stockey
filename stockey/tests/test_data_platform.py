@@ -25708,9 +25708,10 @@ def test_stop_cooldown_query_targets_only_stop_loss_exits(monkeypatch):
 
     monkeypatch.setattr(runner, "sql_to_df", fake_sql)
     assert runner._recently_stopped_tickers() == {}
-    assert "close_reason = 'stop_loss'" in seen["sql"]
-    assert "status = 'closed'" in seen["sql"]
-    assert seen["params"] == (runner.STOP_COOLDOWN_DAYS,)
+    assert "close_reason = ANY(%s)" in seen["sql"] and "status = 'closed'" in seen["sql"]
+    reasons, days = seen["params"]
+    assert set(reasons) == {"stop_loss", "trailing_stop"} and days == runner.STOP_COOLDOWN_DAYS
+    assert "thesis_invalidation" not in reasons and "thesis_broken" not in reasons
 
 
 def test_a_position_records_which_bucket_paid_for_it(monkeypatch):

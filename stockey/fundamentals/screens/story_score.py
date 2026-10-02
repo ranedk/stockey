@@ -8,8 +8,8 @@ So each company in the universe gets:
     re-rates stocks more than level;
   - a dimension's STRENGTH = its best reading. The STORY SCORE asks how exceptional the
     company's best reading is GIVEN how many chances it had: with n readings, the chance that
-    none exceeds percentile p by luck is p^n, so the score is 100 x p_best^n (plus a small
-    bonus, STORY_SECOND_BONUS x the same for the second dimension). A plain "best of n" is
+    none exceeds percentile p by luck is p^n, so the score is 100 x p_best^n; a second strong
+    dimension then closes STORY_SECOND_BONUS (25%) of the remaining gap to 100. A plain "best of n" is
     ~94th percentile for almost everyone -- measured on the first run (median 94.7), it rated
     nearly every company a standout;
   - FLAWS -- deal-breakers that cap the score at FLAW_CAP whatever the stories: cash burn with
@@ -44,6 +44,10 @@ RESULTS_TABLE = "fundamentals_story_score"
 # the quarterly results table against each company's own trend, one-offs stripped; version 1's
 # snapshot-based "quarter YoY minus 5y" acceleration is gone.
 SCORE_VERSION = 2
+# 3 (2026-10-02, code review): results reading v2 -- profit growth only off a real base
+# (>= Rs 5 cr and 5% of sales a year ago), trend windows by date -- and the IST cutoff for
+# alerts/news. A new version re-baselines the live score instead of reading as a jump.
+SCORE_VERSION = 3
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 STORY_SECOND_BONUS = 0.25
@@ -134,21 +138,25 @@ def load_inputs(as_of) -> pd.DataFrame:
          ORDER BY company_id, run_date DESC, state_vector_version DESC
         """, params=(d,))
     df = df.merge(l2, on="screener_company_id", how="left")
+    # End of the as-of day in IST, as an aware timestamp: "::date + 1" in a UTC session is
+    # 05:30 IST the next morning (review 2026-10-02). An alert counts only once it EXISTED
+    # (load_ts) as well as once its filing was detected.
+    cutoff = (pd.Timestamp(d).tz_localize("Asia/Kolkata") + pd.Timedelta(days=1)).to_pydatetime()
     alerts = sql_to_df(
         """
         SELECT a.company_master_id, a.trigger_type, e.detected_at
           FROM fundamentals_l3_alerts a
           JOIN fundamentals_events e ON e.source = a.source AND e.news_id = a.news_id
-         WHERE e.detected_at < %s::date + 1 AND e.detected_at >= %s::date - %s
-        """, params=(d, d, 400))
+         WHERE e.detected_at < %s AND a.load_ts < %s AND e.detected_at >= %s - make_interval(days => %s)
+        """, params=(cutoff, cutoff, cutoff, 400))
     df = df.merge(event_features(alerts, as_of), on="company_master_id", how="left")
     news = sql_to_df(
         """
         SELECT target_type, target_id, direction, materiality, first_seen_at
           FROM fundamentals_news_tag
-         WHERE first_seen_at < %s::date + 1 AND first_seen_at >= %s::date - %s
+         WHERE first_seen_at < %s AND tagged_at < %s AND first_seen_at >= %s - make_interval(days => %s)
            AND materiality >= %s AND direction IN ('positive', 'negative')
-        """, params=(d, d, EVENT_LOOKBACK_DAYS, NEWS_MIN_MATERIALITY)) if _table_exists("fundamentals_news_tag") else pd.DataFrame()
+        """, params=(cutoff, cutoff, cutoff, EVENT_LOOKBACK_DAYS + 1, NEWS_MIN_MATERIALITY)) if _table_exists("fundamentals_news_tag") else pd.DataFrame()
     company_news, sector_news = news_features(news, as_of)
     df = df.merge(company_news, on="company_master_id", how="left")
     df["event_net"] = df[["event_net", "news_net"]].sum(axis=1, min_count=1)
@@ -217,6 +225,12 @@ def event_features(alerts: pd.DataFrame, as_of) -> pd.DataFrame:
 def derive(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     num = lambda c: pd.to_numeric(x.get(c), errors="coerce")
+    # no results reading at all (empty quarterly table, an as-of before 2026-09-29): the rr_
+    # readings are simply missing, not a crash (review 2026-10-02)
+    for c in ("rr_sales_q_cr", "rr_sales_yoy_pct", "rr_sales_vs_trend_pp", "rr_profit_yoy_pct", "rr_profit_vs_trend_pp",
+              "rr_margin_change_pp", "rr_margin_vs_trend_pp"):
+        if c not in x:
+            x[c] = np.nan
     base_ok = num("rr_sales_q_cr") >= MIN_ACCELERATION_SALES_Q_CR
     # margins too: an operating margin on near-zero sales swings by hundreds of points
     # (SPARC -400% -> +57% on Rs 40 cr; RPOWER -3,205 pp on Rs 0.2 cr)
@@ -394,7 +408,6 @@ def run(as_of=None, *, store: bool = True) -> pd.DataFrame:
         # the nightly full run refreshes every company's live score and records what moved
         from fundamentals.screens import reeval
         reeval.apply_scores(out, causes="daily", score_version=SCORE_VERSION)
-        ensure_filter_view()
         from utils.schema_migrations import apply_schema_migration
         apply_schema_migration(
             migration_id="20260929_fundamentals_story_score_as_of_date_date",
@@ -402,6 +415,7 @@ def run(as_of=None, *, store: bool = True) -> pd.DataFrame:
             metadata={"tables": [RESULTS_TABLE]},
             statements=[f"ALTER TABLE {RESULTS_TABLE} ALTER COLUMN as_of_date TYPE DATE USING as_of_date::date"],
         )
+        ensure_filter_view()  # after the DATE migration: Postgres cannot retype a column a view uses
     return out
 
 

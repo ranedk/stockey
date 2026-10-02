@@ -9,10 +9,10 @@ import (
 
 // The pre-registered books (research/preregistrations/2026-10-01_industry_rotation.md).
 const (
-	BookSize        = 20
-	PerIndustryCap  = 4
-	RebalanceWeeks  = 4
-	KeepMultiple    = 2 // keep while in the top 2 x BookSize, industry in the top 2 x LeadingFraction
+	BookSize       = 20
+	PerIndustryCap = 4
+	RebalanceWeeks = 4
+	KeepMultiple   = 2 // keep while in the top 2 x BookSize, industry in the top 2 x LeadingFraction
 )
 
 // BookRule selects one of the books.
