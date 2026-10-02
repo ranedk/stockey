@@ -65,6 +65,10 @@ families.
   do not fight over the browser; serialising N callers still mints N consents. The
   hard cap is `DHAN_MAX_CONSENTS_PER_DAY`, persisted on disk across processes and
   charged before the network call.
+  And a non-owner must never DELETE the cached token: `force_refresh_access_token` used to
+  clear the cache before its ownership check, so a collector whose token had just expired
+  deleted the token `all_dhan_auth_ensure.sh` had saved a second earlier (2026-10-02, Dhan
+  down until a manual login). The check now comes first, and the cache is written atomically.
 - Do not mutate broker/auth behavior (Dhan login, CDP) unless the user explicitly
   asks for that task — a botched change here can lock out the account (see
   `data/dhanlive/auth.py`'s login lock and timezone-aware expiry check).

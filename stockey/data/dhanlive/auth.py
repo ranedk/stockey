@@ -83,8 +83,13 @@ def load_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> str | No
 
 
 def cache_access_token(payload: dict, cache_path: Path = DEFAULT_TOKEN_CACHE) -> None:
+    """Atomic: write a temp file beside the cache, then rename over it. A reader mid-write used
+    to see a half-written file, read it as "no token", and -- through force_refresh_access_token
+    -- delete the token the auth job had just saved (2026-10-02: Dhan down from 07:35 IST)."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, cache_path)
 
 
 def clear_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> bool:
@@ -461,11 +466,17 @@ def force_refresh_access_token(current_token: str | None = None) -> str:
         cached = load_cached_access_token()
         if cached and cached != current_token:
             return cached
-        clear_cached_access_token()
         if is_auto_login_configured():
+            # The ownership check comes BEFORE the cache is touched. It used to clear first, so
+            # every collector whose token had just expired deleted the cache and then failed --
+            # and on 2026-10-02 one did so a second after all_dhan_auth_ensure.sh saved the new
+            # token, taking Dhan down for the day. A process that may not log in must never
+            # remove a token it cannot replace.
             _require_consent_owner("force_refresh_access_token")
+            clear_cached_access_token()
             token_id = get_token_id_from_auto_login()
         else:
+            clear_cached_access_token()
             consent_url = begin_browser_consent()
             token_id = prompt_for_token_id(consent_url)
         return str(consume_consent_token(token_id)["accessToken"])
