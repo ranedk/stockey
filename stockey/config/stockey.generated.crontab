@@ -230,6 +230,21 @@ LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 # 16:30 UTC = 22:00 IST
 30 16 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_portfolio_ruleset.lock ./all_portfolio_ruleset.sh >> "$LOG_DIR/portfolio_ruleset.log" 2>&1
 
+# Economic Times RSS news (fundamentals/collectors/et_news.py), hourly at :07 -- not gated on
+# .pause_fundamentals (feeds keep only 50 items; a skipped hour is lost news).
+7 * * * * dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_news.lock ./all_fundamentals_news.sh >> "$LOG_DIR/fundamentals_news.log" 2>&1
+
+# Event-driven re-evaluation (all_fundamentals_reeval.sh; FUNDAMENTAL_REEVALUATION_PRD 4.2):
+# today's new BSE filings -> extraction -> rule triggers -> news tagging -> re-score, at :17
+# and :47 (off the OCR, news and API minutes). Gated on .pause_fundamentals, and stands aside
+# while the nightly screener runs.
+17,47 * * * * dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_reeval.lock ./all_fundamentals_reeval.sh >> "$LOG_DIR/fundamentals_reeval.log" 2>&1
+
+# OCR of filed documents (fundamentals/collectors/ocr_pipeline.py), its own continuous job
+# since 2026-09-25 -- see all_fundamentals_ocr.sh. Every 30 minutes, under a lock, so a
+# long catch-up run is never doubled; not gated on .pause_fundamentals.
+*/30 * * * * dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_ocr.lock ./all_fundamentals_ocr.sh >> "$LOG_DIR/fundamentals_ocr.log" 2>&1
+
 # Fundamentals screener API (fundamentals/api/app.py), serving the screener/ Nuxt
 # frontend. Long-running service, same respawn-under-lock pattern the old
 # all_frontend.sh used (see stockey-service-management memory): cron retries every 5
