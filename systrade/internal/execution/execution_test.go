@@ -122,3 +122,11 @@ func TestLastClosedSession(t *testing.T) {
 		}
 	}
 }
+
+func TestASeriesChangeIsANoteNotAProblem(t *testing.T) {
+	be := map[string][]store.Instrument{"KABRAEXTRU": {{Symbol: "KABRAEXTRU", SecurityID: 8784, Series: "BE"}}}
+	b := Build("s", sheet(row("KABRAEXTRU", "EXIT", 50, 0, 820, 41000)), be)
+	if !b.OK() || len(b.Notes) != 1 || len(b.Orders) != 1 || b.Orders[0].SecurityID != "8784" {
+		t.Fatalf("BE name: one order to the BE id, a note, no problem; got problems %v notes %v orders %+v", b.Problems, b.Notes, b.Orders)
+	}
+}

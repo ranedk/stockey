@@ -84,3 +84,28 @@ func (s *Store) RawRatios(ctx context.Context, date time.Time) (map[string]float
 	}
 	return out, rows.Err()
 }
+
+// RawClosesAnySeries returns each symbol's raw close on date in whichever equity series it
+// traded (EQ preferred, else BE / BZ), with that series. The fallback price for a held name
+// NSE has moved out of EQ: it no longer has an EQ bar, but it trades and can be sold (2026-10-02).
+func (s *Store) RawClosesAnySeries(ctx context.Context, date time.Time) (map[string]float64, map[string]string, error) {
+	d := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (symbol) symbol, close::float8, series FROM nseindia_ohlcv
+		WHERE series IN ('EQ', 'BE', 'BZ') AND date >= $1 AND date < $2 AND close > 0
+		ORDER BY symbol, (series = 'EQ') DESC`, d, d.AddDate(0, 0, 1))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	closes, series := map[string]float64{}, map[string]string{}
+	for rows.Next() {
+		var sym, ser string
+		var c float64
+		if err := rows.Scan(&sym, &c, &ser); err != nil {
+			return nil, nil, err
+		}
+		closes[sym], series[sym] = c, ser
+	}
+	return closes, series, rows.Err()
+}

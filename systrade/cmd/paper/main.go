@@ -206,8 +206,17 @@ func main() {
 		latest := all[len(all)-1]
 		ratios, err := st.RawRatios(ctx, latest.Date)
 		fatalIf(err)
-		trades, held, err := account.PlanOrders(spec, latest, ratios)
+		// A held name NSE moved from EQ to BE / BZ has no EQ price today; price it from the
+		// series it trades in, so it is sold properly instead of failing the order check.
+		anyClose, anySeries, err := st.RawClosesAnySeries(ctx, latest.Date)
 		fatalIf(err)
+		trades, held, err := account.PlanOrders(spec, latest, ratios, anyClose)
+		fatalIf(err)
+		for _, t := range trades {
+			if ser := anySeries[t.Symbol]; ser != "" && ser != "EQ" {
+				fmt.Printf("note: %s now trades in %s (trade-for-trade); priced and ordered in that series\n", t.Symbol, ser)
+			}
+		}
 		sheet.Orders = withShares(sheet, current, trades, held)
 	}
 

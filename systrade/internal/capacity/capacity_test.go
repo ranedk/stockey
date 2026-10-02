@@ -238,3 +238,15 @@ func TestBookRendersTheAccount(t *testing.T) {
 		t.Fatalf("orders %+v", b.Orders)
 	}
 }
+
+func TestPlanOrdersPricesAHeldNameThatLeftEQFromItsFallbackSeries(t *testing.T) {
+	r := &Result{Policy: AccountPolicy(), hold: map[string]*holding{"GONEBE": {shares: 100, value: 80000}}}
+	latest := paper.Day{Date: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)}
+	trades, held, err := r.PlanOrders(spec(), latest, map[string]float64{}, map[string]float64{"GONEBE": 800})
+	if err != nil || len(trades) != 1 {
+		t.Fatalf("one exit expected, got %v %v", trades, err)
+	}
+	if tr := trades[0]; tr.Side != "EXIT" || tr.FromShares != 100 || tr.ToShares != 0 || held["GONEBE"] != 100 {
+		t.Fatalf("exit 100 shares at the BE price, got %+v held %v", tr, held)
+	}
+}

@@ -40,6 +40,9 @@ type Batch struct {
 	BuyRs       float64
 	SellRs      float64
 	Problems    []string
+	// Notes are facts worth seeing that need no action, e.g. a name NSE moved to trade-for-trade
+	// (BE): its order goes to the BE security id, delivery only.
+	Notes []string
 }
 
 // OK is true when the batch reproduces its sheet exactly and nothing is wrong.
@@ -79,9 +82,15 @@ func Build(strategy string, sheet store.PaperPending, ids map[string][]store.Ins
 
 		var secIDs []int64
 		var freeze float64
+		series := ""
 		for _, in := range ids[o.Symbol] {
 			secIDs = append(secIDs, in.SecurityID)
 			freeze = in.FreezeQty
+			series = in.Series
+		}
+		if series != "" && series != "EQ" {
+			b.Notes = append(b.Notes, fmt.Sprintf("%s trades in %s (trade-for-trade, delivery only): order sent to its %s security id",
+				o.Symbol, series, series))
 		}
 		switch len(secIDs) {
 		case 0:

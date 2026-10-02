@@ -339,12 +339,26 @@ func plan(date time.Time, weights, vals map[string]float64, price func(string) (
 // PlanOrders is the next session's orders for the book Simulate left behind,
 // priced off latest's raw close, and the shares it holds going in. latest
 // should be the last day simulated (or any day, for an empty run).
-func (r *Result) PlanOrders(spec paper.Spec, latest paper.Day, ratios map[string]float64) ([]Trade, map[string]float64, error) {
+// fallback (optional) is a raw close for symbols with no EQ price today -- a held name NSE
+// moved to BE / BZ still trades and is sold at its real price instead of being written off as
+// suspended. It never makes a name a target: targets come from the EQ universe as before.
+func (r *Result) PlanOrders(spec paper.Spec, latest paper.Day, ratios map[string]float64, fallback ...map[string]float64) ([]Trade, map[string]float64, error) {
 	obs := make(map[string]paper.Obs, len(latest.Obs))
 	for _, o := range latest.Obs {
 		obs[o.Symbol] = o
 	}
-	price := rawPrice(obs, ratios, func(o paper.Obs) float64 { return o.Close })
+	eqPrice := rawPrice(obs, ratios, func(o paper.Obs) float64 { return o.Close })
+	price := func(sym string) (float64, bool) {
+		if p, ok := eqPrice(sym); ok {
+			return p, true
+		}
+		for _, fb := range fallback {
+			if p := fb[sym]; p > 0 {
+				return p, true
+			}
+		}
+		return 0, false
+	}
 	vals := map[string]float64{}
 	held := map[string]float64{}
 	for s, h := range r.hold {

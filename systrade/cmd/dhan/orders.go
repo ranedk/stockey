@@ -124,6 +124,9 @@ func report(b execution.Batch) {
 		}
 		fmt.Printf("  %-4s %-14s %6d sh  sec %-6s  ~Rs %9.0f  %s\n", o.Side, o.Symbol, o.Quantity, o.SecurityID, o.ValueRs, o.CorrelationID)
 	}
+	for _, n := range b.Notes {
+		fmt.Println("  note:", n)
+	}
 	if b.OK() {
 		fmt.Println("  reconciled: every sheet trade has exactly one order; no problems")
 		return

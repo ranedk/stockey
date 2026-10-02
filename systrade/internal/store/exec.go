@@ -11,6 +11,10 @@ type Instrument struct {
 	SecurityID int64
 	TickSize   float64
 	FreezeQty  float64 // exchange freeze quantity; 0 when not published
+	// Series the symbol traded in on the latest bhavcopy (EQ, or BE/BZ when NSE has moved it to
+	// trade-for-trade). Dhan gives each series its own security id (KABRAEXTRU: EQ 1805, BE 8784)
+	// and keeps the old one listed as valid, so the id must follow today's series (2026-10-02).
+	Series string
 }
 
 // EquityInstruments returns, for every symbol on the latest EQ bhavcopy, the
@@ -25,16 +29,17 @@ type Instrument struct {
 func (s *Store) EquityInstruments(ctx context.Context) (map[string][]Instrument, error) {
 	rows, err := s.pool.Query(ctx, `
 		WITH cur AS (
-			SELECT symbol, isin FROM nseindia_ohlcv
-			WHERE series = 'EQ'
-			  AND date = (SELECT max(date) FROM nseindia_ohlcv WHERE date > now() - interval '30 days'))
+			SELECT DISTINCT ON (symbol) symbol, isin, series FROM nseindia_ohlcv
+			WHERE series IN ('EQ', 'BE', 'BZ')
+			  AND date = (SELECT max(date) FROM nseindia_ohlcv WHERE date > now() - interval '30 days')
+			ORDER BY symbol, (series = 'EQ') DESC)
 		SELECT DISTINCT c.symbol, m.security_id,
 		       coalesce(m.tick_size, 0)::float8, coalesce(m.sm_freeze_qty, 0)::float8,
-		       (m.underlying_symbol = c.symbol)::int + (m.isin IS NOT DISTINCT FROM c.isin)::int
+		       (m.underlying_symbol = c.symbol)::int + (m.isin IS NOT DISTINCT FROM c.isin)::int, c.series
 		FROM cur c
 		JOIN master_dhan_instruments m
 		  ON m.exch_id = 'NSE' AND m.segment = 'E' AND m.instrument = 'EQUITY'
-		 AND m.series = 'EQ' AND m.valid_to IS NULL
+		 AND m.series = c.series AND m.valid_to IS NULL
 		 AND (m.underlying_symbol = c.symbol OR m.isin = c.isin)`)
 	if err != nil {
 		return nil, err
@@ -45,7 +50,7 @@ func (s *Store) EquityInstruments(ctx context.Context) (map[string][]Instrument,
 	for rows.Next() {
 		var in Instrument
 		var score int
-		if err := rows.Scan(&in.Symbol, &in.SecurityID, &in.TickSize, &in.FreezeQty, &score); err != nil {
+		if err := rows.Scan(&in.Symbol, &in.SecurityID, &in.TickSize, &in.FreezeQty, &score, &in.Series); err != nil {
 			return nil, err
 		}
 		switch {
