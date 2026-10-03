@@ -60,11 +60,18 @@ def compute_trading_days() -> pd.DataFrame:
         params=(MIN_DATE,),
     )
 
-    hol = sql_to_df("SELECT date FROM nseindia_holidays")
+    # Equity cash-market holidays only: the feed lists every segment, and a currency- or
+    # debt-only holiday (2026-08-26 Id-E-Milad: CD/IRD, not CM) is a normal equity session.
+    hol = sql_to_df("SELECT date FROM nseindia_holidays WHERE type = 'CM'")
 
     cal = []
     if not hol.empty:
-        hol["date"] = pd.to_datetime(hol["date"])
+        # tz-NAIVE dates: the column is timestamptz, so pandas reads it tz-aware (UTC), and a
+        # tz-aware index never equals the tz-naive business days -- `difference` removed
+        # nothing, and every 2026 weekday holiday (Republic Day ... Gandhi Jayanti, Diwali,
+        # Christmas) sat in dim_trading_days as a trading day. Found 2026-10-03 when the
+        # completeness gate failed on Gandhi Jayanti "missing" bars.
+        hol["date"] = pd.to_datetime(hol["date"], utc=True).dt.tz_convert(None)
         current_year = pd.Timestamp.today().year
         for y in sorted(hol["date"].dt.year.unique()):
             if y < current_year:  # the past comes from OHLCV, which is authoritative
@@ -82,7 +89,9 @@ def compute_trading_days() -> pd.DataFrame:
     # Sunday, so this is also what keeps weekend sessions in the calendar.
     ov = sql_to_df(
         "SELECT date FROM public.nseindia_holidays "
-        "WHERE type = 'CM' AND holiday ILIKE '%%diwali%%'",
+        # Laxmi Pujan only: the Muhurat session is that evening. "%diwali%" also matched
+        # Diwali-Balipratipada (2026-11-10), a full holiday, and put it back as a session.
+        "WHERE type = 'CM' AND holiday ILIKE '%%laxmi%%pujan%%'",
     )
     if not ov.empty:
         cal = pd.concat([cal, ov], ignore_index=True)
