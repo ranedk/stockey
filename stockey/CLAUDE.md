@@ -130,6 +130,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | every hour at :37 | daily | `all_fundamentals_news.sh` — Economic Times RSS (not gated on the pause: feeds keep only 50 items) |
 | every 30 min | daily | `all_fundamentals_ocr.sh` — OCR of filed documents, last 6 months only (not gated on the pause) |
 | :17 / :47 | daily | `all_fundamentals_reeval.sh` — intraday filings, news tagging, re-score touched companies, story read, watchlist (gated on `.pause_fundamentals`; stands aside while the screener or portfolio job runs) |
+| every 15 min | daily | `all_trigger_study.sh` — trigger-study tagging via the Claude CLI; calls only 22:00–08:00 IST, parks itself until a usage limit resets |
 | every 5 min | daily | `all_fundamentals_api.sh` (respawn-under-lock; no-ops when healthy) |
 
 Ordering is load-bearing: the gate and both monitoring jobs sit AFTER the morning

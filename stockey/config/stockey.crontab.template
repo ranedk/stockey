@@ -253,6 +253,12 @@ LOG_DIR={{LOG_DIR}}
 # long catch-up run is never doubled; not gated on .pause_fundamentals.
 */30 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_ocr.lock ./all_fundamentals_ocr.sh >> "$LOG_DIR/fundamentals_ocr.log" 2>&1
 
+# Trigger study tagger (fundamentals/trigger_study, 2026-10-08) -- tags filings through the
+# Claude CLI on the operator's plan. Every 15 minutes under a lock; it calls only 22:00-08:00
+# IST and, after a usage-limit reply, sits parked until the reset time it recorded, so a hit
+# limit resumes on its own. An empty queue costs one DB read. See all_trigger_study.sh.
+*/15 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_trigger_study.lock ./all_trigger_study.sh >> "$LOG_DIR/trigger_study.log" 2>&1
+
 # Fundamentals screener API (fundamentals/api/app.py), serving the screener/ Nuxt
 # frontend. Long-running service, same respawn-under-lock pattern the old
 # all_frontend.sh used (see stockey-service-management memory): cron retries every 5
