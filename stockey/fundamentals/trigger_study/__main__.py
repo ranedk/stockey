@@ -1,7 +1,8 @@
 """python -m fundamentals.trigger_study <step>
 
-  events     compute momentum entries + outcomes, pick the pilot sample
+  events     compute momentum entries + outcomes, pick the pilot (--sample full: mark the rest)
   fetch      NSE filing lists for the sample's stocks
+  results    NSE XBRL quarterly results (Sep 2019 on) for the sample's stocks
   queue      keyword pre-filter + blind tagging batches
   documents  download attachments for vague / amount-less notable filings, queue them
   run        tag pending batches through the Claude CLI (night window unless --any-time)
@@ -15,6 +16,8 @@ import argparse
 import json
 
 from utils.db import sql_to_df
+
+from fundamentals.trigger_study.events import samples
 
 
 def status() -> dict:
@@ -43,7 +46,7 @@ def auto(max_calls: int, any_time: bool) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m fundamentals.trigger_study")
-    ap.add_argument("step", choices=["events", "fetch", "queue", "documents", "run", "auto", "report", "status"])
+    ap.add_argument("step", choices=["events", "fetch", "results", "queue", "documents", "run", "auto", "report", "status"])
     ap.add_argument("--sample", default="pilot")
     ap.add_argument("--per-group", type=int, default=20)
     ap.add_argument("--max-calls", type=int, default=40)
@@ -52,14 +55,20 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     if a.step == "events":
-        from fundamentals.trigger_study.events import build
-        out = build(per_group=a.per_group)
+        from fundamentals.trigger_study.events import build, mark_full
+        out = mark_full() if a.sample == "full" else build(per_group=a.per_group)
     elif a.step == "fetch":
         from fundamentals.trigger_study.events import EVENTS_TABLE
         from fundamentals.trigger_study.filings import fetch
-        syms = sql_to_df(f"SELECT DISTINCT symbol FROM {EVENTS_TABLE} WHERE sample = %s",
-                         params=(a.sample,))["symbol"].tolist()
+        syms = sql_to_df(f"SELECT DISTINCT symbol FROM {EVENTS_TABLE} WHERE sample = ANY(%s)",
+                         params=(samples(a.sample),))["symbol"].tolist()
         out = fetch(syms)
+    elif a.step == "results":
+        from fundamentals.trigger_study.events import EVENTS_TABLE
+        from fundamentals.trigger_study.nse_results import fetch as fetch_results
+        syms = sql_to_df(f"SELECT DISTINCT symbol FROM {EVENTS_TABLE} WHERE sample = ANY(%s)",
+                         params=(samples(a.sample),))["symbol"].tolist()
+        out = fetch_results(syms)
     elif a.step == "queue":
         from fundamentals.trigger_study.queue import build_tag_queue
         out = build_tag_queue(a.sample)

@@ -52,3 +52,25 @@ def test_call_claude_classifies_a_limit_reply(monkeypatch):
     monkeypatch.setattr("subprocess.run", lambda *a, **k: P())
     res = call_claude("tag", [{"id": "1", "text": "x"}], "claude-haiku-4-5")
     assert res["ok"] is False and res["kind"] == "limit"
+
+
+def test_parse_xbrl_reads_this_quarter_in_crore():
+    from fundamentals.trigger_study.nse_results import parse_xbrl
+    xml = ('<in-bse-fin:RevenueFromOperations contextRef="OneD" unitRef="INR" decimals="-5">1652355000.00</in-bse-fin:RevenueFromOperations>'
+           '<in-bse-fin:RevenueFromOperations contextRef="FourD" unitRef="INR">4000000000.00</in-bse-fin:RevenueFromOperations>'
+           '<in-bse-fin:ProfitLossForPeriod contextRef="OneD" unitRef="INR">91494000.00</in-bse-fin:ProfitLossForPeriod>')
+    f = parse_xbrl(xml)
+    assert round(f["sales"], 2) == 165.24 and round(f["net_profit"], 2) == 9.15
+
+
+def test_choose_rows_keeps_one_basis_and_the_latest_refiling():
+    from fundamentals.trigger_study.nse_results import choose_rows
+    rows = []
+    for q in ("31-Dec-2019", "31-Mar-2020", "30-Jun-2020"):
+        for cons in ("Consolidated", "Non-Consolidated"):
+            rows.append({"toDate": q, "consolidated": cons, "broadCastDate": "05-Feb-2020 14:34:29", "xbrl": f"{q}{cons}.xml"})
+    rows.append({"toDate": "30-Jun-2020", "consolidated": "Consolidated", "broadCastDate": "06-Aug-2020 10:00:00", "xbrl": "refiled.xml"})
+    rows.append({"toDate": "31-Mar-2023", "consolidated": "Consolidated", "broadCastDate": "10-May-2023 10:00:00", "xbrl": "check_years.xml"})
+    df = choose_rows(rows)
+    assert df["consolidated"].all() and len(df) == 3
+    assert df.loc[df["period_end"] == "2020-06-30", "xbrl"].item() == "refiled.xml"

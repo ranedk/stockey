@@ -15,19 +15,19 @@ import pandas as pd
 from utils.db import sql_to_df
 
 from fundamentals.trigger_study import events as ev_mod
-from fundamentals.trigger_study.events import EVENTS_TABLE
+from fundamentals.trigger_study.events import EVENTS_TABLE, samples
 from fundamentals.trigger_study.filings import FILINGS_TABLE
 from fundamentals.trigger_study.llm_runner import TAGS_TABLE
 
-RESULTS_LAG_DAYS = 60          # a quarter counts as public 60 days after it ends (Q4 can take 60)
+RESULTS_LAG_DAYS = 60          # only when NSE gives no publish time
 MIN_IMPORTANCE = 2
 
 
 def load_events(sample: str) -> pd.DataFrame:
     # a stock NSE returned no filings for would read as "no triggers" -- leave it out instead
-    df = sql_to_df(f"""SELECT * FROM {EVENTS_TABLE} e WHERE sample = %s AND label IN ('continued','failed')
+    df = sql_to_df(f"""SELECT * FROM {EVENTS_TABLE} e WHERE sample = ANY(%s) AND label IN ('continued','failed')
                           AND EXISTS (SELECT 1 FROM {FILINGS_TABLE} f WHERE f.symbol = e.symbol)""",
-                   params=(sample,))
+                   params=(samples(sample),))
     for c in ("entry_week", "window_start", "window_end"):
         df[c] = pd.to_datetime(df[c])
     return df
@@ -47,10 +47,12 @@ def load_tags(symbols: list[str]) -> pd.DataFrame:
 
 
 def load_results(symbols: list[str]) -> pd.DataFrame:
-    df = sql_to_df("""SELECT ticker AS symbol, period_end, sales, opm_pct, net_profit
-                        FROM fundamentals_quarterly_results WHERE ticker = ANY(%s)""", params=(symbols,))
-    df["period_end"] = pd.to_datetime(df["period_end"])
-    return df.sort_values(["symbol", "period_end"])
+    """NSE XBRL quarters (from Sep 2019) with their real publish time; a missing publish time
+    falls back to quarter end + RESULTS_LAG_DAYS."""
+    from fundamentals.trigger_study import nse_results
+    df = nse_results.load(symbols)
+    df["public_at"] = df["public_at"].fillna(df["period_end"] + pd.Timedelta(days=RESULTS_LAG_DAYS))
+    return df
 
 
 def _yoy(cur: float, base: float, floor: float) -> float:
@@ -63,7 +65,7 @@ def results_signals(res: pd.DataFrame, symbol: str, as_of: pd.Timestamp, until: 
     """The latest quarter public by `as_of` (or, with `until`, the first one made public in
     (as_of, until]) against the same quarter a year earlier."""
     r = res[res["symbol"] == symbol].set_index("period_end")
-    public = r.index + pd.Timedelta(days=RESULTS_LAG_DAYS)
+    public = pd.DatetimeIndex(r["public_at"])
     if until is None:
         cand = r.index[public <= as_of]
         q = cand.max() if len(cand) else None
@@ -88,7 +90,7 @@ def results_signals(res: pd.DataFrame, symbol: str, as_of: pd.Timestamp, until: 
 
 
 def _ttm_sales(res: pd.DataFrame, symbol: str, as_of: pd.Timestamp) -> float:
-    r = res[(res["symbol"] == symbol) & (res["period_end"] + pd.Timedelta(days=RESULTS_LAG_DAYS) <= as_of)]
+    r = res[(res["symbol"] == symbol) & (res["public_at"] <= as_of)]
     return float(r.tail(4)["sales"].sum()) if len(r) >= 4 else np.nan
 
 

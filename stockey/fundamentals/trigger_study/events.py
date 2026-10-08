@@ -210,3 +210,18 @@ def build(per_group: int = 20) -> dict:
     counts = events["label"].value_counts().to_dict()
     return {"events": len(events), "labels": counts, "pilot": len(pilot),
             "pilot_symbols": sorted(pilot["symbol"])}
+
+
+def samples(sample: str) -> list[str]:
+    """'full' is every labelled discovery event, the pilot's included."""
+    return ["pilot", "full"] if sample == "full" else [sample]
+
+
+def mark_full() -> dict:
+    """Tags every continued/failed event not in the pilot as 'full'. Does NOT recompute events:
+    rebuilding would re-pick the pilot."""
+    with db_session() as (_, cur):
+        cur.execute(f"""UPDATE {EVENTS_TABLE} SET sample = 'full'
+                         WHERE sample IS NULL AND label IN ('continued', 'failed')""")
+        n = cur.rowcount
+    return {"marked_full": n}

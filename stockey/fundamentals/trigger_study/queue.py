@@ -15,7 +15,7 @@ import pandas as pd
 from utils.db import db_session, sql_to_df
 
 from fundamentals.trigger_study.filings import FILINGS_TABLE
-from fundamentals.trigger_study.events import EVENTS_TABLE
+from fundamentals.trigger_study.events import EVENTS_TABLE, samples
 from fundamentals.trigger_study.llm_runner import BATCHES_TABLE, DEFAULT_MODEL, TAGS_TABLE, ensure_tables
 
 TAG_BATCH = 50
@@ -67,11 +67,11 @@ def window_filings(sample: str = "pilot") -> pd.DataFrame:
         SELECT DISTINCT f.filing_id, f.symbol, f.announced_at, f.nse_category, f.text, f.attachment_url,
                f.company_name, coalesce(sr.description, e.sector_code) AS sector
           FROM {FILINGS_TABLE} f
-          JOIN {EVENTS_TABLE} e ON e.symbol = f.symbol AND e.sample = %s
+          JOIN {EVENTS_TABLE} e ON e.symbol = f.symbol AND e.sample = ANY(%s)
                AND f.announced_at::date BETWEEN e.window_start AND e.window_end
           LEFT JOIN (SELECT DISTINCT ON (code) code, description FROM fundamentals_sector_reference
                       ORDER BY code, as_of_date DESC) sr ON sr.code = e.sector_code
-    """, params=(sample,))
+    """, params=(samples(sample),))
 
 
 def _already_batched(pass_name: str) -> set[str]:
