@@ -563,7 +563,8 @@ def run_structured_extraction(*, limit: int | None = None, model: str = DEFAULT_
 
     pending = load_pending_extraction_targets(limit or DEFAULT_BATCH_LIMIT)
     if pending.empty:
-        return {"extracted": 0, "failed": 0, "unsupported_filing_type": 0, "blocked": False}
+        # same keys as a real run: main() reads every one (KeyError on an empty queue, 2026-10-07)
+        return {"extracted": 0, "failed": 0, "unsupported_filing_type": 0, "routine_pit_sast_skipped": 0, "blocked": False}
 
     counts = {"extracted": 0, "failed": 0, "unsupported_filing_type": 0, "routine_pit_sast_skipped": 0}
     consecutive_failures = 0
