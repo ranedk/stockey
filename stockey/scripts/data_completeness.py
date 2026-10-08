@@ -351,7 +351,8 @@ def check_trading_days_runway(f: Findings) -> None:
     if runway < TRADING_DAYS_MIN_RUNWAY:
         f.add(WARN, "trading_days",
               f"dim_trading_days runs out on {latest.date()} ({runway} days of runway) "
-              f"and has no producer in the codebase",
+              f"-- calendar_creator (nightly, after the holidays download) extends it only once "
+              f"NSE publishes next year's holiday list, usually in December",
               latest=str(latest.date()), runway_days=runway)
     else:
         f.add(OK, "trading_days", f"populated through {latest.date()} ({runway} days of runway)",

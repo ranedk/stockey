@@ -432,7 +432,7 @@ info "measured 13:20:00 -> 13:23:03 on 2026-08-28; ~2-4 GB WAL/night for data th
 DTD_MAX="$(s "select max(date)::date from dim_trading_days")"
 info "dim_trading_days populated through $DTD_MAX"
 if [ -n "$DTD_MAX" ] && [ "$DTD_MAX" \< "$(date -u -d '+90 days' +%Y-%m-%d)" ]; then
-  warn "dim_trading_days runs out on $DTD_MAX and has no producer in the codebase (known backlog item)."
+  warn "dim_trading_days runs out on $DTD_MAX -- calendar_creator extends it once NSE publishes next year's holiday list (usually December)."
 fi
 
 # =============================================================================

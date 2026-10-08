@@ -113,6 +113,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 06:50 | daily | `scripts/rotate_logs.sh` |
 | 07:10 | Mon–Sat | `complete_data.sh` — catch-up `download_runner --phase all` |
 | 07:30 | Mon–Sat | `all_data_readiness.sh` (`--fix`, bounded repairs) |
+| 06:55 | Mon | `all_dhan_auth_ensure.sh` — Monday only: the weekend lets Friday's token expire before the 07:10 run |
 | 07:35 | Mon–Fri | `all_dhan_auth_ensure.sh` — **the only job allowed to mint a Dhan consent** |
 | 07:40 | Mon–Sat | `all_ohlcv_reconcile.sh` |
 | 07:45 | Mon–Sat | `all_price_adjustment.sh` |
