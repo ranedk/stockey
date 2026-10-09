@@ -795,11 +795,14 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
             "skipped_too_old": skipped_too_old}
 
 
-RESEARCH_TAIL_SECONDS = env.int("FUNDAMENTALS_OCR_RESEARCH_TAIL_SECONDS", 25 * 60)
 RESEARCH_DOC_SECONDS = env.int("FUNDAMENTALS_OCR_RESEARCH_DOC_SECONDS", 15 * 60)
+# One process keeps going -- daily first, research whenever the daily queue is empty -- for at
+# most this long, then exits so cron starts a fresh one (which also picks up code changes).
+# Under scripts/is_cron_running.sh's 6h stuck-lock warning, with room for a last round.
+PROCESS_MAX_SECONDS = env.int("FUNDAMENTALS_OCR_PROCESS_MAX_SECONDS", 5 * 60 * 60)
 
 
-def run_research_tail(*, seconds: int = RESEARCH_TAIL_SECONDS) -> dict[str, int]:
+def run_research_tail(*, seconds: float) -> dict[str, int]:
     """Research documents (fundamentals/collectors/ocr_research_queue.py), ONLY while the
     daily queue is empty -- re-checked before every document, so a filing that arrives
     mid-tail waits for at most one research document (<= RESEARCH_DOC_SECONDS). Same
@@ -828,32 +831,51 @@ def run_research_tail(*, seconds: int = RESEARCH_TAIL_SECONDS) -> dict[str, int]
 
 
 def main() -> int:
+    """Daily filings first; while none wait, research documents, continuously (operator,
+    2026-10-09: the research backlog runs all the time and yields only to daily work). A
+    research run stops the moment a daily filing is pending, the daily pass runs, and the
+    research resumes -- all in this one process, so the model is loaded once."""
     global STOCKEY_RUN_STATE
     ensure_ocr_timeout_column()
     readmit_bse_attachlive_failures()
     readmit_bse_sast_failures()
-    result = run_ocr_pipeline()
-    # research reads only after the daily work is finished and the budget allows it
-    research = {}
-    if result["backlog_remaining"] == 0 and not result["time_budget_exceeded"]:
+    started = time.monotonic()
+    totals = {"ocred": 0, "failed": 0, "no_document": 0, "skipped_too_old": 0}
+    research = {"research_ocred": 0, "research_failed": 0, "research_yields_to_daily": 0}
+    rounds = 0
+    while True:
+        if rounds and time.monotonic() - started >= PROCESS_MAX_SECONDS:
+            break
+        rounds += 1
+        result = run_ocr_pipeline()
+        for k in totals:
+            totals[k] += int(result.get(k, 0) or 0)
+        # daily work left over (budget hit, blocked source) or the process is due to exit
+        left = PROCESS_MAX_SECONDS - (time.monotonic() - started)
+        if result["backlog_remaining"] > 0 or result["time_budget_exceeded"] or left <= 0:
+            break
         try:
-            research = run_research_tail()
+            tail = run_research_tail(seconds=left)
         except Exception as exc:  # noqa: BLE001 -- the daily result stands whatever happens here
             _record_fallback("ocr_research_tail_failed", source="ocr_research_queue",
                              reason="Research OCR tail raised; daily OCR results are unaffected.", error=exc)
+            break
+        research["research_ocred"] += tail["research_ocred"]
+        research["research_failed"] += tail["research_failed"]
+        research["research_yields_to_daily"] += tail["research_stopped_for_daily"]
+        if not tail["research_stopped_for_daily"]:
+            break   # research queue empty, or out of time
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
-        "ocred": result["ocred"],
-        "rows_written": result["ocred"],
-        "failed": result["failed"],
-        "no_document": result["no_document"],
+        **totals,
+        "rows_written": totals["ocred"],
         "blocked": result["blocked"],
         "time_budget_exceeded": result["time_budget_exceeded"],
         "backlog_remaining": result["backlog_remaining"],
-        "skipped_too_old": result.get("skipped_too_old", 0),
-        "fallback_used": bool(result["failed"] or result["blocked"]),
-        "state_advanced": result["ocred"] > 0,
+        "fallback_used": bool(totals["failed"] or result["blocked"]),
+        "state_advanced": totals["ocred"] > 0 or research["research_ocred"] > 0,
         "status": "blocked" if result["blocked"] else "ok",
+        "rounds": rounds,
         **research,
     }
     print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)

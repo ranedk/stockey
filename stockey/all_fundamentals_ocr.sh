@@ -12,6 +12,11 @@ PYTHON_BIN="$("${SCRIPT_DIR}/scripts/resolve_python.sh")"
 # FUNDAMENTALS_OCR_MAX_RUNTIME_SECONDS and the next picks up where it left off. The
 # nightly pipeline's structured_extraction step scores whatever OCR has finished.
 #
+# Research documents (2026-10-09): when no filing waits, the same process reads the research
+# OCR queue continuously and goes back to filings the moment one is pending; it exits after
+# FUNDAMENTALS_OCR_PROCESS_MAX_SECONDS (5h) and the next cron start carries on. Still one
+# process and one copy of the model, so the limits below cover both.
+#
 # Deliberately NOT gated on .pause_fundamentals: it only reads documents already
 # collected and makes no judgement, so catching up during a pause is what we want.
 # Sharing the machine (2026-09-26): the local model otherwise takes every idle core with

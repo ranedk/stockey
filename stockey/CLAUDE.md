@@ -128,7 +128,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 23:15 | Mon–Fri | `all_ohlcv_reconcile.sh` — Dhan publishes staggered through the evening |
 | 23:40 | Mon–Fri | `all_dhan_intraday_sync.sh` |
 | every hour at :37 | daily | `all_fundamentals_news.sh` — Economic Times RSS (not gated on the pause: feeds keep only 50 items) |
-| every 30 min | daily | `all_fundamentals_ocr.sh` — OCR of filed documents, last 6 months only (not gated on the pause) |
+| every 30 min | daily | `all_fundamentals_ocr.sh` — OCR of filed documents, last 6 months only (not gated on the pause); when none wait, it works the research OCR queue (`fundamentals/collectors/ocr_research_queue.py`) continuously and switches back the moment a filing is pending. One process, model loaded once, exits after 5h so cron starts a fresh one |
 | :17 / :47 | daily | `all_fundamentals_reeval.sh` — intraday filings, news tagging, re-score touched companies, story read, watchlist (gated on `.pause_fundamentals`; stands aside while the screener or portfolio job runs) |
 | every 15 min | daily | `all_trigger_study.sh` — trigger-study tagging via the Claude CLI; calls only 22:00–08:00 IST, parks itself until a usage limit resets |
 | every 5 min | daily | `all_fundamentals_api.sh` (respawn-under-lock; no-ops when healthy) |
