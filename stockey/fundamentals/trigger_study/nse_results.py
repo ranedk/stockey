@@ -21,6 +21,8 @@ from utils.cdp import connect_over_cdp
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.nse_rate_limiter import nse_goto, nse_request_gate
 
+from fundamentals.trigger_study.filings import wait_until_quiet
+
 RESULTS_TABLE = "fundamentals_trigger_results"
 LAST_PERIOD = pd.Timestamp("2022-12-31")   # discovery windows end 2023-03; check years stay unread
 CRORE = 1e7
@@ -103,6 +105,8 @@ def fetch(symbols: list[str]) -> dict:
             nse_goto(page, "https://www.nseindia.com")
             page.wait_for_timeout(1000)
             for sym in todo:
+                if wait_until_quiet():
+                    nse_goto(page, "https://www.nseindia.com")
                 url = f"https://www.nseindia.com/api/corporates-financial-results?index=equities&symbol={sym}&period=Quarterly"
                 try:
                     with nse_request_gate():

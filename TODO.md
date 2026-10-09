@@ -379,6 +379,17 @@ All closed 2026-09-24; detail in `stockey/docs/DATA_AUDIT_2026-09-23.md` (G1-G12
 - [~] **Watch: completeness gate timing** -- first clean night 2026-09-24; move the gate
       after 12:00 IST only if nights fail at 08:00 but pass by noon.
 
+### C10. Trigger study: which filings and results come around momentum entries that keep running
+
+Operator idea, 2026-10-08 (`stockey/docs/TRIGGER_STUDY.md`, LEDGER row 56). Pilot done (20 + 20):
+leads only -- acquisitions and legal trouble more common in the failures; capacity additions,
+stronger sales before entry and better profit/margins after it in the ones that kept running.
+- [ ] Full run (started 2026-10-09): 580 entries, 403 stocks. Filings + NSE results fetch pause
+      in the NSE busy windows; tagging runs nightly via cron (`all_trigger_study.sh`).
+- [ ] Report; pick the triggers per sector; freeze them in a pre-registration.
+- [ ] Check on 2023-2026 entries (untagged until then), then a forward paper track.
+- [ ] Phase 2 if it holds: earnings-call transcripts (NSE, 2022+) for sector numbers.
+
 ## D. The boundary question
 
 ### D1. Momentum + quality — decide where the blend lives

@@ -143,7 +143,10 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
     from utils.cdp import connect_over_cdp
     from utils.nse_rate_limiter import nse_goto, nse_request_gate
 
+    from fundamentals.trigger_study.filings import nse_busy
     ensure_tables()
+    if nse_busy():
+        return {"skipped": "nse_busy_window"}
     cand = document_candidates()
     cand = cand[~cand["filing_id"].isin(_already_batched("document"))]
     if limit:
@@ -160,6 +163,8 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
         try:
             nse_goto(page, "https://www.nseindia.com")
             for r in cand.sample(frac=1.0, random_state=SEED).itertuples():
+                if nse_busy():   # stop downloading; what is queued so far is kept
+                    break
                 try:
                     with nse_request_gate():
                         resp = ctx.request.get(r.attachment_url, timeout=60000)

@@ -74,3 +74,11 @@ def test_choose_rows_keeps_one_basis_and_the_latest_refiling():
     df = choose_rows(rows)
     assert df["consolidated"].all() and len(df) == 3
     assert df.loc[df["period_end"] == "2020-06-30", "xbrl"].item() == "refiled.xml"
+
+
+def test_nse_busy_windows_cover_the_morning_chain_and_the_evening_jobs():
+    from fundamentals.trigger_study.filings import nse_busy
+    assert nse_busy(datetime(2026, 10, 9, 2, 0, tzinfo=timezone.utc))       # 07:30 IST data_readiness
+    assert nse_busy(datetime(2026, 10, 9, 15, 30, tzinfo=timezone.utc))     # 21:00 IST screener
+    assert not nse_busy(datetime(2026, 10, 9, 20, 0, tzinfo=timezone.utc))  # 01:30 IST
+    assert not nse_busy(datetime(2026, 10, 9, 9, 0, tzinfo=timezone.utc))   # 14:30 IST

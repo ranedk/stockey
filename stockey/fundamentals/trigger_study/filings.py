@@ -27,6 +27,31 @@ _JS = """async (url) => {
 }"""
 
 
+# The study's ~30 hours of NSE requests share utils/nse_rate_limiter's gate with the daily
+# collectors. Inside these UTC windows (morning catch-up chain; evening EOD + screener +
+# portfolio) it pauses, so the production jobs never queue behind it.
+BUSY_UTC = ((1 * 60 + 30, 3 * 60 + 45), (13 * 60 + 30, 18 * 60))
+
+
+def nse_busy(now=None) -> bool:
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
+    m = now.hour * 60 + now.minute
+    return any(a <= m < b for a, b in BUSY_UTC)
+
+
+def wait_until_quiet(log=print) -> bool:
+    """True if it paused -- the caller then reloads NSE's home page, since a session left
+    idle for hours may have lost its cookies."""
+    import time
+    if not nse_busy():
+        return False
+    log("[trigger_study] NSE busy window -- pausing", flush=True)
+    while nse_busy():
+        time.sleep(60)
+    return True
+
+
 def ensure_table() -> None:
     with db_session() as (_, cur):
         cur.execute(f"""
@@ -74,6 +99,8 @@ def fetch(symbols: list[str], *, refetch: bool = False) -> dict:
             nse_goto(page, "https://www.nseindia.com")
             page.wait_for_timeout(1500)
             for sym in todo:
+                if wait_until_quiet():
+                    nse_goto(page, "https://www.nseindia.com")
                 url = (f"https://www.nseindia.com/api/corporate-announcements?index=equities"
                        f"&symbol={sym}&from_date={FROM_DATE}&to_date={TO_DATE}")
                 try:
