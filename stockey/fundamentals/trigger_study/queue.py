@@ -14,6 +14,8 @@ import pandas as pd
 
 from utils.db import db_session, sql_to_df
 
+from fundamentals.collectors import ocr_research_queue
+
 from fundamentals.trigger_study.filings import FILINGS_TABLE
 from fundamentals.trigger_study.events import EVENTS_TABLE, samples
 from fundamentals.trigger_study.llm_runner import BATCHES_TABLE, DEFAULT_MODEL, TAGS_TABLE, ensure_tables
@@ -130,10 +132,32 @@ def document_candidates() -> pd.DataFrame:
     """, params=(list(DOC_TRIGGERS),))
 
 
+OCR_REQUESTER = "trigger_study"
+
+
+def queue_ocred_documents(model: str = DEFAULT_MODEL) -> dict:
+    """Scans the OCR job has read since the last call -> document batches."""
+    done = ocr_research_queue.done_for(OCR_REQUESTER)
+    if done.empty:
+        return {"ocred_queued": 0}
+    done = done[~done["doc_id"].isin(_already_batched("document"))]
+    if done.empty:
+        return {"ocred_queued": 0}
+    meta = sql_to_df(f"""SELECT filing_id, symbol, company_name, announced_at, nse_category, text
+                           FROM {FILINGS_TABLE} WHERE filing_id = ANY(%s)""", params=(list(done["doc_id"]),))
+    doc = dict(zip(done["doc_id"], done["text"]))
+    items = [{"id": r.filing_id, "company": r.company_name or r.symbol, "date": str(pd.Timestamp(r.announced_at).date()),
+              "nse_category": r.nse_category, "text": (r.text or "")[:TEXT_CHARS],
+              "document": re.sub(r"[ \t]+", " ", doc.get(r.filing_id) or "").strip()[:DOC_CHARS]}
+             for r in meta.itertuples() if len((doc.get(r.filing_id) or "").strip()) >= 100]
+    return {"ocred_queued": len(items), "ocred_batches": _insert_batches("document", items, DOC_BATCH, model)}
+
+
 def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -> dict:
     """Downloads each candidate's attachment (through the NSE gate), keeps the first pages'
-    text, and queues it. Scanned PDFs with no text layer are skipped and counted, not OCR'd:
-    the study only needs the subject + page one, and OCR here would cost hours."""
+    text, and queues it. Scanned PDFs go to the low-priority research OCR queue
+    (fundamentals/collectors/ocr_research_queue.py) and come back through
+    queue_ocred_documents() once the daily OCR job has read them."""
     import subprocess
     import tempfile
 
@@ -145,8 +169,9 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
 
     from fundamentals.trigger_study.filings import nse_busy
     ensure_tables()
+    ocred = queue_ocred_documents(model)
     if nse_busy():
-        return {"skipped": "nse_busy_window"}
+        return {"skipped": "nse_busy_window", **ocred}
     cand = document_candidates()
     cand = cand[~cand["filing_id"].isin(_already_batched("document"))]
     if limit:
@@ -171,8 +196,9 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
                     if not resp.ok:
                         skipped.append((r.filing_id, f"download_failed_http_{resp.status}"))
                         continue
+                    pdf = resp.body()
                     with tempfile.NamedTemporaryFile(suffix=".pdf") as fh:
-                        fh.write(resp.body())
+                        fh.write(pdf)
                         fh.flush()
                         out = subprocess.run(["pdftotext", "-l", "2", "-layout", fh.name, "-"],
                                              capture_output=True, text=True, timeout=60)
@@ -181,7 +207,9 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
                     skipped.append((r.filing_id, "download_failed"))
                     continue
                 if len(doc) < 200:
-                    skipped.append((r.filing_id, "no_text_layer"))
+                    # a scan: the daily OCR job reads pages 1-2 when its own queue is empty
+                    ocr_research_queue.enqueue(r.filing_id, OCR_REQUESTER, pdf, max_pages=2)
+                    skipped.append((r.filing_id, "sent_to_ocr"))
                     continue
                 items.append({"id": r.filing_id, "company": r.company_name or r.symbol,
                               "date": str(pd.Timestamp(r.announced_at).date()),
@@ -196,4 +224,4 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
                             ON CONFLICT (filing_id, pass) DO NOTHING""", (fid, why))
     batches = _insert_batches("document", items, DOC_BATCH, model)
     reasons = pd.Series([w for _, w in skipped]).value_counts().to_dict() if skipped else {}
-    return {"candidates": len(cand), "queued": len(items), "skipped": reasons, "new_batches": batches}
+    return {"candidates": len(cand), "queued": len(items), "skipped": reasons, "new_batches": batches, **ocred}

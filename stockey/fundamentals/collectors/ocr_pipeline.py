@@ -576,16 +576,21 @@ def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     return extract_pdf_text(pdf_bytes)[0]
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, dict[str, int]]:
+def extract_pdf_text(pdf_bytes: bytes, *, max_pages: int | None = None,
+                     max_document_seconds: int | None = None) -> tuple[str, dict[str, int]]:
     """One document's text: each page from its own text layer when that layer is usable
     (see TEXT_LAYER_MIN_CHARS), otherwise through the local OCR model. Returns the text
     and {pages_total, pages_model}. The model-side bounds are unchanged:
     PER_PAGE_OCR_TIMEOUT_SECONDS per page, MAX_DOCUMENT_OCR_SECONDS per document, and at
-    most MAX_OCR_PAGES pages rendered for the model (text-layer pages are not capped)."""
+    most MAX_OCR_PAGES pages rendered for the model (text-layer pages are not capped).
+    `max_pages` reads only the first N pages (research documents need pages 1-2)."""
     document_started = time.monotonic()
+    doc_budget = max_document_seconds or MAX_DOCUMENT_OCR_SECONDS
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as handle:
         Path(handle.name).write_bytes(pdf_bytes)
         layer = text_layer_pages(handle.name)
+        if max_pages:
+            layer = layer[:max_pages]
         total_pages = len(layer) or None
         if total_pages is None:
             try:
@@ -603,7 +608,10 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, dict[str, int]]:
                 else:
                     model_pages.append(number)
 
-        if not layer:
+        if not layer and max_pages:
+            last = min(max_pages, int(total_pages)) if total_pages else max_pages
+            rendered_pages = render_pdf_pages(handle.name, pages=list(range(1, last + 1)))
+        elif not layer:
             if total_pages is not None and total_pages > MAX_OCR_PAGES:
                 _record_truncation(total_pages)
                 rendered_pages = render_pdf_pages(handle.name, pages=list(range(1, MAX_OCR_PAGES + 1)))
@@ -618,9 +626,9 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, dict[str, int]]:
             rendered_pages = []
 
     for page_number, image in rendered_pages:
-        if time.monotonic() - document_started >= MAX_DOCUMENT_OCR_SECONDS:
+        if time.monotonic() - document_started >= doc_budget:
             raise OcrTimeoutError(
-                f"document OCR exceeded MAX_DOCUMENT_OCR_SECONDS ({MAX_DOCUMENT_OCR_SECONDS}s) "
+                f"document OCR exceeded MAX_DOCUMENT_OCR_SECONDS ({doc_budget}s) "
                 f"with {len(texts)} pages done"
             )
         try:
@@ -787,12 +795,52 @@ def run_ocr_pipeline(*, limit: int | None = None) -> dict[str, object]:
             "skipped_too_old": skipped_too_old}
 
 
+RESEARCH_TAIL_SECONDS = env.int("FUNDAMENTALS_OCR_RESEARCH_TAIL_SECONDS", 25 * 60)
+RESEARCH_DOC_SECONDS = env.int("FUNDAMENTALS_OCR_RESEARCH_DOC_SECONDS", 15 * 60)
+
+
+def run_research_tail(*, seconds: int = RESEARCH_TAIL_SECONDS) -> dict[str, int]:
+    """Research documents (fundamentals/collectors/ocr_research_queue.py), ONLY while the
+    daily queue is empty -- re-checked before every document, so a filing that arrives
+    mid-tail waits for at most one research document (<= RESEARCH_DOC_SECONDS). Same
+    process and the same cached model as the daily work: never a second copy in memory."""
+    from fundamentals.collectors import ocr_research_queue as rq
+
+    started = time.monotonic()
+    done = failed = 0
+    stopped_for_daily = False
+    while time.monotonic() - started < seconds:
+        if count_pending_ocr_targets() > 0:
+            stopped_for_daily = True
+            break
+        item = rq.next_pending()
+        if item is None:
+            break
+        try:
+            text, stats = extract_pdf_text(Path(item["pdf_path"]).read_bytes(), max_pages=int(item["max_pages"]),
+                                           max_document_seconds=RESEARCH_DOC_SECONDS)
+            rq.mark(item["doc_id"], text=text, pages_model=stats["pages_model"])
+            done += 1
+        except Exception as exc:  # noqa: BLE001 -- a research document never fails the daily job
+            rq.mark(item["doc_id"], error=f"{type(exc).__name__}: {exc}")
+            failed += 1
+    return {"research_ocred": done, "research_failed": failed, "research_stopped_for_daily": int(stopped_for_daily)}
+
+
 def main() -> int:
     global STOCKEY_RUN_STATE
     ensure_ocr_timeout_column()
     readmit_bse_attachlive_failures()
     readmit_bse_sast_failures()
     result = run_ocr_pipeline()
+    # research reads only after the daily work is finished and the budget allows it
+    research = {}
+    if result["backlog_remaining"] == 0 and not result["time_budget_exceeded"]:
+        try:
+            research = run_research_tail()
+        except Exception as exc:  # noqa: BLE001 -- the daily result stands whatever happens here
+            _record_fallback("ocr_research_tail_failed", source="ocr_research_queue",
+                             reason="Research OCR tail raised; daily OCR results are unaffected.", error=exc)
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         "ocred": result["ocred"],
@@ -806,6 +854,7 @@ def main() -> int:
         "fallback_used": bool(result["failed"] or result["blocked"]),
         "state_advanced": result["ocred"] > 0,
         "status": "blocked" if result["blocked"] else "ok",
+        **research,
     }
     print(json.dumps(STOCKEY_RUN_STATE, ensure_ascii=False, default=str), flush=True)
     return 0
