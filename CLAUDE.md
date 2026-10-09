@@ -70,7 +70,8 @@ through: stockey's watchlist and stages pages, systrader's paper page.
 - Dhan token: stockey owns login. `web_login` is the INNER step and requires
   `--consent-url`; the operator command is
   `python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login`
-  (scheduled as `all_dhan_auth_ensure.sh`, weekdays 02:05 UTC = 07:35 IST). Login is fully automatic
+  (scheduled as `all_dhan_auth_ensure.sh`, Mon–Sat 01:25 UTC = 06:55 IST; a 07:35 IST
+  backstop run skips when the token is fresh). Login is fully automatic
   — TOTP via `pyotp`/`DHAN_TOTP_SECRET` — so an OTP-looking timeout in the logs
   does NOT mean a human must type a code. Cache at
   `stockey/.cache/dhan_access_token.json`; check expiry with `auth_cli status`
