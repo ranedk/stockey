@@ -177,7 +177,7 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
     if limit:
         cand = cand.head(limit)
     if cand.empty:
-        return {"candidates": 0}
+        return {"candidates": 0, **ocred}
     env = Env()
     env.read_env()
     items, skipped = [], []   # skipped: (filing_id, reason) -- recorded so cron never re-downloads them

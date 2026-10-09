@@ -6,7 +6,7 @@
   queue      keyword pre-filter + blind tagging batches
   documents  download attachments for vague / amount-less notable filings, queue them
   run        tag pending batches through the Claude CLI (night window unless --any-time)
-  auto       what cron calls: run; once tagging is done, queue documents and run again
+  auto       what cron calls: AI tagging (nights) + attachment downloads (any quiet NSE time)
   report     write logs/trigger_study_<sample>.json (+ _triggers.csv, _events.csv)
   status     queue and token counts
 """
@@ -30,17 +30,19 @@ def status() -> dict:
     return {"batches": b.to_dict("records"), "state": st.to_dict("records")}
 
 
+DOC_DOWNLOADS_PER_RUN = 90   # ~15 min at NSE's 10 s gate: one cron interval
+
+
 def auto(max_calls: int, any_time: bool) -> dict:
+    """What cron runs every 15 minutes. Two independent halves, so the work flows
+    continuously instead of in stages (operator, 2026-10-09):
+      - AI tagging (subject lines and documents): night window only, parks on a usage limit;
+      - attachments for whatever has been tagged so far: any time NSE is quiet. Scans go to
+        the research OCR queue, which the OCR job reads whenever no daily filing waits, and
+        come back as document batches here."""
     from fundamentals.trigger_study import llm_runner, queue
-    first = llm_runner.run(max_calls=max_calls, any_time=any_time)
-    out = {"tag_run": first}
-    pending_tag = int(sql_to_df(f"SELECT count(*) AS n FROM {llm_runner.BATCHES_TABLE} "
-                                "WHERE pass = 'tag' AND status = 'pending'").iloc[0]["n"])
-    if first.get("status") == "ok" and pending_tag == 0:
-        out["documents"] = queue.build_document_queue(limit=200)
-        left = max_calls - int(first.get("calls", 0))
-        if left > 0:
-            out["document_run"] = llm_runner.run(max_calls=left, any_time=any_time)
+    out = {"llm_run": llm_runner.run(max_calls=max_calls, any_time=any_time)}
+    out["documents"] = queue.build_document_queue(limit=DOC_DOWNLOADS_PER_RUN)
     return out
 
 
