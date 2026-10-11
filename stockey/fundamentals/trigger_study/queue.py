@@ -82,7 +82,17 @@ def _already_batched(pass_name: str) -> set[str]:
     return set(df["id"])
 
 
+_CTRL_RX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _clean(v):
+    # PDF text can carry NUL and other control characters; Postgres JSONB refuses \u0000
+    # (2026-10-10: nine cron runs failed on it, each losing ~90 finished downloads)
+    return _CTRL_RX.sub(" ", v) if isinstance(v, str) else v
+
+
 def _insert_batches(pass_name: str, items: list[dict], size: int, model: str) -> int:
+    items = [{k: _clean(v) for k, v in it.items()} for it in items]
     n = 0
     with db_session() as (_, cur):
         for i in range(0, len(items), size):
@@ -116,6 +126,9 @@ def build_tag_queue(sample: str = "pilot", model: str = DEFAULT_MODEL) -> dict:
             "queued_items": len(items), "new_batches": batches}
 
 
+# failed downloads come back once, a day later (NSE blocks come and go); a second failure is final
+RETRYABLE_SKIPS = ("download_failed", "not_pdf")
+
 DOC_TRIGGERS = ("order_win", "capacity_expansion", "acquisition_or_jv", "large_investor_entry",
                 "fundraise", "new_product_or_approval", "divestment_or_demerger")
 
@@ -127,9 +140,10 @@ def document_candidates() -> pd.DataFrame:
         SELECT t.filing_id, f.symbol, f.company_name, f.announced_at, f.nse_category, f.text, f.attachment_url
           FROM {TAGS_TABLE} t JOIN {FILINGS_TABLE} f USING (filing_id)
          WHERE t.pass = 'tag' AND f.attachment_url ILIKE '%%.pdf'
-           AND NOT EXISTS (SELECT 1 FROM {TAGS_TABLE} s WHERE s.filing_id = t.filing_id AND s.pass = 'document_skip')
+           AND NOT EXISTS (SELECT 1 FROM {TAGS_TABLE} s WHERE s.filing_id = t.filing_id AND s.pass = 'document_skip'
+                             AND NOT (s.trigger = ANY(%s) AND s.tagged_at < now() - interval '1 day'))
            AND (t.needs_document OR (t.trigger = ANY(%s) AND t.value_cr IS NULL AND t.importance >= 2))
-    """, params=(list(DOC_TRIGGERS),))
+    """, params=(list(RETRYABLE_SKIPS), list(DOC_TRIGGERS)))
 
 
 OCR_REQUESTER = "trigger_study"
@@ -197,6 +211,10 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
                         skipped.append((r.filing_id, f"download_failed_http_{resp.status}"))
                         continue
                     pdf = resp.body()
+                    if b"%PDF" not in pdf[:1024]:
+                        # NSE sometimes answers 200 with an error page: not a scan, a failed download
+                        skipped.append((r.filing_id, "not_pdf"))
+                        continue
                     with tempfile.NamedTemporaryFile(suffix=".pdf") as fh:
                         fh.write(pdf)
                         fh.flush()
@@ -221,7 +239,10 @@ def build_document_queue(model: str = DEFAULT_MODEL, limit: int | None = None) -
         for fid, why in skipped:
             cur.execute(f"""INSERT INTO {TAGS_TABLE} (filing_id, pass, batch_id, trigger, model)
                             VALUES (%s, 'document_skip', 'document_skip', %s, 'none')
-                            ON CONFLICT (filing_id, pass) DO NOTHING""", (fid, why))
+                            ON CONFLICT (filing_id, pass) DO UPDATE SET tagged_at = now(),
+                              trigger = CASE WHEN {TAGS_TABLE}.trigger = ANY(%s)
+                                             THEN EXCLUDED.trigger || '_final' ELSE EXCLUDED.trigger END""",
+                        (fid, why, list(RETRYABLE_SKIPS)))
     batches = _insert_batches("document", items, DOC_BATCH, model)
     reasons = pd.Series([w for _, w in skipped]).value_counts().to_dict() if skipped else {}
     return {"candidates": len(cand), "queued": len(items), "skipped": reasons, "new_batches": batches, **ocred}

@@ -82,3 +82,9 @@ def test_nse_busy_windows_cover_the_morning_chain_and_the_evening_jobs():
     assert nse_busy(datetime(2026, 10, 9, 15, 30, tzinfo=timezone.utc))     # 21:00 IST screener
     assert not nse_busy(datetime(2026, 10, 9, 20, 0, tzinfo=timezone.utc))  # 01:30 IST
     assert not nse_busy(datetime(2026, 10, 9, 9, 0, tzinfo=timezone.utc))   # 14:30 IST
+
+
+def test_queue_items_lose_control_characters_postgres_jsonb_refuses():
+    from fundamentals.trigger_study.queue import _clean
+    assert _clean("Rs 450\x00 crore\x07 order\nnext") == "Rs 450  crore  order\nnext"
+    assert _clean(12) == 12
