@@ -88,3 +88,35 @@ def test_queue_items_lose_control_characters_postgres_jsonb_refuses():
     from fundamentals.trigger_study.queue import _clean
     assert _clean("Rs 450\x00 crore\x07 order\nnext") == "Rs 450  crore  order\nnext"
     assert _clean(12) == 12
+
+
+def test_supervisor_verdicts():
+    from datetime import timedelta
+    from fundamentals.trigger_study.supervise import _verdict
+    now = datetime(2026, 10, 11, 20, 0, tzinfo=timezone.utc)
+    h = timedelta(hours=1)
+    assert _verdict(0, now - h, None, now, "x")["state"] == "done_or_empty"
+    assert _verdict(5, None, None, now, "NSE busy")["state"] == "waiting"          # legitimately idle
+    assert _verdict(5, now - timedelta(minutes=10), None, now, "x")["state"] == "starting"
+    assert _verdict(5, now - h, now - timedelta(minutes=5), now, "x")["state"] == "running"
+    assert _verdict(5, now - h, now - 2 * h, now, "x")["state"] == "STALLED"
+
+
+def test_supervisor_windows():
+    from fundamentals.trigger_study.supervise import night_allowed_since, nse_allowed_since
+    assert night_allowed_since(datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)) is None           # 15:30 IST
+    assert night_allowed_since(datetime(2026, 10, 11, 20, 0, tzinfo=timezone.utc)) == datetime(2026, 10, 11, 16, 30, tzinfo=timezone.utc)
+    assert nse_allowed_since(datetime(2026, 10, 11, 15, 0, tzinfo=timezone.utc)) is None             # evening busy
+    assert nse_allowed_since(datetime(2026, 10, 11, 20, 0, tzinfo=timezone.utc)) == datetime(2026, 10, 11, 18, 0, tzinfo=timezone.utc)
+
+
+def test_supervisor_alerts_once_per_stall_and_once_on_recovery(monkeypatch, tmp_path):
+    from fundamentals.trigger_study import supervise as sv
+    monkeypatch.setattr(sv, "STATE_PATH", tmp_path / "s.json")
+    verdicts = iter([{"downloads": {"state": "STALLED", "work": 9}}, {"downloads": {"state": "STALLED", "work": 9}},
+                     {"downloads": {"state": "running", "work": 4}}])
+    monkeypatch.setattr(sv, "check", lambda now=None: next(verdicts))
+    sent = []
+    for _ in range(3):
+        sv.supervise(send=lambda subj, body: sent.append(subj))
+    assert sent == ["[trigger study] downloads stalled", "[trigger study] downloads recovered"]

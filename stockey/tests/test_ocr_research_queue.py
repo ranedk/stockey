@@ -64,6 +64,32 @@ def test_main_goes_back_to_daily_work_when_research_yields(monkeypatch):
                   {"research_ocred": 2, "research_failed": 0, "research_stopped_for_daily": 0}])
     monkeypatch.setattr(ocr_pipeline, "run_ocr_pipeline", daily_run)
     monkeypatch.setattr(ocr_pipeline, "run_research_tail", lambda **k: next(tails))
+    monkeypatch.setattr(ocr_pipeline, "wait_for_work", lambda s: False)
     ocr_pipeline.main()
     assert len(daily) == 2                      # daily, research (yields), daily again, research (done)
     assert ocr_pipeline.STOCKEY_RUN_STATE["research_ocred"] == 6
+
+
+def test_idle_process_picks_up_work_that_arrives_instead_of_exiting(monkeypatch):
+    monkeypatch.setattr(ocr_pipeline, "ensure_ocr_timeout_column", lambda: None)
+    monkeypatch.setattr(ocr_pipeline, "readmit_bse_attachlive_failures", lambda: None)
+    monkeypatch.setattr(ocr_pipeline, "readmit_bse_sast_failures", lambda: None)
+    rounds = []
+    monkeypatch.setattr(ocr_pipeline, "run_ocr_pipeline", lambda: rounds.append(1) or {
+        "ocred": 0, "failed": 0, "no_document": 0, "blocked": False, "time_budget_exceeded": False,
+        "backlog_remaining": 0, "skipped_too_old": 0})
+    monkeypatch.setattr(ocr_pipeline, "run_research_tail",
+                        lambda **k: {"research_ocred": 1, "research_failed": 0, "research_stopped_for_daily": 0})
+    waits = iter([True, False])      # new work arrives once while idle, then nothing
+    monkeypatch.setattr(ocr_pipeline, "wait_for_work", lambda s: next(waits))
+    ocr_pipeline.main()
+    assert len(rounds) == 2
+
+
+def test_wait_for_work_returns_as_soon_as_a_research_document_arrives(monkeypatch):
+    import fundamentals.collectors.ocr_research_queue as rq
+    counts = iter([0, 0, 1])
+    monkeypatch.setattr(ocr_pipeline, "count_pending_ocr_targets", lambda: 0)
+    monkeypatch.setattr(rq, "pending_count", lambda: next(counts))
+    monkeypatch.setattr(ocr_pipeline.time, "sleep", lambda s: None)
+    assert ocr_pipeline.wait_for_work(600) is True

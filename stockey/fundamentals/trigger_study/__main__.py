@@ -7,6 +7,7 @@
   documents  download attachments for vague / amount-less notable filings, queue them
   run        tag pending batches through the Claude CLI (night window unless --any-time)
   auto       what cron calls: AI tagging (nights) + attachment downloads (any quiet NSE time)
+  supervise  is every stage moving? email the operator when one stalls (cron, every 15 min)
   report     write logs/trigger_study_<sample>.json (+ _triggers.csv, _events.csv)
   status     queue and token counts
 """
@@ -31,29 +32,40 @@ def status() -> dict:
 
 
 DOC_DOWNLOADS_PER_RUN = 90   # ~15 min at NSE's 10 s gate: one cron interval
+RESULTS_SYMBOLS_PER_RUN = 6  # ~15 quarters each at the same gate: about one interval
 
 
-def auto(max_calls: int, any_time: bool) -> dict:
-    """What cron runs every 15 minutes. Two independent halves, so the work flows
-    continuously instead of in stages (operator, 2026-10-09):
-      - AI tagging (subject lines and documents): night window only, parks on a usage limit;
-      - attachments for whatever has been tagged so far: any time NSE is quiet. Scans go to
-        the research OCR queue, which the OCR job reads whenever no daily filing waits, and
-        come back as document batches here."""
-    from fundamentals.trigger_study import llm_runner, queue
-    out = {"llm_run": llm_runner.run(max_calls=max_calls, any_time=any_time)}
-    out["documents"] = queue.build_document_queue(limit=DOC_DOWNLOADS_PER_RUN)
+def auto(max_calls: int, any_time: bool, part: str = "all") -> dict:
+    """What cron runs every 15 minutes, as two jobs under separate locks so neither waits for
+    the other (operator, 2026-10-11: keep something running whenever work exists):
+      llm  -- AI tagging (subject lines and documents): night window only, parks on a usage limit;
+      docs -- NSE work any time NSE is quiet: attachments for whatever is tagged so far (scans
+              go to the research OCR queue), and when none are left, any missing quarterly
+              results."""
+    from fundamentals.trigger_study import llm_runner, nse_results, queue
+    from fundamentals.trigger_study.events import EVENTS_TABLE
+    out = {}
+    if part in ("llm", "all"):
+        out["llm_run"] = llm_runner.run(max_calls=max_calls, any_time=any_time)
+    if part in ("docs", "all"):
+        docs = queue.build_document_queue(limit=DOC_DOWNLOADS_PER_RUN)
+        out["documents"] = docs
+        if docs.get("candidates") == 0:
+            syms = sql_to_df(f"SELECT DISTINCT symbol FROM {EVENTS_TABLE} WHERE sample = ANY(%s)",
+                             params=(samples("full"),))["symbol"].tolist()
+            out["results"] = nse_results.fetch(syms, max_symbols=RESULTS_SYMBOLS_PER_RUN, stop_when_busy=True)
     return out
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m fundamentals.trigger_study")
-    ap.add_argument("step", choices=["events", "fetch", "results", "queue", "documents", "run", "auto", "report", "status"])
+    ap.add_argument("step", choices=["events", "fetch", "results", "queue", "documents", "run", "auto", "supervise", "report", "status"])
     ap.add_argument("--sample", default="pilot")
     ap.add_argument("--per-group", type=int, default=20)
     ap.add_argument("--max-calls", type=int, default=40)
     ap.add_argument("--any-time", action="store_true")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--part", choices=["llm", "docs", "all"], default="all")
     a = ap.parse_args(argv)
 
     if a.step == "events":
@@ -81,7 +93,10 @@ def main(argv: list[str] | None = None) -> int:
         from fundamentals.trigger_study.llm_runner import run
         out = run(max_calls=a.max_calls, any_time=a.any_time)
     elif a.step == "auto":
-        out = auto(a.max_calls, a.any_time)
+        out = auto(a.max_calls, a.any_time, a.part)
+    elif a.step == "supervise":
+        from fundamentals.trigger_study.supervise import supervise
+        out = supervise()
     elif a.step == "report":
         from fundamentals.trigger_study.report import write
         out = {"written": write(a.sample)}

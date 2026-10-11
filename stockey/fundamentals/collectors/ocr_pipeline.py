@@ -800,6 +800,23 @@ RESEARCH_DOC_SECONDS = env.int("FUNDAMENTALS_OCR_RESEARCH_DOC_SECONDS", 15 * 60)
 # most this long, then exits so cron starts a fresh one (which also picks up code changes).
 # Under scripts/is_cron_running.sh's 6h stuck-lock warning, with room for a last round.
 PROCESS_MAX_SECONDS = env.int("FUNDAMENTALS_OCR_PROCESS_MAX_SECONDS", 5 * 60 * 60)
+# With both queues empty the process waits this long for new work (checked every
+# IDLE_POLL_SECONDS) before exiting: a research scan or a filing arriving between cron starts
+# is picked up within a minute instead of up to 30 (operator, 2026-10-11). Cron starts a new
+# process every 30 minutes, so this keeps one running whenever there is anything to do.
+IDLE_WAIT_SECONDS = env.int("FUNDAMENTALS_OCR_IDLE_WAIT_SECONDS", 25 * 60)
+IDLE_POLL_SECONDS = 60
+
+
+def wait_for_work(seconds: float) -> bool:
+    """True as soon as a filing or a research document is pending; False after `seconds`."""
+    from fundamentals.collectors import ocr_research_queue as rq
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if count_pending_ocr_targets() > 0 or rq.pending_count() > 0:
+            return True
+        time.sleep(min(IDLE_POLL_SECONDS, max(deadline - time.monotonic(), 0)))
+    return False
 
 
 def run_research_tail(*, seconds: float) -> dict[str, int]:
@@ -864,7 +881,10 @@ def main() -> int:
         research["research_failed"] += tail["research_failed"]
         research["research_yields_to_daily"] += tail["research_stopped_for_daily"]
         if not tail["research_stopped_for_daily"]:
-            break   # research queue empty, or out of time
+            # research queue empty (or out of time): linger for new work rather than exit
+            left = PROCESS_MAX_SECONDS - (time.monotonic() - started)
+            if left <= 0 or not wait_for_work(min(IDLE_WAIT_SECONDS, left)):
+                break
     STOCKEY_RUN_STATE = {
         "source": SYNC_SOURCE_NAME,
         **totals,

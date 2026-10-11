@@ -89,9 +89,17 @@ def fetched_symbols() -> set[str]:
     return set(sql_to_df(f"SELECT DISTINCT symbol FROM {RESULTS_TABLE}")["symbol"])
 
 
-def fetch(symbols: list[str]) -> dict:
+def missing(symbols: list[str]) -> list[str]:
+    have = fetched_symbols()
+    return [s for s in symbols if s not in have]
+
+
+def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy: bool = False) -> dict:
+    """`stop_when_busy`: return at the NSE busy window instead of waiting it out (the cron
+    path -- the next run carries on); the one-off path waits."""
+    from fundamentals.trigger_study.filings import nse_busy
     ensure_table()
-    todo = [s for s in symbols if s not in fetched_symbols()]
+    todo = missing(symbols)[:max_symbols] if max_symbols else missing(symbols)
     if not todo:
         return {"symbols": 0}
     env = Env()
@@ -105,6 +113,8 @@ def fetch(symbols: list[str]) -> dict:
             nse_goto(page, "https://www.nseindia.com")
             page.wait_for_timeout(1000)
             for sym in todo:
+                if stop_when_busy and nse_busy():
+                    break
                 if wait_until_quiet():
                     nse_goto(page, "https://www.nseindia.com")
                 url = f"https://www.nseindia.com/api/corporates-financial-results?index=equities&symbol={sym}&period=Quarterly"
