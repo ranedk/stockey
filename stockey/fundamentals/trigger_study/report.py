@@ -142,24 +142,58 @@ def build(sample: str = "pilot") -> dict:
     return {"events": evdf, "triggers": trdf, "summary": summarise(evdf, trdf)}
 
 
+MIN_SECTOR_EVENTS = 8   # per group, for a sector to get its own table
+
+
+def _trigger_table(evdf: pd.DataFrame, trdf: pd.DataFrame) -> list[dict]:
+    """Per trigger and side: share of continued vs failed events with at least one, a Fisher
+    exact p and a Benjamini-Hochberg q within this table. Exploration only -- a small q here
+    is a candidate for the frozen list, not evidence."""
+    from scipy.stats import fisher_exact
+    n = evdf["label"].value_counts()
+    nc, nf = int(n.get("continued", 0)), int(n.get("failed", 0))
+    if not nc or not nf or trdf.empty:
+        return []
+    ids = set(evdf["event_id"])
+    material = trdf[(trdf["importance"] >= MIN_IMPORTANCE) & ~trdf["trigger"].isin(["routine", "results_filed"])
+                    & trdf["event_id"].isin(ids)]
+    rows = []
+    for (trig, side), g in material.groupby(["trigger", "side"]):
+        has = g.groupby("label")["event_id"].nunique()
+        c, f = int(has.get("continued", 0)), int(has.get("failed", 0))
+        p = fisher_exact([[c, nc - c], [f, nf - f]])[1]
+        rows.append({"trigger": trig, "side": side, "continued_share": round(c / nc, 3),
+                     "failed_share": round(f / nf, 3), "gap": round(c / nc - f / nf, 3), "p": round(float(p), 4),
+                     "events_with": c + f, "filings": len(g),
+                     "median_days_from_entry": _med(g, "days_from_entry"),
+                     "median_move_4w_before": _med(g, "move_4w_before"), "median_move_13w_after": _med(g, "move_13w_after"),
+                     "median_value_vs_sales": _med(g, "value_vs_sales")})
+    # Benjamini-Hochberg within the table
+    ranked = sorted(range(len(rows)), key=lambda i: rows[i]["p"])
+    m, prev = len(rows), 1.0
+    for k, i in reversed(list(enumerate(ranked, start=1))):
+        prev = min(prev, rows[i]["p"] * m / k)
+        rows[i]["q"] = round(prev, 4)
+    return sorted(rows, key=lambda r: r["p"])
+
+
 def summarise(evdf: pd.DataFrame, trdf: pd.DataFrame) -> dict:
-    n = evdf["label"].value_counts().to_dict()
-    out = {"events": n, "triggers": [], "results": {}}
-    if len(trdf):
-        material = trdf[(trdf["importance"] >= MIN_IMPORTANCE)
-                        & ~trdf["trigger"].isin(["routine", "results_filed"])]
-        for (trig, side), g in material.groupby(["trigger", "side"]):
-            has = g.groupby("label")["event_id"].nunique()
-            c, f = has.get("continued", 0) / max(n.get("continued", 1), 1), has.get("failed", 0) / max(n.get("failed", 1), 1)
-            out["triggers"].append({
-                "trigger": trig, "side": side, "continued_share": round(c, 2), "failed_share": round(f, 2),
-                "gap": round(c - f, 2), "filings": len(g),
-                "median_move_4w_before": _med(g, "move_4w_before"), "median_move_13w_after": _med(g, "move_13w_after"),
-                "median_value_vs_sales": _med(g, "value_vs_sales"),
-            })
-        out["triggers"].sort(key=lambda r: -abs(r["gap"]))
+    from scipy.stats import mannwhitneyu
+    out = {"events": evdf["label"].value_counts().to_dict(), "triggers": _trigger_table(evdf, trdf),
+           "results": {}, "sectors": {}}
     for col in [c for c in evdf.columns if c.startswith(("before_", "after_"))]:
-        out["results"][col] = {lab: _med(g, col) for lab, g in evdf.groupby("label")}
+        g = {lab: pd.to_numeric(x[col], errors="coerce").dropna() for lab, x in evdf.groupby("label")}
+        c, f = g.get("continued", pd.Series(dtype=float)), g.get("failed", pd.Series(dtype=float))
+        p = float(mannwhitneyu(c, f)[1]) if len(c) >= 5 and len(f) >= 5 else None
+        out["results"][col] = {"continued": _med(pd.DataFrame({col: c}), col), "failed": _med(pd.DataFrame({col: f}), col),
+                               "n_continued": len(c), "n_failed": len(f), "p": round(p, 4) if p is not None else None}
+    names = sql_to_df("""SELECT DISTINCT ON (code) code, description FROM fundamentals_sector_reference
+                          ORDER BY code, as_of_date DESC""").set_index("code")["description"].to_dict()
+    for sec, ev in evdf.groupby("sector"):
+        n = ev["label"].value_counts()
+        if n.get("continued", 0) >= MIN_SECTOR_EVENTS and n.get("failed", 0) >= MIN_SECTOR_EVENTS:
+            out["sectors"][names.get(sec, sec)] = {"events": n.to_dict(),
+                                                    "triggers": _trigger_table(ev, trdf)[:8]}
     return out
 
 
