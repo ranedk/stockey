@@ -62,7 +62,7 @@ LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 #   22:00 portfolio_ruleset  (exits, then entries -- reads the screener's confluence scores)
 #   23:05 ohlcv_reconcile   (was 18:45 -- >4h before Dhan had anything)
 #   23:25 price_adjustment  (was 18:50 -- ran on whatever was in the DB, often stale)
-#   23:40 dhan_intraday_sync
+#   21:30 dhan_intraday_sync (was 23:40 -- crossed midnight IST, lost a day's bars 2026-10-09)
 #
 # MORNING = the guarantee, and it runs Mon-SATURDAY (1-6), not Mon-Fri.
 #   BUG FOUND LIVE 2026-09-06: every recovery job was weekday-only, so a FRIDAY-evening
@@ -220,8 +220,11 @@ LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 # Independent of the fundamentals screener below (different tables, no
 # dependency either way) -- scheduled right after price_adjustment purely so
 # the day's EOD data is settled first.
-# 13:25 UTC = 18:55 IST
-10 18 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dhan_intraday_sync.lock ./all_dhan_intraday_sync.sh >> "$LOG_DIR/dhan_intraday_sync.log" 2>&1
+# 16:00 UTC = 21:30 IST -- MOVED from 18:10 UTC (23:40 IST) on 2026-10-12. The ~45-minute run
+# always crossed midnight IST, and on 2026-10-09 every symbol fetched after 00:00 IST came back
+# without that day's bars (Friday stored for 1,415 of 3,400; the morning gate failed). Dhan
+# serves the session well before 21:30, and finishing before midnight removes the rollover.
+00 16 * * 1-5 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dhan_intraday_sync.lock ./all_dhan_intraday_sync.sh >> "$LOG_DIR/dhan_intraday_sync.log" 2>&1
 
 # Fundamentals screener pipeline: L1/L2 refresh, event collectors, OCR + structured
 # extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive

@@ -126,7 +126,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 21:00 | Mon–Fri | `all_fundamentals_screener.sh` |
 | 22:00 | Mon–Fri | `all_portfolio_ruleset.sh` — exits → entries → forecast resolution → **action email** |
 | 23:15 | Mon–Fri | `all_ohlcv_reconcile.sh` — Dhan publishes staggered through the evening |
-| 23:40 | Mon–Fri | `all_dhan_intraday_sync.sh` |
+| 21:30 | Mon–Fri | `all_dhan_intraday_sync.sh` — finishes before midnight IST (from 23:40 it crossed midnight and lost Friday 2026-10-09's bars for 1,984 stocks) |
 | every hour at :37 | daily | `all_fundamentals_news.sh` — Economic Times RSS (not gated on the pause: feeds keep only 50 items) |
 | every 30 min | daily | `all_fundamentals_ocr.sh` — OCR of filed documents, last 6 months only (not gated on the pause); when none wait, it works the research OCR queue (`fundamentals/collectors/ocr_research_queue.py`) continuously and switches back the moment a filing is pending. One process, model loaded once, exits after 5h so cron starts a fresh one |
 | :17 / :47 | daily | `all_fundamentals_reeval.sh` — intraday filings, news tagging, re-score touched companies, story read, watchlist (gated on `.pause_fundamentals`; stands aside while the screener or portfolio job runs) |
