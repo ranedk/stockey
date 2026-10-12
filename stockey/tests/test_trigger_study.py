@@ -120,3 +120,10 @@ def test_supervisor_alerts_once_per_stall_and_once_on_recovery(monkeypatch, tmp_
     for _ in range(3):
         sv.supervise(send=lambda subj, body: sent.append(subj))
     assert sent == ["[trigger study] downloads stalled", "[trigger study] downloads recovered"]
+
+
+def test_parse_reset_bare_utc_zone():
+    # the real message of 2026-10-12, 01:31 UTC
+    now = datetime(2026, 10, 12, 1, 31, tzinfo=timezone.utc)
+    at = parse_reset("You've hit your session limit · resets 2:40am (UTC)", now)
+    assert at == datetime(2026, 10, 12, 2, 40, tzinfo=timezone.utc)

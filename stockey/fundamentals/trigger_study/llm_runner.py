@@ -82,7 +82,9 @@ def parse_reset(message: str, now: datetime) -> datetime | None:
     m = re.search(r"\|(\d{10})\b", message)
     if m:
         return datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
-    tz_m = re.search(r"\(([A-Za-z_]+/[A-Za-z_]+)\)", message)
+    # "(Asia/Calcutta)" or a bare "(UTC)" -- the bare form was read as IST on 2026-10-12 and
+    # parked the runner 18.5 hours past the real reset
+    tz_m = re.search(r"\(([A-Za-z_]+(?:/[A-Za-z_]+)*)\)", message)
     try:
         tz = ZoneInfo(tz_m.group(1)) if tz_m else IST
     except Exception:  # noqa: BLE001 -- unknown zone name: assume the operator's
