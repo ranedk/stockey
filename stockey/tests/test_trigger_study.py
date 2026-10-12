@@ -117,8 +117,11 @@ def test_supervisor_alerts_once_per_stall_and_once_on_recovery(monkeypatch, tmp_
                      {"downloads": {"state": "running", "work": 4}}])
     monkeypatch.setattr(sv, "check", lambda now=None: next(verdicts))
     sent = []
-    for _ in range(3):
-        sv.supervise(send=lambda subj, body: sent.append(subj))
+    from datetime import timedelta
+    t0 = datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)
+    sv.STATE_PATH.write_text('{"downloads": {"work_since": "2026-10-12T09:00:00+00:00"}}')   # work seen an hour ago
+    for k in range(3):
+        sv.supervise(now=t0 + timedelta(minutes=15 * k), send=lambda subj, body: sent.append(subj))
     assert sent == ["[trigger study] downloads stalled", "[trigger study] downloads recovered"]
 
 
@@ -127,3 +130,17 @@ def test_parse_reset_bare_utc_zone():
     now = datetime(2026, 10, 12, 1, 31, tzinfo=timezone.utc)
     at = parse_reset("You've hit your session limit · resets 2:40am (UTC)", now)
     assert at == datetime(2026, 10, 12, 2, 40, tzinfo=timezone.utc)
+
+
+def test_supervisor_does_not_alarm_on_work_that_just_appeared(monkeypatch, tmp_path):
+    from datetime import timedelta
+    from fundamentals.trigger_study import supervise as sv
+    monkeypatch.setattr(sv, "STATE_PATH", tmp_path / "s.json")
+    monkeypatch.setattr(sv, "check", lambda now=None: {"downloads": {"state": "STALLED", "work": 1}})
+    sent = []
+    t0 = datetime(2026, 10, 12, 12, 50, tzinfo=timezone.utc)
+    sv.supervise(now=t0, send=lambda s, b: sent.append(s))                         # first sighting
+    sv.supervise(now=t0 + timedelta(minutes=30), send=lambda s, b: sent.append(s))
+    assert sent == []
+    sv.supervise(now=t0 + timedelta(minutes=50), send=lambda s, b: sent.append(s))  # still stuck 45+ min
+    assert sent == ["[trigger study] downloads stalled"]

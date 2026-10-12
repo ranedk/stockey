@@ -134,16 +134,26 @@ def supervise(now: datetime | None = None, send=None) -> dict:
         state = {}
     sent = []
     for name, v in stages.items():
-        was = state.get(name, {}).get("stalled_since")
+        # The stall clock starts when this stage was first SEEN with work it was allowed to do,
+        # not at its last progress: work that just appeared (a download retry falling due) is
+        # not a stall. False alarm 2026-10-12 18:20 IST: one retry came due, "stalled" at once.
+        entry = state.setdefault(name, {})
+        if v["state"] in ("running", "starting", "STALLED"):
+            entry.setdefault("work_since", now.isoformat())
+            if v["state"] == "STALLED" and now - datetime.fromisoformat(entry["work_since"]) < timedelta(minutes=STALL_MINUTES):
+                v["state"] = "starting"
+        else:
+            entry.pop("work_since", None)
+        was = entry.get("stalled_since")
         if v["state"] == "STALLED" and not was:
-            state[name] = {"stalled_since": now.isoformat()}
+            entry["stalled_since"] = now.isoformat()
             send(f"[trigger study] {name} stalled",
                  f"Stage '{name}' has work ({v['work']}) and has been allowed to run for "
                  f"{STALL_MINUTES}+ minutes, but nothing has moved since {v.get('last_progress')}.\n"
                  f"Check logs/cron/trigger_study*.log and fundamentals_ocr.log.\n\n{json.dumps(stages, indent=1)}")
             sent.append(f"stalled:{name}")
         elif v["state"] != "STALLED" and was:
-            state[name] = {}
+            entry.pop("stalled_since", None)
             send(f"[trigger study] {name} recovered",
                  f"Stage '{name}' is {v['state']} again (stalled since {was}).")
             sent.append(f"recovered:{name}")
