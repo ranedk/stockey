@@ -43,3 +43,21 @@ Decisions from 2023-01-01 are untouched and are the check, run once with this ru
 ## 4. Ledger
 
 LEDGER row 57, trials = 1 (primary). A pass leads to the 2023+ check; a fail ends the line.
+
+## 5. Addendum 2026-10-14 — the once-only check (written before any 2023+ entry, result or return was computed)
+
+In-sample result (LEDGER row 57): PASS, +4.5 pp over 13 weeks, p 0.001. The check runs the
+rule in sections 1 and 3 UNCHANGED, once:
+
+- **Entries:** momentum entries with entry week 2023-01-01 to 2024-12-31, computed by the same
+  code (`events.build_check`, stored as sample 'check'), prices from 2020-06 so the 104-week
+  history and the 26-week momentum have data.
+- **Results:** NSE XBRL quarters 2022-01 to 2024-12 (NSE's XBRL listing ends with the Dec 2024
+  quarter; later results use the newer integrated filing, not read). Entries whose next result
+  is a 2025 quarter therefore have none and are excluded under the existing "no result within
+  120 days" rule — counted and reported, mostly late-2024 entries.
+- **One code change, made and verified before the check:** the year-ago quarter must be on the
+  same basis (consolidated/standalone) as the result. It changes nothing in-sample (re-run gave
+  identical numbers: 610 entries, +4.5 pp, p 0.0012) but the check range can hold both bases.
+- **Pass** = difference >= +3 pp over 13 weeks AND one-sided p < 0.05, as in section 3.
+  Reported alongside: 26 weeks, by year, exclusions. No second run, no threshold change.

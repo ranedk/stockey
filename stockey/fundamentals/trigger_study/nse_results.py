@@ -25,6 +25,10 @@ from fundamentals.trigger_study.filings import wait_until_quiet
 
 RESULTS_TABLE = "fundamentals_trigger_results"
 LAST_PERIOD = pd.Timestamp("2022-12-31")   # discovery windows end 2023-03; check years stay unread
+# The once-only check (LEDGER row 57 addendum): year-ago quarters from 2022, check quarters to
+# Dec 2024 (NSE's XBRL listing ends there; later results use the newer integrated filing).
+CHECK_FIRST_PERIOD = pd.Timestamp("2022-01-01")
+CHECK_LAST_PERIOD = pd.Timestamp("2024-12-31")
 CRORE = 1e7
 
 _JS = """async (url) => {
@@ -67,7 +71,8 @@ def parse_xbrl(xml: str) -> dict:
     return out
 
 
-def choose_rows(listing: list[dict]) -> pd.DataFrame:
+def choose_rows(listing: list[dict], first_period: pd.Timestamp | None = None,
+                last_period: pd.Timestamp = LAST_PERIOD) -> pd.DataFrame:
     """One basis per company, one filing per quarter (the latest broadcast if refiled)."""
     df = pd.DataFrame(listing)
     if df.empty or "toDate" not in df:
@@ -75,7 +80,9 @@ def choose_rows(listing: list[dict]) -> pd.DataFrame:
     df["period_end"] = pd.to_datetime(df["toDate"], format="%d-%b-%Y", errors="coerce")
     df["public_at"] = pd.to_datetime(df["broadCastDate"], format="%d-%b-%Y %H:%M:%S", errors="coerce")
     df["consolidated"] = df["consolidated"].astype(str).str.lower().str.startswith("consolidated")
-    df = df[df["period_end"].notna() & (df["period_end"] <= LAST_PERIOD) & df["xbrl"].astype(str).str.endswith(".xml")]
+    df = df[df["period_end"].notna() & (df["period_end"] <= last_period) & df["xbrl"].astype(str).str.endswith(".xml")]
+    if first_period is not None:
+        df = df[df["period_end"] >= first_period]
     if df.empty:
         return df
     quarters = df["period_end"].nunique()
@@ -89,17 +96,25 @@ def fetched_symbols() -> set[str]:
     return set(sql_to_df(f"SELECT DISTINCT symbol FROM {RESULTS_TABLE}")["symbol"])
 
 
-def missing(symbols: list[str]) -> list[str]:
-    have = fetched_symbols()
+def missing(symbols: list[str], last_period: pd.Timestamp = LAST_PERIOD) -> list[str]:
+    """Symbols not yet asked for this range: discovery = no row at all; the check = no row
+    (result or 'no_filings' marker) dated after the discovery range."""
+    if last_period == LAST_PERIOD:
+        have = fetched_symbols()
+    else:
+        have = set(sql_to_df(f"SELECT DISTINCT symbol FROM {RESULTS_TABLE} WHERE period_end > %s",
+                             params=(LAST_PERIOD.date(),))["symbol"])
     return [s for s in symbols if s not in have]
 
 
-def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy: bool = False) -> dict:
+def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy: bool = False,
+          first_period: pd.Timestamp | None = None, last_period: pd.Timestamp = LAST_PERIOD) -> dict:
     """`stop_when_busy`: return at the NSE busy window instead of waiting it out (the cron
     path -- the next run carries on); the one-off path waits."""
     from fundamentals.trigger_study.filings import nse_busy
     ensure_table()
-    todo = missing(symbols)[:max_symbols] if max_symbols else missing(symbols)
+    todo = missing(symbols, last_period)
+    todo = todo[:max_symbols] if max_symbols else todo
     if not todo:
         return {"symbols": 0}
     env = Env()
@@ -128,7 +143,12 @@ def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy:
                     stats["failed"][sym] = f"HTTP {listing.get('__error')}"
                     continue
                 rows = []
-                for r in choose_rows(listing or []).itertuples():
+                stored = set(map(tuple, sql_to_df(
+                    f"SELECT period_end, consolidated FROM {RESULTS_TABLE} WHERE symbol = %s AND status = 'ok'",
+                    params=(sym,)).astype(str).to_numpy()))
+                for r in choose_rows(listing or [], first_period, last_period).itertuples():
+                    if (str(r.period_end.date()), str(bool(r.consolidated))) in stored:
+                        continue   # already read (the check's year-ago quarters overlap discovery)
                     rec = {"symbol": sym, "period_end": r.period_end.date(), "consolidated": bool(r.consolidated),
                            "public_at": None if pd.isna(r.public_at) else r.public_at.to_pydatetime(),
                            "xbrl_url": r.xbrl, "status": "ok"}
@@ -145,7 +165,7 @@ def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy:
                         stats["parse_empty"] += 1
                     rows.append({**{c: None for c in FIELDS.values()}, **rec, **facts})
                 if not rows:   # mark the company done so a rerun does not ask NSE again
-                    rows = [{**{c: None for c in FIELDS.values()}, "symbol": sym, "period_end": LAST_PERIOD.date(),
+                    rows = [{**{c: None for c in FIELDS.values()}, "symbol": sym, "period_end": last_period.date(),
                              "consolidated": False, "public_at": None, "xbrl_url": None, "status": "no_filings"}]
                 upsert_to_db(pd.DataFrame(rows), RESULTS_TABLE, ["symbol", "period_end", "consolidated"])
                 stats["symbols"] += 1
@@ -157,7 +177,7 @@ def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy:
 
 def load(symbols: list[str]) -> pd.DataFrame:
     """symbol, period_end, public_at, sales, opm_pct (EBITDA margin), net_profit -- Rs crore."""
-    df = sql_to_df(f"""SELECT symbol, period_end, public_at, sales, other_income, finance_costs,
+    df = sql_to_df(f"""SELECT symbol, period_end, consolidated, public_at, sales, other_income, finance_costs,
                               depreciation, pbt, net_profit
                          FROM {RESULTS_TABLE} WHERE status = 'ok' AND symbol = ANY(%s)""", params=(symbols,))
     df["period_end"] = pd.to_datetime(df["period_end"])

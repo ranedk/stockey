@@ -24,6 +24,12 @@ PRICE_FROM = "2014-01-01"
 PRICE_TO = "2023-09-30"            # 26 weeks past the last discovery entry, no further
 DISCOVERY_FROM = pd.Timestamp("2016-07-01")
 DISCOVERY_TO = pd.Timestamp("2022-12-31")
+# The once-only check (LEDGER row 57 addendum): entries 2023-2024, same rules. Prices run to
+# the end of 2025 so a decision made up to March 2025 has its 26 weeks.
+CHECK_PRICE_FROM = "2020-06-01"
+CHECK_PRICE_TO = "2025-12-31"
+CHECK_FROM = pd.Timestamp("2023-01-01")
+CHECK_TO = pd.Timestamp("2024-12-31")
 
 LIQUIDITY_MIN_RS = 5e7             # Rs 5 cr average daily traded value, previous 12 weeks
 TOP_SHARE = 0.10                   # momentum = top tenth by RS26
@@ -49,7 +55,7 @@ def _systrader_conn():
     return create_engine(url).connect()
 
 
-def load_weekly() -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_weekly(price_from: str = PRICE_FROM, price_to: str = PRICE_TO) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Weekly total-return close and average daily traded value, symbols as columns."""
     sql = """
         SELECT symbol, date_trunc('week', date)::date AS wk,
@@ -60,7 +66,7 @@ def load_weekly() -> tuple[pd.DataFrame, pd.DataFrame]:
          GROUP BY 1, 2
     """
     with _systrader_conn() as conn:
-        df = pd.read_sql(text(sql), conn, params={"a": PRICE_FROM, "b": PRICE_TO})
+        df = pd.read_sql(text(sql), conn, params={"a": price_from, "b": price_to})
     df["wk"] = pd.to_datetime(df["wk"])
     close = df.pivot(index="wk", columns="symbol", values="close").sort_index()
     tv = df.pivot(index="wk", columns="symbol", values="tv").sort_index()
@@ -88,9 +94,9 @@ def _group_index(capped: pd.DataFrame, elig: pd.DataFrame, members: list[str], f
     return r.mean(axis=1).where(n >= 5, fallback)
 
 
-def panel() -> dict:
+def panel(price_from: str = PRICE_FROM, price_to: str = PRICE_TO) -> dict:
     """Weekly closes, eligibility, momentum rank and the market / industry index levels."""
-    close, tv = load_weekly()
+    close, tv = load_weekly(price_from, price_to)
     memb = load_membership()
     ret = close.pct_change(fill_method=None)
     capped = ret.clip(-0.5, 0.5)
@@ -118,7 +124,8 @@ def panel() -> dict:
             "industry_lvl": industry_lvl, "memb": memb}
 
 
-def compute_events(pn: dict | None = None) -> pd.DataFrame:
+def compute_events(pn: dict | None = None, entry_from: pd.Timestamp = DISCOVERY_FROM,
+                   entry_to: pd.Timestamp = DISCOVERY_TO) -> pd.DataFrame:
     pn = pn or panel()
     close, rank, entry, r52 = pn["close"], pn["rank"], pn["entry"], pn["r52"]
     mkt_lvl, industry_lvl, memb = pn["mkt_lvl"], pn["industry_lvl"], pn["memb"]
@@ -133,7 +140,7 @@ def compute_events(pn: dict | None = None) -> pd.DataFrame:
         ilvl = industry_lvl[ind]
         for t in np.flatnonzero(entry[sym].to_numpy()):
             wk = weeks[t]
-            if wk < DISCOVERY_FROM or wk > DISCOVERY_TO or t + HORIZON >= len(weeks):
+            if wk < entry_from or wk > entry_to or t + HORIZON >= len(weeks):
                 continue
             if r52[sym].iat[t] > ROCKET_52W:
                 continue
@@ -225,3 +232,14 @@ def mark_full() -> dict:
                          WHERE sample IS NULL AND label IN ('continued', 'failed')""")
         n = cur.rowcount
     return {"marked_full": n}
+
+
+def build_check() -> dict:
+    """Entries 2023-2024 for the once-only check, stored with sample='check'. Never touches the
+    discovery events (their entry dates end 2022-12-31, so no event_id can collide)."""
+    ensure_table()
+    pn = panel(CHECK_PRICE_FROM, CHECK_PRICE_TO)
+    ev = compute_events(pn, CHECK_FROM, CHECK_TO)
+    ev["sample"] = "check"
+    upsert_to_db(ev, EVENTS_TABLE, ["event_id"])
+    return {"check_events": len(ev), "symbols": int(ev["symbol"].nunique()), "labels": ev["label"].value_counts().to_dict()}

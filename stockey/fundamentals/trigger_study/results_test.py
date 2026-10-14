@@ -25,11 +25,18 @@ REPS = 10_000
 SEED = 1
 
 
-def build_rows(pn: dict | None = None, *, last_start: str = "2022-12-31", first_start: str | None = None) -> tuple[pd.DataFrame, dict]:
+def build_rows(pn: dict | None = None, *, last_start: str = "2022-12-31", first_start: str | None = None,
+               samples: list[str] | None = None) -> tuple[pd.DataFrame, dict]:
+    """`samples`: which events (None = every event computed for discovery, i.e. not 'check')."""
     pn = pn or ev_mod.panel()
     close, ilvl = pn["close"], pn["industry_lvl"]
     weeks = close.index
-    events = sql_to_df(f"SELECT event_id, symbol, industry_code, entry_week, label FROM {EVENTS_TABLE}")
+    if samples:
+        events = sql_to_df(f"SELECT event_id, symbol, industry_code, entry_week, label FROM {EVENTS_TABLE} "
+                           "WHERE sample = ANY(%s)", params=(samples,))
+    else:
+        events = sql_to_df(f"SELECT event_id, symbol, industry_code, entry_week, label FROM {EVENTS_TABLE} "
+                           "WHERE sample IS DISTINCT FROM 'check'")
     events["entry_week"] = pd.to_datetime(events["entry_week"])
     res = nse_results.load(sorted(events["symbol"].unique()))
     excluded: dict[str, int] = {}
@@ -48,7 +55,7 @@ def build_rows(pn: dict | None = None, *, last_start: str = "2022-12-31", first_
             continue
         q = after.iloc[0]
         prior = r[(r["period_end"] - q["period_end"]).dt.days.abs().sub(365).abs() <= 20]
-        prior = prior[prior["period_end"] < q["period_end"]]
+        prior = prior[(prior["period_end"] < q["period_end"]) & (prior["consolidated"] == q["consolidated"])]
         if prior.empty:
             skip("no_year_ago_quarter")
             continue
