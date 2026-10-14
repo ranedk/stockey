@@ -427,7 +427,7 @@ def _fetch_company_announcements_page(scrip_code: str, *, from_date, to_date, pa
             "strPrevDate": from_date.strftime("%Y%m%d"),
             "strToDate": to_date.strftime("%Y%m%d"),
             "strSearch": "P",
-            "strscrip": scrip_code,
+            "strScrip": scrip_code,
             "strType": "C",
         },
     )
@@ -483,7 +483,7 @@ def _fetch_company_range(scrip_code: str, *, from_date, to_date) -> list[dict]:
 
 
 # Market-wide daily fetch (2026-09-25, universe rebuild step 6). The same endpoint with an
-# empty strscrip returns EVERY company's announcements for a date (2026-09-24: 1,641 rows,
+# empty strScrip returns EVERY company's announcements for a date (2026-09-24: 1,641 rows,
 # 33 pages). ~33 requests a day regardless of universe size, against one request per
 # company per run (1,386 companies at the 10s BSE gate = ~4h) for the per-company crawl.
 # BSE refuses a multi-day range without a category (empty Table), so it is one day per
@@ -517,7 +517,10 @@ def fetch_market_announcements(day, *, stop_before=None) -> list[dict]:
     first; with stop_before (a tz-aware timestamp) paging stops once a page reaches filings
     older than it -- the intraday pass reads only what is new since its last run."""
     params = {"pageno": 1, "strCat": "-1", "subcategory": "-1", "strPrevDate": day.strftime("%Y%m%d"),
-              "strToDate": day.strftime("%Y%m%d"), "strSearch": "P", "strscrip": "", "strType": "C"}
+              "strToDate": day.strftime("%Y%m%d"), "strSearch": "P", "strScrip": "", "strType": "C"}
+    # "strScrip", capital S: since 2026-10-13 ~16:45 IST BSE answers 403 to the lowercase
+    # "strscrip" this code had always sent (confirmed side by side 2026-10-14: same request,
+    # only that key's case changed, 403 vs 200)
     payload = _bse_get(ANNOUNCEMENTS_URL, params)
     if "Table" not in payload:
         raise BseBlockedError("response missing expected 'Table' key")
