@@ -242,4 +242,4 @@ def build_check() -> dict:
     ev = compute_events(pn, CHECK_FROM, CHECK_TO)
     ev["sample"] = "check"
     upsert_to_db(ev, EVENTS_TABLE, ["event_id"])
-    return {"check_events": len(ev), "symbols": int(ev["symbol"].nunique()), "labels": ev["label"].value_counts().to_dict()}
+    return {"check_events": len(ev), "symbols": int(ev["symbol"].nunique())}   # outcome labels not shown before the check
