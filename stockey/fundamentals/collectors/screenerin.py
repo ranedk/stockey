@@ -26,6 +26,7 @@ on it."""
 from __future__ import annotations
 
 import re
+import time
 from urllib.parse import urlencode
 
 import requests
@@ -222,13 +223,30 @@ def parse_screener_results(html: str) -> list[dict[str, object]]:
     return companies
 
 
+SERVER_ERROR_WAITS_SECONDS = (30, 90, 300)
+
+
 def _fetch_query_page(session: requests.Session, query_text: str, *, page: int) -> tuple[str, list[dict[str, object]]]:
     params = {"sort": "", "order": "", "source_id": "", "query": query_text}
     if page > 1:
         params["page"] = page
     screener_url = f"{RAW_SCREEN_URL}?{urlencode(params)}"
-    with exchange_request_gate(domain="screenerin"):
-        response = session.get(screener_url, timeout=60, allow_redirects=True)
+    # A 5xx is screener.in's own server failing, not a refusal: retry it a few times with a
+    # growing wait. One 502 on 2026-10-14 failed the whole nightly snapshot (14 minutes in),
+    # then l1_universe, and the valuation axis went to 0% coverage. 4xx still fails at once.
+    for attempt, wait in enumerate(SERVER_ERROR_WAITS_SECONDS + (None,)):
+        with exchange_request_gate(domain="screenerin"):
+            response = session.get(screener_url, timeout=60, allow_redirects=True)
+        if response.status_code < 500 or wait is None:
+            break
+        _record_fallback(
+            "screenerin_server_error_retry",
+            reason=f"screener.in answered {response.status_code}; retrying in {wait}s (attempt {attempt + 1}).",
+            error=f"HTTP {response.status_code}",
+            severity="warn",
+            metadata={"page": page, "status": response.status_code},
+        )
+        time.sleep(wait)
     response.raise_for_status()
     if "login" in str(response.url).lower():
         raise RuntimeError("Screener.in redirected to login while executing a query -- session likely expired")
