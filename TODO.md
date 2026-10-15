@@ -379,16 +379,15 @@ All closed 2026-09-24; detail in `stockey/docs/DATA_AUDIT_2026-09-23.md` (G1-G12
 - [~] **Watch: completeness gate timing** -- first clean night 2026-09-24; move the gate
       after 12:00 IST only if nights fail at 08:00 but pass by noon.
 
-### C10. Trigger study: which filings and results come around momentum entries that keep running
+### C10. Trigger study: which filings and results come around momentum entries that keep running -- CLOSED
 
-Operator idea, 2026-10-08 (`stockey/docs/TRIGGER_STUDY.md`, LEDGER row 56). Pilot done (20 + 20):
-leads only -- acquisitions and legal trouble more common in the failures; capacity additions,
-stronger sales before entry and better profit/margins after it in the ones that kept running.
-- [ ] Full run (started 2026-10-09): 580 entries, 403 stocks. Filings + NSE results fetch pause
-      in the NSE busy windows; tagging runs nightly via cron (`all_trigger_study.sh`).
-- [ ] Report; pick the triggers per sector; freeze them in a pre-registration.
-- [ ] Check on 2023-2026 entries (untagged until then), then a forward paper track.
-- [ ] Phase 2 if it holds: earnings-call transcripts (NSE, 2022+) for sector numbers.
+Operator idea, 2026-10-08 (`stockey/docs/TRIGGER_STUDY.md`, LEDGER rows 56-57).
+- [x] Full run: 561 entries 2016-2022, 403 stocks, ~18,400 filings + 2,800 attachments tagged
+      blind. No filing type separates winners from failures (best q 0.64), in any sector.
+- [x] Results confirmation (row 57): in-sample PASS (+4.5 pp / 13 weeks, p 0.001), but the
+      once-only 2023-2024 check FAILED (-0.6 pp, p 0.66). No paper track.
+- Left behind and still useful: NSE XBRL results collector (`trigger_study/nse_results.py`,
+  Sep 2019 - Dec 2024), the blind Claude-CLI tagger + research OCR queue, the supervisor.
 
 ## D. The boundary question
 
