@@ -107,13 +107,31 @@ def missing(symbols: list[str], last_period: pd.Timestamp = LAST_PERIOD) -> list
     return [s for s in symbols if s not in have]
 
 
+PROGRESS_TABLE = "fundamentals_trigger_results_progress"
+
+
+def _done_for(range_key: str) -> set[str]:
+    with db_session() as (_, cur):
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} (
+                            symbol TEXT NOT NULL, range_key TEXT NOT NULL,
+                            done_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (symbol, range_key))""")
+    return set(sql_to_df(f"SELECT symbol FROM {PROGRESS_TABLE} WHERE range_key = %s", params=(range_key,))["symbol"])
+
+
 def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy: bool = False,
-          first_period: pd.Timestamp | None = None, last_period: pd.Timestamp = LAST_PERIOD) -> dict:
+          first_period: pd.Timestamp | None = None, last_period: pd.Timestamp = LAST_PERIOD,
+          range_key: str | None = None) -> dict:
+    """`range_key`: track completion per (symbol, range) in PROGRESS_TABLE instead of inferring
+    it from stored rows -- a symbol read for one range is not done for another."""
     """`stop_when_busy`: return at the NSE busy window instead of waiting it out (the cron
     path -- the next run carries on); the one-off path waits."""
     from fundamentals.trigger_study.filings import nse_busy
     ensure_table()
-    todo = missing(symbols, last_period)
+    if range_key:
+        done = _done_for(range_key)
+        todo = [s for s in symbols if s not in done]
+    else:
+        todo = missing(symbols, last_period)
     todo = todo[:max_symbols] if max_symbols else todo
     if not todo:
         return {"symbols": 0}
@@ -164,10 +182,15 @@ def fetch(symbols: list[str], *, max_symbols: int | None = None, stop_when_busy:
                         rec["status"] = "parse_empty"
                         stats["parse_empty"] += 1
                     rows.append({**{c: None for c in FIELDS.values()}, **rec, **facts})
-                if not rows:   # mark the company done so a rerun does not ask NSE again
+                if not rows and not range_key and not stored:   # mark done so a rerun does not ask NSE again
                     rows = [{**{c: None for c in FIELDS.values()}, "symbol": sym, "period_end": last_period.date(),
                              "consolidated": False, "public_at": None, "xbrl_url": None, "status": "no_filings"}]
-                upsert_to_db(pd.DataFrame(rows), RESULTS_TABLE, ["symbol", "period_end", "consolidated"])
+                if rows:
+                    upsert_to_db(pd.DataFrame(rows), RESULTS_TABLE, ["symbol", "period_end", "consolidated"])
+                if range_key:
+                    with db_session() as (_, cur):
+                        cur.execute(f"INSERT INTO {PROGRESS_TABLE} (symbol, range_key) VALUES (%s, %s) "
+                                    "ON CONFLICT DO NOTHING", (sym, range_key))
                 stats["symbols"] += 1
                 stats["quarters"] += sum(1 for x in rows if x["status"] == "ok")
         finally:
