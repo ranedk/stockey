@@ -56,5 +56,10 @@ fi
 # decisions are not made until this job, so an email sent from there would report
 # yesterday's actions every night while looking correct. It sends even when nothing
 # happened, so that a quiet day and a broken pipeline are distinguishable from the inbox.
-exec "${SCRIPT_DIR}/scripts/run_with_markers.sh" "portfolio_notify" \
+"${SCRIPT_DIR}/scripts/run_with_markers.sh" "portfolio_notify" \
     "${PYTHON_BIN}" -m fundamentals.screens.portfolio_notify
+# Paper books beside v3 (LEDGER row 59): replayed whole every night from 2026-10-02 on cached
+# inputs, so only the new evening costs anything (one stage call, AI verdicts for new names).
+# After the email on purpose: a replay problem must never delay or block the real record.
+exec "${SCRIPT_DIR}/scripts/run_with_markers.sh" "portfolio_replay" \
+    "${PYTHON_BIN}" -m fundamentals.screens.portfolio_replay
