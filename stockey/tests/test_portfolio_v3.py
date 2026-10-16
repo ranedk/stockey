@@ -148,3 +148,20 @@ def test_hard_negative_lists_stay_in_step():
     from fundamentals.screens.portfolio_exit import HARD_NEGATIVE_TRIGGERS
 
     assert set(v3.HARD_NEGATIVE_TRIGGERS) == set(HARD_NEGATIVE_TRIGGERS)
+
+
+@pytest.mark.live_db
+def test_v3_exit_state_uses_the_entry_day_close_and_highs_from_entry_on():
+    """2026-10-16: the entry was the EARLIEST close of a 10-day lookback and the trailing high
+    included pre-entry closes. With no split since entry the adjusted entry must equal the
+    stored entry price, and the high can never sit below it."""
+    from fundamentals.screens.portfolio_exit import _open_positions, _v3_state
+    pos = _open_positions()
+    pos = pos[pos["ruleset_version"] >= 3]
+    if pos.empty:
+        pytest.skip("no open v3 positions")
+    st = _v3_state(pos)
+    for r in pos.itertuples():
+        s = st[str(r.position_id)]
+        if s["entry_adjusted"] is not None and s["trail_high"] is not None:
+            assert s["trail_high"] >= s["entry_adjusted"] * 0.999

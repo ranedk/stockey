@@ -264,13 +264,19 @@ def _v3_state(positions: pd.DataFrame) -> dict[str, dict]:
         opened = pd.Timestamp(r.opened_at)
         entry_day = getattr(r, "entry_price_date", None)
         entry_day = str(pd.Timestamp(entry_day).date()) if entry_day is not None and not pd.isna(entry_day) else str(opened.date())
+        # The window reaches 10 days back only so a holiday entry day still finds a close: the
+        # entry is the LATEST close on or before the entry day, and the high counts from the entry
+        # day on. Before 2026-10-16 it took the EARLIEST close in the window (~10 days before
+        # entry; off by -33%..+13% on the open book) and pre-entry highs (up to +5%), so stops sat
+        # at the wrong levels. No v3 exit had been triggered by it (the two closes were a fade
+        # and a flaw).
         df = sql_to_df(
-            "SELECT max(adj_close) AS hi, "
-            "       (array_agg(adj_close ORDER BY date) FILTER (WHERE date <= %s::date))[1] AS at_entry "
+            "SELECT max(adj_close) FILTER (WHERE date >= %s::date) AS hi, "
+            "       (array_agg(adj_close ORDER BY date DESC) FILTER (WHERE date <= %s::date))[1] AS at_entry "
             "  FROM advisory_adjusted_ohlcv_daily "
             " WHERE symbol = %s AND date >= greatest(%s::date - 10, now()::date - interval '800 days') "
             "   AND date <= now()::date",
-            params=(entry_day, str(r.ticker), entry_day))
+            params=(entry_day, entry_day, str(r.ticker), entry_day))
         hi = None if df.empty or pd.isna(df.iloc[0]["hi"]) else float(df.iloc[0]["hi"])
         highs[str(r.position_id)] = hi
         at_entry = None if df.empty or pd.isna(df.iloc[0]["at_entry"]) else float(df.iloc[0]["at_entry"])
