@@ -114,8 +114,9 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleStage serves GET /api/stage?stages=1,2,3,4&min_bars=260&max_stale_days=21.
-// All params optional; stageapi.Options.withDefaults fills in the rest.
+// handleStage serves GET /api/stage?stages=1,2,3,4&min_bars=260&max_stale_days=21&as_of=2026-10-05.
+// All params optional; stageapi.Options.withDefaults fills in the rest. as_of classifies with
+// bars through that date only (stockey's paper-portfolio replay); without it, live as before.
 func handleStage(st *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -124,7 +125,17 @@ func handleStage(st *store.Store) http.HandlerFunc {
 			MaxStaleDays: atoiOr(q.Get("max_stale_days"), 0),
 			Stages:       parseStages(q.Get("stages")),
 		}
-		result, err := stageapi.List(r.Context(), st, opts, time.Now())
+		now := time.Now()
+		if raw := q.Get("as_of"); raw != "" {
+			d, err := time.Parse("2006-01-02", raw)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "as_of must be YYYY-MM-DD"})
+				return
+			}
+			opts.AsOf = d
+			now = d.Add(24*time.Hour - time.Second)
+		}
+		result, err := stageapi.List(r.Context(), st, opts, now)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return

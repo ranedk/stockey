@@ -63,6 +63,17 @@ type Options struct {
 	MaxStaleDays int   // exclude a symbol whose latest daily bar is older than this (default 21)
 	Stages       []int // filter to these stage numbers (1-4); nil/empty = all classified stages
 	Concurrency  int   // worker pool size for the per-symbol DB fetch+classify (default 12)
+	// AsOf, when set, classifies as of that date: daily bars after it are dropped first, and
+	// staleness is judged against it. Added 2026-10-16 for stockey's paper-portfolio replay,
+	// which needs the stage each night's run would have seen. Zero = live (unchanged).
+	AsOf time.Time
+}
+
+// truncateThrough keeps the bars dated on or before the end of `day` (any time that day).
+func truncateThrough(s core.Series, day time.Time) core.Series {
+	end := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
+	n := sort.Search(len(s.Times), func(i int) bool { return !s.Times[i].Before(end) })
+	return core.Series{Times: s.Times[:n], Values: s.Values[:n]}
 }
 
 func (o Options) withDefaults() Options {
@@ -160,6 +171,9 @@ func classifyOne(ctx context.Context, st *store.Store, symbol string, opts Optio
 	}
 
 	daily, dailyVol, err := st.StageSeries(ctx, symbol)
+	if err == nil && !opts.AsOf.IsZero() {
+		daily, dailyVol = truncateThrough(daily, opts.AsOf), truncateThrough(dailyVol, opts.AsOf)
+	}
 	if err != nil || daily.Len() < opts.MinBars {
 		return out{short: true}
 	}
