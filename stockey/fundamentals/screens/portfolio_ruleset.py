@@ -173,12 +173,13 @@ def stage_for(company_master_id: str, stages: dict[str, int], stage_keys: dict[s
     return None
 
 
-def compute_stop_pct(symbols: list[str]) -> dict[str, dict]:
+def compute_stop_pct(symbols: list[str], *, as_of=None) -> dict[str, dict]:
     """Volatility-scaled stop percentage per symbol, clamped to the operator's band.
 
     Uses adjusted closes stockey already owns (advisory_adjusted_ohlcv_daily). A symbol
     with too little history gets the MIDPOINT of the band rather than the widest end --
     an unknown-volatility name should not silently receive the loosest stop.
+    `as_of` (a date) uses only closes on or before it -- the paper-portfolio replay.
     """
     if not symbols:
         return {}
@@ -189,11 +190,13 @@ def compute_stop_pct(symbols: list[str]) -> dict[str, dict]:
                        adj_close / NULLIF(lag(adj_close) OVER (PARTITION BY symbol ORDER BY date), 0) - 1 AS r
                   FROM advisory_adjusted_ohlcv_daily
                  WHERE symbol = ANY(%s)
-                   AND date >= now() - make_interval(days => %s)) x
+                   AND date >= coalesce(%s::timestamptz, now()) - make_interval(days => %s)
+                   AND date < coalesce(%s::timestamptz, now()) + interval '1 day') x
          WHERE r IS NOT NULL
          GROUP BY symbol
         """,
-        params=(list(symbols), VOL_LOOKBACK_DAYS),
+        params=(list(symbols), None if as_of is None else str(pd.Timestamp(as_of).date()), VOL_LOOKBACK_DAYS,
+                None if as_of is None else str(pd.Timestamp(as_of).date())),
     )
     vol_by_symbol = {
         str(r.symbol): float(r.daily_vol)
