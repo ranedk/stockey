@@ -48,6 +48,12 @@ SCORE_VERSION = 2
 # (>= Rs 5 cr and 5% of sales a year ago), trend windows by date -- and the IST cutoff for
 # alerts/news. A new version re-baselines the live score instead of reading as a jump.
 SCORE_VERSION = 3
+# 4 (2026-10-19, operator): "cheap vs own history" is ignored when the 5-year median P/E is
+# above MAX_HISTORICAL_PE. Such a history is near-zero earnings, not a valuation: FISCHER
+# (median P/E ~1,630, sales ~Rs 0.7 cr a quarter, loss-making) read as trading at 6% of its
+# normal valuation and scored 99 on that reading alone; SOLARA (296) and POLICYBZR (258) too.
+SCORE_VERSION = 4
+MAX_HISTORICAL_PE = 100.0
 STOCKEY_RUN_STATE: dict[str, object] = {}
 
 STORY_SECOND_BONUS = 0.25
@@ -92,6 +98,19 @@ PERCENTILE_READINGS = [
     ("value", "cheap_vs_own_history", "valuation_vs_own_history_ratio", False, "change"),
     ("events", "net_events", "event_net", True, "change"),
 ]
+def guard_own_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Blank "cheap vs own history" where the 5-year median P/E (current P/E / the ratio) is
+    above MAX_HISTORICAL_PE -- see SCORE_VERSION 4. The column is then simply missing for that
+    company, like any other reading without data; the rest of its readings still count."""
+    if "valuation_vs_own_history_ratio" not in df or "l2_pe" not in df:
+        return df
+    r = pd.to_numeric(df["valuation_vs_own_history_ratio"], errors="coerce")
+    hist = pd.to_numeric(df["l2_pe"], errors="coerce") / r.where(r > 0)
+    out = df.copy()
+    out.loc[hist > MAX_HISTORICAL_PE, "valuation_vs_own_history_ratio"] = float("nan")
+    return out
+
+
 # Readings that do not describe a lender's business.
 NOT_FOR_FINANCIALS = frozenset({"low_debt", "interest_cover", "fcf_yield", "low_ev_ebit"})
 # Readings that only describe a lender's business: for everyone else a low price-to-book
@@ -133,11 +152,11 @@ def load_inputs(as_of) -> pd.DataFrame:
         """
         SELECT DISTINCT ON (company_id) company_id AS screener_company_id, promoter_stake_direction,
                institutional_stake_direction, institutional_first_entry, pledge_pct_trend_direction,
-               net_debt_trend_direction, valuation_vs_own_history_ratio
+               net_debt_trend_direction, valuation_vs_own_history_ratio, pe AS l2_pe
           FROM fundamentals_l2_state WHERE run_date::date <= %s
          ORDER BY company_id, run_date DESC, state_vector_version DESC
         """, params=(d,))
-    df = df.merge(l2, on="screener_company_id", how="left")
+    df = guard_own_history(df.merge(l2, on="screener_company_id", how="left"))
     # End of the as-of day in IST, as an aware timestamp: "::date + 1" in a UTC session is
     # 05:30 IST the next morning (review 2026-10-02). An alert counts only once it EXISTED
     # (load_ts) as well as once its filing was detected.
