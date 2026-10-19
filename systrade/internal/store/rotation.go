@@ -115,3 +115,33 @@ func (s *Store) StoryFilter(ctx context.Context) ([]StoryFilterRow, error) {
 	}
 	return out, rows.Err()
 }
+
+// TrackHoldingRow is one name a stockey forward track holds after a rebalance.
+type TrackHoldingRow struct {
+	RebalanceDate time.Time
+	Symbol        string
+}
+
+// ForwardTrackHoldings returns a stockey forward track's held names per rebalance
+// (fundamentals_forward_track_holding, synced in full since 2026-10-19; TODO D1). Rows whose
+// action is an exit are not holdings.
+func (s *Store) ForwardTrackHoldings(ctx context.Context, track string, version int) ([]TrackHoldingRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT rebalance_date, symbol FROM fundamentals_forward_track_holding
+		 WHERE track = $1 AND version = $2 AND symbol IS NOT NULL
+		   AND coalesce(action, '') NOT IN ('exit', 'sell', 'exited')
+		 ORDER BY rebalance_date, symbol`, track, version)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TrackHoldingRow
+	for rows.Next() {
+		var r TrackHoldingRow
+		if err := rows.Scan(&r.RebalanceDate, &r.Symbol); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

@@ -373,7 +373,16 @@ func parseSignal(name string) (signalFn, error) {
 			fatalIf(err)
 			return s
 		}, nil
-	case "low-volatility-blend", "momentum-lowvol-combination":
+	case "quality":
+		// Not computed from prices: buildDays fills it from stockey's quality track holdings.
+		return func(ser bars.Series, _ core.Series, _ core.Series) []float64 {
+			out := make([]float64, len(ser.Bars))
+			for i := range out {
+				out[i] = math.NaN()
+			}
+			return out
+		}, nil
+	case "low-volatility-blend", "momentum-lowvol-combination", "momentum-quality-combination":
 		// Book-blends rank by their variants; eligibility comes from them.
 		return windowReturn(6*month, 0), nil
 	case "momentum-lookback-blend":
@@ -518,6 +527,31 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				spec.Name, latest.Format("2006-01-02"), to.Format("2006-01-02"))
 		}
 	}
+	// A "quality" variant holds stockey's quality track (TODO D1, LEDGER row 60): the names
+	// it held after its last rebalance on or before the decision day.
+	qualityAt := -1
+	var quality *paper.TrackHoldings
+	for k, v := range spec.Variants {
+		if v == "quality" {
+			qualityAt = k
+		}
+	}
+	if qualityAt >= 0 {
+		rows, err := st.ForwardTrackHoldings(ctx, "quality", 1)
+		if err != nil {
+			return nil, err
+		}
+		in := make([]paper.HoldingRow, len(rows))
+		for i, r := range rows {
+			in[i] = paper.HoldingRow{RebalanceDate: r.RebalanceDate, Symbol: r.Symbol}
+		}
+		quality = paper.NewTrackHoldings(in)
+		if latest := quality.Latest(); latest.IsZero() || to.Sub(latest) > 40*24*time.Hour {
+			// a monthly track: more than 40 days without a rebalance means the feed stopped
+			fmt.Fprintf(os.Stderr, "paper: WARNING %s: newest quality rebalance is %s (> 40 days before %s) -- holdings carried forward\n",
+				spec.Name, latest.Format("2006-01-02"), to.Format("2006-01-02"))
+		}
+	}
 	var groups map[string][2]string
 	if spec.MaxPerGroup > 0 {
 		var err error
@@ -581,6 +615,12 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				defined := false
 				for k := range vs {
 					sigs[k] = vs[k][i-1]
+					if k == qualityAt {
+						sigs[k] = math.NaN()
+						if quality.Held(ser.Symbol, times[i-1]) { // decided at yesterday's close
+							sigs[k] = 1
+						}
+					}
 					if !math.IsNaN(sigs[k]) {
 						defined = true
 					}

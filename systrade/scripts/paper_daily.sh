@@ -48,6 +48,7 @@ go run ./cmd/paper run -strategy trend-speed-blend-buffered
 go run ./cmd/paper run -strategy stage2-rs-leaders
 # its fundamentals-filtered pair (LEDGER row 55)
 go run ./cmd/paper run -strategy stage2-rs-leaders-clean
+go run ./cmd/paper run -strategy momentum-quality-combination   # TODO D1, LEDGER 60 (2026-10-19)
 
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate

@@ -394,7 +394,8 @@ Operator idea, 2026-10-08 (`stockey/docs/TRIGGER_STUDY.md`, LEDGER rows 56-57).
 ### D1. Momentum + quality — decide where the blend lives
 - [x] **Decided 2026-10-19 (operator):** systrader may READ stockey's forward-track holdings
       (`fundamentals_forward_track_holding`, synced in full nightly; DATA_CONTRACT both copies).
-      Next: pre-register the blend as a systrader paper track.
+      Blend pre-registered and running: `momentum-quality-combination`, 50/50, from 2026-10-20
+      (LEDGER 60), judged from 2027-10-20.
 - **Was:** momentum runs in systrader, quality would run in stockey, and
       `DATA_CONTRACT.md` says stockey writes no fundamentals into systrader's
       reach. To blend them, one of two things must change: a fundamentals table

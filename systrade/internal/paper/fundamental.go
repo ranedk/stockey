@@ -78,3 +78,52 @@ func (f *FundamentalPass) Latest() time.Time {
 	}
 	return f.dates[len(f.dates)-1]
 }
+
+
+// TrackHoldings is another strategy's book by rebalance date -- stockey's frozen forward
+// tracks (fundamentals_forward_track_holding). Held(symbol, day) answers from the latest
+// rebalance on or before `day`, so a decision never sees a rebalance made after it.
+type TrackHoldings struct {
+	dates []time.Time
+	held  []map[string]bool
+}
+
+// HoldingRow is one held name at one rebalance (store.TrackHoldingRow, decoupled).
+type HoldingRow struct {
+	RebalanceDate time.Time
+	Symbol        string
+}
+
+// NewTrackHoldings groups the rows by rebalance date.
+func NewTrackHoldings(rows []HoldingRow) *TrackHoldings {
+	by := map[time.Time]map[string]bool{}
+	for _, r := range rows {
+		if by[r.RebalanceDate] == nil {
+			by[r.RebalanceDate] = map[string]bool{}
+		}
+		by[r.RebalanceDate][r.Symbol] = true
+	}
+	th := &TrackHoldings{}
+	for d := range by {
+		th.dates = append(th.dates, d)
+	}
+	sort.Slice(th.dates, func(i, j int) bool { return th.dates[i].Before(th.dates[j]) })
+	for _, d := range th.dates {
+		th.held = append(th.held, by[d])
+	}
+	return th
+}
+
+// Held reports whether symbol was in the book as of day; false before the first rebalance.
+func (th *TrackHoldings) Held(symbol string, day time.Time) bool {
+	i := sort.Search(len(th.dates), func(i int) bool { return th.dates[i].After(day) }) - 1
+	return i >= 0 && th.held[i][symbol]
+}
+
+// Latest is the newest rebalance date (zero if none).
+func (th *TrackHoldings) Latest() time.Time {
+	if len(th.dates) == 0 {
+		return time.Time{}
+	}
+	return th.dates[len(th.dates)-1]
+}

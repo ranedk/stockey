@@ -131,6 +131,11 @@ type Spec struct {
 	// stockey's filter on the decision day (FundamentalPass: a flaw, a story score below that
 	// day's median, or no score). Zero value = off.
 	FundamentalFilter bool
+	// HoldAllVariants marks book-blend variants whose book is EVERY eligible name with a
+	// defined signal, equal weight -- not that variant's top quantile. For a variant that is
+	// another strategy's holdings list (the "quality" variant: stockey's quality track, read
+	// from fundamentals_forward_track_holding). nil = every variant ranks, as before.
+	HoldAllVariants []bool
 }
 
 // StopKind is the per-position exit rule.
@@ -499,10 +504,34 @@ func Stage2RSLeadersCleanSpec() Spec {
 	return s
 }
 
+// MomentumQualityCombinationSpec is the configuration frozen on 2026-10-19 (TODO D1, LEDGER
+// row 60): half the book in the momentum lookback blend's four variants at their own frozen
+// weights (33/33/17/17 of the half), half in stockey's frozen quality track (LEDGER row 46) --
+// its holdings as of the last rebalance on or before the decision day, equal weight, read from
+// fundamentals_forward_track_holding. A quality name below this book's liquidity floor is not
+// held (its share goes to the quality names that are). Monthly. Forward only: the quality track
+// has no history before 2026-10-02.
+func MomentumQualityCombinationSpec() Spec {
+	s := FrozenSpec()
+	s.Name = "momentum-quality-combination"
+	s.Start = time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)
+	s.Signal = "momentum-quality-combination"
+	s.SignalLabel = "Momentum lookback blend 50% + stockey quality top 30 50% (equal weight within each half), long-only, monthly"
+	s.Doc = "docs/strategies/2026-10-19_momentum_quality_combination.md"
+	s.Mode = ModeBookBlend
+	s.Variants = []string{"mom6", "mom9", "mom12", "mom12_1", "quality"}
+	s.VariantWeights = []float64{0.165, 0.165, 0.085, 0.085, 0.50}
+	s.HoldAllVariants = []bool{false, false, false, false, true}
+	s.RebalanceEvery = 21
+	s.Composite = true
+	return s
+}
+
 // Specs lists every strategy with a forward record, in the order they began.
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
-		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec()}
+		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec(),
+		MomentumQualityCombinationSpec()}
 }
 
 // SpecFor finds a registered strategy by name.
@@ -1471,6 +1500,15 @@ func variantTopsBuffered(eligible []Obs, spec Spec, prev []map[string]bool) [][]
 			if v < len(o.Signals) && !math.IsNaN(o.Signals[v]) {
 				have = append(have, o)
 			}
+		}
+		if v < len(spec.HoldAllVariants) && spec.HoldAllVariants[v] {
+			names := make([]string, len(have))
+			for i, o := range have {
+				names[i] = o.Symbol
+			}
+			sort.Strings(names)
+			out[v] = names
+			continue
 		}
 		if len(have) < spec.Quantile {
 			continue
