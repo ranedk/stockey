@@ -143,7 +143,7 @@ being popular, not for being weak.
 - **Size:** small. **Do this first — B1, B2 and B3 all read it.**
 
 ### B5. Rebuild the universe: Layer 1 + Layer 2 (PRD agreed 2026-09-25)
-- [ ] **What:** replace the L1 screen with `stockey/docs/UNIVERSE_PRD.md`: Layer 1
+- [x] **What:** replace the L1 screen with `stockey/docs/UNIVERSE_PRD.md`: Layer 1 -- done 2026-09-25 (l1_universe v2 + Layer 2)
       (NSE main board, not on the surveillance list, >= Rs 300 cr, >= Rs 50 L traded a
       day, listed >= 1 year, pledge < 50%) tags each stock with one of five groups;
       Layer 2 excludes fundamentally bad businesses with checks per group.
@@ -162,7 +162,7 @@ being popular, not for being weak.
 - **Size:** large. Supersedes B1-B4 below (kept for their reasoning).
 
 ### B6. Story-and-flaw scoring, event-driven re-evaluation, weighted portfolio (PRD agreed 2026-09-29)
-- [ ] **What:** `stockey/docs/FUNDAMENTAL_REEVALUATION_PRD.md` -- everything after the universe:
+- [x] **What:** `stockey/docs/FUNDAMENTAL_REEVALUATION_PRD.md` -- everything after the universe: -- done 2026-10-02 (steps 3-7 built, live)
       churn fixes first (ruleset v2), then a daily dated story/flaw score per company (change and
       acceleration beside level; the market's price reactions decide what counts), results reading,
       a re-evaluation queue driven by filings / peer filings / ET news / prices / macro, a structured
@@ -427,7 +427,7 @@ Everything here was open in a repo README or PRD before this file existed.
 
 **stockey**
 
-- [ ] **A large uncommitted change set was committed blind as `WIP`** (b4b3230,
+- [x] **A large uncommitted change set was committed blind as `WIP`** (b4b3230, -- resolved: both tests pass (checked 2026-10-19)
   2026-09-23 16:11 — one minute after this file was written). It left two
   failing tests on HEAD: `test_entry_sizing_is_frozen_on_the_position` (stub
   arity vs `portfolio_runner.py:160`) and `test_morning_catch_up_runs_on_saturday`.
