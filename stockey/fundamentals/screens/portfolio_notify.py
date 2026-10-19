@@ -119,12 +119,32 @@ def load_actions(*, as_of=None) -> dict[str, list[dict]]:
         """,
         params=(day,),
     )
+    # Trims and rebalance signals (portfolio_v3.record_adjustment): the book is record-only, so
+    # these are instructions to resize, never closes. Added to the email 2026-10-19 (operator).
+    adjusted = sql_to_df(
+        """
+        SELECT ticker, kind, price, value_before_rs, value_after_rs, target_value_rs, reason
+          FROM fundamentals_portfolio_adjustment
+         WHERE (adjusted_at AT TIME ZONE 'Asia/Kolkata')::date = %s
+         ORDER BY kind, ticker
+        """,
+        params=(day,),
+    ) if _table_exists("fundamentals_portfolio_adjustment") else pd.DataFrame()
     return {
         "day": day,
+        "adjusted": [] if adjusted.empty else adjusted.to_dict("records"),
         "entered": [] if entered.empty else entered.to_dict("records"),
         "exited": [] if exited.empty else exited.to_dict("records"),
         "deferred": [] if deferred.empty else deferred.to_dict("records"),
     }
+
+
+def _table_exists(name: str) -> bool:
+    return bool(sql_to_df("SELECT to_regclass(%s) IS NOT NULL AS ok", params=(name,)).iloc[0]["ok"])
+
+
+ADJUST_LABEL = {"trim": "Trim a third (valuation)", "rebalance_down": "Rebalance down to target",
+                "rebalance_up": "Rebalance up to target"}
 
 
 def load_book_summary() -> dict:
@@ -165,9 +185,10 @@ def _return_pct(entry, exit_) -> float | None:
 
 
 def build_action_email(actions: dict, book: dict) -> tuple[str, str, str]:
-    """(subject, text, html). Entries and exits only."""
+    """(subject, text, html). Entries, exits, trims and rebalances."""
     day, entered, exited, deferred = (actions["day"], actions["entered"],
                                       actions["exited"], actions["deferred"])
+    adjusted = actions.get("adjusted", [])
     mode = "LIVE" if book["is_live"] else "RECORD-ONLY"
 
     bits = []
@@ -175,6 +196,8 @@ def build_action_email(actions: dict, book: dict) -> tuple[str, str, str]:
         bits.append(f"{len(entered)} enter")
     if exited:
         bits.append(f"{len(exited)} exit")
+    if adjusted:
+        bits.append(f"{len(adjusted)} adjust")
     subject = f"[Portfolio] {', '.join(bits) if bits else 'No action'} -- {day}"
 
     text = [f"Portfolio actions for {day} ({mode}).", ""]
@@ -253,6 +276,40 @@ def build_action_email(actions: dict, book: dict) -> tuple[str, str, str]:
             f"<th></th></tr>{''.join(rows)}</table></div>"
         )
 
+    if adjusted:
+        text.append("")
+        text.append(f"ADJUST ({len(adjusted)}) -- resize, the position stays open:")
+        rows = []
+        for a in adjusted:
+            label = ADJUST_LABEL.get(str(a.get("kind")), str(a.get("kind")))
+            change = None
+            try:
+                change = float(a["value_after_rs"]) - float(a["value_before_rs"])
+            except (TypeError, ValueError):
+                pass
+            verb = "-" if change is None else ("sell" if change < 0 else "buy")
+            text.append(
+                f"  {a['ticker']}: {label} | {_rupees(a.get('value_before_rs'))} -> {_rupees(a.get('value_after_rs'))}"
+                f" ({verb} {_rupees(abs(change)) if change is not None else '-'} at {_price(a.get('price'))})"
+            )
+            if a.get("reason"):
+                text.append(f"      why: {a['reason']}")
+            rows.append(
+                "<tr>"
+                f"<td><strong>{html.escape(str(a['ticker']))}</strong></td>"
+                f"<td>{html.escape(label)}</td>"
+                f"<td>{html.escape(_rupees(a.get('value_before_rs')))} &rarr; {html.escape(_rupees(a.get('value_after_rs')))}</td>"
+                f"<td>{html.escape(verb)} {html.escape(_rupees(abs(change)) if change is not None else '-')}"
+                f"<br><span class='rule'>at {html.escape(_price(a.get('price')))}</span></td>"
+                f"<td class='thesis'>{html.escape(str(a.get('reason') or '-'))}</td></tr>"
+            )
+        cards.append(
+            "<div class='card'><h1>Adjust</h1>"
+            f"<p class='sub'>{len(adjusted)} position(s) to resize. They stay open.</p>"
+            "<table><tr><th>Ticker</th><th>What</th><th>Value</th><th>Trade</th><th>Why</th></tr>"
+            f"{''.join(rows)}</table></div>"
+        )
+
     if deferred:
         text.append("")
         text.append(f"DEFERRED ({len(deferred)}) -- exit triggered, adjudicator held one cycle:")
@@ -270,8 +327,8 @@ def build_action_email(actions: dict, book: dict) -> tuple[str, str, str]:
             f"<table>{rows}</table></div>"
         )
 
-    if not (entered or exited or deferred):
-        text.append("No entries or exits today.")
+    if not (entered or exited or deferred or adjusted):
+        text.append("No entries, exits or adjustments today.")
         cards.append(
             "<div class='card'><h1>No action today</h1>"
             "<p class='quiet'>The ruleset opened nothing and closed nothing. This email is sent "
@@ -291,7 +348,7 @@ def build_action_email(actions: dict, book: dict) -> tuple[str, str, str]:
         f"<div class='card'><h1>Portfolio actions</h1><p class='sub'>{html.escape(day)}</p>"
         f"{banner}<p class='quiet'>{html.escape(footer)}</p></div>"
         f"{''.join(cards)}"
-        "<p class='footer'>Generated by the nightly ruleset. Entries and exits only &mdash; "
+        "<p class='footer'>Generated by the nightly ruleset. Entries, exits and resizes only &mdash; "
         "the watchlist lives on the screener's /watchlist page.</p></body></html>"
     )
     return subject, "\n".join(text), html_body
@@ -315,7 +372,7 @@ def send_portfolio_actions(*, as_of=None, dry_run: bool = False) -> dict[str, ob
 
     result = {"source": SYNC_SOURCE_NAME, "status": "ok", "day": actions["day"],
               "entered": len(actions["entered"]), "exited": len(actions["exited"]),
-              "deferred": len(actions["deferred"]), "subject": subject}
+              "deferred": len(actions["deferred"]), "adjusted": len(actions.get("adjusted", [])), "subject": subject}
     if dry_run:
         return {**result, "sent": 0, "dry_run": True}
     sent = send_email(subject, text_body, html_body)
