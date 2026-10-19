@@ -106,6 +106,7 @@ def test_runner_v3_sizes_by_weight_and_replaces_when_full(monkeypatch):
     monkeypatch.setattr(runner, "_catchup_signal_dates", lambda: {})
     monkeypatch.setattr(runner, "_recently_stopped_tickers", lambda: {})
     monkeypatch.setattr(runner, "_open_accepted_tickers", lambda: {f"H{i}" for i in range(25)})
+    monkeypatch.setattr(runner, "_open_accepted_v3_count", lambda: 25)
     monkeypatch.setattr(runner, "_open_vetoed_tickers", lambda: {})
     monkeypatch.setattr(runner, "_latest_price", lambda t: (100.0, None))
     monkeypatch.setattr(runner, "evaluate_entry_candidates", lambda: {"ruleset_version": 3, "stage_api_available": True,
@@ -116,6 +117,10 @@ def test_runner_v3_sizes_by_weight_and_replaces_when_full(monkeypatch):
     out = runner.run_portfolio(live=False, dry_run=True)
     assert out["ruleset_version"] == 3 and out["entered_tickers"] == ["NEW"]
     assert out["replaced"][0]["ticker"] == "H0"                    # the weakest (70), 95 >= 70 + 15
+    # v1 leftovers do not take v3 slots (operator 2026-10-19): 25 open in total, 16 of them v3
+    monkeypatch.setattr(runner, "_open_accepted_v3_count", lambda: 16)
+    out = runner.run_portfolio(live=False, dry_run=True)
+    assert out["entered_tickers"] == ["NEW"] and not out["replaced"]
     assert "nse:H0" not in out["target_weights"] and out["target_weights"]["nse:NEW"] > out["target_weights"]["nse:H1"]
 
 

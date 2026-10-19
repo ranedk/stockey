@@ -143,6 +143,7 @@ const { data: scoring, status, error } = await useAsyncData(
       </section>
 
       <RulesetPortfolioPanel />
+      <PaperBooksPanel />
     </template>
 
     <p v-else-if="status === 'pending'" class="mt-6 text-sm text-slate-500">Loading…</p>

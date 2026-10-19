@@ -260,6 +260,12 @@ def _open_accepted_tickers() -> set[str]:
     return set(df["ticker"]) if not df.empty else set()
 
 
+def _open_accepted_v3_count() -> int:
+    df = sql_to_df("SELECT count(*) AS n FROM fundamentals_portfolio_position "
+                   "WHERE status = 'open' AND entry_decision = 'accept' AND ruleset_version >= 3")
+    return int(df.iloc[0]["n"])
+
+
 def _recently_stopped_tickers() -> dict:
     """Names stopped out inside the cooldown, mapped to WHEN the stop fired. Ruleset v3's
     trailing stop counts too: exits run before entries, so without it a name sold at 22:00 was
@@ -441,7 +447,10 @@ def run_portfolio(*, live: bool = False, dry_run: bool = False) -> dict[str, obj
     # is the BUCKET's, not a global one: 100 x the old flat Rs 1 lakh happened to equal a
     # crore, but 25 x Rs 4 lakh is the same crore held in fewer, larger positions. Capping
     # on the old global count would let a bucket deploy four times its envelope.
-    book_used = len(already_accepted)
+    # v3 counts only its OWN open positions against the bucket (operator 2026-10-19): 9 open v1
+    # leftovers were filling 9 of the 25 slots, so v3 turned names away holding 16. They still
+    # block re-entry of the same ticker (already_accepted) and run off by their own exits.
+    book_used = _open_accepted_v3_count() if v3 else len(already_accepted)
     book_capacity = bucket_config(DEFAULT_BUCKET)["target_positions"] or MAX_POSITIONS
     catchup_signal = _catchup_signal_dates()
     catchup_open = _open_catchup_count() if catchup_signal else 0

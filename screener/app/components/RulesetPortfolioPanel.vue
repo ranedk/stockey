@@ -74,8 +74,9 @@ const bookPnl = computed(() => {
       </span>
       <span v-if="data" class="text-xs text-slate-500">
         ₹{{ Math.round(data.capital_committed_rs).toLocaleString('en-IN') }} would be
-        committed · {{ data.book_used }}/{{ data.book_capacity }} slots
+        committed · {{ data.book_used }}/{{ data.book_capacity }} v3 slots
         (₹{{ Math.round(data.capital_per_position_rs).toLocaleString('en-IN') }} each)
+        <template v-if="data.legacy_open"> · {{ data.legacy_open }} older v1 position(s) running off, not counted</template>
       </span>
     </div>
 

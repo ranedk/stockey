@@ -137,6 +137,12 @@ def portfolio() -> list[dict]:
     return queries.get_portfolio()
 
 
+@app.get("/api/paper-books")
+def paper_books() -> dict:
+    """The replayed paper books beside v3: v3 replay, uncapped, v4 (LEDGER row 59)."""
+    return queries.get_paper_books()
+
+
 @app.get("/api/portfolio/scoring")
 def portfolio_scoring() -> dict:
     return queries.get_portfolio_scoring()

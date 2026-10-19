@@ -495,4 +495,51 @@ export interface RulesetPortfolioResponse {
   capital_per_position_rs: number
   book_used: number
   book_capacity: number
+  legacy_open: number
+}
+
+// /api/paper-books -- the replayed paper books beside v3 (stockey portfolio_replay.py, LEDGER row 59)
+export interface PaperBookPosition {
+  ticker: string
+  opened_on: string
+  entry_price: number | null
+  size_rs: number | null
+  weight: number | null
+  story_score_at_entry: number | null
+  status: 'open' | 'closed'
+  closed_on: string | null
+  exit_price: number | null
+  exit_reason: string | null
+  realized_rs: number | null
+  trim_count: number
+  last_price: number | null
+}
+
+export interface PaperBookNavRow {
+  as_of: string
+  open_positions: number
+  deployed_rs: number
+  market_value_rs: number
+  realized_rs: number
+  unrealized_rs: number
+}
+
+export interface PaperBook {
+  book: 'v3_replay' | 'uncapped' | 'v4'
+  label: string
+  description: string
+  open_positions: number
+  entered: number
+  closed: number
+  pnl_rs: number
+  return_on_capital: number
+  return_on_deployed: number | null
+  series: PaperBookNavRow[]
+  positions: PaperBookPosition[]
+}
+
+export interface PaperBooksResponse {
+  books: PaperBook[]
+  as_of: string | null
+  since: string | null
 }

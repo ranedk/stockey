@@ -903,9 +903,60 @@ def get_ruleset_positions() -> dict:
         # The bucket's figures -- what the runner sizes and caps with. The flat Rs 1 lakh /
         # 100-name constants predate buckets and were shown here after they stopped applying.
         "capital_per_position_rs": capital_per_position_rs(DEFAULT_BUCKET),
-        "book_used": sum(1 for r in accepted if r["status"] == "open"),
+        # v3's own positions only (operator 2026-10-19): open v1 leftovers no longer take v3
+        # slots -- they run off by their own exits and are shown separately.
+        "book_used": sum(1 for r in accepted if r["status"] == "open" and (r["ruleset_version"] or 0) >= 3),
+        "legacy_open": sum(1 for r in accepted if r["status"] == "open" and (r["ruleset_version"] or 0) < 3),
         "book_capacity": bucket_config(DEFAULT_BUCKET)["target_positions"] or MAX_POSITIONS,
         # record-only until at least one real position exists
         "mode": "live" if real else "record-only",
         "positions": rows,
     }
+
+
+
+PAPER_BOOK_LABELS = {
+    "v3_replay": ("v3 (replayed)", "The v3 rules replayed from 2026-10-02 on point-in-time inputs, without the "
+                                   "old v1 positions taking slots."),
+    "uncapped": ("Uncapped", "Every name v3's rules and the adjudicator accept, Rs 4 lakh each, no limit -- "
+                             "what the 25-name cap leaves out."),
+    "v4": ("v4", "25 names weighted by inverse volatility (no score tilt), 2-8% each, sector <= 25%; "
+                 "no new entries while the Nifty 50 is below its 50-session average."),
+}
+
+
+def get_paper_books() -> dict:
+    """The replayed paper books (fundamentals/screens/portfolio_replay.py, LEDGER row 59)."""
+    try:
+        nav = sql_to_df("SELECT * FROM fundamentals_replay_nav ORDER BY book, as_of")
+        pos = sql_to_df("""SELECT book, ticker, opened_on, entry_price, size_rs, weight, story_score_at_entry,
+                                  status, closed_on, exit_price, exit_reason, realized_rs, trim_count
+                             FROM fundamentals_replay_position ORDER BY book, status DESC, opened_on DESC""")
+    except Exception:  # noqa: BLE001 -- tables appear after the first replay
+        return {"books": [], "as_of": None}
+    last_px = {}
+    if not pos.empty:
+        px = sql_to_df("""SELECT DISTINCT ON (symbol) symbol, adj_close FROM advisory_adjusted_ohlcv_daily
+                           WHERE symbol = ANY(%s) AND date >= now() - make_interval(days => %s)
+                           ORDER BY symbol, date DESC""", params=(sorted(pos["ticker"].unique()), PRICE_LOOKBACK_DAYS))
+        last_px = dict(zip(px["symbol"], px["adj_close"]))
+    books = []
+    for name, (label, desc) in PAPER_BOOK_LABELS.items():
+        n = nav[nav["book"] == name]
+        p = pos[pos["book"] == name].copy()
+        p["last_price"] = p["ticker"].map(last_px)
+        last = n.iloc[-1] if len(n) else None
+        pnl = float(last["realized_rs"] + last["unrealized_rs"]) if last is not None else 0.0
+        deployed = float(p["size_rs"].sum()) if len(p) else 0.0
+        books.append({
+            "book": name, "label": label, "description": desc,
+            "open_positions": int(last["open_positions"]) if last is not None else 0,
+            "entered": int(len(p)), "closed": int((p["status"] == "closed").sum()) if len(p) else 0,
+            "pnl_rs": round(pnl), "return_on_capital": pnl / 1e7,
+            "return_on_deployed": pnl / deployed if deployed else None,
+            "series": _clean_records(n[["as_of", "open_positions", "deployed_rs", "market_value_rs", "realized_rs",
+                                        "unrealized_rs"]]) if len(n) else [],
+            "positions": _clean_records(p.drop(columns=["book"])),
+        })
+    return {"books": books, "as_of": str(nav["as_of"].max()) if len(nav) else None,
+            "since": str(nav["as_of"].min()) if len(nav) else None}
