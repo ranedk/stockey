@@ -55,6 +55,7 @@ FULL_TABLES=(
   company_master_nse_alias  # NSE renames: current symbol -> existing company (2026-09-24)
   master_sharpely_equity    # sector / industry / basic-industry codes per stock (rotation view, 2026-10-01)
   fundamentals_sector_reference  # code -> name for those levels (rotation view, 2026-10-01)
+  fundamentals_forward_track_holding  # stockey's frozen forward tracks' holdings per rebalance (quality v1 etc., LEDGER 46) -- read by systrader for momentum+quality (operator 2026-10-19, TODO D1)
 )
 
 INCR_TABLES=(               # incremental on the "date" column + reconciliation
