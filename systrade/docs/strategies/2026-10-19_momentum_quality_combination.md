@@ -13,8 +13,8 @@ holdings on 2026-10-19 (DATA_CONTRACT updated, both copies).
 **Mechanics:** `paper.MomentumQualityCombinationSpec`. The quality half holds the names the
 stockey track held after its last rebalance ON OR BEFORE the decision day
 (`fundamentals_forward_track_holding`, synced nightly), so no decision sees a later rebalance.
-A quality name below this book's liquidity floor (the frozen spec's 60-bar median traded
-value) is not held and its share goes to the quality names that are — on 2026-10-19 that is
+A quality name below this book's liquidity floor (60-session median traded value of Rs 10
+crore, the frozen spec's) is not held and its share goes to the quality names that are — on 2026-10-19 that is
 17 of 30. Rebalanced every 21 sessions, 50 bps round trip, long-only, starts 2026-10-20.
 
 **Judged:** from 2027-10-20 (12 months), paired monthly against the momentum lookback blend
