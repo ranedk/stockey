@@ -46,6 +46,22 @@ export interface WatchlistItem {
   primary_dimension: string | null
   entry_basis: string | null
   flaws: string | null
+  checks: ScoresAndChecks
+}
+
+// 2026-10-19: the re-evaluation work's checks, per company (queries.load_scores_and_checks)
+export interface ScoresAndChecks {
+  in_portfolio: boolean
+  score_7d_ago?: number | null
+  score_change_7d?: number | null
+  valuation_ratio?: number | null
+  results?: {
+    latest_period_end: string | null
+    sales_yoy_pct: number | null
+    profit_yoy_pct: number | null
+    margin_change_pp: number | null
+    one_off_share: number | null
+  }
 }
 
 // GET /api/watchlist/summary -- equal-weight average return across the current
@@ -116,6 +132,7 @@ export interface WatchlistDetail {
   sector_context: Record<string, unknown> | null
   portfolio: PortfolioThesis[]
   signal_pointers: SignalPointer[]
+  checks?: ScoresAndChecks
 }
 
 export interface SectorWatchedCompany {

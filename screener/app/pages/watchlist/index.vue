@@ -153,6 +153,7 @@ const emptyStateMessage = computed(() => {
                 :evaluable="item.evaluable_count"
               />
             </div>
+            <ScoresAndChecks class="mt-1.5" :checks="item.checks" :flaws="item.flaws" compact />
             <div v-if="item.strategies.length" class="mt-1.5 flex flex-wrap gap-1">
               <BadgePill v-for="s in item.strategies" :key="s" :label="strategyLabel(s)" tone="neutral" />
             </div>

@@ -229,10 +229,55 @@ def get_watchlist(status: str | None = "active") -> list[dict]:
     # gate is a no-op anyway (every row in `watchlist` already IS active), so this
     # only changes behavior for status=None/"stale"/"invalidated"/"price_flagged".
     drafts_by_company = _load_draft_theses_by_company(active_only=(status == "active"))
+    checks = load_scores_and_checks([r["company_master_id"] for r in watchlist])
     for row in watchlist:
         row["strategies"] = strategies_by_company.get(row["company_master_id"], [])
         row["draft_thesis"] = drafts_by_company.get(row["company_master_id"])
+        row["checks"] = checks.get(row["company_master_id"], {})
     return watchlist
+
+
+def load_scores_and_checks(company_ids: list[str]) -> dict[str, dict]:
+    """Per company, the checks the re-evaluation work added (2026-10-19, operator: show them on
+    the watchlist): story score now and 7 days ago, the latest results reading, valuation vs its
+    own history (the portfolio's entry filter and trim line), and whether v3 holds it."""
+    if not company_ids:
+        return {}
+    ids = list(company_ids)
+    mapping = """(SELECT DISTINCT ON (screener_company_id) screener_company_id::bigint AS sid, company_master_id
+                    FROM fundamentals_snapshot_daily ORDER BY screener_company_id, as_of_date DESC)"""
+    score = sql_to_df(f"""
+        SELECT l.company_master_id, l.story_score AS score_now, l.in_band,
+               (SELECT s.story_score FROM fundamentals_story_score s
+                 WHERE s.company_master_id = l.company_master_id AND s.as_of_date <= now()::date - 7
+                 ORDER BY s.as_of_date DESC LIMIT 1) AS score_7d_ago
+          FROM fundamentals_story_score_live l WHERE l.company_master_id = ANY(%s)""", params=(ids,))
+    results = sql_to_df(f"""
+        SELECT DISTINCT ON (m.company_master_id) m.company_master_id, r.latest_period_end,
+               r.sales_yoy_pct, r.profit_yoy_pct, r.margin_change_pp, r.one_off_share
+          FROM fundamentals_results_reading r JOIN {mapping} m ON m.sid = r.company_id
+         WHERE m.company_master_id = ANY(%s)
+         ORDER BY m.company_master_id, r.as_of_date DESC""", params=(ids,))
+    valuation = sql_to_df(f"""
+        SELECT DISTINCT ON (m.company_master_id) m.company_master_id,
+               s.valuation_vs_own_history_ratio AS valuation_ratio
+          FROM fundamentals_l2_state s JOIN {mapping} m ON m.sid = s.company_id
+         WHERE m.company_master_id = ANY(%s)
+         ORDER BY m.company_master_id, s.run_date DESC""", params=(ids,))
+    held = set(sql_to_df("""SELECT company_master_id FROM fundamentals_portfolio_position
+                             WHERE status = 'open' AND entry_decision = 'accept' AND ruleset_version >= 3
+                               AND company_master_id = ANY(%s)""", params=(ids,))["company_master_id"])
+    out: dict[str, dict] = {c: {"in_portfolio": c in held} for c in ids}
+    for r in _clean_records(score):
+        now, ago = r.get("score_now"), r.get("score_7d_ago")
+        out[r["company_master_id"]].update({"score_7d_ago": ago,
+                                            "score_change_7d": (now - ago) if now is not None and ago is not None else None})
+    for r in _clean_records(results):
+        out[r["company_master_id"]]["results"] = {k: r[k] for k in ("latest_period_end", "sales_yoy_pct", "profit_yoy_pct",
+                                                                     "margin_change_pp", "one_off_share")}
+    for r in _clean_records(valuation):
+        out[r["company_master_id"]]["valuation_ratio"] = r.get("valuation_ratio")
+    return out
 
 
 def get_watchlist_return_summary(status: str | None = "active") -> dict:
@@ -433,6 +478,7 @@ def get_watchlist_detail(company_master_id: str) -> dict | None:
         # PRD §12 todo #6 follow-up (2026-09-02): the five axes behind the watchlist's
         # confluence badge. None until confluence_score.py has scored this company.
         "confluence": load_confluence_for_company(company_master_id),
+        "checks": load_scores_and_checks([company_master_id]).get(company_master_id, {}),
     }
 
 

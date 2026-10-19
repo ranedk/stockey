@@ -124,6 +124,8 @@ const bandLabel = computed(() => {
       <p v-else class="mt-2 text-sm italic text-slate-400">Narrative not generated yet -- run the watch_summary pipeline.</p>
     </section>
 
+    <ScoresAndChecks :checks="data.checks" :flaws="data.watchlist.flaws" />
+
     <ConfluencePanel :confluence="data.confluence ?? null" />
 
     <!-- Portfolio: machine-decided, read-only -->
