@@ -379,6 +379,15 @@ All closed 2026-09-24; detail in `stockey/docs/DATA_AUDIT_2026-09-23.md` (G1-G12
 - [~] **Watch: completeness gate timing** -- first clean night 2026-09-24; move the gate
       after 12:00 IST only if nights fail at 08:00 but pass by noon.
 
+### C11. Junk weekend rows in `nseindia_indices` (found 2026-10-20)
+
+- [ ] 2023-06-04 (Sun) and 2023-11-04 (Sat) hold closes 5-8% off the surrounding sessions in
+  Nifty 50, Nifty Bank and India VIX (Nifty 17,599 / 17,722 between ~18,500 and ~19,200
+  closes). The other weekend rows are real special sessions (Muhurat, Budget Saturdays, the
+  2024 DR drills). Delete the two at source and find which collector wrote them; anything
+  computing index returns or volatility across those dates is wrong until then (LEDGER 61-62
+  filtered them by hand).
+
 ### C10. Trigger study: which filings and results come around momentum entries that keep running -- CLOSED
 
 Operator idea, 2026-10-08 (`stockey/docs/TRIGGER_STUDY.md`, LEDGER rows 56-57).
