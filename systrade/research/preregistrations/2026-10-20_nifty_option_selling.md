@@ -54,8 +54,10 @@ width minus net credit), in index points; the weekly return is P&L / capital at 
 - p: one-sided against zero, bootstrap over weeks (10,000 reps, seed 1). Benjamini-Hochberg
   across A, B, C.
 - **In-sample PASS** for a structure: mean net weekly return > 0 with BH q < 0.10, positive in
-  at least 2 of the 3 in-sample years, and maximum drawdown no deeper than 50% of a year's
-  average capital at risk.
+  at least 2 of the 3 in-sample years, and, sized so that each week puts 10% of the account
+  at risk, the account's maximum drawdown (non-compounded) no deeper than 35%. (Clarified
+  2026-10-20 before any result: the first wording, "50% of a year's average capital at
+  risk", did not say what the drawdown was measured against.)
 
 ## 5. Years
 
