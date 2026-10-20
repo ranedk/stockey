@@ -472,6 +472,33 @@ Everything here was open in a repo README or PRD before this file existed.
 
 ---
 
+## G. Nifty intraday + F&O (opened 2026-10-20)
+
+Operator, 2026-10-20: look beyond long-only daily stock books -- Nifty, intraday and F&O,
+TA or event-based. Quick checks on data in hand (LEDGER 61-63): option sellers ARE paid on
+Nifty (VIX above next-month realised vol in 79% of windows, +2.5 pts) but a naked monthly
+straddle only breaks even; trend on Nifty/Bank Nifty futures and first-half-hour momentum
+are dead.
+
+- [~] **Data** (stockey, backfills launched 2026-10-20 ~15:10 UTC, resumable -- re-run the
+  same command to continue or retry):
+  - `dhan_option_rolling`: Nifty options, 1-min, 5 years, WEEK1 -> MONTH1 -> WEEK2, ATM+-10,
+    CE/PE (`python -m data.dhanlive.option_rolling --underlying NIFTY --years 5 --series WEEK1
+    --workers 6`; log `stockey/logs/option_rolling_backfill.log`). ~18 h in all.
+  - `nseindia_fo_bhavcopy`: index futures + options EOD, 2016+ (`python -m
+    data.nseindia.fo_bhavcopy --from 2016-01-01 --to <date>`; log
+    `stockey/logs/fo_bhavcopy_backfill.log`). ~15 h through the NSE gate.
+  - Both readable from systrade through `postgres_fdw`. Neither is scheduled yet: add a
+    nightly keep-current step once the backfill ends, then turn on compression for
+    `dhan_option_rolling` (not before -- compressing mid-backfill is the 2026-08-23 WAL storm).
+  - Nifty's own 1-min history comes from `dhan_option_rolling.spot`; a separate index
+    backfill into the compressed `dhan_ohlcv_intraday` was skipped for the same WAL reason.
+- [ ] **Pre-register an option-selling test** with the loss limit built in (defined-risk
+  structures or hedged), judged as a whole system after real costs, on the new data.
+- [ ] **Event study**: implied vol into and out of RBI policy, Budget and expiry days.
+- [ ] **Live intraday plumbing** -- live feed, intraday scheduler, kill switch -- only for
+  what passes forward paper trading.
+
 ## F. Closed — do not re-open without new evidence
 
 - [-] **Short-interval / swing TA (2-10 day holds).** Twice rejected on
