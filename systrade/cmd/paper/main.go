@@ -39,6 +39,9 @@ import (
 // and the 60-bar turnover median are both fully formed on day one.
 const warmupDays = 500
 
+// minBars is the history a series needs before it is scored at all.
+const minBars = 150
+
 func main() {
 	// "paper run" reads better than "paper", and flag.Parse stops at the first
 	// positional argument, so the verb has to come off before the flags are
@@ -71,6 +74,7 @@ func main() {
 	signal2 := flag.String("signal2", "reversal20", "the second signal, used by -mode=switch and -mode=blend")
 	mode := flag.String("mode", "", "override the spec's selection mode: single | switch | blend | bookblend")
 	switchBreadth := flag.Float64("switch-breadth", 0.40, "for -mode=switch: use the second signal below this share of the universe in an uptrend")
+	asOf := flag.String("as-of", "", "replay with bars through this date (YYYY-MM-DD), always -dry; lists that night's sheet and that day's account fills, one per line, to reconcile them (stability gate S3)")
 	flag.Parse()
 
 	spec, ok := paper.SpecFor(*strategy)
@@ -125,6 +129,11 @@ func main() {
 
 	from := spec.Start.AddDate(0, 0, -warmupDays)
 	to := time.Now().UTC()
+	if *asOf != "" {
+		to, err = time.Parse("2006-01-02", *asOf)
+		fatalIf(err)
+		*dry = true
+	}
 	if traits.NeedsMarket(spec.Variants) {
 		marketForBeta, err = marketReturns(ctx, st, from, to, spec.MinTurnover)
 		fatalIf(err)
@@ -150,7 +159,7 @@ func main() {
 	fmt.Printf("%s: loading adjusted bars %s..%s\n", spec.Name,
 		from.Format("2006-01-02"), to.Format("2006-01-02"))
 
-	all, err := buildDays(ctx, st, spec, sig, sig2, variants, from, to, true)
+	all, next, err := buildDays(ctx, st, spec, sig, sig2, variants, from, to, true)
 	fatalIf(err)
 	if len(all) == 0 {
 		fatal(fmt.Errorf("no price data at all in %s..%s", from.Format("2006-01-02"), to.Format("2006-01-02")))
@@ -186,7 +195,7 @@ func main() {
 		current = track.Books[paper.BookStrategy].Holdings
 		daysToDue = track.DaysToNextRebalance()
 	}
-	sheet := paper.Pending(spec, all[len(all)-1], current, daysToDue, track.Members())
+	sheet := paper.Pending(spec, *next, current, daysToDue, track.Members())
 	if track != nil && !sheet.Due {
 		// Not a rebalance: the sheet would show only "if it were due" orders, so a stop exit
 		// queued for the next open is listed explicitly (review 2026-10-02).
@@ -210,7 +219,7 @@ func main() {
 		// series it trades in, so it is sold properly instead of failing the order check.
 		anyClose, anySeries, err := st.RawClosesAnySeries(ctx, latest.Date)
 		fatalIf(err)
-		trades, held, err := account.PlanOrders(spec, latest, ratios, anyClose)
+		trades, held, err := account.PlanOrders(spec, *next, ratios, anyClose)
 		fatalIf(err)
 		for _, t := range trades {
 			if ser := anySeries[t.Symbol]; ser != "" && ser != "EQ" {
@@ -221,6 +230,20 @@ func main() {
 	}
 
 	report(spec, track, sheet)
+
+	if *asOf != "" && account != nil {
+		for _, o := range sheet.Orders {
+			if o.InShares && o.ValueRs > 0 {
+				fmt.Printf("sheet\t%s\t%s\t%.0f\t%.0f\n", o.Symbol, o.Side, o.FromShares, o.ToShares)
+			}
+		}
+		last := account.Dates[len(account.Dates)-1]
+		for _, t := range account.Trades {
+			if t.Date.Equal(last) {
+				fmt.Printf("fill\t%s\t%s\t%.0f\t%.0f\t%s\n", t.Symbol, t.Side, t.FromShares, t.ToShares, t.Date.Format("2006-01-02"))
+			}
+		}
+	}
 
 	if *dry {
 		fmt.Println("\n-dry: nothing written")
@@ -233,9 +256,9 @@ func main() {
 	// view. Forward records only: a reference track's latest day is the same
 	// day and would only duplicate it.
 	if *name == "" && *start == "" {
-		quals := paper.Qualify(spec, all[len(all)-1])
-		fatalIf(st.SaveQualifications(ctx, spec.Name, all[len(all)-1].Date, quals))
-		fmt.Printf("qualifying: %d stock-variant pairs on %s\n", len(quals), all[len(all)-1].Date.Format("2006-01-02"))
+		quals := paper.Qualify(spec, *next)
+		fatalIf(st.SaveQualifications(ctx, spec.Name, next.Date, quals))
+		fmt.Printf("qualifying: %d stock-variant pairs on %s\n", len(quals), next.Date.Format("2006-01-02"))
 	}
 	fmt.Printf("\nstored: %d tracked days x %d books, %d pending orders\n",
 		len(track.Dates), len(track.Books), len(sheet.Orders))
@@ -508,13 +531,31 @@ func ruleSignal(r rules.Rule) signalFn {
 	}
 }
 
-func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, variants []signalFn, from, to time.Time, all bool) ([]paper.Day, error) {
+// buildDays streams the adjusted bars into one paper.Day per session.
+//
+// With `all`, every recent day also carries Decided -- every name that traded at
+// the previous close, decided there, which is what the sheet printed that evening
+// chose from -- and next is the session after the last bar, decided at its close.
+// The order sheet is planned on next and the account fills on Decided, so the two
+// are the same orders. A day's own Obs carry signals from the close BEFORE it:
+// planning tonight's sheet on the last real day read signals a session stale, and
+// a name that did not trade on the fill day dropped out of the account's ranking
+// but not the sheet's (2026-10-20).
+func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, signal2 signalFn, variants []signalFn, from, to time.Time, all bool) (days []paper.Day, next *paper.Day, err error) {
 	byDate := map[time.Time][]paper.Obs{}
+	// decided[close] is every name that traded at that close, decided there; only
+	// kept from just before the tracked record (or the sheet) starts.
+	decided := map[time.Time][]paper.Obs{}
+	decidedFrom := spec.Start
+	if to.Before(decidedFrom) {
+		decidedFrom = to
+	}
+	decidedFrom = decidedFrom.AddDate(0, 0, -10)
 	var fundamentals *paper.FundamentalPass
 	if spec.FundamentalFilter {
 		rows, err := st.StoryFilter(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		in := make([]paper.FilterRow, len(rows))
 		for i, r := range rows {
@@ -539,7 +580,7 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 	if qualityAt >= 0 {
 		rows, err := st.ForwardTrackHoldings(ctx, "quality", 1)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		in := make([]paper.HoldingRow, len(rows))
 		for i, r := range rows {
@@ -556,12 +597,12 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 	if spec.MaxPerGroup > 0 {
 		var err error
 		if groups, err = st.RotationMembership(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	err := st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
+	err = st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
 		n := len(ser.Bars)
-		if n < 150 {
+		if n < minBars {
 			return nil
 		}
 		times := make([]time.Time, n)
@@ -599,25 +640,18 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 		if all {
 			earliest = from.AddDate(0, 0, 200)
 		}
-		for i := 1; i < n; i++ {
-			d := times[i]
-			if d.Before(earliest) {
-				continue
-			}
-			b := ser.Bars[i]
-			if b.Open <= 0 || b.Close <= 0 {
-				continue
-			}
-			f, t60 := fc[i-1], turnover[i-1] // decided at yesterday's close
+		// obsAt is the session after bar j, decided at j's close.
+		obsAt := func(j int) paper.Obs {
+			f, t60 := fc[j], turnover[j]
 			var sigs []float64
 			if len(vs) > 0 {
 				sigs = make([]float64, len(vs))
 				defined := false
 				for k := range vs {
-					sigs[k] = vs[k][i-1]
+					sigs[k] = vs[k][j]
 					if k == qualityAt {
 						sigs[k] = math.NaN()
-						if quality.Held(ser.Symbol, times[i-1]) { // decided at yesterday's close
+						if quality.Held(ser.Symbol, times[j]) {
 							sigs[k] = 1
 						}
 					}
@@ -635,20 +669,49 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 			}
 			eligible := !math.IsNaN(f) && !math.IsNaN(t60) && t60 >= spec.MinTurnover
 			annVol := math.NaN()
-			if v := vol.Values[i-1]; !math.IsNaN(v) && closes[i-1] > 0 {
-				annVol = v / closes[i-1] * 16 // daily price vol -> annualised fraction
+			if v := vol.Values[j]; !math.IsNaN(v) && closes[j] > 0 {
+				annVol = v / closes[j] * 16 // daily price vol -> annualised fraction
 			}
 			o := paper.Obs{
-				Symbol: ser.Symbol, Open: b.Open, Close: b.Close, PrevClose: closes[i-1],
+				Symbol: ser.Symbol, PrevClose: closes[j],
 				Forecast: f, Turnover: t60, Eligible: eligible, AnnVol: annVol,
-				Forecast2: fc2[i-1],
+				Forecast2: fc2[j],
 				Signals:   sigs,
-				AboveSMA:  !math.IsNaN(sma[i-1]) && closes[i-1] > sma[i-1],
+				AboveSMA:  !math.IsNaN(sma[j]) && closes[j] > sma[j],
 				Group:     group,
 			}
 			if weekly != nil {
-				w := weekly[i-1] // buying: the last week completed by yesterday's close
-				o.Excluded = w.Stage != stage.Stage2Advancing
+				o.Excluded = weekly[j].Stage != stage.Stage2Advancing // buying: the last week completed by j's close
+			}
+			if fundamentals != nil {
+				if ok, _ := fundamentals.Passes(ser.Symbol, times[j]); !ok {
+					o.Excluded = true
+				}
+			}
+			return o
+		}
+		// A name qualifies once minBars bars have closed by the decision. Gating on
+		// the whole series admitted a new listing a session early in the replay,
+		// against a sheet that could not have had it (2026-10-20).
+		for j := minBars - 1; all && j < n; j++ {
+			if closes[j] > 0 && !times[j].Before(decidedFrom) {
+				o := obsAt(j)
+				o.Open, o.Close = closes[j], closes[j]
+				decided[times[j]] = append(decided[times[j]], o)
+			}
+		}
+		for i := minBars; i < n; i++ {
+			d := times[i]
+			if d.Before(earliest) {
+				continue
+			}
+			b := ser.Bars[i]
+			if b.Open <= 0 || b.Close <= 0 {
+				continue
+			}
+			o := obsAt(i - 1) // decided at yesterday's close
+			o.Open, o.Close = b.Open, b.Close
+			if weekly != nil {
 				// Exiting: the week completed at TODAY's close. The stop check runs after this
 				// close and sells at the next open, so a Friday break sells Monday -- with
 				// weekly[i-1] it sold a session late (review 2026-10-02). No look-ahead: it is
@@ -656,25 +719,27 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				x := weekly[i]
 				o.ExitSignal = x.Stage != stage.StageUnknown && x.Close < x.MA30
 			}
-			if fundamentals != nil {
-				if ok, _ := fundamentals.Passes(ser.Symbol, times[i-1]); !ok {
-					o.Excluded = true
-				}
-			}
 			byDate[d] = append(byDate[d], o)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	days := make([]paper.Day, 0, len(byDate))
+	days = make([]paper.Day, 0, len(byDate))
 	for d, obs := range byDate {
 		days = append(days, paper.Day{Date: d, Obs: obs})
 	}
 	sort.Slice(days, func(i, j int) bool { return days[i].Date.Before(days[j].Date) })
-	return days, nil
+	if all && len(days) > 0 {
+		for k := 1; k < len(days); k++ {
+			days[k].Decided = decided[days[k-1].Date]
+		}
+		latest := days[len(days)-1].Date
+		next = &paper.Day{Date: latest, Obs: decided[latest]}
+	}
+	return days, next, nil
 }
 
 func fatalIf(err error) {
@@ -705,6 +770,7 @@ func withShares(sheet paper.PendingSheet, current map[string]float64, trades []c
 		o.InShares = true
 		if t, ok := bySym[o.Symbol]; ok {
 			o.FromShares, o.ToShares, o.ValueRs, o.CostRs = t.FromShares, t.ToShares, t.Value, t.Cost
+			o.Side = t.Side // the shares' direction: rounding can run against the weight's
 		} else {
 			o.FromShares, o.ToShares = held[o.Symbol], held[o.Symbol]
 		}

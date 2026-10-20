@@ -70,7 +70,7 @@ func runBuffer(args []string) {
 			fatalIf(err)
 			variants = append(variants, fn)
 		}
-		days, err := buildDays(ctx, st, spec, sig, sig2, variants, load, to, false)
+		days, _, err := buildDays(ctx, st, spec, sig, sig2, variants, load, to, false)
 		fatalIf(err)
 		specClocks := clocks
 		if len(specClocks) == 0 {

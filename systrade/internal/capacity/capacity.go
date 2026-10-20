@@ -91,21 +91,43 @@ type Result struct {
 	Rebalances                      []Rebalance
 	Trades                          []Trade
 
-	hold map[string]*holding // the book after the last day
-	last map[string]paper.Obs
+	hold    map[string]*holding // the book after the last day
+	last    map[string]paper.Obs
+	members []map[string]bool // the rank buffer's selection at the last rebalance
 }
 
 type holding struct {
 	value      float64 // rupees, marked with adjusted returns
-	shares     float64 // raw shares, as of the last rebalance
+	shares     float64 // whole raw shares, changed only by a trade or a split
+	ratio      float64 // the raw/adjusted ratio the shares are counted at
 	entryDate  time.Time
 	entryPrice float64 // adjusted open at the first fill, as the weight book records it
+}
+
+// splitMin is the smallest change in the raw/adjusted ratio read as a split or
+// bonus. A dividend moves it too, by a percent or two, and changes no share count.
+const splitMin = 0.05
+
+// sharesAt is the holding's share count once the raw/adjusted ratio is r: a
+// split or bonus since the shares were counted multiplies them; a dividend does not.
+func (h *holding) sharesAt(r float64) float64 {
+	if h.ratio > 0 && r > 0 {
+		if f := h.ratio / r; math.Abs(f-1) > splitMin {
+			return math.Round(h.shares * f)
+		}
+	}
+	return h.shares
 }
 
 // Simulate walks days on the spec's rebalance clock. days must be sorted and
 // start on a rebalance day, exactly as paper.Compute takes them. Specs with an
 // exposure overlay or a stop are refused: none of the frozen tracks has one,
 // and sizing them would need the overlay's own rupee logic.
+//
+// A rebalance trades what the order sheet printed the evening before (stability
+// gate S3, 2026-10-20): whole shares planned at the previous close, filled at the
+// day's open. It used to re-plan at the open, so the account's trades and the
+// sheet's disagreed by a share or two on most names.
 func Simulate(spec paper.Spec, days []paper.Day, raw RawRatios, pol Policy) (*Result, error) {
 	if !Supports(spec) {
 		return nil, fmt.Errorf("capacity: %s has an overlay or stop; not supported", spec.Name)
@@ -138,11 +160,24 @@ func Simulate(spec paper.Spec, days []paper.Day, raw RawRatios, pol Policy) (*Re
 		tradedBefore := res.Traded
 		rebal := di%spec.RebalanceEvery == 0
 		if rebal {
-			ratios, err := raw(d.Date)
+			// The sheet was priced off the previous close, at that day's ratios. The
+			// first day has no previous one here; its own ratios differ only on an ex-date.
+			before := d.Date
+			if di > 0 {
+				before = days[di-1].Date
+			}
+			ratios, err := raw(before)
 			if err != nil {
 				return nil, err
 			}
-			c, k, err := rebalance(res, hold, spec, d, prices, ratios, pol)
+			decide := d
+			switch {
+			case d.Decided != nil:
+				decide = paper.Day{Date: d.Date, Obs: d.Decided}
+			case di > 0:
+				decide = tradedOn(d, days[di-1])
+			}
+			c, k, err := rebalance(res, hold, spec, decide, prices, ratios, pol)
 			if err != nil {
 				return nil, err
 			}
@@ -190,17 +225,50 @@ func Supports(spec paper.Spec) bool {
 	return spec.Overlay == paper.OverlayNone && spec.Stop == paper.StopNone
 }
 
-// rebalance trades the book to the day's targets at the open and returns the
-// rupees it cost, and the capital it sized off.
+// tradedOn is d with only the names that also traded on prev: the sheet is
+// planned at prev's close, and a name with no bar there was not on it. The
+// fallback when d carries no Decided list; it misses names that traded on prev
+// but not on d, which the sheet ranked.
+func tradedOn(d, prev paper.Day) paper.Day {
+	there := make(map[string]bool, len(prev.Obs))
+	for _, o := range prev.Obs {
+		there[o.Symbol] = true
+	}
+	out := paper.Day{Date: d.Date, Obs: make([]paper.Obs, 0, len(d.Obs))}
+	for _, o := range d.Obs {
+		if there[o.Symbol] {
+			out.Obs = append(out.Obs, o)
+		}
+	}
+	return out
+}
+
+// rebalance trades the book to the day's targets: planned on decide (the names
+// and signals at the previous close) exactly as PlanOrders printed them, filled
+// at today's open from prices. ratios are the previous day's, so the fill counts
+// shares in the units the sheet did. An order for a name with no bar today is
+// not filled, as a broker would not fill it. It returns the rupees it cost, and
+// the capital it sized off.
 func rebalance(res *Result, hold map[string]*holding, spec paper.Spec, d paper.Day,
 	prices map[string]paper.Obs, ratios map[string]float64, pol Policy) (float64, float64, error) {
 
-	price := rawPrice(prices, ratios, func(o paper.Obs) float64 { return o.Open })
+	decided := make(map[string]paper.Obs, len(d.Obs))
+	for _, o := range d.Obs {
+		decided[o.Symbol] = o
+	}
+	planPrice := rawPrice(decided, ratios, func(o paper.Obs) float64 { return o.PrevClose })
+	fillPrice := rawPrice(prices, ratios, func(o paper.Obs) float64 { return o.Open })
+	shares := make(map[string]float64, len(hold))
 	vals := make(map[string]float64, len(hold))
 	for s, h := range hold {
-		vals[s] = h.value
+		if r, ok := ratios[s]; ok {
+			h.shares, h.ratio = h.sharesAt(r), r
+		}
+		shares[s], vals[s] = h.shares, h.value
 	}
-	trades, capital, targeted, zero, err := plan(d.Date, paper.TargetWeights(spec, d), vals, price, prices, pol)
+	weights, members := paper.SelectWeights(spec, d, res.members)
+	res.members = members
+	trades, capital, targeted, zero, err := plan(d.Date, weights, shares, vals, planPrice, decided, pol)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -208,7 +276,17 @@ func rebalance(res *Result, hold map[string]*holding, spec paper.Spec, d paper.D
 	res.RoundedToZero += zero
 
 	var cost float64
-	for _, t := range trades {
+	filled := trades[:0]
+	for i := range trades {
+		t := &trades[i]
+		if t.Price > 0 {
+			p, ok := fillPrice(t.Symbol)
+			if !ok {
+				continue // no bar today: the order stands unfilled
+			}
+			charge(t, p, prices[t.Symbol])
+		}
+		filled = append(filled, *t)
 		cost += t.Cost
 		res.Traded += t.Value
 		res.Impact += t.Impact
@@ -227,17 +305,12 @@ func rebalance(res *Result, hold map[string]*holding, spec paper.Spec, d paper.D
 			h = &holding{entryDate: d.Date, entryPrice: prices[t.Symbol].Open}
 			hold[t.Symbol] = h
 		}
-		h.value = t.ToShares * t.Price
+		h.shares, h.ratio, h.value = t.ToShares, ratios[t.Symbol], t.ToShares*t.Price
 	}
-	res.Trades = append(res.Trades, trades...)
+	res.Trades = append(res.Trades, filled...)
 
 	rb := Rebalance{Date: d.Date}
-	for s, h := range hold {
-		// Recount every position at today's raw price: a split changes the
-		// number of shares without a trade.
-		if p, ok := price(s); ok {
-			h.shares = h.value / p
-		}
+	for _, h := range hold {
 		rb.Positions = append(rb.Positions, h.value)
 	}
 	sort.Float64s(rb.Positions)
@@ -257,9 +330,9 @@ func rawPrice(prices map[string]paper.Obs, ratios map[string]float64, field func
 }
 
 // plan is the policy, and the only place it lives: which trades take a book
-// holding vals (rupees) to its targets. Simulate executes them at the open;
-// PlanOrders prints them for the next session.
-func plan(date time.Time, weights, vals map[string]float64, price func(string) (float64, bool),
+// holding shares (whole, raw; vals in rupees) to its targets. PlanOrders prints
+// them for the next session; Simulate fills the same trades at its open.
+func plan(date time.Time, weights, shares, vals map[string]float64, price func(string) (float64, bool),
 	obs map[string]paper.Obs, pol Policy) (trades []Trade, capital float64, targeted, zero int, err error) {
 
 	capital = pol.Capital
@@ -308,46 +381,58 @@ func plan(date time.Time, weights, vals map[string]float64, price func(string) (
 			// book drops such a name at its last value on the next rebalance;
 			// so does this one, paying the statutory sale and DP charge on it.
 			if tgt == 0 && held {
-				trades = append(trades, Trade{Date: date, Symbol: sym, Side: "EXIT", Value: v, Cost: costs.Sell(v)})
+				trades = append(trades, Trade{Date: date, Symbol: sym, Side: "EXIT", FromShares: shares[sym], Value: v, Cost: costs.Sell(v)})
 			}
 			continue
 		}
 		var cur float64
 		if held {
-			cur = v / p
+			cur = shares[sym]
 		}
 		if !((tgt == 0 && cur > 0) || (cur == 0 && tgt > 0) || math.Abs(cur-tgt) > pol.Inertia*tgt) {
 			continue // Law 12: within 10% of target, no trade
 		}
-		o := obs[sym]
-		dv := (tgt - cur) * p
-		imp := costs.Impact(math.Abs(dv), o.Turnover, o.AnnVol/16)
-		t := Trade{Date: date, Symbol: sym, FromShares: cur, ToShares: tgt, Price: p, Value: math.Abs(dv), Impact: imp}
+		t := Trade{Date: date, Symbol: sym, FromShares: cur, ToShares: tgt}
 		switch {
 		case tgt == 0:
-			t.Side, t.Cost = "EXIT", costs.Sell(-dv)+imp
-		case dv > 0:
-			t.Side, t.Cost = "BUY", costs.Buy(dv)+imp
+			t.Side = "EXIT"
+		case tgt > cur:
+			t.Side = "BUY"
 		default:
-			t.Side, t.Cost = "SELL", costs.Sell(-dv)+imp
+			t.Side = "SELL"
 		}
+		charge(&t, p, obs[sym])
 		trades = append(trades, t)
 	}
 	return trades, capital, targeted, zero, nil
 }
 
+// charge prices a trade's shares at p: the rupees traded and what they cost.
+func charge(t *Trade, p float64, o paper.Obs) {
+	dv := math.Abs(t.ToShares-t.FromShares) * p
+	t.Price, t.Value = p, dv
+	t.Impact = costs.Impact(dv, o.Turnover, o.AnnVol/16)
+	if t.Side == "BUY" {
+		t.Cost = costs.Buy(dv) + t.Impact
+	} else {
+		t.Cost = costs.Sell(dv) + t.Impact
+	}
+}
+
 // PlanOrders is the next session's orders for the book Simulate left behind,
-// priced off latest's raw close, and the shares it holds going in. latest
-// should be the last day simulated (or any day, for an empty run).
+// and the shares it holds going in. next is the next session's decision day
+// (its PrevClose the latest close, its signals decided at that close); ratios
+// are the latest close's. These are exactly the trades Simulate will fill at
+// that session's open.
 // fallback (optional) is a raw close for symbols with no EQ price today -- a held name NSE
 // moved to BE / BZ still trades and is sold at its real price instead of being written off as
 // suspended. It never makes a name a target: targets come from the EQ universe as before.
-func (r *Result) PlanOrders(spec paper.Spec, latest paper.Day, ratios map[string]float64, fallback ...map[string]float64) ([]Trade, map[string]float64, error) {
-	obs := make(map[string]paper.Obs, len(latest.Obs))
-	for _, o := range latest.Obs {
+func (r *Result) PlanOrders(spec paper.Spec, next paper.Day, ratios map[string]float64, fallback ...map[string]float64) ([]Trade, map[string]float64, error) {
+	obs := make(map[string]paper.Obs, len(next.Obs))
+	for _, o := range next.Obs {
 		obs[o.Symbol] = o
 	}
-	eqPrice := rawPrice(obs, ratios, func(o paper.Obs) float64 { return o.Close })
+	eqPrice := rawPrice(obs, ratios, func(o paper.Obs) float64 { return o.PrevClose })
 	price := func(sym string) (float64, bool) {
 		if p, ok := eqPrice(sym); ok {
 			return p, true
@@ -362,14 +447,10 @@ func (r *Result) PlanOrders(spec paper.Spec, latest paper.Day, ratios map[string
 	vals := map[string]float64{}
 	held := map[string]float64{}
 	for s, h := range r.hold {
-		vals[s] = h.value
-		if p, ok := price(s); ok {
-			held[s] = h.value / p
-		} else {
-			held[s] = h.shares
-		}
+		vals[s], held[s] = h.value, h.sharesAt(ratios[s])
 	}
-	trades, _, _, _, err := plan(latest.Date, paper.TargetWeights(spec, latest), vals, price, obs, r.Policy)
+	weights, _ := paper.SelectWeights(spec, next, r.members)
+	trades, _, _, _, err := plan(next.Date, weights, held, vals, price, obs, r.Policy)
 	return trades, held, err
 }
 

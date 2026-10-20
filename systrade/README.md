@@ -394,11 +394,21 @@ go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
       and Dhan's charges per trade (`capacity.AccountPolicy`). The order
       sheet shows shares, rupees and charges beside the weights; the forward
       record shows the account's NAV and realised cost beside the weight books
+      (2026-10-20, stability gate S3: the account now fills exactly the
+      sheet printed the evening before -- whole shares planned at the
+      previous close, filled at the open; names with no bar on the fill day
+      stay unfilled. Before, it re-planned at the open and only 30-60% of a
+      rebalance's trades matched the sheet; the sheet also read signals a
+      session stale. All five rebalances of 2026-10-05..19 replay exactly
+      with `paper run -strategy <s> -as-of <date>`)
 - [ ] **Stability gate** (`docs/RESEARCH_PROTOCOL.md`, amendment 2026-09-13):
       20 consecutive clean trading days of the scheduled runs, fresh and
       complete order sheets, one rebalance reconciled end to end, charges
       under the kill level, and the Dhan execution dry run — then capital may
       move. Replaces waiting for the 12-month reading; kill rules stay
+      (2026-10-20: S1 restarted 2026-10-05 after the paper job failed
+      2026-09-28..10-01; 11 clean days by 10-19, day 20 about 2026-11-02.
+      S3 failed by construction until the 2026-10-20 fix above)
 - [ ] Multi-strategy live portfolio (operator 2026-09-13): one account holding
       several tracks, weighted by risk with Law 6's handcrafting (correlations
       and costs — not backtested returns), a stock held by several tracks

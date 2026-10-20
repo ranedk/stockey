@@ -415,9 +415,15 @@ Everything here was open in a repo README or PRD before this file existed.
 
 **systrader**
 
-- [~] **Stability gate** — 20 clean trading days from the 2026-09-22 dry run,
-  completing about 2026-10-17, then capital may move. Nothing to build; do not
-  disturb the schedulers.
+- [~] **Stability gate** — 20 clean trading days, then capital may move. Do not
+  disturb the schedulers. **Checked 2026-10-20:** S1's count restarted 2026-10-05
+  (the paper job failed 2026-09-28..10-01 on "no whole-share change", plus a
+  manual run 10-02); 11 clean days by 10-19, day 20 about 2026-11-02. S3 (account
+  trades = the evening-before sheet) failed by construction -- only 30-60% of
+  trades matched; fixed 2026-10-20 (the account fills the sheet; the sheet reads
+  the latest close's signals). S3 still needs one scheduled rebalance after the
+  fix, checked with `paper run -strategy <s> -as-of <date>`. S4, S5 not yet
+  recorded.
 - [ ] **Multi-strategy live portfolio** — one account, several tracks,
   risk-weighted by handcrafting, positions netted across tracks. Better done
   after A3, which may change what the tracks look like.

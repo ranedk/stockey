@@ -49,9 +49,9 @@ func TestWholeSharesAndInertia(t *testing.T) {
 	days := []paper.Day{
 		book(0, flat(100), nil, rank),
 		book(1, flat(100), nil, rank),
-		book(2, up5, flat(100), rank), // 5 shares vs a target of round(500/105)=5: hold
-		book(3, up5, nil, rank),
-		book(4, up30, up5, rank), // target round(500/130)=4, 20% away: sell one
+		book(2, up5, flat(100), rank), // planned at the previous close, 100: 5 shares is the target, hold
+		book(3, up30, up5, rank),
+		book(4, up30, nil, rank), // planned at 130: target round(500/130)=4, 20% away: sell one
 	}
 	r, err := Simulate(spec(), days, ones, Policy{Capital: 1000, Inertia: 0.10})
 	if err != nil {
@@ -248,5 +248,83 @@ func TestPlanOrdersPricesAHeldNameThatLeftEQFromItsFallbackSeries(t *testing.T) 
 	}
 	if tr := trades[0]; tr.Side != "EXIT" || tr.FromShares != 100 || tr.ToShares != 0 || held["GONEBE"] != 100 {
 		t.Fatalf("exit 100 shares at the BE price, got %+v held %v", tr, held)
+	}
+}
+
+func TestTheFillIsTheSheetFromTheEveningBefore(t *testing.T) {
+	// The open gaps 8% away from the close the sheet was priced off. The account
+	// trades the sheet's share counts anyway, at the open: what a broker fills.
+	days := []paper.Day{book(0, flat(100), nil, rank), book(1, flat(97), flat(100), rank)}
+	r, err := Simulate(spec(), days, ones, Policy{Capital: 1000, Inertia: 0.10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	swap := map[string]float64{"A": 1, "B": 2, "C": 3, "D": 4}
+	evening := paper.Day{Date: days[1].Date}
+	for s, p := range flat(97) {
+		evening.Obs = append(evening.Obs, paper.Obs{Symbol: s, Open: p, Close: p, PrevClose: p,
+			Forecast: swap[s], Turnover: 1e15, Eligible: true})
+	}
+	ratios, _ := ones(evening.Date)
+	sheet, _, err := r.PlanOrders(spec(), evening, ratios)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gap := map[string]float64{"A": 89, "B": 89, "C": 89, "D": 89}
+	opened := book(2, gap, flat(97), swap)
+	r2, err := Simulate(spec(), append(days, opened), ones, Policy{Capital: 1000, Inertia: 0.10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filled []Trade
+	for _, tr := range r2.Trades {
+		if tr.Date.Equal(opened.Date) {
+			filled = append(filled, tr)
+		}
+	}
+	if len(filled) != len(sheet) || len(sheet) != 4 {
+		t.Fatalf("filled %d trades, sheet had %d: %+v vs %+v", len(filled), len(sheet), filled, sheet)
+	}
+	for i, s := range sheet {
+		f := filled[i]
+		if f.Symbol != s.Symbol || f.Side != s.Side || f.FromShares != s.FromShares || f.ToShares != s.ToShares {
+			t.Fatalf("fill %+v differs from the sheet's %+v", f, s)
+		}
+		if f.Price != 89 || f.Value != math.Abs(f.ToShares-f.FromShares)*89 {
+			t.Fatalf("fill %+v not at the open", f)
+		}
+	}
+	if sheet[2].ToShares != 5 { // round(500/97): sized off the close, not the open's round(500/89)=6
+		t.Fatalf("sheet sized %v shares, want 5", sheet[2].ToShares)
+	}
+}
+
+func TestANameWithNoBarTodayIsRankedButNotFilled(t *testing.T) {
+	// C and D were decided at day 1's close (Decided); D has no bar on day 2. The
+	// sheet ranked both, so the account sizes the same targets, and D's order
+	// stays unfilled -- no broker fills a stock that does not trade.
+	swap := map[string]float64{"A": 1, "B": 2, "C": 3, "D": 4}
+	days := []paper.Day{book(0, flat(100), nil, rank), book(1, flat(100), nil, rank)}
+	open := book(2, map[string]float64{"A": 100, "B": 100, "C": 100}, flat(100), swap)
+	open.Decided = book(2, flat(100), nil, swap).Obs
+	r, err := Simulate(spec(), append(days, open), ones, Policy{Capital: 1000, Inertia: 0.10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Trade{}
+	for _, tr := range r.Trades {
+		if tr.Date.Equal(open.Date) {
+			got[tr.Symbol] = tr
+		}
+	}
+	if _, ok := got["D"]; ok || len(got) != 3 {
+		t.Fatalf("fills %+v; want A and B exited, C bought, D unfilled", got)
+	}
+	if c := got["C"]; c.ToShares != 5 {
+		t.Fatalf("C sized %v shares, want 5: a two-name book, D still counted", c.ToShares)
+	}
+	if r.Held[2] != 1 {
+		t.Fatalf("held %d names after the day, want C alone", r.Held[2])
 	}
 }

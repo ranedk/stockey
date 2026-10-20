@@ -53,7 +53,7 @@ func runCapacity(args []string) {
 		fatalIf(err)
 		variants = append(variants, fn)
 	}
-	days, err := buildDays(ctx, st, spec, sig, sig2, variants, load, to, false)
+	days, _, err := buildDays(ctx, st, spec, sig, sig2, variants, load, to, false)
 	fatalIf(err)
 	if len(days) == 0 {
 		fatal(fmt.Errorf("no days in %s..%s", *fromS, *toS))

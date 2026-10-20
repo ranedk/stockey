@@ -597,6 +597,10 @@ type Obs struct {
 type Day struct {
 	Date time.Time
 	Obs  []Obs
+	// Decided is every name that traded at the previous session's close, decided
+	// at it: what the order sheet printed that evening chose from, including names
+	// with no bar today. Nil when not built; only the rupee account reads it.
+	Decided []Obs
 }
 
 // NavPoint is one book's record for one day.
@@ -1606,4 +1610,11 @@ func Qualify(spec Spec, d Day) []Qualification {
 // capital-aware simulation sizes in rupees.
 func TargetWeights(spec Spec, d Day) map[string]float64 {
 	return targetWeights(BookStrategy, spec, d)
+}
+
+// SelectWeights is TargetWeights with the strategy book's rank buffer: prev is
+// the selection at the last rebalance (nil = none), and the new one is returned.
+// A capital-aware simulation keeps its own, so it targets what the book does.
+func SelectWeights(spec Spec, d Day, prev []map[string]bool) (map[string]float64, []map[string]bool) {
+	return selectWeights(BookStrategy, spec, d, prev)
 }
