@@ -493,8 +493,9 @@ are dead.
     `dhan_option_rolling` (not before -- compressing mid-backfill is the 2026-08-23 WAL storm).
   - Nifty's own 1-min history comes from `dhan_option_rolling.spot`; a separate index
     backfill into the compressed `dhan_ohlcv_intraday` was skipped for the same WAL reason.
-- [ ] **Pre-register an option-selling test** with the loss limit built in (defined-risk
-  structures or hedged), judged as a whole system after real costs, on the new data.
+- [x] **Option-selling test** (LEDGER 64, 2026-10-20): weekly iron fly / condor / expiry-day
+  fly, held to expiry, real costs. **All three FAILED in-sample** (2021-10..2024-10: −2.8%,
+  −2.1%, −0.05% a week on capital at risk). Check period not run, not burned.
 - [ ] **Event study**: implied vol into and out of RBI policy, Budget and expiry days.
 - [ ] **Live intraday plumbing** -- live feed, intraday scheduler, kill switch -- only for
   what passes forward paper trading.

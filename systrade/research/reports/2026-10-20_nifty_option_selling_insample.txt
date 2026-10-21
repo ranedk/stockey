@@ -1,0 +1,19 @@
+LEDGER 64, period insample: expiries 2021-10-21..2024-10-31, 161 weeks
+
+A iron fly, 2 sessions out: 157 trades of 161
+   mean net return on risk -2.78%/week (x52 = -145%/yr), hit 55%, worst -106%, best +90%
+   account max drawdown -55% at 10% of the account at risk a week (-547% of one week's risk); mean credit 172.8 pts, mean cost 4.4 pts, mean risk 327 pts
+   bootstrap p 0.7921, BH q 0.7921
+   by year (trades, mean %/week, sum %):  2021:11/-11.24/-124  2022:51/-4.49/-229  2023:51/-0.42/-22  2024:44/-1.42/-62
+
+B iron condor, 2 sessions out: 157 trades of 161
+   mean net return on risk -2.09%/week (x52 = -109%/yr), hit 71%, worst -106%, best +50%
+   account max drawdown -49% at 10% of the account at risk a week (-488% of one week's risk); mean credit 45.1 pts, mean cost 3.1 pts, mean risk 255 pts
+   bootstrap p 0.7797, BH q 0.7921
+   by year (trades, mean %/week, sum %):  2021:11/-6.78/-75  2022:51/-4.29/-219  2023:51/-1.92/-98  2024:44/+1.44/+63
+
+C iron fly, expiry day 09:30: 158 trades of 161
+   mean net return on risk -0.05%/week (x52 = -3%/yr), hit 58%, worst -98%, best +59%
+   account max drawdown -16% at 10% of the account at risk a week (-157% of one week's risk); mean credit 101.6 pts, mean cost 3.4 pts, mean risk 398 pts
+   bootstrap p 0.5131, BH q 0.7921
+   by year (trades, mean %/week, sum %):  2021:11/-2.42/-27  2022:52/-0.15/-8  2023:51/-0.36/-18  2024:44/+1.01/+44
