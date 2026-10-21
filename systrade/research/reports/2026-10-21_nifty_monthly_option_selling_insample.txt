@@ -1,0 +1,27 @@
+LEDGER 68, period insample: monthly expiries 2016-02-01..2024-10-31, 105 months (2 skipped)
+
+M1 hold to expiry: 103 months
+   mean net return on risk -7.49%/month, hit 50%, worst -102%, best +92%; exits by trigger 0
+   account at 10% risk a month: -9.0%/yr, max drawdown -107%; mean credit 429 pts, mean risk 508 pts
+   bootstrap p 0.8935, BH q 0.9015; years positive 4 of 9
+   by year (months / mean %): 2016:11/+5.1  2017:12/-18.0  2018:12/-41.9  2019:11/+11.3  2020:12/-29.0  2021:12/+3.5  2022:12/-3.3  2023:12/-8.8  2024:9/+24.3
+
+M2 exit 10 sessions out: 103 months
+   mean net return on risk -3.93%/month, hit 59%, worst -87%, best +35%; exits by trigger 0
+   account at 10% risk a month: -4.7%/yr, max drawdown -49%; mean credit 429 pts, mean risk 508 pts
+   bootstrap p 0.9015, BH q 0.9015; years positive 2 of 9
+   by year (months / mean %): 2016:11/-0.9  2017:12/-3.9  2018:12/-7.4  2019:11/+13.4  2020:12/-8.6  2021:12/-14.3  2022:12/-3.2  2023:12/-11.3  2024:9/+4.7
+
+M3 M2 + take profit 50%: 103 months
+   mean net return on risk -3.93%/month, hit 59%, worst -87%, best +35%; exits by trigger 0
+   account at 10% risk a month: -4.7%/yr, max drawdown -49%; mean credit 429 pts, mean risk 508 pts
+   bootstrap p 0.9015, BH q 0.9015; years positive 2 of 9
+   by year (months / mean %): 2016:11/-0.9  2017:12/-3.9  2018:12/-7.4  2019:11/+13.4  2020:12/-8.6  2021:12/-14.3  2022:12/-3.2  2023:12/-11.3  2024:9/+4.7
+
+M4 M2 + stop 1x credit: 103 months
+   mean net return on risk -3.93%/month, hit 59%, worst -87%, best +35%; exits by trigger 0
+   account at 10% risk a month: -4.7%/yr, max drawdown -49%; mean credit 429 pts, mean risk 508 pts
+   bootstrap p 0.9015, BH q 0.9015; years positive 2 of 9
+   by year (months / mean %): 2016:11/-0.9  2017:12/-3.9  2018:12/-7.4  2019:11/+13.4  2020:12/-8.6  2021:12/-14.3  2022:12/-3.2  2023:12/-11.3  2024:9/+4.7
+
+M2 minus M1 (does exiting early help?): mean +3.56%/month over 103 months, M2 better in 53%, bootstrap p 0.2250

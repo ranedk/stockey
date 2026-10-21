@@ -516,7 +516,11 @@ judge on the unused 2024-11..2026-10 check period.
    Monthly (LEDGER 67): YES, and front-loaded -- a full-month straddle sold after the roll
    paid out 0.89 of its premium (66% of months won, gross); the last 10 / 5 sessions paid
    out 1.09 / 1.28. Selling near expiry is the losing part.
-2. [ ] **Managed MONTHLY option selling** (re-aimed by rows 65-67) -- new pre-registered
+2. [x] **Managed MONTHLY option selling** -- LEDGER 68, 2026-10-21: **all four FAILED in-sample**
+   (2016-2024: hold −7.5%, exit early −3.9% a month on risk; take-profit and stop never
+   triggered). Early exit roughly broke even before costs; costs ~14 pts a month. The
+   premium is in the tails, which the wings buy back. Check period not run.
+   Original plan: (re-aimed by rows 65-67) -- new pre-registered
    family, 3-4 versions: sell the monthly ATM at the roll with wings, exit early (before the
    last ~10 sessions) vs hold to expiry, take profit at half the premium; skip election
    months. ("Sell when VIX is rich vs recent movement" dropped: row 66 found no sort.)
