@@ -1,0 +1,45 @@
+LEDGER 70 -- one-day ATM straddle selling by pattern, EXPLORATION, entries 2021-10-21..2024-10-30 (gross)
+  a 1-day sale must clear costs of roughly 1-2% of premium a round trip (two legs, in and out)
+
+  all days       n= 578  mean  +4.00% of premium  ( +9.6 pts)  hit  67%  worst  -265%   by year 2021:+1.5 2022:+4.8 2023:+1.1 2024:+7.2
+  NR7            n=  98  mean  +0.61% of premium  ( +6.3 pts)  hit  64%  worst  -209%   by year 2021:-38.3 2022:-5.1 2023:+2.8 2024:+14.3
+    not NR7      n= 480  mean  +4.69% of premium  (+10.3 pts)  hit  67%  worst  -265%   by year 2021:+7.5 2022:+7.1 2023:+0.7 2024:+5.9
+  inside         n=  55  mean  +6.76% of premium  (+14.0 pts)  hit  71%  worst   -82%   by year 2021:-37.9 2022:+0.0 2023:+10.5 2024:+14.2
+    not inside   n= 523  mean  +3.71% of premium  ( +9.2 pts)  hit  66%  worst  -265%   by year 2021:+3.7 2022:+5.2 2023:+0.1 2024:+6.3
+  big move       n=  46  mean +11.83% of premium  (+26.3 pts)  hit  70%  worst   -55%   by year 2021:-3.0 2022:+13.0 2023:+11.2 2024:+16.1
+    not big move n= 532  mean  +3.33% of premium  ( +8.2 pts)  hit  67%  worst  -265%   by year 2021:+2.0 2022:+4.1 2023:+0.2 2024:+6.5
+  gap            n= 144  mean  +5.53% of premium  (+11.4 pts)  hit  60%  worst  -109%   by year 2021:+3.3 2022:+3.9 2023:+6.3 2024:+11.1
+    not gap      n= 434  mean  +3.50% of premium  ( +9.0 pts)  hit  69%  worst  -265%   by year 2021:+0.4 2022:+5.4 2023:+0.3 2024:+6.5
+  reversal       n= 130  mean  +0.05% of premium  ( +5.3 pts)  hit  69%  worst  -265%   by year 2021:+21.9 2022:-5.5 2023:-0.7 2024:+0.3
+    not reversal n= 448  mean  +5.15% of premium  (+10.9 pts)  hit  66%  worst  -209%   by year 2021:-8.0 2022:+7.8 2023:+1.5 2024:+9.2
+  steady trend   n= 368  mean  +4.98% of premium  (+10.3 pts)  hit  67%  worst  -209%   by year 2021:-11.9 2022:+6.4 2023:+2.8 2024:+9.4
+    not steady trend n= 210  mean  +2.30% of premium  ( +8.5 pts)  hit  67%  worst  -265%   by year 2021:+18.0 2022:+1.9 2023:-2.2 2024:+3.3
+  tight range    n= 296  mean  +4.37% of premium  ( +8.8 pts)  hit  67%  worst  -265%   by year 2021:-0.8 2022:+7.3 2023:+1.7 2024:+7.0
+    not tight range n= 282  mean  +3.62% of premium  (+10.4 pts)  hit  67%  worst  -209%   by year 2021:+3.1 2022:+2.4 2023:-0.2 2024:+7.3
+  event next     n=  16  mean -11.37% of premium  (+16.9 pts)  hit  50%  worst  -199%   by year 2021:-53.3 2022:+1.6 2023:-47.2 2024:+19.9
+    not event next n= 562  mean  +4.44% of premium  ( +9.4 pts)  hit  67%  worst  -265%   by year 2021:+3.0 2022:+4.9 2023:+2.4 2024:+6.8
+
+  where the all-days number comes from:
+  entry Fri      n= 143  mean  +0.80% of premium  ( +3.0 pts)  hit  66%  worst   -88%   by year 2021:-9.0 2022:+0.9 2023:-0.5 2024:+4.8
+  entry Mon      n= 146  mean  +5.56% of premium  (+13.5 pts)  hit  74%  worst  -109%   by year 2021:+8.6 2022:+0.2 2023:+5.1 2024:+12.2
+  entry Sat      n=   2  mean -27.17% of premium  (-72.1 pts)  hit  50%  worst   -70%   by year 2024:-27.2
+  entry Tue      n= 145  mean  +2.35% of premium  ( +7.6 pts)  hit  67%  worst  -166%   by year 2021:+14.2 2022:+8.6 2023:-8.7 2024:+4.3
+  entry Wed      n= 142  mean  +7.76% of premium  (+15.5 pts)  hit  61%  worst  -265%   by year 2021:-10.0 2022:+9.9 2023:+7.6 2024:+9.5
+  1 cal. day(s)  n= 417  mean  +5.92% of premium  (+12.9 pts)  hit  68%  worst  -265%   by year 2021:+4.7 2022:+5.6 2023:+4.1 2024:+8.7
+  2 cal. day(s)  n=  17  mean  +0.18% of premium  ( +7.6 pts)  hit  59%  worst   -89%   by year 2022:+14.9 2023:-21.5 2024:+4.3
+  3 cal. day(s)  n= 136  mean  -0.13% of premium  ( +0.6 pts)  hit  65%  worst   -88%   by year 2021:-9.0 2022:+0.7 2023:-0.8 2024:+1.9
+  4 cal. day(s)  n=   7  mean  +8.68% of premium  (+22.0 pts)  hit  71%  worst   -12%   by year 2022:+9.7 2023:+3.2 2024:+19.2
+  7 cal. day(s)  n=   1  mean -199.37% of premium  (-175.2 pts)  hit   0%  worst  -199%   by year 2023:-199.4
+  0 sess. to exp n=   1  mean -199.37% of premium  (-175.2 pts)  hit   0%  worst  -199%   by year 2023:-199.4
+  1 sess. to exp n= 156  mean  +8.17% of premium  (+16.2 pts)  hit  60%  worst  -265%   by year 2021:-4.9 2022:+11.1 2023:+5.6 2024:+10.9
+  2 sess. to exp n= 155  mean  +2.56% of premium  ( +7.0 pts)  hit  68%  worst  -166%   by year 2021:+13.2 2022:+4.1 2023:-3.0 2024:+4.8
+  3 sess. to exp n= 153  mean  +4.95% of premium  (+11.3 pts)  hit  73%  worst   -70%   by year 2021:+2.3 2022:+2.3 2023:+7.1 2024:+6.3
+  4 sess. to exp n= 113  mean  +0.74% of premium  ( +3.6 pts)  hit  67%  worst   -88%   by year 2021:-6.2 2022:+0.5 2023:-2.3 2024:+6.8
+
+  overnight (15:15 -> 09:30) vs daytime (09:30 -> 15:15), same strikes, % of entry premium:
+  all   n= 578  night  +1.16% (hit  66%)   day  +2.84% (hit  66%)   by year night 2021:-0.1 2022:+2.9 2023:-1.5 2024:+2.5
+  Fri   n= 143  night  +0.71% (hit  66%)   day  +0.09% (hit  64%)   by year night 2021:-4.0 2022:+0.9 2023:+0.1 2024:+2.4
+  Mon   n= 146  night  +1.58% (hit  71%)   day  +3.97% (hit  73%)   by year night 2021:+0.4 2022:+2.3 2023:-0.4 2024:+3.4
+  Sat   n=   2  night  +0.40% (hit  50%)   day -27.57% (hit  50%)   by year night 2024:+0.4
+  Tue   n= 145  night  +0.21% (hit  60%)   day  +2.15% (hit  66%)   by year night 2021:-0.6 2022:+1.5 2023:-1.4 2024:+0.7
+  Wed   n= 142  night  +2.16% (hit  66%)   day  +5.59% (hit  61%)   by year night 2021:+3.8 2022:+7.2 2023:-4.1 2024:+3.8

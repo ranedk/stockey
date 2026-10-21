@@ -525,10 +525,18 @@ judge on the unused 2024-11..2026-10 check period.
    last ~10 sessions) vs hold to expiry, take profit at half the premium; skip election
    months. ("Sell when VIX is rich vs recent movement" dropped: row 66 found no sort.)
    In-sample 2021-10..2024-10, then the once-only check.
-3. [ ] **"20 trades a month" Nifty model** -- trade only on days meeting a clear setup, fixed
+3. [~] **"20 trades a month" Nifty model** -- operator 2026-10-21: the contacts SELL Nifty (some
+   Bank Nifty) options, enter/exit on patterns with a stop, stay out around elections, global
+   events and trend reversals. LEDGER 70 (exploration): no pattern sorts cleanly, but selling
+   a fresh ATM straddle each day earned ~4% of premium a day gross (67% of days) while
+   holding from two sessions out broke even -- reconcile that first, then costs + wings.
+   Bank Nifty options not downloaded yet.
+   Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
-4. [ ] **Stock books: one targeted check** -- row 5's trend/breadth floor on the current paper
+4. [x] **Stock books: one targeted check** -- LEDGER 69: row 20's floor vs matched constant on 5
+   more books: 4 fail, **stage2-rs-leaders passes** (14.2%/−37.5% vs 13.4%/−43.8%). Next: a
+   forward paper track of it. Original plan: -- row 5's trend/breadth floor on the current paper
    books, one pre-registered test, not a redo.
 - [ ] **Live intraday plumbing** -- live feed, intraday scheduler, kill switch -- only for
   what passes forward paper trading.
