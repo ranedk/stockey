@@ -30,6 +30,11 @@ the account.
   around the money, too narrow for monthly wings and for marking a position after a move.
 - Monthly expiry = the last NIFTY option expiry of its calendar month (holiday-moved, as the
   bhavcopy records it).
+  - Clarified 2026-10-21, from the data check, before any P&L: when the bhavcopy's date is
+    a market holiday (2018-03-29, 2023-03-30, 2023-06-29, 2026-03-31), the contract expired
+    on the session before, and that session's close settles it.
+  - On some days the bhavcopy labels such a contract with the moved date and on others with
+    the scheduled one, so each day's chain is the latest expiry within 4 days of the label.
 - Index close and settlement: Nifty 50's official close (`nseindia_indices`, the junk weekend
   rows of TODO C11 excluded).
 - Lot size: the bhavcopy's where present (2024-07-08+); before that 75 for expiries to
