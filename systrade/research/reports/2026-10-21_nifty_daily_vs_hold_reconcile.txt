@@ -1,0 +1,27 @@
+Daily-vs-hold reconciliation, 151 weekly expiries 2021-10..2024-10 (points, gross)
+  held from E:   P0  180.4  -> P1  173.3 -> P2  163.9 -> intrinsic  163.5
+    seller P&L: day 1 (E->M)   +7.2   day 2 (M->X 15:15)   +9.4   last 15 min   +0.4   total  +16.9  (+9.4% of P0)
+  daily day 2 (fresh ATM at M): Q1  131.9 -> Q2  115.8   seller  +16.1
+  day 2 held vs fresh, split by how far Nifty moved on day 1 (|K1 - K0|):
+    moved 0-0 pts: n= 27  held day 2  -21.6  fresh day 2  -21.6  held total  +23.7
+    moved 50-100 pts: n= 74  held day 2  +26.2  fresh day 2  +30.7  held total  +56.8
+    moved 150-+ pts: n= 50  held day 2   +1.2  fresh day 2  +14.9  held total  -45.7
+
+  quote age at 15:15, offsets -2..+2 (minutes since the bar closed): median 0, 95th pct 0, max 0; share over 5 min 0.0%
+  strike collisions between offsets (same strike, two bars): 0 across 471 snapshots
+  put-call parity, (C - P) - (spot - K), strikes within 100 pts: median +2.6 pts, 5-95% -16.1..+31.6 (carry to expiry is a few pts; wide = stale or mismatched)
+
+  row 70's daily trade, days skipped because the strike was out of Dhan's range next day:
+    kept 578 days: mean +4.00% of premium
+    skipped 10 days, priced from the bhavcopy: mean -130.0% of premium, worst -374%, unpriced 2
+      2022-02-11  premium  287.6  seller  -297.3 pts
+      2022-02-23  premium  166.1  seller  -620.2 pts
+      2022-10-21  premium  227.9  seller   -12.9 pts
+      2023-11-10  premium  164.3  seller    +nan pts
+      2024-03-01  premium  313.8  seller    +nan pts
+      2024-05-31  premium  874.3  seller   -79.3 pts
+      2024-06-03  premium  661.2  seller  -848.1 pts
+      2024-06-04  premium  572.6  seller   -62.2 pts
+      2024-08-02  premium  303.4  seller  -408.6 pts
+      2024-10-01  premium  146.2  seller  -400.9 pts
+    ALL days together: mean +2.17% of premium a day, hit 66%, n=586

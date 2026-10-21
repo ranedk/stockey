@@ -527,9 +527,9 @@ judge on the unused 2024-11..2026-10 check period.
    In-sample 2021-10..2024-10, then the once-only check.
 3. [~] **"20 trades a month" Nifty model** -- operator 2026-10-21: the contacts SELL Nifty (some
    Bank Nifty) options, enter/exit on patterns with a stop, stay out around elections, global
-   events and trend reversals. LEDGER 70 (exploration): no pattern sorts cleanly, but selling
-   a fresh ATM straddle each day earned ~4% of premium a day gross (67% of days) while
-   holding from two sessions out broke even -- reconcile that first, then costs + wings.
+   events and trend reversals. LEDGER 70 (exploration): no pattern sorts cleanly. The
+   apparent +4%/day from selling a fresh ATM straddle daily was SURVIVORSHIP (big-move days
+   fell outside Dhan's +-10 strikes and were skipped); corrected +2.2% gross, ~0 after costs.
    Bank Nifty options not downloaded yet.
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
