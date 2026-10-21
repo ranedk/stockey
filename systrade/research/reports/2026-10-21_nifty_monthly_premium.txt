@@ -1,0 +1,19 @@
+LEDGER 67 -- monthly Nifty straddles, EXPLORATION, 35 monthly expiries 2021-10-21..2024-10-31 (gross)
+
+first session after the previous monthly expiry: 32 months
+   payout/premium 0.89  (below 1 = sellers paid)  months sellers won 66%
+   straddle priced at 0.95x VIX's  mean premium 650 pts
+   seller P&L per month as % of Nifty: mean +0.42%, worst -5.15%, best +3.24%
+   by year payout/premium: 2021:0.24  2022:0.94  2023:1.11  2024:0.83
+
+10 sessions out: 33 months
+   payout/premium 1.09  (below 1 = sellers paid)  months sellers won 52%
+   straddle priced at 0.89x VIX's  mean premium 431 pts
+   seller P&L per month as % of Nifty: mean -0.20%, worst -5.26%, best +2.57%
+   by year payout/premium: 2021:0.61  2022:1.27  2023:1.14  2024:0.91
+
+5 sessions out: 34 months
+   payout/premium 1.28  (below 1 = sellers paid)  months sellers won 44%
+   straddle priced at 0.87x VIX's  mean premium 296 pts
+   seller P&L per month as % of Nifty: mean -0.42%, worst -3.67%, best +1.22%
+   by year payout/premium: 2021:0.87  2022:1.24  2023:1.64  2024:1.18

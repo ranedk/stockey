@@ -511,10 +511,16 @@ judge on the unused 2024-11..2026-10 check period.
    their premium -- event-free weeks broke even before costs too. Skipping events cannot
    rescue weekly selling. Next question: are MONTHLY options priced like VIX (row 61's
    gap)? Waits for the MONTH1 download.
-2. [ ] **Selective, managed option selling** -- new pre-registered family, 3-4 versions: sell
-   only when VIX is clearly above recent realised movement, skip the step-1 weeks, take
-   profit at half the premium, stop at a fixed multiple. In-sample 2021-10..2024-10, then
-   the once-only check.
+   Follow-up (LEDGER 66): sell-when-rich / buy-when-cheap against recent movement shows no
+   sort on weekly options (rank correlation +0.01..+0.14, the wrong sign).
+   Monthly (LEDGER 67): YES, and front-loaded -- a full-month straddle sold after the roll
+   paid out 0.89 of its premium (66% of months won, gross); the last 10 / 5 sessions paid
+   out 1.09 / 1.28. Selling near expiry is the losing part.
+2. [ ] **Managed MONTHLY option selling** (re-aimed by rows 65-67) -- new pre-registered
+   family, 3-4 versions: sell the monthly ATM at the roll with wings, exit early (before the
+   last ~10 sessions) vs hold to expiry, take profit at half the premium; skip election
+   months. ("Sell when VIX is rich vs recent movement" dropped: row 66 found no sort.)
+   In-sample 2021-10..2024-10, then the once-only check.
 3. [ ] **"20 trades a month" Nifty model** -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
