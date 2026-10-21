@@ -530,13 +530,15 @@ judge on the unused 2024-11..2026-10 check period.
    events and trend reversals. LEDGER 70 (exploration): no pattern sorts cleanly. The
    apparent +4%/day from selling a fresh ATM straddle daily was SURVIVORSHIP (big-move days
    fell outside Dhan's +-10 strikes and were skipped); corrected +2.2% gross, ~0 after costs.
-   Bank Nifty options not downloaded yet.
+   Bank Nifty options not downloaded yet. Rows 61-70 together: Nifty options are about fairly
+   priced; Nifty option work paused here (2026-10-21) pending new evidence.
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
 4. [x] **Stock books: one targeted check** -- LEDGER 69: row 20's floor vs matched constant on 5
-   more books: 4 fail, **stage2-rs-leaders passes** (14.2%/−37.5% vs 13.4%/−43.8%). Next: a
-   forward paper track of it. Original plan: -- row 5's trend/breadth floor on the current paper
+   more books: 4 fail, **stage2-rs-leaders passes** (14.2%/−37.5% vs 13.4%/−43.8%). Forward
+   pair started 2026-10-22 (LEDGER 71): stage2-rs-leaders-floor vs stage2-rs-leaders-const67,
+   first judgement 2027-10-22 (`docs/strategies/2026-10-21_stage2_rs_leaders_floor.md`). Original plan: -- row 5's trend/breadth floor on the current paper
    books, one pre-registered test, not a redo.
 - [ ] **Live intraday plumbing** -- live feed, intraday scheduler, kill switch -- only for
   what passes forward paper trading.

@@ -711,3 +711,48 @@ func TestBufferedSpeedBlendDiffersFromSpeedBlendOnlyInTheBuffer(t *testing.T) {
 		t.Error("not registered")
 	}
 }
+
+func TestMarketWarmupLetsTheFloorActOnDayOne(t *testing.T) {
+	s := overlaySpec(OverlayRegimeFloor)
+	s.ExposureDaily = true
+	s.TrendWindow = 5
+	rets := []float64{0.01, 0.01, 0.01, 0.01, 0.01, 0.01, -0.05, -0.05}
+	all := mkDaysVarying(10, rets)
+	prior, days := all[:6], all[6:]
+	cold, err := Compute(s, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cold.NextExposure != 1 {
+		t.Fatalf("without warm-up the floor has no opinion yet, got exposure %v", cold.NextExposure)
+	}
+	warm, err := ComputeWithPrior(s, prior, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warm.NextExposure != 0 {
+		t.Fatalf("warmed index fell below its average: want flat, got %v", warm.NextExposure)
+	}
+	sheet := PendingAt(s, days[len(days)-1], map[string]float64{}, 1, warm.NextExposure)
+	if len(sheet.Orders) != 0 {
+		t.Fatalf("a flat floor buys nothing, got %d orders", len(sheet.Orders))
+	}
+}
+
+func TestConstantOverlayScalesTheSheet(t *testing.T) {
+	s := overlaySpec(OverlayConstant)
+	s.ConstantExposure = 0.67
+	days := mkDays(1, 10, 0)
+	tr, err := Compute(s, days)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sheet := PendingAt(s, days[0], map[string]float64{}, 1, tr.NextExposure)
+	var sum float64
+	for _, w := range sheet.Target {
+		sum += w
+	}
+	if math.Abs(sum-0.67) > 1e-9 {
+		t.Fatalf("sheet targets sum to %v, want 0.67", sum)
+	}
+}

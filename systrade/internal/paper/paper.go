@@ -114,6 +114,11 @@ type Spec struct {
 	// benefit. The published volatility-scaling work rescales monthly, so
 	// daily is the deviation, not the default.
 	ExposureDaily bool
+	// MarketWarmup seeds the regime floor's market index from the bars loaded before Start
+	// (cmd/paper's warm-up window), so a forward track's floor can act from its first day
+	// instead of sitting fully invested until it has seen TrendWindow sessions of its own.
+	// Zero value = off: every earlier record and backtest reproduces unchanged.
+	MarketWarmup bool
 	// Stage2Only ranks only names whose last completed week is Weinstein Stage 2
 	// (internal/stage); everything else stays in the universe -- the equal-weight and
 	// random benchmarks still hold it -- but the strategy may not buy it. buildDays sets
@@ -504,6 +509,36 @@ func Stage2RSLeadersCleanSpec() Spec {
 	return s
 }
 
+// Stage2RSLeadersFloorSpec is stage2-rs-leaders with row 20's regime floor, frozen 2026-10-21
+// (LEDGER rows 69 and 71): flat whenever the universe's equal-weight index is below its 200-day
+// average, acting daily. Row 69 found it beat its matched constant on this book alone (14.19%/-37.5%
+// vs 13.42%/-43.8%, 2014-2026, IN-SAMPLE); this record and its pair below decide.
+func Stage2RSLeadersFloorSpec() Spec {
+	s := Stage2RSLeadersSpec()
+	s.Name = "stage2-rs-leaders-floor"
+	s.Start = time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	s.SignalLabel = s.SignalLabel + "; flat while the market is below its 200-day average (checked daily)"
+	s.Doc = "docs/strategies/2026-10-21_stage2_rs_leaders_floor.md"
+	s.Overlay = OverlayRegimeFloor
+	s.ExposureDaily = true
+	s.MarketWarmup = true
+	return s
+}
+
+// Stage2RSLeadersConstantSpec is the floor's matched control: the same book held at a fixed 67%
+// -- the floor's own average exposure over row 69's history -- every day. Same start, so the
+// pair differs ONLY by WHEN the cash is held.
+func Stage2RSLeadersConstantSpec() Spec {
+	s := Stage2RSLeadersSpec()
+	s.Name = "stage2-rs-leaders-const67"
+	s.Start = time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	s.SignalLabel = s.SignalLabel + "; always 67% invested (the floor's matched control)"
+	s.Doc = "docs/strategies/2026-10-21_stage2_rs_leaders_floor.md"
+	s.Overlay = OverlayConstant
+	s.ConstantExposure = 0.67
+	return s
+}
+
 // MomentumQualityCombinationSpec is the configuration frozen on 2026-10-19 (TODO D1, LEDGER
 // row 60): half the book in the momentum lookback blend's four variants at their own frozen
 // weights (33/33/17/17 of the half), half in stockey's frozen quality track (LEDGER row 46) --
@@ -531,7 +566,7 @@ func MomentumQualityCombinationSpec() Spec {
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
 		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec(),
-		MomentumQualityCombinationSpec()}
+		MomentumQualityCombinationSpec(), Stage2RSLeadersFloorSpec(), Stage2RSLeadersConstantSpec()}
 }
 
 // SpecFor finds a registered strategy by name.
@@ -701,12 +736,21 @@ type Track struct {
 	Exposure  []ExposurePoint
 	Dates     []time.Time
 	NextRebal time.Time // zero if the next rebalance date is not yet known
+	// NextExposure is the share of the book the overlay will hold at the next open, from
+	// information up to the last close -- what the order sheet is scaled to.
+	NextExposure float64
 	LastRebal time.Time
 }
 
 // Compute walks the calendar and produces the record. days must be sorted
 // ascending and contain only dates on or after spec.Start.
 func Compute(spec Spec, days []Day) (*Track, error) {
+	return ComputeWithPrior(spec, nil, days)
+}
+
+// ComputeWithPrior is Compute with the market index first walked through prior, the days
+// before the record starts (used only when spec.MarketWarmup is set).
+func ComputeWithPrior(spec Spec, prior, days []Day) (*Track, error) {
 	if spec.RebalanceEvery < 1 {
 		return nil, fmt.Errorf("paper: RebalanceEvery must be at least 1")
 	}
@@ -733,6 +777,9 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 	//              this strategy actually fishes in, for the trend filter.
 	var baseRet []float64
 	marketIdx := []float64{100}
+	for _, d := range prior {
+		marketIdx = append(marketIdx, marketIdx[len(marketIdx)-1]*(1+equalWeightReturn(d)))
+	}
 	lastExposure := 1.0
 
 	for di, d := range days {
@@ -854,6 +901,10 @@ func Compute(spec Spec, days []Day) (*Track, error) {
 	}
 	if len(days) > 0 {
 		tr.NextRebal = nextRebalanceIndexDate(days, spec.RebalanceEvery)
+	}
+	tr.NextExposure = exposureFor(spec, baseRet, marketIdx)
+	if !spec.ExposureDaily && len(days) > 0 && len(days)%spec.RebalanceEvery != 0 {
+		tr.NextExposure = lastExposure
 	}
 	return tr, nil
 }
@@ -1469,11 +1520,20 @@ type PendingSheet struct {
 // rank-buffered strategy's live orders follow the same rule as its record; a
 // strategy without a buffer ignores it.
 func Pending(spec Spec, latest Day, current map[string]float64, daysToDue int, members ...[]map[string]bool) PendingSheet {
+	return PendingAt(spec, latest, current, daysToDue, 1, members...)
+}
+
+// PendingAt is Pending for a book with an exposure overlay: the target is scaled to the
+// exposure the overlay will hold at the next open (Track.NextExposure), as the record does.
+func PendingAt(spec Spec, latest Day, current map[string]float64, daysToDue int, exposure float64, members ...[]map[string]bool) PendingSheet {
 	var prev []map[string]bool
 	if len(members) > 0 {
 		prev = members[0]
 	}
 	target, _ := selectWeights(BookStrategy, spec, latest, prev)
+	if spec.Overlay != OverlayNone {
+		target = rescale(target, exposure)
+	}
 	prices := make(map[string]Obs, len(latest.Obs))
 	for _, o := range latest.Obs {
 		prices[o.Symbol] = o

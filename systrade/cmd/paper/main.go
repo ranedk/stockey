@@ -128,6 +128,9 @@ func main() {
 	defer st.Close()
 
 	from := spec.Start.AddDate(0, 0, -warmupDays)
+	if spec.MarketWarmup {
+		from = from.AddDate(0, 0, -400) // the signals' warm-up plus ~280 sessions for the floor's average
+	}
 	to := time.Now().UTC()
 	if *asOf != "" {
 		to, err = time.Parse("2006-01-02", *asOf)
@@ -164,14 +167,19 @@ func main() {
 	if len(all) == 0 {
 		fatal(fmt.Errorf("no price data at all in %s..%s", from.Format("2006-01-02"), to.Format("2006-01-02")))
 	}
-	var tracked []paper.Day
+	var tracked, prior []paper.Day
 	for _, d := range all {
 		if !d.Date.Before(spec.Start) {
 			tracked = append(tracked, d)
+		} else if spec.MarketWarmup {
+			prior = append(prior, d)
 		}
 	}
+	if spec.MarketWarmup && len(prior) <= spec.TrendWindow {
+		fatal(fmt.Errorf("%s: %d warm-up sessions before the start, the floor needs more than %d", spec.Name, len(prior), spec.TrendWindow))
+	}
 
-	track, err := paper.Compute(spec, tracked)
+	track, err := paper.ComputeWithPrior(spec, prior, tracked)
 	fatalIf(err)
 
 	// The Rs 1 crore account: the same targets in whole shares, Law 12 inertia
@@ -195,7 +203,7 @@ func main() {
 		current = track.Books[paper.BookStrategy].Holdings
 		daysToDue = track.DaysToNextRebalance()
 	}
-	sheet := paper.Pending(spec, *next, current, daysToDue, track.Members())
+	sheet := paper.PendingAt(spec, *next, current, daysToDue, track.NextExposure, track.Members())
 	if track != nil && !sheet.Due {
 		// Not a rebalance: the sheet would show only "if it were due" orders, so a stop exit
 		// queued for the next open is listed explicitly (review 2026-10-02).
@@ -205,7 +213,19 @@ func main() {
 			closes[o.Symbol] = o.Close
 		}
 		var exits []paper.Order
-		for _, sym := range track.PendingExits() {
+		stops := track.PendingExits()
+		// A daily overlay that turns to cash sells the whole book at the next open, not only
+		// the stopped names.
+		if spec.Overlay != paper.OverlayNone && spec.ExposureDaily && track.NextExposure == 0 {
+			stops = stops[:0]
+			for sym, w := range current {
+				if w > 0 {
+					stops = append(stops, sym)
+				}
+			}
+			sort.Strings(stops)
+		}
+		for _, sym := range stops {
 			exits = append(exits, paper.Order{Date: latest.Date, Book: paper.BookStrategy, Symbol: sym, Side: "EXIT",
 				FromWeight: current[sym], ToWeight: 0, FillPrice: closes[sym]})
 		}

@@ -56,7 +56,7 @@ func TestFrozenSpecsAreUntouched(t *testing.T) {
 		if s.Name == "stage2-rs-leaders" {
 			continue
 		}
-		if s.Name == "stage2-rs-leaders-clean" {
+		if s.Name == "stage2-rs-leaders-clean" || s.Name == "stage2-rs-leaders-floor" || s.Name == "stage2-rs-leaders-const67" {
 			continue
 		}
 		if s.Stage2Only || s.MaxPerGroup != 0 || s.Stop == StopSignal || s.FundamentalFilter || s.StoppedSlotsToCash {
