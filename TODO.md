@@ -496,7 +496,30 @@ are dead.
 - [x] **Option-selling test** (LEDGER 64, 2026-10-20): weekly iron fly / condor / expiry-day
   fly, held to expiry, real costs. **All three FAILED in-sample** (2021-10..2024-10: −2.8%,
   −2.1%, −0.05% a week on capital at risk). Check period not run, not burned.
-- [ ] **Event study**: implied vol into and out of RBI policy, Budget and expiry days.
+### G-goal: "trade less, exit sooner" (operator, 2026-10-21)
+
+Lesson from row 64: working F&O traders skip weeks (event weeks, quiet premium) and manage
+trades (take profit early, cut losses) instead of trading every week and holding to expiry.
+Already measured on the STOCK books and rejected there (stops row 21-22, timing overlays row
+20; only stockey's trend/breadth floor helped, row 5) -- so the goal is F&O-first. Guard:
+every skip/exit rule is a dial; pick few, from a reason, written down before looking, and
+judge on the unused 2024-11..2026-10 check period.
+
+1. [x] **Event study** (LEDGER 65, 2026-10-21, data to 2024-10 only): election days move ~6x
+   what VIX allows, Budget ~2.4x, RBI and expiry days are normal-to-quiet. But the main
+   finding is elsewhere: weekly straddles are priced ~15% UNDER VIX and paid out 0.98 of
+   their premium -- event-free weeks broke even before costs too. Skipping events cannot
+   rescue weekly selling. Next question: are MONTHLY options priced like VIX (row 61's
+   gap)? Waits for the MONTH1 download.
+2. [ ] **Selective, managed option selling** -- new pre-registered family, 3-4 versions: sell
+   only when VIX is clearly above recent realised movement, skip the step-1 weeks, take
+   profit at half the premium, stop at a fixed multiple. In-sample 2021-10..2024-10, then
+   the once-only check.
+3. [ ] **"20 trades a month" Nifty model** -- trade only on days meeting a clear setup, fixed
+   exit. Best with the operator's contact's rough method (what they wait for, when they
+   exit, when they stay out).
+4. [ ] **Stock books: one targeted check** -- row 5's trend/breadth floor on the current paper
+   books, one pre-registered test, not a redo.
 - [ ] **Live intraday plumbing** -- live feed, intraday scheduler, kill switch -- only for
   what passes forward paper trading.
 

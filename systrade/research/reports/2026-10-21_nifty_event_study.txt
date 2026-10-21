@@ -1,0 +1,83 @@
+LEDGER 65 -- Nifty around known events, EXPLORATION, data to 2024-10-31 only
+sessions 2220, RBI 55, Budget 11, Election 4, weekly expiries 299 (from 2019-02)
+
+1. EVENT DAY: close-to-close move vs what VIX implied the evening before
+   variance ratio > 1: sellers underpaid that day; < 1: overpaid
+  2016-01..2021-09
+    RBI      n=  34  variance ratio  0.49  mean |move|/implied 0.64 (fair 0.80)  beyond 2x  2.9%  90% CI 0.22-1.02
+    Budget   n=   7  variance ratio  3.43  mean |move|/implied 1.33 (fair 0.80)  beyond 2x 28.6%  90% CI 0.86-5.88
+    Election n=   2  variance ratio  2.21  mean |move|/implied 1.22 (fair 0.80)  beyond 2x 50.0%
+    Expiry   n= 133  variance ratio  0.84  mean |move|/implied 0.64 (fair 0.80)  beyond 2x  1.5%  90% CI 0.50-1.37
+    other    n=1246  variance ratio  0.88  mean |move|/implied 0.63 (fair 0.80)  beyond 2x  2.6%  90% CI 0.70-1.11
+  2021-10..2024-10
+    RBI      n=  20  variance ratio  1.08  mean |move|/implied 0.82 (fair 0.80)  beyond 2x  0.0%  90% CI 0.61-1.58
+    Budget   n=   4  variance ratio  0.39  mean |move|/implied 0.37 (fair 0.80)  beyond 2x  0.0%
+    Election n=   2  variance ratio 11.50  mean |move|/implied 3.35 (fair 0.80)  beyond 2x 100.0%
+    Expiry   n= 154  variance ratio  0.76  mean |move|/implied 0.64 (fair 0.80)  beyond 2x  1.9%  90% CI 0.54-1.04
+    other    n= 583  variance ratio  0.70  mean |move|/implied 0.65 (fair 0.80)  beyond 2x  2.2%  90% CI 0.63-0.79
+  all to 2024-10
+    RBI      n=  54  variance ratio  0.64  mean |move|/implied 0.71 (fair 0.80)  beyond 2x  1.9%  90% CI 0.38-1.07
+    Budget   n=  11  variance ratio  2.39  mean |move|/implied 0.98 (fair 0.80)  beyond 2x 18.2%  90% CI 0.65-4.33
+    Election n=   4  variance ratio  5.95  mean |move|/implied 2.29 (fair 0.80)  beyond 2x 75.0%
+    Expiry   n= 287  variance ratio  0.81  mean |move|/implied 0.64 (fair 0.80)  beyond 2x  1.7%  90% CI 0.57-1.13
+    other    n=1829  variance ratio  0.84  mean |move|/implied 0.64 (fair 0.80)  beyond 2x  2.5%  90% CI 0.71-1.00
+
+   biggest event-day moves (multiples of the implied move):
+    2024-06-04 Election  Nifty -6.11%  =  -4.6x implied (VIX 26.8)
+    2021-02-01 Budget    Nifty +4.63%  =  +2.9x implied (VIX 23.3)
+    2020-02-01 Budget    Nifty -2.54%  =  -2.3x implied (VIX 16.8)
+    2018-10-05 RBI       Nifty -2.70%  =  -2.3x implied (VIX 19.7)
+    2024-06-03 Election  Nifty +3.20%  =  +2.1x implied (VIX 20.9)
+    2019-05-20 Election  Nifty +3.63%  =  +2.0x implied (VIX 23.7)
+    2024-06-07 RBI       Nifty +2.03%  =  +1.9x implied (VIX 16.9)
+    2018-04-05 RBI       Nifty +1.92%  =  +1.9x implied (VIX 14.8)
+
+2. ROW 64'S WINDOW: close two sessions before a weekly expiry -> expiry close
+   implied = VIX at entry x sqrt(2/252); split by a named event inside the window
+  2021-10..2024-10
+    RBI      n=  12  variance ratio  0.70  mean |move|/implied 0.62 (fair 0.80)  beyond 2x  0.0%
+    Budget   n=   2  variance ratio  0.17  mean |move|/implied 0.38 (fair 0.80)  beyond 2x  0.0%
+    Election    n=0
+    none     n= 146  variance ratio  0.81  mean |move|/implied 0.68 (fair 0.80)  beyond 2x  2.7%
+    low VIX  n=  54  variance ratio  0.75  mean |move|/implied 0.67 (fair 0.80)  beyond 2x  3.7%  (VIX 10.2-13.5)
+    mid VIX  n=  53  variance ratio  0.53  mean |move|/implied 0.60 (fair 0.80)  beyond 2x  1.9%  (VIX 13.6-17.0)
+    high VIX n=  53  variance ratio  0.94  mean |move|/implied 0.74 (fair 0.80)  beyond 2x  1.9%  (VIX 17.2-28.6)
+  all to 2024-10
+    RBI      n=  19  variance ratio  0.64  mean |move|/implied 0.65 (fair 0.80)  beyond 2x  0.0%
+    Budget   n=   2  variance ratio  0.17  mean |move|/implied 0.38 (fair 0.80)  beyond 2x  0.0%
+    Election n=   1  variance ratio  0.04  mean |move|/implied 0.19 (fair 0.80)  beyond 2x  0.0%
+    none     n= 277  variance ratio  0.81  mean |move|/implied 0.64 (fair 0.80)  beyond 2x  1.8%
+    low VIX  n= 100  variance ratio  0.66  mean |move|/implied 0.66 (fair 0.80)  beyond 2x  3.0%  (VIX 10.2-14.5)
+    mid VIX  n=  99  variance ratio  0.47  mean |move|/implied 0.55 (fair 0.80)  beyond 2x  0.0%  (VIX 14.5-19.3)
+    high VIX n= 100  variance ratio  0.94  mean |move|/implied 0.69 (fair 0.80)  beyond 2x  2.0%  (VIX 19.3-83.6)
+  2019-02..2021-09
+    RBI      n=   7  variance ratio  0.56  mean |move|/implied 0.70 (fair 0.80)  beyond 2x  0.0%
+    Budget      n=0
+    Election n=   1  variance ratio  0.04  mean |move|/implied 0.19 (fair 0.80)  beyond 2x  0.0%
+    none     n= 130  variance ratio  0.81  mean |move|/implied 0.58 (fair 0.80)  beyond 2x  0.8%
+    low VIX  n=  46  variance ratio  0.39  mean |move|/implied 0.51 (fair 0.80)  beyond 2x  0.0%  (VIX 11.6-16.0)
+    mid VIX  n=  46  variance ratio  0.54  mean |move|/implied 0.58 (fair 0.80)  beyond 2x  0.0%  (VIX 16.0-21.7)
+    high VIX n=  46  variance ratio  0.96  mean |move|/implied 0.67 (fair 0.80)  beyond 2x  2.2%  (VIX 21.8-83.6)
+
+3. VIX AROUND THE EVENT (points; all days' average change shown as the baseline)
+   all days: mean daily VIX change -0.001
+   RBI       n= 55  5 sessions before -0.49 (baseline -0.00)  event day -0.24  next day -0.07
+   Budget    n= 11  5 sessions before +1.30 (baseline -0.00)  event day -1.56  next day -0.38
+   Election  n=  4  5 sessions before +0.34 (baseline -0.00)  event day -2.62  next day -0.76
+   Expiry    n=298  5 sessions before -0.11 (baseline -0.00)  event day -0.27  next day -0.06
+
+4. EXPIRY DAY INTRADAY: 09:30 -> last bar, Nifty spot from the rolling-option data, 2021-10..2024-10
+    Expiry   n= 158  variance ratio  0.46  mean |move|/implied 0.54 (fair 0.80)  beyond 2x  0.6%
+    other    n= 591  variance ratio  0.44  mean |move|/implied 0.51 (fair 0.80)  beyond 2x  0.7%
+    (the intraday share of a day's variance is under the session share, so 'other' shows the normal level to compare against, not 1.0)
+
+5. ROW 64'S WINDOW AT REAL OPTION PRICES: ATM straddle at 15:15 two sessions out vs the
+   expiry payout |close - strike|, 2021-10..2024-10 (row 64's own in-sample, already seen)
+   payout/premium above 1: sellers lost before costs; VIX ratio = the straddle's price vs VIX's
+    all      n=157  payout/premium 0.98  premium 186.2 pts  straddle priced at 0.85x VIX's
+    Budget   n=  2  payout/premium 0.40  premium 293.8 pts  straddle priced at 1.29x VIX's
+    RBI      n= 12  payout/premium 0.86  premium 190.7 pts  straddle priced at 0.86x VIX's
+    none     n=143  payout/premium 1.01  premium 184.3 pts  straddle priced at 0.84x VIX's
+    low VIX  n= 53  payout/premium 1.00  premium 144.8 pts  straddle priced at 0.83x VIX's
+    mid VIX  n= 52  payout/premium 0.86  premium 183.3 pts  straddle priced at 0.84x VIX's
+    high VIX n= 52  payout/premium 1.08  premium 231.3 pts  straddle priced at 0.89x VIX's
