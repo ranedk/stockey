@@ -50,6 +50,12 @@ go run ./cmd/paper run -strategy stage2-rs-leaders
 go run ./cmd/paper run -strategy stage2-rs-leaders-clean
 go run ./cmd/paper run -strategy momentum-quality-combination   # TODO D1, LEDGER 60 (2026-10-19)
 
+# E1, the expiry-day stopped straddle basket (LEDGER 78, docs/strategies/2026-10-22_e1_expiry_straddle.md).
+# Python: it reuses the research library's frozen trade code. Reads the option bars stockey's
+# all_option_data_daily.sh lands each morning; an expiry without bars yet waits for the next run.
+# A failure here must not stop the dry-run order sheets below.
+../stockey/.xstockey/bin/python scripts/paper_e1_expiry_straddle.py || echo "paper_e1_expiry_straddle FAILED (exit $?)"
+
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate
 # evidence (docs/RESEARCH_PROTOCOL.md, S2 and S5). Never sends — no -live.

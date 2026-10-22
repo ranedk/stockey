@@ -547,7 +547,11 @@ judge on the unused 2024-11..2026-10 check period.
    weekly EXPIRY days (+3-4.5 bps, t ~2.4) and lose on the rest; ORB-30 steady everywhere.
    LEDGER 78 (pre-registered, unseen 2024-11..2026-09, burned): **E1 expiry-day stopped straddle
    basket PASSED** (+2.73 bps of notional per expiry, t 2.5, both halves positive, maxDD −7%);
-   ORB-30 FAILED. Next: [ ] forward paper track for E1 (protocol gate before any capital).
+   ORB-30 FAILED. [x] Forward paper track for E1 set up 2026-10-22 (starts 2026-10-23,
+   docs/strategies/2026-10-22_e1_expiry_straddle.md; judged after 52 expiries): stockey's
+   all_option_data_daily.sh (Tue-Sat 09:00 IST) keeps the option bars + F&O bhavcopy current;
+   scripts/paper_e1_expiry_straddle.py runs in paper_daily.sh -> systrader_paper_option_e1.
+   [ ] Not yet on the screener's Paper page (Go API reads systrader_paper_* stock tracks only).
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
