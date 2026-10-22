@@ -49,9 +49,6 @@ go run ./cmd/paper run -strategy stage2-rs-leaders
 # its fundamentals-filtered pair (LEDGER row 55)
 go run ./cmd/paper run -strategy stage2-rs-leaders-clean
 go run ./cmd/paper run -strategy momentum-quality-combination   # TODO D1, LEDGER 60 (2026-10-19)
-# Stage 2 leaders with the market floor vs the same at a fixed 67% (LEDGER 69/71, 2026-10-21)
-go run ./cmd/paper run -strategy stage2-rs-leaders-floor
-go run ./cmd/paper run -strategy stage2-rs-leaders-const67
 
 # Every forward track's sheet as Dhan pre-open orders, DRY RUN: built,
 # checked against the sheet and logged to systrader_exec_*. Stability-gate

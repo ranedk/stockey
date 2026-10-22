@@ -509,36 +509,6 @@ func Stage2RSLeadersCleanSpec() Spec {
 	return s
 }
 
-// Stage2RSLeadersFloorSpec is stage2-rs-leaders with row 20's regime floor, frozen 2026-10-21
-// (LEDGER rows 69 and 71): flat whenever the universe's equal-weight index is below its 200-day
-// average, acting daily. Row 69 found it beat its matched constant on this book alone (14.19%/-37.5%
-// vs 13.42%/-43.8%, 2014-2026, IN-SAMPLE); this record and its pair below decide.
-func Stage2RSLeadersFloorSpec() Spec {
-	s := Stage2RSLeadersSpec()
-	s.Name = "stage2-rs-leaders-floor"
-	s.Start = time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
-	s.SignalLabel = s.SignalLabel + "; flat while the market is below its 200-day average (checked daily)"
-	s.Doc = "docs/strategies/2026-10-21_stage2_rs_leaders_floor.md"
-	s.Overlay = OverlayRegimeFloor
-	s.ExposureDaily = true
-	s.MarketWarmup = true
-	return s
-}
-
-// Stage2RSLeadersConstantSpec is the floor's matched control: the same book held at a fixed 67%
-// -- the floor's own average exposure over row 69's history -- every day. Same start, so the
-// pair differs ONLY by WHEN the cash is held.
-func Stage2RSLeadersConstantSpec() Spec {
-	s := Stage2RSLeadersSpec()
-	s.Name = "stage2-rs-leaders-const67"
-	s.Start = time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
-	s.SignalLabel = s.SignalLabel + "; always 67% invested (the floor's matched control)"
-	s.Doc = "docs/strategies/2026-10-21_stage2_rs_leaders_floor.md"
-	s.Overlay = OverlayConstant
-	s.ConstantExposure = 0.67
-	return s
-}
-
 // MomentumQualityCombinationSpec is the configuration frozen on 2026-10-19 (TODO D1, LEDGER
 // row 60): half the book in the momentum lookback blend's four variants at their own frozen
 // weights (33/33/17/17 of the half), half in stockey's frozen quality track (LEDGER row 46) --
@@ -566,7 +536,7 @@ func MomentumQualityCombinationSpec() Spec {
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
 		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec(),
-		MomentumQualityCombinationSpec(), Stage2RSLeadersFloorSpec(), Stage2RSLeadersConstantSpec()}
+		MomentumQualityCombinationSpec()}
 }
 
 // SpecFor finds a registered strategy by name.
