@@ -1,0 +1,337 @@
+LEDGER 77 -- condition map of row 76's 36 Nifty algos (EXPLORATION, trials=0), 2021-10..2024-10
+net bps of notional per traded day by cell; p = permutation p of (best cell - worst cell); q = BH over all 313 member x condition tests (a guide, not a claim)
+
+A. Cells where a member EARNS after costs: best cell mean > 0 with t > 2 (sorted by t)
+  S-1100-25                expiry     best 'yes'   +2.9 bps (n 159, t +2.48); all days -0.1;  cells: no -0.9  yes +2.9;  spread p 0.011 q 0.20
+  S-0920-50                expiry     best 'yes'   +4.5 bps (n 159, t +2.46); all days +0.1;  cells: no -1.1  yes +4.5;  spread p 0.001 q 0.16
+  S-1000-25                expiry     best 'yes'   +3.1 bps (n 159, t +2.34); all days -0.2;  cells: no -1.1  yes +3.1;  spread p 0.011 q 0.20
+  S-1100-50                expiry     best 'yes'   +3.0 bps (n 159, t +2.25); all days -0.4;  cells: no -1.3  yes +3.0;  spread p 0.001 q 0.16
+  S-0920-50                vix        best 'high'   +3.0 bps (n 249, t +2.12); all days +0.1;  cells: high +3.0  low -1.4  mid -1.3;  spread p 0.031 q 0.37
+
+B. Strongest sorts (spread between cells), q < 0.10, whatever the sign
+
+C. By condition: how many members it sorts (p < 0.05) and how many get a cell earning with t > 2
+  vix         4/36 sorted (5% expected by chance: 1.8);  1 earning cells
+  vix_5d      2/36 sorted (5% expected by chance: 1.8);  0 earning cells
+  trend_20d   3/36 sorted (5% expected by chance: 1.8);  0 earning cells
+  rv_vs_vix   2/36 sorted (5% expected by chance: 1.8);  0 earning cells
+  prev_range  1/36 sorted (5% expected by chance: 1.8);  0 earning cells
+  gap         1/31 sorted (5% expected by chance: 1.6);  0 earning cells
+  expiry      8/36 sorted (5% expected by chance: 1.8);  4 earning cells
+  own_10d     6/35 sorted (5% expected by chance: 1.8);  0 earning cells
+  own_20d     7/31 sorted (5% expected by chance: 1.6);  0 earning cells
+
+D. Every member x condition (bps per traded day by cell)
+  S-0920-25                vix        high +0.6  low -2.5  mid +2.0   p 0.044
+  S-0920-25                vix_5d     falling +1.9  flat -0.6  rising -1.1   p 0.244
+  S-0920-25                trend_20d  down +1.8  flat -0.7  up -0.9   p 0.335
+  S-0920-25                rv_vs_vix  about -0.5  moved less -1.3  moved more +2.0   p 0.171
+  S-0920-25                prev_range mid +0.1  narrow -0.4  wide +0.4   p 0.907
+  S-0920-25                gap        big -0.1  mid -0.7  small +1.0   p 0.619
+  S-0920-25                expiry     no -0.7  yes +3.0   p 0.048
+  S-0920-25                own_10d    neg +0.1  pos +0.4   p 0.887
+  S-0920-25                own_20d    neg +0.4  pos -0.0   p 0.769
+  S-0920-50                vix        high +3.0  low -1.4  mid -1.3   p 0.031
+  S-0920-50                vix_5d     falling +0.7  flat -1.4  rising +1.1   p 0.317
+  S-0920-50                trend_20d  down +0.6  flat +0.2  up -0.5   p 0.816
+  S-0920-50                rv_vs_vix  about +0.5  moved less -1.3  moved more +1.1   p 0.366
+  S-0920-50                prev_range mid +0.9  narrow -1.4  wide +0.9   p 0.402
+  S-0920-50                gap        big +1.5  mid -1.6  small +0.4   p 0.197
+  S-0920-50                expiry     no -1.1  yes +4.5   p 0.001
+  S-0920-50                own_10d    neg +0.0  pos +0.4   p 0.831
+  S-0920-50                own_20d    neg -1.3  pos +1.9   p 0.033
+  S-0920-none              vix        high -1.2  low -2.5  mid -1.2   p 0.881
+  S-0920-none              vix_5d     falling -2.8  flat -1.5  rising -0.6   p 0.697
+  S-0920-none              trend_20d  down -1.7  flat -1.0  up -2.2   p 0.883
+  S-0920-none              rv_vs_vix  about -1.0  moved less -4.1  moved more +0.2   p 0.263
+  S-0920-none              prev_range mid -1.5  narrow -3.8  wide +0.4   p 0.274
+  S-0920-none              gap        big -2.1  mid -1.3  small -1.5   p 0.944
+  S-0920-none              expiry     no -1.5  yes -2.1   p 0.828
+  S-0920-none              own_10d    neg +0.8  pos -4.5   p 0.009
+  S-0920-none              own_20d    neg +0.4  pos -5.1   p 0.013
+  S-1000-25                vix        high -1.3  low -0.1  mid +0.9   p 0.391
+  S-1000-25                vix_5d     falling -0.4  flat +0.2  rising -0.3   p 0.937
+  S-1000-25                trend_20d  down -1.7  flat +0.4  up +0.7   p 0.339
+  S-1000-25                rv_vs_vix  about -0.1  moved less +1.4  moved more -1.9   p 0.121
+  S-1000-25                prev_range mid +1.5  narrow -0.2  wide -1.9   p 0.103
+  S-1000-25                gap        big -2.3  mid +1.5  small +0.2   p 0.053
+  S-1000-25                expiry     no -1.1  yes +3.1   p 0.011
+  S-1000-25                own_10d    neg -0.2  pos -0.4   p 0.924
+  S-1000-25                own_20d    neg -0.7  pos +0.2   p 0.496
+  S-1000-50                vix        high -1.2  low -0.9  mid +0.7   p 0.399
+  S-1000-50                vix_5d     falling +0.7  flat -0.8  rising -1.3   p 0.336
+  S-1000-50                trend_20d  down -0.4  flat -0.8  up -0.3   p 0.930
+  S-1000-50                rv_vs_vix  about -0.3  moved less -0.5  moved more -0.6   p 0.988
+  S-1000-50                prev_range mid +0.0  narrow -0.2  wide -1.2   p 0.649
+  S-1000-50                gap        big -2.1  mid -0.5  small +1.1   p 0.071
+  S-1000-50                expiry     no -0.8  yes +0.7   p 0.296
+  S-1000-50                own_10d    neg +0.5  pos -1.5   p 0.094
+  S-1000-50                own_20d    neg -0.5  pos -0.4   p 0.916
+  S-1000-none              vix        high -1.0  low -2.5  mid -0.5   p 0.648
+  S-1000-none              vix_5d     falling -0.5  flat -2.1  rising -1.3   p 0.772
+  S-1000-none              trend_20d  down -1.6  flat -0.7  up -1.6   p 0.918
+  S-1000-none              rv_vs_vix  about -0.0  moved less -3.8  moved more -0.0   p 0.225
+  S-1000-none              prev_range mid -1.2  narrow -2.8  wide +0.1   p 0.430
+  S-1000-none              gap        big -2.8  mid +0.2  small -1.3   p 0.406
+  S-1000-none              expiry     no -1.6  yes -0.2   p 0.535
+  S-1000-none              own_10d    neg +0.5  pos -3.5   p 0.031
+  S-1000-none              own_20d    neg +0.2  pos -3.8   p 0.041
+  S-1100-25                vix        high +1.0  low -0.0  mid -1.4   p 0.247
+  S-1100-25                vix_5d     falling +0.3  flat +0.7  rising -1.4   p 0.309
+  S-1100-25                trend_20d  down -0.7  flat +0.3  up +0.0   p 0.793
+  S-1100-25                rv_vs_vix  about -0.8  moved less -0.5  moved more +0.9   p 0.457
+  S-1100-25                prev_range mid -0.1  narrow -0.2  wide -0.1   p 0.997
+  S-1100-25                gap        big -1.4  mid +0.4  small +0.6   p 0.405
+  S-1100-25                expiry     no -0.9  yes +2.9   p 0.011
+  S-1100-25                own_10d    neg -1.4  pos +1.1   p 0.043
+  S-1100-25                own_20d    neg -1.1  pos +0.7   p 0.146
+  S-1100-50                vix        high +0.6  low -1.0  mid -0.7   p 0.438
+  S-1100-50                vix_5d     falling -0.3  flat -1.0  rising +0.2   p 0.587
+  S-1100-50                trend_20d  down -0.4  flat -0.4  up -0.3   p 0.995
+  S-1100-50                rv_vs_vix  about -1.3  moved less -0.3  moved more +0.5   p 0.385
+  S-1100-50                prev_range mid -1.1  narrow -1.3  wide +1.3   p 0.087
+  S-1100-50                gap        big -1.5  mid +0.4  small -0.1   p 0.293
+  S-1100-50                expiry     no -1.3  yes +3.0   p 0.001
+  S-1100-50                own_10d    neg -0.7  pos -0.3   p 0.764
+  S-1100-50                own_20d    neg -0.7  pos -0.3   p 0.649
+  S-1100-none              vix        high -2.1  low -3.0  mid -0.1   p 0.318
+  S-1100-none              vix_5d     falling -0.5  flat -2.8  rising -2.0   p 0.508
+  S-1100-none              trend_20d  down -2.0  flat -1.7  up -1.5   p 0.961
+  S-1100-none              rv_vs_vix  about -0.5  moved less -3.3  moved more -1.4   p 0.357
+  S-1100-none              prev_range mid -1.0  narrow -3.6  wide -0.7   p 0.323
+  S-1100-none              gap        big -3.5  mid -0.6  small -1.2   p 0.337
+  S-1100-none              expiry     no -1.9  yes -1.2   p 0.740
+  S-1100-none              own_10d    neg +0.2  pos -4.7   p 0.003
+  S-1100-none              own_20d    neg -1.3  pos -3.0   p 0.334
+  F-0920-200-managed       vix        high -4.0  low -4.3  mid -4.5   p 0.776
+  F-0920-200-managed       vix_5d     falling -4.2  flat -4.7  rising -3.8   p 0.422
+  F-0920-200-managed       trend_20d  down -5.4  flat -3.3  up -4.1   p 0.005
+  F-0920-200-managed       rv_vs_vix  about -4.1  moved less -4.5  moved more -4.2   p 0.825
+  F-0920-200-managed       prev_range mid -4.7  narrow -4.1  wide -3.9   p 0.419
+  F-0920-200-managed       gap        big -4.3  mid -4.1  small -4.4   p 0.889
+  F-0920-200-managed       expiry     no -4.4  yes -3.8   p 0.346
+  F-0920-200-managed       own_20d    neg -4.3   p 1.000
+  F-0920-200-unmanaged     vix        high -6.0  low -6.0  mid -3.6   p 0.236
+  F-0920-200-unmanaged     vix_5d     falling -5.6  flat -5.0  rising -4.9   p 0.871
+  F-0920-200-unmanaged     trend_20d  down -5.2  flat -5.1  up -5.2   p 0.999
+  F-0920-200-unmanaged     rv_vs_vix  about -5.4  moved less -6.2  moved more -3.9   p 0.266
+  F-0920-200-unmanaged     prev_range mid -4.4  narrow -6.2  wide -5.0   p 0.423
+  F-0920-200-unmanaged     gap        big -5.2  mid -5.0  small -5.3   p 0.968
+  F-0920-200-unmanaged     expiry     no -4.8  yes -6.6   p 0.229
+  F-0920-200-unmanaged     own_10d    neg -4.8  pos -6.7   p 0.271
+  F-0920-200-unmanaged     own_20d    neg -4.9  pos -7.0   p 0.481
+  F-0920-400-managed       vix        high -5.7  low -4.6  mid -5.9   p 0.549
+  F-0920-400-managed       vix_5d     falling -5.7  flat -5.5  rising -5.0   p 0.794
+  F-0920-400-managed       trend_20d  down -7.2  flat -3.7  up -5.3   p 0.009
+  F-0920-400-managed       rv_vs_vix  about -4.4  moved less -4.9  moved more -6.9   p 0.102
+  F-0920-400-managed       prev_range mid -5.1  narrow -4.7  wide -6.4   p 0.312
+  F-0920-400-managed       gap        big -5.5  mid -6.1  small -4.5   p 0.388
+  F-0920-400-managed       expiry     no -6.2  yes -2.6   p 0.004
+  F-0920-400-managed       own_10d    neg -5.3  pos -7.1   p 0.319
+  F-0920-400-unmanaged     vix        high -7.0  low -5.8  mid -4.6   p 0.540
+  F-0920-400-unmanaged     vix_5d     falling -5.8  flat -5.6  rising -5.9   p 0.990
+  F-0920-400-unmanaged     trend_20d  down -6.8  flat -5.2  up -5.3   p 0.716
+  F-0920-400-unmanaged     rv_vs_vix  about -5.5  moved less -7.7  moved more -4.2   p 0.262
+  F-0920-400-unmanaged     prev_range mid -5.2  narrow -6.8  wide -5.3   p 0.739
+  F-0920-400-unmanaged     gap        big -6.7  mid -5.1  small -5.5   p 0.732
+  F-0920-400-unmanaged     expiry     no -5.8  yes -5.6   p 0.929
+  F-0920-400-unmanaged     own_10d    neg -5.4  pos -6.9   p 0.462
+  F-0920-400-unmanaged     own_20d    neg -5.3  pos -9.5   p 0.168
+  F-1000-200-managed       vix        high -4.9  low -4.0  mid -3.4   p 0.026
+  F-1000-200-managed       vix_5d     falling -3.6  flat -4.5  rising -4.3   p 0.297
+  F-1000-200-managed       trend_20d  down -4.9  flat -3.5  up -3.9   p 0.056
+  F-1000-200-managed       rv_vs_vix  about -4.4  moved less -4.0  moved more -3.9   p 0.667
+  F-1000-200-managed       prev_range mid -3.8  narrow -3.7  wide -4.7   p 0.213
+  F-1000-200-managed       gap        big -4.3  mid -3.7  small -4.3   p 0.614
+  F-1000-200-managed       expiry     no -4.0  yes -4.4   p 0.529
+  F-1000-200-managed       own_10d    neg -4.1  pos -3.0   p 0.332
+  F-1000-200-unmanaged     vix        high -5.3  low -5.4  mid -3.5   p 0.305
+  F-1000-200-unmanaged     vix_5d     falling -4.0  flat -5.0  rising -5.2   p 0.621
+  F-1000-200-unmanaged     trend_20d  down -4.5  flat -4.8  up -4.9   p 0.967
+  F-1000-200-unmanaged     rv_vs_vix  about -4.6  moved less -6.0  moved more -3.6   p 0.181
+  F-1000-200-unmanaged     prev_range mid -3.9  narrow -5.5  wide -4.7   p 0.457
+  F-1000-200-unmanaged     gap        big -5.1  mid -4.5  small -4.6   p 0.875
+  F-1000-200-unmanaged     expiry     no -4.5  yes -5.5   p 0.483
+  F-1000-200-unmanaged     own_10d    neg -4.7  pos -4.5   p 0.896
+  F-1000-200-unmanaged     own_20d    neg -4.8  pos -4.0   p 0.698
+  F-1000-400-managed       vix        high -6.3  low -4.1  mid -3.3   p 0.011
+  F-1000-400-managed       vix_5d     falling -3.9  flat -4.6  rising -5.2   p 0.416
+  F-1000-400-managed       trend_20d  down -5.8  flat -3.4  up -4.6   p 0.070
+  F-1000-400-managed       rv_vs_vix  about -4.3  moved less -4.3  moved more -5.1   p 0.707
+  F-1000-400-managed       prev_range mid -4.2  narrow -3.3  wide -6.2   p 0.018
+  F-1000-400-managed       gap        big -5.4  mid -4.4  small -4.0   p 0.365
+  F-1000-400-managed       expiry     no -4.7  yes -4.2   p 0.679
+  F-1000-400-managed       own_10d    neg -4.5  pos -5.6   p 0.445
+  F-1000-400-unmanaged     vix        high -5.3  low -5.5  mid -4.0   p 0.724
+  F-1000-400-unmanaged     vix_5d     falling -3.8  flat -5.7  rising -5.4   p 0.579
+  F-1000-400-unmanaged     trend_20d  down -5.4  flat -4.5  up -5.0   p 0.895
+  F-1000-400-unmanaged     rv_vs_vix  about -4.2  moved less -7.1  moved more -3.6   p 0.153
+  F-1000-400-unmanaged     prev_range mid -4.7  narrow -5.9  wide -4.4   p 0.720
+  F-1000-400-unmanaged     gap        big -6.3  mid -3.8  small -4.9   p 0.407
+  F-1000-400-unmanaged     expiry     no -5.3  yes -3.8   p 0.449
+  F-1000-400-unmanaged     own_10d    neg -4.6  pos -6.0   p 0.466
+  F-1000-400-unmanaged     own_20d    neg -5.0  pos -5.3   p 0.871
+  F-1100-200-managed       vix        high -3.9  low -4.0  mid -4.0   p 0.982
+  F-1100-200-managed       vix_5d     falling -3.3  flat -4.9  rising -3.6   p 0.015
+  F-1100-200-managed       trend_20d  down -4.4  flat -3.3  up -4.1   p 0.155
+  F-1100-200-managed       rv_vs_vix  about -4.3  moved less -3.8  moved more -3.8   p 0.670
+  F-1100-200-managed       prev_range mid -4.0  narrow -3.9  wide -4.0   p 1.000
+  F-1100-200-managed       gap        big -4.6  mid -3.2  small -4.0   p 0.058
+  F-1100-200-managed       expiry     no -4.3  yes -2.7   p 0.007
+  F-1100-200-managed       own_10d    neg -4.1  pos -3.3   p 0.513
+  F-1100-200-unmanaged     vix        high -5.3  low -5.9  mid -3.0   p 0.051
+  F-1100-200-unmanaged     vix_5d     falling -4.0  flat -5.1  rising -5.1   p 0.672
+  F-1100-200-unmanaged     trend_20d  down -4.4  flat -4.8  up -4.9   p 0.905
+  F-1100-200-unmanaged     rv_vs_vix  about -4.1  moved less -5.4  moved more -4.6   p 0.559
+  F-1100-200-unmanaged     prev_range mid -3.5  narrow -6.2  wide -4.5   p 0.069
+  F-1100-200-unmanaged     gap        big -5.1  mid -5.0  small -4.1   p 0.744
+  F-1100-200-unmanaged     expiry     no -4.7  yes -4.7   p 0.948
+  F-1100-200-unmanaged     own_10d    neg -4.8  pos -4.5   p 0.883
+  F-1100-400-managed       vix        high -4.8  low -4.1  mid -3.9   p 0.654
+  F-1100-400-managed       vix_5d     falling -3.3  flat -5.2  rising -4.3   p 0.179
+  F-1100-400-managed       trend_20d  down -5.8  flat -3.2  up -3.7   p 0.029
+  F-1100-400-managed       rv_vs_vix  about -4.4  moved less -3.6  moved more -4.8   p 0.493
+  F-1100-400-managed       prev_range mid -4.2  narrow -3.6  wide -5.0   p 0.410
+  F-1100-400-managed       gap        big -5.3  mid -3.0  small -4.5   p 0.068
+  F-1100-400-managed       expiry     no -4.8  yes -2.1   p 0.009
+  F-1100-400-managed       own_10d    neg -4.6  pos -2.1   p 0.054
+  F-1100-400-managed       own_20d    neg -4.5  pos -2.9   p 0.315
+  F-1100-400-unmanaged     vix        high -6.9  low -5.8  mid -3.4   p 0.135
+  F-1100-400-unmanaged     vix_5d     falling -4.3  flat -5.7  rising -6.2   p 0.539
+  F-1100-400-unmanaged     trend_20d  down -5.9  flat -5.0  up -5.2   p 0.881
+  F-1100-400-unmanaged     rv_vs_vix  about -4.3  moved less -6.4  moved more -5.5   p 0.486
+  F-1100-400-unmanaged     prev_range mid -4.0  narrow -6.5  wide -5.6   p 0.347
+  F-1100-400-unmanaged     gap        big -7.3  mid -4.4  small -4.5   p 0.245
+  F-1100-400-unmanaged     expiry     no -5.6  yes -4.5   p 0.539
+  F-1100-400-unmanaged     own_10d    neg -5.2  pos -6.5   p 0.516
+  F-1100-400-unmanaged     own_20d    neg -5.4  pos -5.9   p 0.889
+  O-fly-1000-bhav          vix        high -1.1  low -6.3  mid +0.1   p 0.203
+  O-fly-1000-bhav          vix_5d     falling +0.8  flat -7.3  rising -0.5   p 0.090
+  O-fly-1000-bhav          trend_20d  down -2.5  flat +0.2  up -4.9   p 0.373
+  O-fly-1000-bhav          rv_vs_vix  about +1.5  moved less -8.5  moved more -0.3   p 0.020
+  O-fly-1000-bhav          prev_range mid -4.3  narrow -1.9  wide -1.2   p 0.717
+  O-fly-1000-bhav          gap        big -1.5  mid -1.1  small -4.6   p 0.619
+  O-fly-1000-bhav          expiry     no -2.4   p 1.000
+  O-fly-1000-bhav          own_10d    neg -2.0  pos -2.7   p 0.817
+  O-fly-1000-bhav          own_20d    neg -1.5  pos -3.6   p 0.504
+  O-fly-1515-bhav          vix        high -4.0  low -4.0  mid +0.0   p 0.386
+  O-fly-1515-bhav          vix_5d     falling +0.3  flat -7.3  rising -0.9   p 0.041
+  O-fly-1515-bhav          trend_20d  down -2.1  flat -3.2  up -2.7   p 0.941
+  O-fly-1515-bhav          rv_vs_vix  about -1.2  moved less -4.9  moved more -1.8   p 0.448
+  O-fly-1515-bhav          prev_range mid -1.3  narrow -0.8  wide -5.7   p 0.259
+  O-fly-1515-bhav          gap        big -1.9  mid -3.3  small -2.8   p 0.892
+  O-fly-1515-bhav          expiry     no -2.7   p 1.000
+  O-fly-1515-bhav          own_10d    neg -1.3  pos -4.0   p 0.281
+  O-fly-1515-bhav          own_20d    neg -1.4  pos -4.9   p 0.206
+  O-D3-managed             vix        high -6.0  low -4.2  mid -2.4   p 0.140
+  O-D3-managed             vix_5d     falling -3.4  flat -4.9  rising -4.2   p 0.711
+  O-D3-managed             trend_20d  down -5.3  flat -2.3  up -4.8   p 0.236
+  O-D3-managed             rv_vs_vix  about -3.8  moved less -5.3  moved more -3.5   p 0.605
+  O-D3-managed             prev_range mid -3.1  narrow -3.0  wide -6.2   p 0.217
+  O-D3-managed             gap        big -4.2  mid -4.6  small -3.7   p 0.883
+  O-D3-managed             expiry     no -4.2   p 1.000
+  O-D3-managed             own_10d    neg -3.8  pos -5.5   p 0.377
+  O-D3-managed             own_20d    neg -4.3  pos -3.5   p 0.718
+  L-0920-none              vix        high -3.8  low -1.8  mid -3.3   p 0.745
+  L-0920-none              vix_5d     falling -1.8  flat -3.1  rising -4.0   p 0.680
+  L-0920-none              trend_20d  down -3.2  flat -3.5  up -2.3   p 0.890
+  L-0920-none              rv_vs_vix  about -3.6  moved less -0.4  moved more -4.9   p 0.202
+  L-0920-none              prev_range mid -3.0  narrow -0.7  wide -5.3   p 0.196
+  L-0920-none              gap        big -2.7  mid -3.3  small -3.0   p 0.977
+  L-0920-none              expiry     no -3.1  yes -2.4   p 0.770
+  L-0920-none              own_10d    neg -0.9  pos -7.8   p 0.003
+  L-0920-none              own_20d    neg -1.3  pos -7.6   p 0.010
+  L-0920-tp50sl30          vix        high -4.3  low -2.5  mid -3.2   p 0.656
+  L-0920-tp50sl30          vix_5d     falling -3.2  flat -2.8  rising -3.9   p 0.826
+  L-0920-tp50sl30          trend_20d  down -2.9  flat -3.9  up -3.2   p 0.866
+  L-0920-tp50sl30          rv_vs_vix  about -3.9  moved less -2.6  moved more -3.4   p 0.788
+  L-0920-tp50sl30          prev_range mid -4.4  narrow -2.2  wide -3.3   p 0.501
+  L-0920-tp50sl30          gap        big -3.3  mid -3.2  small -3.4   p 0.991
+  L-0920-tp50sl30          expiry     no -3.4  yes -2.9   p 0.786
+  L-0920-tp50sl30          own_10d    neg -1.9  pos -7.4   p 0.005
+  L-0920-tp50sl30          own_20d    neg -2.4  pos -6.6   p 0.048
+  L-1000-none              vix        high -4.0  low -1.9  mid -4.1   p 0.625
+  L-1000-none              vix_5d     falling -4.1  flat -2.5  rising -3.3   p 0.767
+  L-1000-none              trend_20d  down -3.3  flat -3.8  up -2.9   p 0.916
+  L-1000-none              rv_vs_vix  about -4.5  moved less -0.7  moved more -4.7   p 0.171
+  L-1000-none              prev_range mid -3.3  narrow -1.6  wide -5.0   p 0.320
+  L-1000-none              gap        big -2.0  mid -4.7  small -3.2   p 0.433
+  L-1000-none              expiry     no -3.1  yes -4.2   p 0.617
+  L-1000-none              own_10d    neg -2.1  pos -6.3   p 0.051
+  L-1000-none              own_20d    neg -2.3  pos -5.9   p 0.105
+  L-1000-tp50sl30          vix        high -3.6  low -2.3  mid -3.4   p 0.778
+  L-1000-tp50sl30          vix_5d     falling -3.9  flat -2.2  rising -3.2   p 0.623
+  L-1000-tp50sl30          trend_20d  down -3.1  flat -3.0  up -3.3   p 0.986
+  L-1000-tp50sl30          rv_vs_vix  about -3.8  moved less -2.5  moved more -3.0   p 0.753
+  L-1000-tp50sl30          prev_range mid -3.8  narrow -2.1  wide -3.4   p 0.622
+  L-1000-tp50sl30          gap        big -1.8  mid -4.1  small -3.4   p 0.356
+  L-1000-tp50sl30          expiry     no -3.3  yes -2.5   p 0.659
+  L-1000-tp50sl30          own_10d    neg -2.4  pos -5.1   p 0.111
+  L-1000-tp50sl30          own_20d    neg -2.1  pos -6.9   p 0.007
+  T-ewmac-8-32             vix        high -6.4  low +4.5  mid -2.6   p 0.183
+  T-ewmac-8-32             vix_5d     falling -2.4  flat -5.2  rising +3.1   p 0.385
+  T-ewmac-8-32             trend_20d  down -4.2  flat -2.8  up +2.5   p 0.540
+  T-ewmac-8-32             rv_vs_vix  about -0.6  moved less -2.2  moved more -1.8   p 0.966
+  T-ewmac-8-32             prev_range mid +2.4  narrow -1.0  wide -5.9   p 0.368
+  T-ewmac-8-32             expiry     no -1.9  yes +0.0   p 0.745
+  T-ewmac-8-32             own_10d    neg +0.0  pos -2.2   p 0.644
+  T-ewmac-8-32             own_20d    neg -0.4  pos -1.9   p 0.772
+  T-ewmac-16-64            vix        high -5.6  low +3.8  mid -5.3   p 0.303
+  T-ewmac-16-64            vix_5d     falling -2.5  flat -5.8  rising +1.2   p 0.551
+  T-ewmac-16-64            trend_20d  down -4.7  flat -0.8  up -1.6   p 0.823
+  T-ewmac-16-64            rv_vs_vix  about -4.5  moved less -2.2  moved more -0.3   p 0.790
+  T-ewmac-16-64            prev_range mid +2.2  narrow -2.3  wide -7.0   p 0.342
+  T-ewmac-16-64            expiry     no -1.5  yes -5.6   p 0.533
+  T-ewmac-16-64            own_10d    neg +0.8  pos -4.9   p 0.286
+  T-ewmac-16-64            own_20d    neg +0.5  pos -5.0   p 0.308
+  T-ewmac-32-128           vix        high -3.4  low +3.5  mid -8.3   p 0.260
+  T-ewmac-32-128           vix_5d     falling -2.3  flat -5.4  rising -0.4   p 0.776
+  T-ewmac-32-128           trend_20d  down -6.1  flat +1.7  up -3.7   p 0.560
+  T-ewmac-32-128           rv_vs_vix  about -8.4  moved less +0.2  moved more +0.0   p 0.479
+  T-ewmac-32-128           prev_range mid +3.2  narrow -3.0  wide -8.3   p 0.249
+  T-ewmac-32-128           expiry     no -1.2  yes -8.3   p 0.331
+  T-ewmac-32-128           own_10d    neg -1.7  pos -2.5   p 0.894
+  T-ewmac-32-128           own_20d    neg -0.6  pos -4.1   p 0.582
+  T-ewmac-64-256           vix        high -1.6  low +5.4  mid -8.8   p 0.209
+  T-ewmac-64-256           vix_5d     falling -1.4  flat -4.2  rising +0.5   p 0.848
+  T-ewmac-64-256           trend_20d  down -6.1  flat +3.7  up -2.6   p 0.464
+  T-ewmac-64-256           rv_vs_vix  about -8.4  moved less +4.1  moved more -0.7   p 0.315
+  T-ewmac-64-256           prev_range mid +4.5  narrow -1.6  wide -8.0   p 0.302
+  T-ewmac-64-256           expiry     no +0.2  yes -8.7   p 0.297
+  T-ewmac-64-256           own_10d    neg -1.3  pos -0.7   p 0.929
+  T-ewmac-64-256           own_20d    neg -1.3  pos -0.5   p 0.912
+  I-orb15                  vix        high +4.5  low -3.1  mid +1.0   p 0.214
+  I-orb15                  vix_5d     falling +4.2  flat -1.8  rising -0.1   p 0.395
+  I-orb15                  trend_20d  down +0.8  flat +1.5  up +0.1   p 0.948
+  I-orb15                  rv_vs_vix  about +1.7  moved less -0.7  moved more +1.4   p 0.842
+  I-orb15                  prev_range mid +0.4  narrow +0.5  wide +1.5   p 0.974
+  I-orb15                  gap        big +2.6  mid -1.8  small +1.6   p 0.601
+  I-orb15                  expiry     no -0.2  yes +4.4   p 0.293
+  I-orb15                  own_10d    neg -1.4  pos +3.7   p 0.191
+  I-orb15                  own_20d    neg +1.2  pos +0.7   p 0.879
+  I-orb30                  vix        high +2.4  low -0.2  mid +4.8   p 0.516
+  I-orb30                  vix_5d     falling +3.1  flat +3.3  rising +0.6   p 0.820
+  I-orb30                  trend_20d  down +2.6  flat +2.1  up +2.2   p 0.996
+  I-orb30                  rv_vs_vix  about +1.2  moved less +1.1  moved more +4.7   p 0.726
+  I-orb30                  prev_range mid +3.5  narrow +1.0  wide +2.5   p 0.852
+  I-orb30                  gap        big +4.0  mid +0.1  small +3.0   p 0.675
+  I-orb30                  expiry     no +1.3  yes +6.4   p 0.259
+  I-orb30                  own_10d    neg +3.6  pos +1.2   p 0.513
+  I-orb30                  own_20d    neg +2.4  pos +2.5   p 0.976
+  I-mom-first-half-hour    vix        high +0.5  low -3.1  mid -3.1   p 0.141
+  I-mom-first-half-hour    vix_5d     falling -1.6  flat -2.6  rising -1.6   p 0.867
+  I-mom-first-half-hour    trend_20d  down -2.4  flat -0.6  up -2.7   p 0.500
+  I-mom-first-half-hour    rv_vs_vix  about -3.3  moved less -2.5  moved more +0.0   p 0.218
+  I-mom-first-half-hour    prev_range mid -3.2  narrow -2.0  wide -0.5   p 0.316
+  I-mom-first-half-hour    gap        big +0.2  mid -4.3  small -1.6   p 0.045
+  I-mom-first-half-hour    expiry     no -2.0  yes -1.5   p 0.812
+  I-mom-first-half-hour    own_10d    neg -2.9  pos -0.1   p 0.095
+  I-mom-first-half-hour    own_20d    neg -3.4  pos +1.8   p 0.004
+  I-gap-fade               vix        high -0.2  low -8.0  mid +1.0   p 0.663
+  I-gap-fade               vix_5d     falling -7.6  flat -11.7  rising +11.6   p 0.051
+  I-gap-fade               trend_20d  down -1.5  flat +7.6  up -14.5   p 0.080
+  I-gap-fade               rv_vs_vix  about +11.3  moved less -18.1  moved more -1.8   p 0.013
+  I-gap-fade               prev_range mid +0.2  narrow -7.2  wide -1.0   p 0.739
+  I-gap-fade               expiry     no -5.3  yes +10.3   p 0.116
+  I-gap-fade               own_10d    neg -0.7  pos -3.3   p 0.754
+  I-gap-fade               own_20d    neg +4.4  pos -8.1   p 0.130

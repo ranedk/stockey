@@ -542,6 +542,9 @@ judge on the unused 2024-11..2026-10 check period.
    winners kept winning, but as a fixed ranking, not cycles. LEDGER 76 (36 Nifty algos, run the
    top 3 until they break, 2022-24): ALL THREE rules FAILED -- best about zero (R2 −0.5%/yr).
    Picking recent winners only avoids the steady losers; nothing positive to rotate into.
+   LEDGER 77 (condition map, exploration): VIX/trend/range/gap barely sort the 36 (near chance);
+   own recent results point the wrong way for most. Only lead: stopped short straddles earn on
+   weekly EXPIRY days (+3-4.5 bps, t ~2.4) and lose on the rest; ORB-30 steady everywhere.
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
