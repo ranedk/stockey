@@ -538,6 +538,10 @@ judge on the unused 2024-11..2026-10 check period.
    2021-24 (A ~0 net, B −1.9% of risk a trade; the overnight hold gave back the day's decay).
    Row 74 (vendor's credit-spread exits, learned on 2025-26, tested on 2021-24): ALL THREE FAILED
    -- gross ~0, costs ~9 pts a day. Nifty option selling closed again (2026-10-22).
+   Operator's rotation theory (2026-10-22): LEDGER 75 (Dhan marketplace, exploration) -- recent
+   winners kept winning, but as a fixed ranking, not cycles. LEDGER 76 (36 Nifty algos, run the
+   top 3 until they break, 2022-24): ALL THREE rules FAILED -- best about zero (R2 −0.5%/yr).
+   Picking recent winners only avoids the steady losers; nothing positive to rotate into.
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).

@@ -283,7 +283,7 @@ def trend_members(lo, hi):
     px, ret = ix["close"], ix["close"].pct_change()
     fut = ret - (ix["repo"] - ix["div_yield"]) / 100 / 252
     vol_d = ret.ewm(span=36, adjust=False).std()
-    out = {}
+    out, held = {}, {}
     for (f, s_), scalar in CARVER.items():
         raw = px.ewm(span=f, adjust=False).mean() - px.ewm(span=s_, adjust=False).mean()
         fc = (raw / (vol_d * px) * scalar).clip(-20, 20)
@@ -291,8 +291,9 @@ def trend_members(lo, hi):
         rolls = pd.Series(0.0, index=pos.index)
         rolls.iloc[::21] = 2 * pos.abs().iloc[::21]
         r = pos * fut - (pos.diff().abs() + rolls) * 0.0003
-        out[f"T-ewmac-{f}-{s_}"] = r[(r.index >= pd.Timestamp(lo).date()) & (r.index <= pd.Timestamp(hi).date())]
-    return pd.DataFrame(out), ix
+        keep = (r.index >= pd.Timestamp(lo).date()) & (r.index <= pd.Timestamp(hi).date())
+        out[f"T-ewmac-{f}-{s_}"], held[f"T-ewmac-{f}-{s_}"] = r[keep], pos[keep]
+    return pd.DataFrame(out), pd.DataFrame(held)  # daily returns; position held that day (x notional)
 
 
 def main():
