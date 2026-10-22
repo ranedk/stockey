@@ -1,0 +1,26 @@
+LEDGER 73 -- short-hold Nifty option selling, insample entries 2021-10-21..2024-10-31
+A intraday stopped straddle: 747 trades, skipped {'no bars': 3}
+B one-day iron fly: 584 trades, skipped {'expiry day': 159, 'missing exit leg': 4, 'no ATM bar': 3}
+
+A intraday stopped straddle: n=747  mean net +0.10% per trade  (gross +4.35 pts, net -0.12 pts)  hit 55%  worst -32%  p 0.4562
+   account (2% at risk per trade, not compounded): total +0.6%, maxDD -6.7%
+   by year 2021: +5.64%  2022: +1.99%  2023: -2.47%  2024: -0.46%
+   legs stopped: 907 of 1494 (61%), days with both stopped 206; legs that left Dhan's window 3
+B one-day iron fly: n=584  mean net -1.86% per trade  (gross +3.02 pts, net -4.51 pts)  hit 59%  worst -107%  p 0.9061
+   account (2% at risk per trade, not compounded): total -21.7%, maxDD -30.3%
+   by year 2021: -1.49%  2022: -1.96%  2023: -4.01%  2024: +0.67%
+   same-day part 10:00->15:15 (n=452, survivorship-prone): +9.23 pts gross of +3.02; settled at expiry 158 trades
+
+VERDICT (pass = mean > 0 with BH q < 0.10, >= 2 of 3 full years positive, maxDD within 35%):
+  A: mean +0.10%  q 0.9061  years positive 1/3  maxDD -6.7%  -> FAIL
+  B: mean -1.86%  q 0.9061  years positive 1/3  maxDD -30.3%  -> FAIL
+
+slippage sensitivity (mean net per trade; A % of premium, B % of risk), not gating:
+  0.25 pt                  A +0.70%
+  1 pt                     A -1.11%
+  old rule max(0.25, 1%)   A -0.70%
+  0.25 pt                  B -0.97%
+  1 pt                     B -3.65%
+  old rule max(0.25, 1%)   B -2.95%
+  A by weekday: Fri -0.91%  Mon -2.23%  Sat +8.06%  Thu +3.77%  Tue -0.74%  Wed +0.35%
+  B by weekday: Fri -7.08%  Mon -0.96%  Sat -16.44%  Tue +2.18%  Wed -1.34%
