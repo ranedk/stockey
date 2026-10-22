@@ -4,5 +4,11 @@
     "configHash": "stockey-advisory-adaptive_ensemble-v0.1-frozen-json",
     "burnedAt": "2026-07-01T00:00:00+05:30",
     "note": "Burned by the stockey session's adaptive_ensemble.py holdout run (NO-GO). Imported 2026-07-27: any ensemble-family verification overlapping 2020-01..2021-07 is contaminated; systrader Part B for this family starts 2021-08 or later."
+  },
+  {
+    "name": "nifty-expiry-straddle-orb30-row78-check-2024-11-to-2026-09",
+    "configHash": "preregistrations/2026-10-22_nifty_expiry_straddle_and_orb.md",
+    "burnedAt": "2026-10-22T11:04:30+00:00",
+    "note": "LEDGER row 78's once-only check, sessions 2024-11-01..2026-09-30."
   }
 ]

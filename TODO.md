@@ -545,6 +545,9 @@ judge on the unused 2024-11..2026-10 check period.
    LEDGER 77 (condition map, exploration): VIX/trend/range/gap barely sort the 36 (near chance);
    own recent results point the wrong way for most. Only lead: stopped short straddles earn on
    weekly EXPIRY days (+3-4.5 bps, t ~2.4) and lose on the rest; ORB-30 steady everywhere.
+   LEDGER 78 (pre-registered, unseen 2024-11..2026-09, burned): **E1 expiry-day stopped straddle
+   basket PASSED** (+2.73 bps of notional per expiry, t 2.5, both halves positive, maxDD −7%);
+   ORB-30 FAILED. Next: [ ] forward paper track for E1 (protocol gate before any capital).
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
