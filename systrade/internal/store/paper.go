@@ -444,3 +444,43 @@ func (s *Store) PaperQualifications(ctx context.Context) ([]PaperQualRow, error)
 	}
 	return out, rows.Err()
 }
+
+// PaperOptionRow is one member's result on one expiry session of an option
+// paper track (systrader_paper_option_e1, written by scripts/paper_e1_expiry_straddle.py).
+type PaperOptionRow struct {
+	Session     time.Time
+	Member      string
+	Strike      *float64
+	Spot        *float64
+	NetBps      *float64
+	MissingLegs *int
+}
+
+// PaperOptionE1 reads the E1 expiry-straddle record. The table is created by
+// the Python job on its first run, so a missing table is an empty record, not
+// an error.
+func (s *Store) PaperOptionE1(ctx context.Context) ([]PaperOptionRow, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('systrader_paper_option_e1') IS NOT NULL`).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT session, member, strike, spot, net_bps, missing_legs
+		FROM systrader_paper_option_e1 ORDER BY session, member`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PaperOptionRow
+	for rows.Next() {
+		var r PaperOptionRow
+		if err := rows.Scan(&r.Session, &r.Member, &r.Strike, &r.Spot, &r.NetBps, &r.MissingLegs); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

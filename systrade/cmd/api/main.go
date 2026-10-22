@@ -59,6 +59,7 @@ func main() {
 	mux.HandleFunc("GET /api/stage", handleStage(st))
 	mux.HandleFunc("GET /api/paper", handlePaperList(st))
 	mux.HandleFunc("GET /api/paper/qualifiers", handlePaperQualifiers(st))
+	mux.HandleFunc("GET /api/paper/options", handlePaperOptions(st))
 	mux.HandleFunc("GET /api/paper/{name}", handlePaperDetail(st))
 	mux.HandleFunc("GET /api/rotation", handleRotation(st))
 	mux.HandleFunc("GET /api/rotation/industry/{code}", handleRotationIndustry(st))
@@ -95,6 +96,19 @@ func handlePaperQualifiers(st *store.Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// handlePaperOptions serves the Nifty option paper tracks (E1, LEDGER 78): per
+// expiry session results in bps of notional, written by a Python job.
+func handlePaperOptions(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out, err := paperapi.OptionTracks(r.Context(), st)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tracks": out})
 	}
 }
 

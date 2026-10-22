@@ -141,6 +141,37 @@ export interface PaperListResponse {
   strategies: PaperStrategy[]
 }
 
+// GET /api/paper/options: Nifty option paper tracks (E1, LEDGER 78). Per expiry session, bps of
+// notional net of costs -- not a NAV: the strategy is flat between expiries.
+export interface PaperOptionSession {
+  date: string
+  strike: number | null
+  spot: number | null
+  basket_bps: number | null
+  members: Record<string, number | null>
+  missing_legs: number
+  cum_bps: number
+}
+
+export interface PaperOptionTrack {
+  name: string
+  rule: string
+  costs: string
+  doc: string
+  start: string
+  judged: string
+  check_bps: number
+  count: number
+  mean_bps: number | null
+  positive: number
+  as_of: string
+  sessions: PaperOptionSession[]
+}
+
+export interface PaperOptionsResponse {
+  tracks: PaperOptionTrack[]
+}
+
 // GET /api/rotation (systrade/docs/SECTOR_ROTATION_PRD.md): industry rotation, relative
 // strength and stages on a weekly clock. Reporting only.
 export interface RotationMarket {

@@ -354,3 +354,100 @@ func Qualifications(ctx context.Context, st *store.Store) (QualMatrix, error) {
 	}
 	return m, nil
 }
+
+// OptionSession is one expiry session of an option paper track.
+type OptionSession struct {
+	Date      string              `json:"date"`
+	Strike    *float64            `json:"strike"`
+	Spot      *float64            `json:"spot"`
+	BasketBps *float64            `json:"basket_bps"`
+	Members   map[string]*float64 `json:"members"`
+	Missing   int                 `json:"missing_legs"`
+	// CumBps is the running sum of the basket, bps of notional, uncompounded.
+	CumBps float64 `json:"cum_bps"`
+}
+
+// OptionTrack is a Nifty option paper track: results come per expiry session
+// in bps of notional, not as a NAV, because the strategy is flat between them.
+type OptionTrack struct {
+	Name     string          `json:"name"`
+	Rule     string          `json:"rule"`
+	Costs    string          `json:"costs"`
+	Doc      string          `json:"doc"`
+	Start    string          `json:"start"`
+	Judged   string          `json:"judged"`
+	CheckBps float64         `json:"check_bps"`
+	Count    int             `json:"count"`
+	MeanBps  *float64        `json:"mean_bps"`
+	Positive int             `json:"positive"`
+	AsOf     string          `json:"as_of"`
+	Sessions []OptionSession `json:"sessions"`
+}
+
+// E1 frozen description (docs/strategies/2026-10-22_e1_expiry_straddle.md);
+// the numbers are the record, computed by scripts/paper_e1_expiry_straddle.py.
+var e1Track = OptionTrack{
+	Name: "e1-expiry-straddle",
+	Rule: "Weekly Nifty expiry sessions only: sell the at-the-money straddle at 09:20 / 10:00 / 11:00 with a " +
+		"+25% or +50% stop on each leg, buy back the rest at 15:15; the record is the average of the six",
+	Costs:    "Rs 20/order, STT, exchange, SEBI, GST, stamp, 0.5 point slippage per leg per transaction",
+	Doc:      "docs/strategies/2026-10-22_e1_expiry_straddle.md",
+	Start:    "2026-10-23",
+	Judged:   "after 52 expiry sessions: kept if the average is above zero",
+	CheckBps: 2.73,
+}
+
+// OptionTracks assembles the option paper tracks (E1 only so far).
+func OptionTracks(ctx context.Context, st *store.Store) ([]OptionTrack, error) {
+	rows, err := st.PaperOptionE1(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t := e1Track
+	t.Sessions = []OptionSession{}
+	byDate := map[string]*OptionSession{}
+	var order []string
+	for _, r := range rows {
+		k := r.Session.Format("2006-01-02")
+		s := byDate[k]
+		if s == nil {
+			s = &OptionSession{Date: k, Strike: r.Strike, Spot: r.Spot, Members: map[string]*float64{}}
+			byDate[k] = s
+			order = append(order, k)
+		}
+		s.Members[r.Member] = r.NetBps
+		if r.MissingLegs != nil {
+			s.Missing += *r.MissingLegs
+		}
+	}
+	cum, sum := 0.0, 0.0
+	for _, k := range order {
+		s := byDate[k]
+		var tot float64
+		n := 0
+		for _, v := range s.Members {
+			if v != nil {
+				tot += *v
+				n++
+			}
+		}
+		if n > 0 {
+			b := tot / float64(n)
+			s.BasketBps = &b
+			cum += b
+			sum += b
+			t.Count++
+			if b > 0 {
+				t.Positive++
+			}
+		}
+		s.CumBps = cum
+		t.Sessions = append(t.Sessions, *s)
+	}
+	if t.Count > 0 {
+		m := sum / float64(t.Count)
+		t.MeanBps = &m
+		t.AsOf = order[len(order)-1]
+	}
+	return []OptionTrack{t}, nil
+}

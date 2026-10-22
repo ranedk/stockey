@@ -67,6 +67,8 @@ const { data: quals } = await useAsyncData('paper-qualifiers',
       </NuxtLink>
     </div>
 
+    <PaperOptionTracks />
+
     <QualificationMatrix v-if="quals?.rows?.length" :matrix="quals" />
   </div>
 </template>
