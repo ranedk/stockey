@@ -1,0 +1,112 @@
+Dhan algo marketplace, Nifty option strategies (Stratzy), fetched 2026-10-22 -- EXPLORATION
+per year, % of margin per lot, not compounded; net = after statutory costs, Rs 20/order, 0.25 pt slippage/leg/side
+
+type           strategy                             live from  trades    gross      net  net pre net live
+-              Single Lattice Straddle              2025-04-17    347    -28.0    -48.5        -    -48.5
+-              Hamilton's Credit Spread             2025-01-10    405    +10.1    -67.4        -    -67.4
+-              Drifting Credit Spread Overnight     2025-06-26    206    -60.8   -106.4        -   -106.4
+Credit Spread  Delta-Ripple Credit Spread Overnight 2026-02-06    205   +160.0   +117.6    +61.8   +175.2
+Credit Spread  Zen Credit Spread Overnight          2025-07-09    219   +221.2   +174.7        -   +174.7
+Credit Spread  Curvature Credit Spread Overnight    2025-07-21    193   +196.1   +152.9        -   +152.9
+Credit Spread  Delta-Leverage Credit Spread Overnig 2026-01-09    135   +157.9   +130.0   +121.4   +140.9
+Credit Spread  Delta-Rotation Credit Spread Expiry  2026-01-05    190    +92.6    +55.6    -25.0   +119.5
+Credit Spread  Convex Credit Spread Overnight       2025-09-03    166   +153.5   +110.5        -   +110.5
+Credit Spread  Ratio-Weave Credit Spread Expiry     2026-02-06    142    +71.0    +41.5    -17.4    +97.0
+Credit Spread  Mathematician's Credit Spread Overni 2025-07-21    219   +130.3    +81.1        -    +81.1
+Credit Spread  Damper Credit Spread                 2025-09-17    293   +149.7    +75.8        -    +75.8
+Credit Spread  Ratio-Return Credit Spread Exit-Earl 2026-01-09    147    +96.7    +66.4    +58.4    +74.8
+Credit Spread  Ripple-Return Credit Spread Expiry   2026-02-23     24    +86.2    +74.6        -    +74.6
+Credit Spread  Ratio-Ripple Credit Spread Exit-Earl 2026-02-23     24    +82.6    +71.0        -    +71.0
+Credit Spread  Delta-Shift Credit Spread Expiry     2026-02-06    231   +128.5    +79.9   +100.7    +66.4
+Credit Spread  Gamma-Fluxer Credit Spread Overnight 2026-01-09    214    +71.2    +25.8    -25.9    +65.1
+Credit Spread  Wave-Return Credit Spread Overnight  2026-02-06    189   +119.8    +80.0   +108.6    +59.0
+Credit Spread  IV-Imbalance Credit Spread Overnight 2025-07-21    214   +105.2    +56.1        -    +56.1
+Credit Spread  Ratio-Hunter2 Credit Spread Exit-Ear 2026-04-30     95    +27.9     +9.0    +18.7     +0.8
+Credit Spread  Theta-Harvest Credit Spread Expiry   2026-01-09    211    +63.8    +19.9    +58.7     -8.7
+Credit Spread  E-QUEUE Credit Spread Overnight      2026-02-06     77    +31.5    +15.2    +48.5    -16.0
+Credit Spread  Warp-Drive Credit Spread Exit-Early  2026-02-06     77    +37.4    +21.1    +67.7    -22.8
+Credit Spread  Rolling-Carry Credit Spread Exit-Ear 2026-01-09    238    +23.8    -24.5     -2.6    -42.4
+Credit Spread  Chain-Sync Credit Spread Overnight   2025-07-21    224    -18.5    -70.5        -    -70.5
+Credit Spread  Theta-Flux Credit Spread Overnight   2026-01-09    204    -60.2   -102.1   -109.1    -99.9
+Credit Spread  Vega-Shift Credit Spread Expiry      2026-01-02    264    -23.4    -75.4    -40.8   -100.6
+Credit Spread  Curve-Whisper Credit Spread Overnigh 2026-02-06    229    -18.4    -65.2    -25.9   -105.3
+Credit Spread  V-Score Credit Spread Overnight      2025-06-26    209    -90.0   -136.3        -   -136.3
+Credit Spread  Ratio-Fluxer Credit Spread Expiry    2026-03-09     31   +116.6   +110.2        -        -
+Option Buying  Vacuum GRID (35% SL)                 2025-06-23    355  +3205.7  +2751.6        -  +2751.6
+Option Buying  Burst GRID (30% SL)                  2025-06-23    387  +2451.4  +1980.0        -  +1980.0
+Option Buying  SkewHunter                           2025-06-02    395  +1176.0   +724.6        -   +724.6
+Option Buying  Settle-Down 40% TSL                  2026-03-05    138   +853.8   +680.0   +745.3   +632.9
+Option Buying  SkewHunter TSL                       2025-06-02    416   +708.8   +229.4        -   +229.4
+Option Buying  Fixed RR 1:3 (30% SL)                2025-06-11    161   +438.8   +176.1        -   +176.1
+Option Buying  Wise-Move 25% TSL                    2026-03-02    122   +453.3   +270.6   +489.2     +9.8
+Option Buying  Index Sniper                         2024-11-28    461   +186.9   -292.9        -   -292.9
+Option Buying  Seed-Fund 40% SL FixedRR 1:3         2026-03-02    115    +26.7   -125.7   +169.5   -482.7
+Option Buying  Thrifty 40% TSL                      2026-03-02    118    -34.3   -187.2    +56.0   -487.6
+Option Buying  Burst RR 1:2 (25% SL)                2025-06-23    417    -23.0   -529.3        -   -529.3
+Option Buying  Only-Calls 40% TSL                   2026-03-02    155    -61.0   -291.3    -36.3   -602.1
+Short Straddle Quiet Short Straddle                 2025-06-11    170    +12.8     +2.9        -     +2.9
+Short Straddle Lattice Short Straddles              2025-01-22    371    +18.6     +0.1        -     +0.1
+Short Straddle Single Kurtosis Straddle             2025-04-15    211    +12.1     -0.2        -     -0.2
+Short Straddle Single Tightgrip Straddle            2025-06-02    290    -34.6    -53.2        -    -53.2
+Short Straddle Single Rangetrap Straddle            2025-06-10    312    -52.5    -72.7        -    -72.7
+Short Strangle Expiry Short Strangle                2025-04-07    118    +41.6    +35.3        -    +35.3
+Short Strangle Compressed Strangle                  2025-06-03    128    +19.7    +11.8        -    +11.8
+Short Strangle Chanakya Short Strangle Overnight    2026-03-02    164    +18.0     +8.7    +13.4     +3.3
+Short Strangle Intraday Short Strangle              2024-12-04    511    +22.2     -1.0        -     -1.0
+Short Strangle Market-Pulse Short Strangle Overnigh 2026-02-23    164    +10.5     +1.2     +3.5     -1.4
+Short Strangle Holonomy's Short Strangles           2025-01-22    380    +16.4     -1.8        -     -1.8
+Short Strangle Flux Strangle                        2025-06-02    107     +2.5     -3.8        -     -3.8
+Short Strangle Sahi-Nivesh Short Strangle Overnight 2026-02-25    150    +19.3    +10.8    +25.1     -5.4
+Short Strangle Carry Forward Strangle               2025-01-14    367    +15.0     -6.1        -     -6.1
+Short Strangle Theta-zone Strangle                  2025-06-10    140     -0.9     -9.4        -     -9.4
+Short Strangle Slow-Climb Short Strangle Overnight  2026-02-25    126     +5.7     -1.5     +8.8    -13.5
+Short Strangle Premium-zone Strangle                2025-06-11    152     -5.0    -14.4        -    -14.4
+Short Strangle Homecoming Short Strangle Overnight  2026-02-27    146     +1.2     -7.1     +9.0    -26.3
+Short Strangle Bazaar Short Strangle Overnight      2026-02-23    130     -5.3    -12.8     +9.8    -39.1
+
+by type, LIVE trades only (strategies with >= 20 live trades):
+  Credit Spread   n=26  gross (all) median   +86.2   net live median   +65.7, mean   +38.2, positive 17/26
+  Short Strangle  n=14  gross (all) median   +12.8   net live median    -4.6, mean    -5.1, positive 3/14
+  Short Straddle  n= 5  gross (all) median   +12.1   net live median    -0.2, mean   -24.6, positive 2/5
+  Option Buying   n=12  gross (all) median  +446.1   net live median   +92.9, mean  +342.5, positive 7/12
+  (option buying: margin = one lot's premium, so its % is on a tiny base and not comparable)
+
+credit spreads, direction (single short leg; 4649 trades with Nifty spot at entry and exit):
+  Nifty moved their way entry->exit: 46.0%; trade profitable: 50.8%; mean move their way +5.4 bp
+  direction agrees with the sign of morning :  50.3%  (corr +0.01)
+  direction agrees with the sign of gap     :  48.5%  (corr -0.05)
+  direction agrees with the sign of prev1   :  51.0%  (corr +0.03)
+  direction agrees with the sign of prev5   :  48.5%  (corr -0.03)
+  days on which every strategy trading took the same side: 8% of 340
+  holding time median 0.95 days; entry hour IST: 10h 2746, 11h 763, 12h 540, 13h 444, 14h 156
+
+  live, per strategy (direction-right rate vs result):
+                                           n  right %  pnl % margin
+strat                                                              
+V-Score Credit Spread Overnight          209     36.4        -117.3
+Theta-Flux Credit Spread Overnight       114     36.8         -37.1
+Vega-Shift Credit Spread Expiry          141     42.6         -29.9
+Curve-Whisper Credit Spread Overnight    123     31.7         -26.5
+Chain-Sync Credit Spread Overnight       224     37.9         -22.9
+Warp-Drive Credit Spread Exit-Early       45     46.7          -1.8
+E-QUEUE Credit Spread Overnight           47     42.6           3.4
+Ratio-Hunter2 Credit Spread Exit-Early    35     42.9           3.8
+Rolling-Carry Credit Spread Exit-Early   124     42.7          10.5
+Theta-Harvest Credit Spread Expiry       122     40.2          23.5
+Ratio-Ripple Credit Spread Exit-Early     24     50.0          52.2
+Ripple-Return Credit Spread Expiry        24     50.0          54.5
+Delta-Shift Credit Spread Expiry         128     43.0          73.9
+Ratio-Return Credit Spread Exit-Early     78     48.7          81.1
+Wave-Return Credit Spread Overnight      100     42.0          81.8
+Ratio-Fluxer Credit Spread Expiry         12     66.7          85.0
+Ratio-Weave Credit Spread Expiry          60     48.3          85.2
+Gamma-Fluxer Credit Spread Overnight     120     45.0          86.6
+Delta-Rotation Credit Spread Expiry       97     54.6         121.4
+IV-Imbalance Credit Spread Overnight     214     43.5         130.2
+Delta-Leverage Credit Spread Overnight    74     52.7         130.6
+Delta-Ripple Credit Spread Overnight     108     45.4         154.1
+Damper Credit Spread                     292     53.1         154.8
+Mathematician's Credit Spread Overnight  219     46.1         161.2
+Convex Credit Spread Overnight           165     47.3         178.4
+Curvature Credit Spread Overnight        193     47.7         242.7
+Zen Credit Spread Overnight              218     49.5         288.8

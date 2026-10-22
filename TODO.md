@@ -532,6 +532,9 @@ judge on the unused 2024-11..2026-10 check period.
    fell outside Dhan's +-10 strikes and were skipped); corrected +2.2% gross, ~0 after costs.
    Bank Nifty options not downloaded yet. Rows 61-70 together: Nifty options are about fairly
    priced; Nifty option work paused here (2026-10-21) pending new evidence.
+   Reopened 2026-10-22 (operator): Dhan's marketplace (LEDGER 72) -- plain straddles/strangles
+   ~0 live after costs, one-day credit spreads +66%/yr on margin with no-skill direction. Row 73
+   pre-registered: A intraday stopped straddle, B one-day iron fly. Next: run row 73 in-sample.
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
