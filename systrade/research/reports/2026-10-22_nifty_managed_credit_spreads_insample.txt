@@ -1,0 +1,28 @@
+LEDGER 74 -- Nifty credit spreads with Dhan-style exits, entries 2021-10-21..2024-10-31 (one ATM call spread + put spread, wings 400)
+D1 intraday, managed: 747 trades, skipped {'no bars': 3}
+D2 intraday, unmanaged: 747 trades, skipped {'no bars': 3}
+D3 overnight, managed: 588 trades, skipped {'expiry day': 159, 'no bars': 3}
+
+D1 intraday, managed: n=747  mean net -4.73% of risk  (gross -0.27 pts, net -8.87 pts, risk 231)  hit 32%  worst -226%  p 1.0000
+   account (2% at risk, not compounded): total -70.6%, maxDD -71.3%;  by year 2021: -1.72%  2022: -5.81%  2023: -2.83%  2024: -6.35%
+   exits time 39%, stop 31%, take profit 30%;  legs missing at exit 66
+   expiry day no -5.26%  yes -2.74%;  by weekday Fri -7.50%  Mon -6.33%  Sat -0.58%  Thu -2.83%  Tue -4.50%  Wed -2.62%
+D2 intraday, unmanaged: n=747  mean net -4.84% of risk  (gross -1.13 pts, net -9.73 pts, risk 231)  hit 46%  worst -121%  p 1.0000
+   account (2% at risk, not compounded): total -72.3%, maxDD -72.3%;  by year 2021: -2.79%  2022: -5.40%  2023: -3.46%  2024: -6.26%
+   exits time 100%;  legs missing at exit 152
+   expiry day no -5.48%  yes -2.47%;  by weekday Fri -8.18%  Mon -6.84%  Sat -0.58%  Thu -2.35%  Tue -4.24%  Wed -2.76%
+D3 overnight, managed: n=588  mean net -4.90% of risk  (gross +0.70 pts, net -7.96 pts, risk 210)  hit 32%  worst -226%  p 1.0000
+   account (2% at risk, not compounded): total -57.6%, maxDD -58.4%;  by year 2021: -3.27%  2022: -6.17%  2023: -3.46%  2024: -5.43%
+   exits take profit 48%, stop 43%, time 9%;  legs missing at exit 137
+   expiry day no -4.90%;  by weekday Fri -8.82%  Mon -5.58%  Sat +26.47%  Tue -4.26%  Wed -1.41%
+
+VERDICT (pass = mean > 0 with BH q < 0.10, >= 2 of 3 full years positive, maxDD within 35%):
+  D1 intraday, managed     mean -4.73%  q 1.0000  years positive 0/3  maxDD -71.3%  -> FAIL
+  D2 intraday, unmanaged   mean -4.84%  q 1.0000  years positive 0/3  maxDD -72.3%  -> FAIL
+  D3 overnight, managed    mean -4.90%  q 1.0000  years positive 0/3  maxDD -58.4%  -> FAIL
+
+slippage sensitivity, mean net % of risk (not gating):
+  0.5 pt (verdict)         D1 -4.73%  D2 -4.84%  D3 -4.90%
+  0.25 pt                  D1 -3.80%  D2 -3.91%  D3 -3.90%
+  1 pt                     D1 -6.59%  D2 -6.70%  D3 -6.91%
+  old rule max(0.25, 1%)   D1 -5.55%  D2 -5.69%  D3 -6.02%

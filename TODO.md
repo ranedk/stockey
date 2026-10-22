@@ -536,6 +536,8 @@ judge on the unused 2024-11..2026-10 check period.
    ~0 live after costs, one-day credit spreads +66%/yr on margin with no-skill direction. Row 73
    pre-registered: A intraday stopped straddle, B one-day iron fly -- BOTH FAILED in-sample
    2021-24 (A ~0 net, B −1.9% of risk a trade; the overnight hold gave back the day's decay).
+   Row 74 (vendor's credit-spread exits, learned on 2025-26, tested on 2021-24): ALL THREE FAILED
+   -- gross ~0, costs ~9 pts a day. Nifty option selling closed again (2026-10-22).
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
