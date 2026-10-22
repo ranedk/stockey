@@ -1,0 +1,71 @@
+LEDGER 75 -- do Dhan marketplace strategies that worked recently keep working? (EXPLORATION)
+returns after row 72's costs, % of margin per lot; holding month = the calendar month after the window
+
+ALL trades (incl. before go-live): 59 strategies, 2024-11-28..2026-10-22
+  all strategies, formation 2 months: 15 test months, 58 strategies a month
+    score ret  : rank corr mean +0.098 (positive in 9/15 months, t +2.20);  top third - bottom third next month +19.99% of margin (t +1.52), average strategy +5.48%
+    score tstat: rank corr mean +0.092 (positive in 11/15 months, t +2.49);  top third - bottom third next month +19.85% of margin (t +2.29), average strategy +5.48%
+    time series: next month after a positive window +11.06% (n 470), after a negative one +0.93% (n 352); P(next > 0) 57% vs 49%
+    break rule (last month below -2 sd): 13 cases, next month -4.42% vs others +6.90%
+  selling only, formation 2 months: 15 test months, 44 strategies a month
+    score ret  : rank corr mean +0.064 (positive in 10/15 months, t +1.87);  top third - bottom third next month +2.26% of margin (t +1.72), average strategy +0.62%
+    score tstat: rank corr mean +0.048 (positive in 10/15 months, t +1.10);  top third - bottom third next month +2.80% of margin (t +1.49), average strategy +0.62%
+    time series: next month after a positive window +1.45% (n 347), after a negative one -0.07% (n 264); P(next > 0) 58% vs 52%
+    break rule (last month below -2 sd): 8 cases, next month -0.12% vs others +0.81%
+  all strategies, formation 3 months: 14 test months, 58 strategies a month
+    score ret  : rank corr mean +0.158 (positive in 9/14 months, t +2.54);  top third - bottom third next month +34.22% of margin (t +2.22), average strategy +5.11%
+    score tstat: rank corr mean +0.147 (positive in 11/14 months, t +2.60);  top third - bottom third next month +29.44% of margin (t +2.69), average strategy +5.11%
+    time series: next month after a positive window +13.97% (n 452), after a negative one -5.12% (n 313); P(next > 0) 56% vs 47%
+    break rule (last month below -2 sd): 18 cases, next month -3.18% vs others +6.39%
+  selling only, formation 3 months: 14 test months, 44 strategies a month
+    score ret  : rank corr mean +0.103 (positive in 10/14 months, t +2.27);  top third - bottom third next month +4.70% of margin (t +2.02), average strategy +0.18%
+    score tstat: rank corr mean +0.092 (positive in 9/14 months, t +1.79);  top third - bottom third next month +5.07% of margin (t +2.40), average strategy +0.18%
+    time series: next month after a positive window +1.60% (n 326), after a negative one -1.22% (n 243); P(next > 0) 56% vs 49%
+    break rule (last month below -2 sd): 14 cases, next month -5.29% vs others +0.54%
+
+LIVE trades only: 58 strategies, 2024-11-28..2026-10-22
+  all strategies, formation 2 months: 15 test months, 31 strategies a month
+    score ret  : rank corr mean +0.178 (positive in 12/15 months, t +2.61);  top third - bottom third next month +34.74% of margin (t +1.67), average strategy +10.66%
+    score tstat: rank corr mean +0.120 (positive in 12/15 months, t +2.45);  top third - bottom third next month +18.50% of margin (t +1.27), average strategy +10.66%
+    time series: next month after a positive window +14.47% (n 327), after a negative one -0.75% (n 249); P(next > 0) 57% vs 45%
+    break rule (last month below -2 sd): 9 cases, next month +0.70% vs others +8.01%
+  selling only, formation 2 months: 14 test months, 22 strategies a month
+    score ret  : rank corr mean +0.153 (positive in 9/14 months, t +2.15);  top third - bottom third next month +4.99% of margin (t +2.97), average strategy +0.11%
+    score tstat: rank corr mean +0.103 (positive in 9/14 months, t +1.80);  top third - bottom third next month +3.62% of margin (t +1.66), average strategy +0.11%
+    time series: next month after a positive window +2.04% (n 224), after a negative one -0.72% (n 177); P(next > 0) 58% vs 48%
+    break rule (last month below -2 sd): 5 cases, next month -2.10% vs others +0.86%
+  all strategies, formation 3 months: 14 test months, 31 strategies a month
+    score ret  : rank corr mean +0.247 (positive in 10/14 months, t +2.88);  top third - bottom third next month +58.05% of margin (t +2.35), average strategy +8.83%
+    score tstat: rank corr mean +0.214 (positive in 11/14 months, t +4.39);  top third - bottom third next month +41.97% of margin (t +3.13), average strategy +8.83%
+    time series: next month after a positive window +16.25% (n 305), after a negative one -9.19% (n 221); P(next > 0) 56% vs 42%
+    break rule (last month below -2 sd): 11 cases, next month -3.90% vs others +5.76%
+  selling only, formation 3 months: 13 test months, 21 strategies a month
+    score ret  : rank corr mean +0.157 (positive in 11/13 months, t +2.78);  top third - bottom third next month +6.69% of margin (t +2.43), average strategy -0.53%
+    score tstat: rank corr mean +0.115 (positive in 9/13 months, t +2.24);  top third - bottom third next month +5.86% of margin (t +2.60), average strategy -0.53%
+    time series: next month after a positive window +2.81% (n 201), after a negative one -2.31% (n 165); P(next > 0) 59% vs 45%
+    break rule (last month below -2 sd): 7 cases, next month -8.52% vs others +0.68%
+
+
+cycle or fixed ranking? (added after the first results, same data)
+ALL trades:
+  all strategies, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.092 (n15)  L2 +0.098 (n14)  L3 +0.132 (n13)  L4 +0.025 (n12)  L6 +0.045 (n10)   | strategy's average over all other months (look-ahead) +0.180
+  selling only, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.063 (n15)  L2 +0.025 (n14)  L3 +0.093 (n13)  L4 +0.010 (n12)  L6 +0.029 (n10)   | strategy's average over all other months (look-ahead) +0.192
+  all strategies, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.154 (n14)  L2 +0.126 (n13)  L3 +0.113 (n12)  L4 -0.043 (n11)  L6 -0.003 (n9)   | strategy's average over all other months (look-ahead) +0.167
+  selling only, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.094 (n14)  L2 +0.053 (n13)  L3 +0.100 (n12)  L4 +0.001 (n11)  L6 +0.082 (n9)   | strategy's average over all other months (look-ahead) +0.186
+LIVE only:
+  all strategies, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.172 (n15)  L2 +0.173 (n14)  L3 +0.174 (n13)  L4 +0.109 (n12)  L6 +0.136 (n10)   | strategy's average over all other months (look-ahead) +0.208
+  selling only, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.151 (n14)  L2 +0.088 (n13)  L3 +0.137 (n12)  L4 +0.056 (n11)  L6 +0.057 (n9)   | strategy's average over all other months (look-ahead) +0.148
+  all strategies, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.243 (n14)  L2 +0.165 (n13)  L3 +0.228 (n12)  L4 +0.053 (n11)  L6 +0.132 (n9)   | strategy's average over all other months (look-ahead) +0.241
+  selling only, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.148 (n13)  L2 +0.146 (n12)  L3 +0.141 (n11)  L4 +0.054 (n10)  L6 +0.130 (n8)   | strategy's average over all other months (look-ahead) +0.226
+
+cycle or fixed ranking? (added after the first results, same data)
+ALL trades:
+  all strategies, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.092 (n15)  L2 +0.098 (n14)  L3 +0.132 (n13)  L4 +0.025 (n12)  L6 +0.045 (n10)   | strategy's average over all other months (look-ahead) +0.180
+  selling only, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.063 (n15)  L2 +0.025 (n14)  L3 +0.093 (n13)  L4 +0.010 (n12)  L6 +0.029 (n10)   | strategy's average over all other months (look-ahead) +0.192
+  all strategies, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.154 (n14)  L2 +0.126 (n13)  L3 +0.113 (n12)  L4 -0.043 (n11)  L6 -0.003 (n9)   | strategy's average over all other months (look-ahead) +0.167
+  selling only, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.094 (n14)  L2 +0.053 (n13)  L3 +0.100 (n12)  L4 +0.001 (n11)  L6 +0.082 (n9)   | strategy's average over all other months (look-ahead) +0.186
+LIVE only:
+  all strategies, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.172 (n15)  L2 +0.173 (n14)  L3 +0.174 (n13)  L4 +0.109 (n12)  L6 +0.136 (n10)   | strategy's average over all other months (look-ahead) +0.208
+  selling only, formation 2 months -- rank corr of the score with the month L ahead:  L1 +0.151 (n14)  L2 +0.088 (n13)  L3 +0.137 (n12)  L4 +0.056 (n11)  L6 +0.057 (n9)   | strategy's average over all other months (look-ahead) +0.148
+  all strategies, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.243 (n14)  L2 +0.165 (n13)  L3 +0.228 (n12)  L4 +0.053 (n11)  L6 +0.132 (n9)   | strategy's average over all other months (look-ahead) +0.241
+  selling only, formation 3 months -- rank corr of the score with the month L ahead:  L1 +0.148 (n13)  L2 +0.146 (n12)  L3 +0.141 (n11)  L4 +0.054 (n10)  L6 +0.130 (n8)   | strategy's average over all other months (look-ahead) +0.226
