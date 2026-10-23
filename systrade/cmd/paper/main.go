@@ -70,6 +70,8 @@ func main() {
 	exitRate := flag.Float64("random-exit-rate", 0, "for -stop=random: exits per position per day")
 	rebalance := flag.Int("rebalance", 0, "trading days between rebalances (0 = spec default)")
 	holdCount := flag.Int("hold-count", 0, "hold a fixed number of names instead of a quantile")
+	keepMultiple := flag.Int("keep-multiple", 0, "rank buffer: keep a held name until it falls outside the top N times this (0 = spec default)")
+	keepWeights := flag.Bool("keep-weights", false, "at a rebalance trade only the names that change; held names keep their drifted weight")
 	signal := flag.String("signal", "", "override the spec's selection signal: ewmac32 | ewmac16 | trend-speed-blend | ret5 | reversal20 | reversal60")
 	signal2 := flag.String("signal2", "reversal20", "the second signal, used by -mode=switch and -mode=blend")
 	mode := flag.String("mode", "", "override the spec's selection mode: single | switch | blend | bookblend")
@@ -117,6 +119,12 @@ func main() {
 	}
 	if *holdCount > 0 {
 		spec.HoldCount = *holdCount
+	}
+	if *keepMultiple > 0 {
+		spec.KeepMultiple = *keepMultiple
+	}
+	if *keepWeights {
+		spec.KeepWeights = true
 	}
 	sig, err := parseSignal(*signal)
 	fatalIf(err)

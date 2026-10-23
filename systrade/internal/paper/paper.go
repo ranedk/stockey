@@ -132,6 +132,12 @@ type Spec struct {
 	// same day -- the behaviour every earlier stop experiment was measured with, so it stays
 	// the default (review 2026-10-02).
 	StoppedSlotsToCash bool
+	// KeepWeights trades only the names that change at a rebalance (LEDGER 82): a name still
+	// selected keeps the weight it drifted to, and the weight of the names sold is shared
+	// equally by the names bought. Without it every rebalance evens all weights out again,
+	// which costs turnover on every held name -- the reason row 23's daily book died.
+	// Applies to the strategy and random books; equal-weight stays the plain beta control.
+	KeepWeights bool
 	// FundamentalFilter also excludes, from the strategy's buying list only, names that fail
 	// stockey's filter on the decision day (FundamentalPass: a flaw, a story score below that
 	// day's median, or no score). Zero value = off.
@@ -821,6 +827,9 @@ func ComputeWithPrior(spec Spec, prior, days []Day) (*Track, error) {
 				} else {
 					target = targetWeights(name, spec, d)
 				}
+				if spec.KeepWeights && name != BookEqual && len(drifted) > 0 {
+					target = keepWeights(drifted, target)
+				}
 			}
 			if name == BookStrategy && !(spec.StoppedSlotsToCash && !rebalance && spec.Overlay == OverlayNone) {
 				target = rescale(target, exposure)
@@ -1096,6 +1105,35 @@ func changed(a, b map[string]float64) bool {
 }
 
 // targetWeights is where the three books differ, and the only place they do.
+// keepWeights turns a fresh selection into the fewest trades: names in both `held` and
+// `target` keep their held weight, and whatever the book held in names it no longer wants
+// (plus any cash below the target's total) goes equally to the names it newly wants.
+func keepWeights(held, target map[string]float64) map[string]float64 {
+	total, kept := 0.0, 0.0
+	var fresh []string
+	out := make(map[string]float64, len(target))
+	for sym, w := range target {
+		total += w
+		if h, ok := held[sym]; ok {
+			out[sym] = h
+			kept += h
+		} else {
+			fresh = append(fresh, sym)
+		}
+	}
+	if len(fresh) == 0 {
+		return out
+	}
+	share := (total - kept) / float64(len(fresh))
+	if share < 0 {
+		share = 0
+	}
+	for _, sym := range fresh {
+		out[sym] = share
+	}
+	return out
+}
+
 func targetWeights(book string, spec Spec, d Day) map[string]float64 {
 	w, _ := selectWeights(book, spec, d, nil)
 	return w

@@ -756,3 +756,18 @@ func TestConstantOverlayScalesTheSheet(t *testing.T) {
 		t.Fatalf("sheet targets sum to %v, want 0.67", sum)
 	}
 }
+
+func TestKeepWeightsTradesOnlyTheNamesThatChange(t *testing.T) {
+	held := map[string]float64{"A": 0.5, "B": 0.3, "C": 0.2}
+	target := map[string]float64{"A": 1.0 / 3, "B": 1.0 / 3, "D": 1.0 / 3}
+	got := keepWeights(held, target)
+	if got["A"] != 0.5 || got["B"] != 0.3 {
+		t.Fatalf("kept names must keep their held weight, got %v", got)
+	}
+	if math.Abs(got["D"]-0.2) > 1e-12 || len(got) != 3 {
+		t.Fatalf("the new name takes the sold name's weight, got %v", got)
+	}
+	if turnoverBetween(held, got) > 0.4+1e-12 {
+		t.Fatalf("only C out and D in should trade, turnover %v", turnoverBetween(held, got))
+	}
+}

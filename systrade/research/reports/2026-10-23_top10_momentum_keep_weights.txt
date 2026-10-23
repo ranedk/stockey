@@ -1,0 +1,45 @@
+LEDGER 82 -- 10-stock momentum book that trades only the names that change (EXPLORATION, trials=0, 8 variants).
+Score: trend-speed-blend (EWMAC 16/64, 32/128, 64/256 blend). Replays: cmd/paper run -strategy trend-speed-blend -start 2016-01-04 -dry <flags>,
+new flags -keep-multiple (rank buffer) and -keep-weights (held names keep their drifted weight; sold names' weight goes to the new ones).
+Reference: the quintile book (~160 names, 20-day rebalance) from the same start: 20.10%/yr, and 19.6..23.8 across row 81's 21 start days.
+
+== V1_top10_20d   (-hold-count 10 -rebalance 20 -keep-multiple 1)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            566.22    17.74%   21.85%   -44.1%        10    4.07%      100%
+equal-weight        316.33    11.45%   19.64%   -57.2%       796    0.57%      100%
+random-ranking      124.47     2.08%   22.82%   -69.1%        10    0.84%      100%
+== V2_top10_20d_keep3_kw   (-hold-count 10 -rebalance 20 -keep-multiple 3 -keep-weights)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            668.97    19.60%   21.69%   -52.3%        10    2.25%      100%
+equal-weight        316.33    11.45%   19.64%   -57.2%       796    0.57%      100%
+random-ranking      155.34     4.23%   22.41%   -67.1%        10    0.51%      100%
+== V3_top10_daily_keep3_kw   (-hold-count 10 -rebalance 1 -keep-multiple 3 -keep-weights)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            457.34    15.39%   22.55%   -45.0%        10    5.68%      100%
+equal-weight        318.29    11.52%   19.81%   -57.7%       802    1.56%      100%
+random-ranking      192.42     6.36%   24.62%   -66.1%        10    0.75%      100%
+== V4_top10_weekly_keep3_kw   (-hold-count 10 -rebalance 5 -keep-multiple 3 -keep-weights)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            878.12    22.70%   21.37%   -47.8%        10    3.48%      100%
+equal-weight        321.35    11.62%   19.76%   -57.2%       802    0.88%      100%
+random-ranking      177.68     5.56%   23.08%   -67.4%        10    0.68%      100%
+== V5_top10_daily_keep2_kw   (-hold-count 10 -rebalance 1 -keep-multiple 2 -keep-weights)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            427.02    14.65%   21.15%   -54.8%        10   11.08%      100%
+equal-weight        318.29    11.52%   19.81%   -57.7%       802    1.56%      100%
+random-ranking      192.42     6.36%   24.62%   -66.1%        10    0.75%      100%
+== V6_top10_daily_keep5_kw   (-hold-count 10 -rebalance 1 -keep-multiple 5 -keep-weights)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            855.15    22.40%   21.46%   -46.9%        10    2.68%      100%
+equal-weight        318.29    11.52%   19.81%   -57.7%       802    1.56%      100%
+random-ranking      192.42     6.36%   24.62%   -66.1%        10    0.75%      100%
+== V7_top20_daily_keep3_kw   (-hold-count 20 -rebalance 1 -keep-multiple 3 -keep-weights)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            947.47    23.58%   20.92%   -37.1%        20    2.35%      100%
+equal-weight        318.29    11.52%   19.81%   -57.7%       802    1.56%      100%
+random-ranking      373.76    13.22%   20.87%   -54.6%        20    0.85%      100%
+== V8_top10_daily_keep3_reweigh   (-hold-count 10 -rebalance 1 -keep-multiple 3)
+book                   NAV    return  ann vol    maxDD  holdings  cost/yr  exposure
+strategy            486.49    16.07%   21.05%   -45.7%        10    6.81%      100%
+equal-weight        318.29    11.52%   19.81%   -57.7%       802    1.56%      100%
+random-ranking      118.69     1.63%   22.78%   -70.8%        10    2.05%      100%

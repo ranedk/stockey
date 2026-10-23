@@ -37,6 +37,13 @@ def main():
     last = sessions[-1]
     # only contracts that have already expired: a future label would map onto the last session we hold
     cmap = {x: s for x, s in r73.contract_map(sessions, str(START), str(last)).items() if x <= last}
+    # and only labels that actually traded on their expiry session: when NSE moves the expiry weekday
+    # it relabels open contracts, and the old label stays in the bhavcopy without ever expiring
+    # (Nifty 2025-09-25, 2025-12-24, 2026-06-25 -- row 78's erratum)
+    traded = set(r64.q("SELECT DISTINCT expiry, trade_date FROM nseindia_fo_bhavcopy WHERE symbol = 'NIFTY' "
+                       "AND instrument = 'OPTIDX' AND trade_date BETWEEN %(lo)s AND %(hi)s AND expiry = trade_date",
+                       {"lo": START, "hi": last}).itertuples(index=False, name=None))
+    cmap = {x: s for x, s in cmap.items() if (x, s) in traded}
     lots = r73.lots()
     rows, pending = [], []
     for label, d in sorted(cmap.items()):

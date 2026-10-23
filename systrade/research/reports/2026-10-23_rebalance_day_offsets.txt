@@ -1,0 +1,18 @@
+LEDGER 81 -- rebalance-day luck (EXPLORATION, trials=0). Each price-only paper book replayed with cmd/paper -dry from
+each of the first 21 trading days of 2016 (2016-01-04..2016-02-02) to 2026-10-22, so the 20/21-day rebalance clock lands on every
+possible day. Returns are annualised over each run's own window; 'vs EW' = minus the equal-weight book of the same run,
+which removes the start-date noise (equal-weight alone moves 11.45..13.46%/yr across the 21 starts).
+Run: for each book and start, paper run -strategy <book> -start <day> -dry; then
+     python research/scripts/2026-10-23_rebalance_day_offsets_summary.py <dir of outputs>
+
+                              n  ret_min  ret_median  ret_max  spread  dd_worst  dd_best  vs_ew_min  vs_ew_max  offset0_ret
+book                                                                                                                       
+low-volatility-blend         21    11.47       12.09    12.66    1.19     -31.2    -30.0      -1.09       0.32        11.47
+momentum-lookback-blend      21    19.85       21.66    23.64    3.79     -49.7    -46.0       8.14      10.49        20.45
+momentum-lowvol-combination  21    15.90       17.13    18.08    2.18     -39.5    -36.9       4.04       4.93        16.03
+stage2-rs-leaders            21    14.89       17.87    22.86    7.97     -54.5    -41.0       3.18       9.40        17.22
+trend-quintile               21    18.28       20.42    23.31    5.03     -40.8    -34.9       6.54      10.02        18.80
+trend-speed-blend            21    19.62       21.16    23.84    4.22     -39.2    -34.1       7.25      10.57        20.10
+trend-speed-blend-buffered   21    20.06       21.48    22.88    2.82     -39.4    -35.6       8.14       9.82        20.58
+
+equal-weight return across offsets (start-date noise only): 11.45 .. 13.46
