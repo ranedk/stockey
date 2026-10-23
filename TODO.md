@@ -551,7 +551,11 @@ judge on the unused 2024-11..2026-10 check period.
    docs/strategies/2026-10-22_e1_expiry_straddle.md; judged after 52 expiries): stockey's
    all_option_data_daily.sh (Tue-Sat 09:00 IST) keeps the option bars + F&O bhavcopy current;
    scripts/paper_e1_expiry_straddle.py runs in paper_daily.sh -> systrader_paper_option_e1.
-   [ ] Not yet on the screener's Paper page (Go API reads systrader_paper_* stock tracks only).
+   [x] On the screener's Paper page (GET /api/paper/options, 2026-10-22).
+   LEDGER 79 (exploration): wings do NOT make E1 margin-efficient -- they cost 2.2-4.4 bps per
+   expiry against a 2.9 bp edge (stops already cap the loss). Measured margin: naked 17.2% of
+   notional on expiry day -> E1 ~9%/yr on margin. [ ] Lever to look at instead: back the margin
+   with pledged holdings / liquid-fund collateral so it earns on the 4 idle days.
    Original plan: -- trade only on days meeting a clear setup, fixed
    exit. Best with the operator's contact's rough method (what they wait for, when they
    exit, when they stay out).
