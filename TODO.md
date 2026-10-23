@@ -106,6 +106,18 @@ Inputs to everything below, not opinions. Each was measured, not assumed:
   the five.
 - **Size:** medium. **Unblocked 2026-09-28** (A1 + A2 done; A2 says: test K=2 on the two trend tracks only).
 
+### A4. Rebalance-day luck and a clockless book (2026-10-23)
+- [x] **Row 81:** every momentum book beats equal-weight on all 21 possible rebalance days;
+      Stage 2 leaders is the most timing-sensitive (14.9-22.9%/yr by start day).
+- [x] **Row 82:** 10/20-name books that trade only the names that change. New forward track
+      `trend-top20-daily` (top 20, daily check, held until outside the top 60, kept weights, no
+      funds), starts 2026-10-26; judged vs trend-speed-blend at 12 months.
+- [ ] Stage 2 leaders as 4 staggered slices a week apart (removes its timing luck) -- a new spec
+      if wanted; not started.
+- [ ] The frozen tracks' universes include liquid-fund ETFs (they top a vol-normalised trend
+      score). Harmless in a 160-name quintile (20.1 vs 19.6%/yr without them); know it when
+      reading their holdings. Any change is a new spec (Law 19).
+
 ---
 
 ## B. Universe: widen it, and know what each filter costs

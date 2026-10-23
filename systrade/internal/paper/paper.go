@@ -138,6 +138,10 @@ type Spec struct {
 	// which costs turnover on every held name -- the reason row 23's daily book died.
 	// Applies to the strategy and random books; equal-weight stays the plain beta control.
 	KeepWeights bool
+	// ExcludeFunds leaves ETFs, fund units, REITs and InvITs out of the universe (all books):
+	// the volatility-normalised trend score ranks cash-like funds at the top, harmless in a
+	// 160-name quintile, a real share of a 20-name book (LEDGER 82).
+	ExcludeFunds bool
 	// FundamentalFilter also excludes, from the strategy's buying list only, names that fail
 	// stockey's filter on the decision day (FundamentalPass: a flaw, a story score below that
 	// day's median, or no score). Zero value = off.
@@ -475,6 +479,27 @@ func SpeedBlendBufferedSpec() Spec {
 	return s
 }
 
+// TrendTop20DailySpec is the configuration frozen on 2026-10-23 (LEDGER row 82, the
+// operator's "only trade the names that change" idea): trend-speed-blend's score, the top 20
+// names, checked every session; a held name stays until it falls outside the top 60
+// (KeepMultiple 3), and only the names that change are traded -- held names keep the weight
+// they drifted to (KeepWeights). No rebalance calendar, so no rebalance-day luck (row 81).
+// Its 23.6%/yr in row 82 is IN-SAMPLE, the best of 8 variants: it motivates the track, it
+// does not count as evidence.
+func TrendTop20DailySpec() Spec {
+	s := SpeedBlendSpec()
+	s.Name = "trend-top20-daily"
+	s.Start = time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	s.SignalLabel = "EWMAC 16/64, 32/128 and 64/256 blended 40/16/44, FDM 1.10 — top 20, checked daily, held until outside the top 60, only changed names traded, long-only"
+	s.Doc = "docs/strategies/2026-10-23_trend_top20_daily.md"
+	s.HoldCount = 20
+	s.RebalanceEvery = 1
+	s.KeepMultiple = 3
+	s.KeepWeights = true
+	s.ExcludeFunds = true
+	return s
+}
+
 // Stage2RSLeadersSpec is the configuration frozen on 2026-10-01: the plain Stage 2
 // reference book of LEDGER row 53 -- the 20 liquid Stage 2 names with the highest 6-month
 // return (the same order as RS26: subtracting the market's return changes no rank), at most
@@ -542,7 +567,7 @@ func MomentumQualityCombinationSpec() Spec {
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
 		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec(),
-		MomentumQualityCombinationSpec()}
+		MomentumQualityCombinationSpec(), TrendTop20DailySpec()}
 }
 
 // SpecFor finds a registered strategy by name.

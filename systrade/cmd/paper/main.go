@@ -71,6 +71,7 @@ func main() {
 	rebalance := flag.Int("rebalance", 0, "trading days between rebalances (0 = spec default)")
 	holdCount := flag.Int("hold-count", 0, "hold a fixed number of names instead of a quantile")
 	keepMultiple := flag.Int("keep-multiple", 0, "rank buffer: keep a held name until it falls outside the top N times this (0 = spec default)")
+	noFunds := flag.Bool("exclude-funds", false, "leave ETFs, fund units, REITs and InvITs out of the universe")
 	keepWeights := flag.Bool("keep-weights", false, "at a rebalance trade only the names that change; held names keep their drifted weight")
 	signal := flag.String("signal", "", "override the spec's selection signal: ewmac32 | ewmac16 | trend-speed-blend | ret5 | reversal20 | reversal60")
 	signal2 := flag.String("signal2", "reversal20", "the second signal, used by -mode=switch and -mode=blend")
@@ -125,6 +126,9 @@ func main() {
 	}
 	if *keepWeights {
 		spec.KeepWeights = true
+	}
+	if *noFunds {
+		spec.ExcludeFunds = true
 	}
 	sig, err := parseSignal(*signal)
 	fatalIf(err)
@@ -628,9 +632,15 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 			return nil, nil, err
 		}
 	}
+	var funds map[string]bool
+	if spec.ExcludeFunds {
+		if funds, err = st.FundSymbols(ctx); err != nil {
+			return nil, nil, err
+		}
+	}
 	err = st.StreamAdjustedBars(ctx, from, to, func(ser bars.Series) error {
 		n := len(ser.Bars)
-		if n < minBars {
+		if n < minBars || funds[ser.Symbol] {
 			return nil
 		}
 		times := make([]time.Time, n)

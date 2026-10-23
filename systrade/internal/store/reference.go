@@ -64,3 +64,28 @@ func (s *Store) MarketCaps(ctx context.Context) (map[string][]MCapPoint, error) 
 	}
 	return out, rows.Err()
 }
+
+// FundSymbols returns the listed funds: ETFs, mutual-fund units, REITs and InvITs, by
+// dim_security's instrument type, plus untagged symbols whose name says fund (BEES, ETF,
+// IETF, LIQUID) -- about a third of dim_security's rows, mostly delisted ones, carry no type.
+// A volatility-normalised trend score ranks cash-like funds at the top (they rise with
+// almost no volatility), so a few-names book must leave them out (LEDGER 82).
+func (s *Store) FundSymbols(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT symbol FROM dim_security
+		WHERE symbol IS NOT NULL AND (instrument_type IN ('ETF', 'MF', 'REIT', 'InvITU')
+		   OR (instrument_type IS NULL AND symbol ~ '(BEES|ETF|LIQUID)'))`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		out[sym] = true
+	}
+	return out, rows.Err()
+}

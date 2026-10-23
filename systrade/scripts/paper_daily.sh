@@ -49,6 +49,7 @@ go run ./cmd/paper run -strategy stage2-rs-leaders
 # its fundamentals-filtered pair (LEDGER row 55)
 go run ./cmd/paper run -strategy stage2-rs-leaders-clean
 go run ./cmd/paper run -strategy momentum-quality-combination   # TODO D1, LEDGER 60 (2026-10-19)
+go run ./cmd/paper run -strategy trend-top20-daily   # LEDGER 82 (2026-10-23): top 20, daily, trade only changes
 
 # E1, the expiry-day stopped straddle basket (LEDGER 78, docs/strategies/2026-10-22_e1_expiry_straddle.md).
 # Python: it reuses the research library's frozen trade code. Reads the option bars stockey's
