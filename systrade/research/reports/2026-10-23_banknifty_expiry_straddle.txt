@@ -1,0 +1,18 @@
+LEDGER 80, Bank Nifty expiry sessions 2021-10-21..2026-09-29: 184 (weekly era 161, monthly era 23); phantom labels dropped ['2023-03-30', '2023-06-29', '2023-09-07', '2023-09-14', '2023-09-21', '2023-10-05', '2024-03-28', '2024-04-25', '2024-06-27', '2024-09-26', '2024-12-26', '2025-01-29', '2025-02-26', '2025-03-26', '2025-06-25', '2025-09-24', '2025-09-25', '2025-12-24', '2025-12-31', '2026-03-26', '2026-03-31']
+skips {'no WEEK1 bars': 1}; weekdays {'Thu': 105, 'Wed': 60, 'Tue': 17, 'Mon': 1}
+legs missing at exit: 9
+
+E1 on Bank Nifty: n 183  mean +4.52 bps of notional per expiry (t +4.63)  hit 64%  p 0.0000
+   halves by count: 2021-10-28..2023-07-20 +5.17   2023-07-27..2026-09-29 +3.87
+   monthly-only era (after 2024-11-13): n 23 mean +0.19  (weekly era +5.14)
+   at 10% vol (scale 12.4x): +20.9%/yr, maxDD -10.2%
+
+VERDICT: PASS  (mean > 0, p < 0.10: yes; both halves positive: yes; maxDD within 35%: yes; monthly era positive: yes)
+
+reported, not gated:
+  members (bps): S-0920-25 +3.5  S-0920-50 +4.2  S-1000-25 +4.8  S-1000-50 +3.6  S-1100-25 +5.2  S-1100-50 +5.8
+  by year: 2021 +11.17 (n 10)  2022 +7.50 (n 52)  2023 +0.33 (n 52)  2024 +6.30 (n 48)  2025 +1.79 (n 12)  2026 -1.79 (n 9)
+  at 0.5 pt slippage: +4.97 bps
+  at 2.0 pt slippage: +3.60 bps
+  non-expiry sessions, weekly era (Nifty contrast about −1): -1.14 bps (n 593)
+  correlation with Nifty E1 on 126 shared expiry sessions: +0.51

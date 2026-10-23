@@ -10,5 +10,11 @@
     "configHash": "preregistrations/2026-10-22_nifty_expiry_straddle_and_orb.md",
     "burnedAt": "2026-10-22T11:04:30+00:00",
     "note": "LEDGER row 78's once-only check, sessions 2024-11-01..2026-09-30."
+  },
+  {
+    "name": "banknifty-expiry-straddle-row80-2021-10-to-2026-09",
+    "configHash": "preregistrations/2026-10-23_banknifty_expiry_straddle.md",
+    "burnedAt": "2026-10-23T13:55:02+00:00",
+    "note": "LEDGER row 80's once-only run, Bank Nifty expiry sessions 2021-10-21..2026-09-30."
   }
 ]
