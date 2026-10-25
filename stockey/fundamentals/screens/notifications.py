@@ -31,7 +31,7 @@ set, and the sender identity must be verified in AWS SES (and the account out of
 sandbox mode, or every recipient also verified) before anything actually delivers --
 this module does not attempt to verify that state itself, it will simply fail loudly
 (fallback-recorded, not silently swallowed) if SES rejects the send. Confirmed live
-2026-08-12 against a real SES send once japlin.com's domain identity + IAM send
+2026-08-12 against a real SES send once the sender domain's identity (japlin.com then; singularity45.ai since 2026-10-25) + IAM send
 permissions were set up.
 
 WATCHLIST_ALERT_EMAIL_TO holds one or more addresses separated by whitespace (env

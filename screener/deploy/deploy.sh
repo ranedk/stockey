@@ -13,7 +13,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 STATIC_ROOT="/var/www/screener"
 UPSTREAM="127.0.0.1:3000"
-HOSTNAME_PUBLIC="${SCREENER_HOSTNAME:-stockey.japlin.com}"
+HOSTNAME_PUBLIC="${SCREENER_HOSTNAME:-stockey.singularity45.ai}"
 export PATH="$HOME/.local/tools/node/bin:$PATH"
 cd "$REPO"
 

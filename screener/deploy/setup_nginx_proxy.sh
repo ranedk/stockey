@@ -16,7 +16,7 @@
 # Idempotent. Re-running with the same username changes that password; a different
 # username adds a user.
 #
-# CLOUDFLARE MODE (the default, and what stockey.japlin.com actually uses)
+# CLOUDFLARE MODE (the default, and what stockey.singularity45.ai actually uses)
 #   The hostname resolves to Cloudflare (2606:4700:...), so the browser's TLS terminates
 #   at Cloudflare's edge, NOT here. Two consequences the plain setup gets wrong:
 #
@@ -264,8 +264,8 @@ cat <<DONE
   Done (mode: ${MODE}$( [ -n "$ORIGIN_CERT" ] && echo ", origin TLS on :443" )).
 
   Verify:
-      curl -sI https://stockey.japlin.com/ | head -1                 # expect 401
-      curl -sI -u ${USERNAME}:<pass> https://stockey.japlin.com/ | head -1   # expect 200
+      curl -sI https://stockey.singularity45.ai/ | head -1                 # expect 401
+      curl -sI -u ${USERNAME}:<pass> https://stockey.singularity45.ai/ | head -1   # expect 200
 
   Nuxt must stay listening on ${APP_UPSTREAM}:
       cd ~/code/trading/screener && ./deploy/build_and_deploy.sh      # production
