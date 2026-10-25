@@ -59,6 +59,9 @@ func TestFrozenSpecsAreUntouched(t *testing.T) {
 		if s.Name == "stage2-rs-leaders-clean" {
 			continue
 		}
+		if s.Name == "paradigm-capitalmind-momentum" { // its industry cap is part of the method (LEDGER 83)
+			continue
+		}
 		if s.Stage2Only || s.MaxPerGroup != 0 || s.Stop == StopSignal || s.FundamentalFilter || s.StoppedSlotsToCash {
 			t.Fatalf("%s picked up a new field", s.Name)
 		}

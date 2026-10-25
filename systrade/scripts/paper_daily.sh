@@ -51,6 +51,13 @@ go run ./cmd/paper run -strategy stage2-rs-leaders-clean
 go run ./cmd/paper run -strategy momentum-quality-combination   # TODO D1, LEDGER 60 (2026-10-19)
 go run ./cmd/paper run -strategy trend-top20-daily   # LEDGER 82 (2026-10-23): top 20, daily, trade only changes
 
+# Investor-paradigm replicas (LEDGER 83, 2026-10-23; docs/strategies/2026-10-23_investor_paradigms.md):
+# our rules from what Capitalmind and WeekendInvesting publish, each with a 2016+ reference replay.
+for p in paradigm-capitalmind-momentum paradigm-wi-mi20 paradigm-wi-top10 paradigm-wi-nnf10 paradigm-wi-mi30; do
+  go run ./cmd/paper run -strategy "$p"
+  go run ./cmd/paper run -strategy "$p" -name "$p-reference" -start 2016-01-04
+done
+
 # E1, the expiry-day stopped straddle basket (LEDGER 78, docs/strategies/2026-10-22_e1_expiry_straddle.md).
 # Python: it reuses the research library's frozen trade code. Reads the option bars stockey's
 # all_option_data_daily.sh lands each morning; an expiry without bars yet waits for the next run.

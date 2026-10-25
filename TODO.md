@@ -117,6 +117,10 @@ Inputs to everything below, not opinions. Each was measured, not assumed:
 - [ ] The frozen tracks' universes include liquid-fund ETFs (they top a vol-normalised trend
       score). Harmless in a 160-name quintile (20.1 vs 19.6%/yr without them); know it when
       reading their holdings. Any change is a new spec (Law 19).
+- [x] **Row 83:** investor-paradigm replicas (7 managers, 10 tracks: 5 momentum in systrader with
+      2016+ replays, 5 fundamental stockey forward tracks), start 2026-10-26, page /paradigms.
+- [ ] Paradigms: review the forward records at 12 months (2027-10); Maheshwari holds few names in
+      weak breadth (6 of 15 on 2026-10-23) -- know it, don't tune it (new version if changed).
 
 ---
 

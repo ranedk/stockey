@@ -422,6 +422,22 @@ func parseSignal(name string) (signalFn, error) {
 		return windowReturn(12*month, 0), nil
 	case "mom12_1":
 		return windowReturn(12*month, month), nil
+	case "cm-composite":
+		// Capitalmind's published shape (LEDGER 83): returns over several lookbacks, each
+		// divided by its own volatility, averaged -- a steady riser beats a jumpy one with
+		// the same return. Their weights are private; 3/6/12 months equally is ours.
+		return volAdjustedComposite(3*month, 6*month, 12*month), nil
+	case "wi-rs":
+		// WeekendInvesting's ranking is unpublished; the report's stated approximation is
+		// the average of the 6- and 12-month returns (LEDGER 83).
+		return func(ser bars.Series, closes core.Series, vol core.Series) []float64 {
+			a := windowReturn(6*month, 0)(ser, closes, vol)
+			b := windowReturn(12*month, 0)(ser, closes, vol)
+			for i := range a {
+				a[i] = (a[i] + b[i]) / 2
+			}
+			return a
+		}, nil
 	case "vol1", "vol3", "vol6", "vol12", "beta12", "idio12":
 		return func(ser bars.Series, _ core.Series, _ core.Series) []float64 {
 			s, err := traits.LowRiskScore(name, ser.Bars, marketForBeta)
@@ -551,6 +567,62 @@ func windowReturn(from, to int) signalFn {
 		}
 		return out
 	}
+}
+
+// volAdjustedComposite averages, over the given lookbacks, the trailing return divided by
+// the standard deviation of daily returns over the same window scaled to that window.
+func volAdjustedComposite(windows ...int) signalFn {
+	return func(_ bars.Series, closes core.Series, _ core.Series) []float64 {
+		v := closes.Values
+		out := make([]float64, len(v))
+		for i := range out {
+			out[i] = math.NaN()
+			sum := 0.0
+			ok := true
+			for _, w := range windows {
+				if i-w < 0 || v[i-w] <= 0 {
+					ok = false
+					break
+				}
+				var s, ss float64
+				for k := i - w + 1; k <= i; k++ {
+					r := 0.0
+					if v[k-1] > 0 {
+						r = v[k]/v[k-1] - 1
+					}
+					s += r
+					ss += r * r
+				}
+				mean := s / float64(w)
+				sd := math.Sqrt(math.Max(ss/float64(w)-mean*mean, 0))
+				if sd <= 0 {
+					ok = false
+					break
+				}
+				sum += (v[i]/v[i-w] - 1) / (sd * math.Sqrt(float64(w)))
+			}
+			if ok {
+				out[i] = sum / float64(len(windows))
+			}
+		}
+		return out
+	}
+}
+
+// parabolic marks a bar after which a name has just gone parabolic: up more than 50% in 20
+// sessions, or two or more daily moves of 9.5%+ either way (circuit-like) in the last 10.
+// Capitalmind screens these out; the thresholds are ours (LEDGER 83).
+func parabolic(closes []float64, j int) bool {
+	if j >= 20 && closes[j-20] > 0 && closes[j]/closes[j-20]-1 > 0.5 {
+		return true
+	}
+	big := 0
+	for k := j; k > j-10 && k >= 1; k-- {
+		if closes[k-1] > 0 && math.Abs(closes[k]/closes[k-1]-1) >= 0.095 {
+			big++
+		}
+	}
+	return big >= 2
 }
 
 func ruleSignal(r rules.Rule) signalFn {
@@ -725,6 +797,9 @@ func buildDays(ctx context.Context, st *store.Store, spec paper.Spec, signal, si
 				if ok, _ := fundamentals.Passes(ser.Symbol, times[j]); !ok {
 					o.Excluded = true
 				}
+			}
+			if spec.ParabolicFilter && parabolic(closes, j) {
+				o.Excluded = true
 			}
 			return o
 		}

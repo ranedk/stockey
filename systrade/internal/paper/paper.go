@@ -142,6 +142,26 @@ type Spec struct {
 	// the volatility-normalised trend score ranks cash-like funds at the top, harmless in a
 	// 160-name quintile, a real share of a 20-name book (LEDGER 82).
 	ExcludeFunds bool
+	// The investor-paradigm replicas (LEDGER 83). Zero values = off, so every earlier spec
+	// reproduces unchanged.
+	//
+	// BandLo..BandHi restricts the universe, for every book, to the eligible names ranked
+	// BandLo..BandHi (1-based) by 60-day median traded value -- the stand-in for an index
+	// universe (top 50 ~ Nifty 50, 101-500 ~ MidSmallcap 400): index membership has no
+	// history here, and market caps only from 2024.
+	BandLo, BandHi int
+	// MinForecast, when UseMinForecast is set, is the score a name must beat to be bought
+	// or kept ("absolute momentum"); with FixedSlots the slots nobody fills stay in cash.
+	MinForecast    float64
+	UseMinForecast bool
+	// RequireAboveSMA: the strategy may only hold names closing above their 200-day average.
+	RequireAboveSMA bool
+	// ParabolicFilter: buildDays marks names that just went parabolic (Obs.Excluded) and the
+	// strategy may not hold them -- Capitalmind's entry filter, thresholds ours.
+	ParabolicFilter bool
+	// FixedSlots weights each name 1/N of the book (N = HoldCount) whatever the count
+	// chosen, so a short list leaves cash instead of growing each position.
+	FixedSlots bool
 	// FundamentalFilter also excludes, from the strategy's buying list only, names that fail
 	// stockey's filter on the decision day (FundamentalPass: a flaw, a story score below that
 	// day's median, or no score). Zero value = off.
@@ -500,6 +520,84 @@ func TrendTop20DailySpec() Spec {
 	return s
 }
 
+// The investor-paradigm replicas (LEDGER 83, operator 2026-10-23, from ../twitter_handles.md):
+// OUR rules built from what each manager has published, never their portfolios or returns.
+// Where a step is private (score weights, exit bands, thresholds) the value is ours and the
+// spec says so. All start 2026-10-26, exclude funds, and rank their universe by traded value
+// from Rs 1 cr/day upwards (BandLo..BandHi stands in for the index each one names).
+func paradigmBase(name, signal, label string) Spec {
+	s := FrozenSpec()
+	s.Name = name
+	s.Start = time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	s.Signal = signal
+	s.SignalLabel = label
+	s.Doc = "docs/strategies/2026-10-23_investor_paradigms.md"
+	s.MinTurnover = 1e7
+	s.ExcludeFunds = true
+	return s
+}
+
+// CapitalmindMomentumSpec: Capitalmind Adaptive Momentum. Top 500 by traded value; score =
+// 3/6/12-month returns each over its own volatility, averaged; may hold only names with a
+// positive score, above their 200-day average and not just gone parabolic; 30 slots of 1/30,
+// empty ones in cash; at most 5 per industry; monthly; the whole book to cash while the
+// market's equal-weight index is below its 200-day average (their breadth rule; ours).
+func CapitalmindMomentumSpec() Spec {
+	s := paradigmBase("paradigm-capitalmind-momentum", "cm-composite",
+		"Capitalmind-style: 3/6/12-month return over volatility, top 30 of the top 500, cash when few qualify or the market is below trend")
+	s.BandHi = 500
+	s.HoldCount = 30
+	s.RebalanceEvery = 21
+	s.UseMinForecast = true
+	s.RequireAboveSMA = true
+	s.ParabolicFilter = true
+	s.FixedSlots = true
+	s.MaxPerGroup = 5
+	s.Overlay = OverlayRegimeFloor
+	s.MarketWarmup = true
+	return s
+}
+
+// weekendInvestingSpec: WeekendInvesting's rotational books -- the top N of a fixed universe
+// by the average of 6- and 12-month return, checked weekly; a holding is sold only when it
+// falls out of the top 2N (their exit band is private; ours), winners are never trimmed.
+func weekendInvestingSpec(name, label string, lo, hi, n int) Spec {
+	s := paradigmBase(name, "wi-rs", label)
+	s.BandLo, s.BandHi = lo, hi
+	s.HoldCount = n
+	s.RebalanceEvery = 5
+	s.KeepMultiple = 2
+	s.KeepWeights = true
+	return s
+}
+
+// WIMi20Spec: Mi 20 -- the 20 strongest of ranks 101-500 (Nifty MidSmallcap 400 stand-in).
+func WIMi20Spec() Spec {
+	return weekendInvestingSpec("paradigm-wi-mi20", "WeekendInvesting Mi 20-style: top 20 of ranks 101-500, weekly, sold outside the top 40", 101, 500, 20)
+}
+
+// WITop10Spec: Mi India Top 10 -- the 10 strongest of the top 50 (Nifty 50 stand-in).
+func WITop10Spec() Spec {
+	return weekendInvestingSpec("paradigm-wi-top10", "WeekendInvesting Mi India Top 10-style: top 10 of the 50 largest, weekly, sold outside the top 20", 1, 50, 10)
+}
+
+// WINNF10Spec: Mi NNF 10 -- the 10 strongest of ranks 51-100 (Nifty Next 50 stand-in).
+func WINNF10Spec() Spec {
+	return weekendInvestingSpec("paradigm-wi-nnf10", "WeekendInvesting Mi NNF 10-style: top 10 of ranks 51-100, weekly, sold outside the top 20", 51, 100, 10)
+}
+
+// WIMi30Spec: Mi 30, the ABSOLUTE book -- up to 33 names of the top 500, each 1/33, only
+// those with a positive score and above their 200-day average; empty slots in cash; held
+// until outside the top 99 (low churn).
+func WIMi30Spec() Spec {
+	s := weekendInvestingSpec("paradigm-wi-mi30", "WeekendInvesting Mi 30-style: up to 33 of the top 500 with positive momentum above the 200-day average, cash otherwise, weekly", 1, 500, 33)
+	s.KeepMultiple = 3
+	s.UseMinForecast = true
+	s.RequireAboveSMA = true
+	s.FixedSlots = true
+	return s
+}
+
 // Stage2RSLeadersSpec is the configuration frozen on 2026-10-01: the plain Stage 2
 // reference book of LEDGER row 53 -- the 20 liquid Stage 2 names with the highest 6-month
 // return (the same order as RS26: subtracting the market's return changes no rank), at most
@@ -567,7 +665,8 @@ func MomentumQualityCombinationSpec() Spec {
 func Specs() []Spec {
 	return []Spec{FrozenSpec(), SpeedBlendSpec(), MomentumLookbackBlendSpec(), LowVolBlendSpec(),
 		MomentumLowVolCombinationSpec(), SpeedBlendBufferedSpec(), Stage2RSLeadersSpec(), Stage2RSLeadersCleanSpec(),
-		MomentumQualityCombinationSpec(), TrendTop20DailySpec()}
+		MomentumQualityCombinationSpec(), TrendTop20DailySpec(),
+		CapitalmindMomentumSpec(), WIMi20Spec(), WITop10Spec(), WINNF10Spec(), WIMi30Spec()}
 }
 
 // SpecFor finds a registered strategy by name.
@@ -856,7 +955,13 @@ func ComputeWithPrior(spec Spec, prior, days []Day) (*Track, error) {
 					target = keepWeights(drifted, target)
 				}
 			}
-			if name == BookStrategy && !(spec.StoppedSlotsToCash && !rebalance && spec.Overlay == OverlayNone) {
+			if name == BookStrategy && spec.FixedSlots {
+				// Empty slots are cash: scale by the exposure without re-filling them, and only
+				// on the rebalance clock -- between rebalances the book just drifts.
+				if rebalance {
+					target = scaleBy(target, exposure)
+				}
+			} else if name == BookStrategy && !(spec.StoppedSlotsToCash && !rebalance && spec.Overlay == OverlayNone) {
 				target = rescale(target, exposure)
 			}
 			if changed(held, target) {
@@ -1099,6 +1204,19 @@ func equalWeightReturn(d Day) float64 {
 
 // rescale makes the weights sum to `exposure` rather than to 1. The remainder
 // is cash and earns nothing.
+// scaleBy multiplies every weight by the exposure, keeping whatever was in cash in cash.
+func scaleBy(w map[string]float64, exposure float64) map[string]float64 {
+	out := make(map[string]float64, len(w))
+	e := math.Max(0, math.Min(1, exposure))
+	if e == 0 {
+		return out
+	}
+	for k, v := range w {
+		out[k] = v * e
+	}
+	return out
+}
+
 func rescale(w map[string]float64, exposure float64) map[string]float64 {
 	var sum float64
 	for _, v := range w {
@@ -1174,6 +1292,7 @@ func selectWeights(book string, spec Spec, d Day, prev []map[string]bool) (map[s
 			eligible = append(eligible, o)
 		}
 	}
+	eligible = band(eligible, spec.BandLo, spec.BandHi)
 	if len(eligible) < spec.Quantile {
 		return map[string]float64{}, nil
 	}
@@ -1217,6 +1336,7 @@ func selectWeights(book string, spec Spec, d Day, prev []map[string]bool) (map[s
 			tops := variantTopsBuffered(eligible, spec, prev)
 			return weightsFromTops(tops, spec), membersOf(tops)
 		default:
+			eligible = holdable(eligible, spec)
 			if spec.Stage2Only || spec.FundamentalFilter {
 				// deterministic tie-break here only: the frozen tracks keep their original sort
 				eligible = rankable(eligible)
@@ -1242,10 +1362,60 @@ func selectWeights(book string, spec Spec, d Day, prev []map[string]bool) (map[s
 		chosen = pickTop(eligible, n, spec.KeepMultiple, held)
 	}
 	out := make(map[string]float64, len(chosen))
+	slots := len(chosen)
+	if spec.FixedSlots && book != BookEqual {
+		slots = n
+	}
 	for _, sym := range chosen {
-		out[sym] = 1 / float64(len(chosen))
+		out[sym] = 1 / float64(slots)
 	}
 	return out, membersOf([][]string{chosen})
+}
+
+// band keeps the names ranked lo..hi (1-based) by traded value; lo = hi = 0 keeps all.
+func band(obs []Obs, lo, hi int) []Obs {
+	if hi <= 0 {
+		return obs
+	}
+	byValue := append([]Obs(nil), obs...)
+	sort.Slice(byValue, func(i, j int) bool {
+		if byValue[i].Turnover != byValue[j].Turnover {
+			return byValue[i].Turnover > byValue[j].Turnover
+		}
+		return byValue[i].Symbol < byValue[j].Symbol
+	})
+	if lo < 1 {
+		lo = 1
+	}
+	if hi > len(byValue) {
+		hi = len(byValue)
+	}
+	if lo > hi {
+		return nil
+	}
+	return byValue[lo-1 : hi]
+}
+
+// holdable drops the names the strategy book may not hold under the paradigm rules
+// (absolute score floor, 200-day average, parabolic filter); the benchmarks never call it.
+func holdable(obs []Obs, spec Spec) []Obs {
+	if !spec.UseMinForecast && !spec.RequireAboveSMA && !spec.ParabolicFilter {
+		return obs
+	}
+	out := make([]Obs, 0, len(obs))
+	for _, o := range obs {
+		if spec.UseMinForecast && !(o.Forecast > spec.MinForecast) {
+			continue
+		}
+		if spec.RequireAboveSMA && !o.AboveSMA {
+			continue
+		}
+		if spec.ParabolicFilter && o.Excluded {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
 }
 
 // pickTop takes the first n names of an already-ranked list, applying the rank

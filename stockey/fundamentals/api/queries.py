@@ -1006,3 +1006,11 @@ def get_paper_books() -> dict:
         })
     return {"books": books, "as_of": str(nav["as_of"].max()) if len(nav) else None,
             "since": str(nav["as_of"].min()) if len(nav) else None}
+
+
+def get_paradigm_tracks() -> list[dict]:
+    """The five frozen paradigm forward tracks (fundamentals/screens/forward_tracks.py): spec with
+    paradigm + approximations, latest holdings with return since entry, return since the start
+    against the equal-weight universe. Read-only; computed fresh on each call."""
+    from fundamentals.screens.forward_tracks import PARADIGM_TRACKS, track_summary
+    return [track_summary(t) for t in PARADIGM_TRACKS]

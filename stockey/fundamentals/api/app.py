@@ -143,6 +143,13 @@ def paper_books() -> dict:
     return queries.get_paper_books()
 
 
+@app.get("/api/paradigms/tracks")
+def paradigm_tracks() -> list[dict]:
+    """The five fundamental paradigm forward tracks (marcellus, sageone, maheshwari, kedia,
+    whiteoak) for screener's /paradigms page; the momentum paradigms live in systrader."""
+    return queries.get_paradigm_tracks()
+
+
 @app.get("/api/portfolio/scoring")
 def portfolio_scoring() -> dict:
     return queries.get_portfolio_scoring()

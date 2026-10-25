@@ -84,11 +84,35 @@ type SpecView struct {
 }
 
 func specView(s paper.Spec) SpecView {
+	universe := fmt.Sprintf("NSE cash equity, 60-bar median turnover at or above Rs %.0f crore", s.MinTurnover/1e7)
+	if s.BandHi > 0 {
+		universe += fmt.Sprintf("; ranks %d-%d by traded value", max(s.BandLo, 1), s.BandHi)
+	}
+	if s.ExcludeFunds {
+		universe += "; ETFs, fund units, REITs and InvITs left out"
+	}
+	selection := fmt.Sprintf("top %dth of the eligible universe by forecast", s.Quantile)
+	if s.HoldCount > 0 {
+		selection = fmt.Sprintf("top %d names by forecast", s.HoldCount)
+	}
+	if s.KeepMultiple > 1 {
+		selection += fmt.Sprintf(", a held name kept until it falls outside the top %d", s.KeepMultiple*max(s.HoldCount, 1))
+		if s.HoldCount == 0 {
+			selection = fmt.Sprintf("top %dth by forecast, a held name kept while inside the top %d %dths", s.Quantile, s.KeepMultiple, s.Quantile)
+		}
+	}
+	weighting := "equal weight across the held names, fully invested, no leverage or shorting"
+	if s.FixedSlots {
+		weighting = fmt.Sprintf("1/%d of the book per name; slots nobody qualifies for stay in cash", s.HoldCount)
+	}
+	if s.KeepWeights {
+		weighting += "; held names keep the weight they drift to, only names that change are traded"
+	}
 	return SpecView{
-		Universe:  fmt.Sprintf("NSE cash equity, 60-bar median turnover at or above Rs %.0f crore", s.MinTurnover/1e7),
+		Universe:  universe,
 		Signal:    s.SignalLabel,
-		Selection: fmt.Sprintf("top %dth of the eligible universe by forecast", s.Quantile),
-		Weighting: "equal weight across the held names, fully invested, no leverage or shorting",
+		Selection: selection,
+		Weighting: weighting,
 		Rebalance: fmt.Sprintf("every %d trading days; hold in between", s.RebalanceEvery),
 		Execution: "decide at the close, fill at the next open",
 		Costs: fmt.Sprintf("%.0f bps round trip charged on turnover; the Rs %.0f crore account pays Dhan's charges per trade in whole shares",

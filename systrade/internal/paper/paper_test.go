@@ -771,3 +771,51 @@ func TestKeepWeightsTradesOnlyTheNamesThatChange(t *testing.T) {
 		t.Fatalf("only C out and D in should trade, turnover %v", turnoverBetween(held, got))
 	}
 }
+
+func TestBandKeepsTheRanksByTradedValue(t *testing.T) {
+	obs := []Obs{{Symbol: "A", Turnover: 5}, {Symbol: "B", Turnover: 9}, {Symbol: "C", Turnover: 1}, {Symbol: "D", Turnover: 7}}
+	got := band(obs, 2, 3)
+	if len(got) != 2 || got[0].Symbol != "D" || got[1].Symbol != "A" {
+		t.Fatalf("ranks 2-3 by turnover are D, A; got %v", got)
+	}
+	if len(band(obs, 0, 0)) != 4 {
+		t.Fatal("no band keeps everything")
+	}
+}
+
+func TestFixedSlotsLeaveCashWhenFewQualify(t *testing.T) {
+	spec := FrozenSpec()
+	spec.HoldCount, spec.FixedSlots, spec.UseMinForecast = 4, true, true
+	d := Day{Obs: []Obs{
+		{Symbol: "A", Forecast: 2, Eligible: true}, {Symbol: "B", Forecast: 1, Eligible: true},
+		{Symbol: "C", Forecast: -1, Eligible: true}, {Symbol: "D", Forecast: -2, Eligible: true},
+		{Symbol: "E", Forecast: -3, Eligible: true},
+	}}
+	w, _ := selectWeights(BookStrategy, spec, d, nil)
+	if len(w) != 2 || w["A"] != 0.25 || w["B"] != 0.25 {
+		t.Fatalf("only the two positive scores, a quarter each, half in cash; got %v", w)
+	}
+}
+
+func TestFixedSlotsCashSurvivesTheDailyLoop(t *testing.T) {
+	spec := FrozenSpec()
+	spec.HoldCount, spec.FixedSlots, spec.UseMinForecast, spec.RebalanceEvery = 4, true, true, 1
+	day := Day{Date: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), Obs: []Obs{
+		{Symbol: "A", Forecast: 2, Eligible: true, PrevClose: 100, Open: 100, Close: 100},
+		{Symbol: "B", Forecast: 1, Eligible: true, PrevClose: 100, Open: 100, Close: 100},
+		{Symbol: "C", Forecast: -1, Eligible: true, PrevClose: 100, Open: 100, Close: 100},
+		{Symbol: "D", Forecast: -2, Eligible: true, PrevClose: 100, Open: 100, Close: 100},
+		{Symbol: "E", Forecast: -3, Eligible: true, PrevClose: 100, Open: 100, Close: 100},
+	}}
+	tr, err := Compute(spec, []Day{day})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := 0.0
+	for _, w := range tr.Books[BookStrategy].Holdings {
+		sum += w
+	}
+	if math.Abs(sum-0.5) > 1e-9 {
+		t.Fatalf("two of four slots filled must leave half in cash, invested %v", sum)
+	}
+}
