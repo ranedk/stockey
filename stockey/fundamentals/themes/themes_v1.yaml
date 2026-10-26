@@ -1,0 +1,306 @@
+# Theme map v1 (docs/THEMATIC_WATCHLIST_PRD.md section 4.1). Frozen once tagging starts:
+# a change is a new file (themes_v2.yaml) with the date and reason, never an edit here.
+#
+# Per theme:
+#   definition      what a company must make, build or sell to count -- the tagger's test
+#   include         keyword seeds for finding candidates (products, not company names)
+#   exclude         look-alikes that do NOT count
+#   layer           upstream | midstream | end_product | service
+#   min_exposure    share of revenue (%) to be a member; 10 for young themes with few pure plays
+#   capacity        public sources for capacity being built (besides company disclosures)
+#   policy          government support to track (the LLM keeps the dated policy table from these)
+version: 1
+frozen_on: null          # set when the first tagging run starts
+reviewed_by_operator: 2026-10-26   # "keep all these themes"
+
+themes:
+  # ---------------------------------------------------------------- energy transition
+  - id: solar_cells
+    name: Solar wafers and cells
+    area: energy_transition
+    layer: upstream
+    definition: Makes silicon ingots, wafers or solar cells (PV cells), or polysilicon for them.
+    include: [solar cell, PV cell, TOPCon, PERC cell, ingot, wafer, polysilicon, cell line]
+    exclude: [module assembly only, solar EPC, inverter trading]
+    min_exposure: 10
+    capacity: [MNRE ALMM List-II (cells), MNRE ALMM List-III draft (wafers), company GW disclosures]
+    policy: [ALMM List-II mandate from 2026-06-01, PLI high-efficiency solar modules (tranche II), basic customs duty on cells]
+
+  - id: solar_modules
+    name: Solar modules
+    area: energy_transition
+    layer: midstream
+    definition: Assembles solar PV modules (panels) for sale.
+    include: [solar module, PV module, solar panel, bifacial module, module line]
+    exclude: [cells only, EPC that buys modules, rooftop installers without a module plant]
+    min_exposure: 20
+    capacity: [MNRE ALMM List-I (modules), company GW disclosures]
+    policy: [ALMM List-I, PLI high-efficiency solar modules, basic customs duty on modules, PM Surya Ghar rooftop scheme]
+
+  - id: solar_epc_ipp
+    name: Solar EPC and power producers
+    area: energy_transition
+    layer: service
+    definition: Builds solar (or solar-hybrid) plants for others (EPC), or owns and sells power from them (IPP), incl. rooftop.
+    include: [solar EPC, solar park, renewable IPP, hybrid power project, rooftop solar installation, PPA with SECI]
+    exclude: [module or cell sales, conventional thermal power]
+    min_exposure: 20
+    capacity: [MNRE installed renewable capacity (monthly), SECI / NTPC / NHPC tender awards, CEA reports]
+    policy: [500 GW non-fossil target by 2030, PM Surya Ghar, PM-KUSUM, ISTS waiver]
+
+  - id: wind_components
+    name: Wind turbines and components
+    area: energy_transition
+    layer: end_product
+    definition: Makes wind turbines or their parts (blades, towers, gearboxes, castings, bearings), or builds wind farms.
+    include: [wind turbine, WTG, blade, nacelle, tower, gearbox for wind, wind farm EPC, repowering]
+    exclude: [general castings with no wind customers]
+    min_exposure: 20
+    capacity: [MNRE installed wind capacity, MNRE RLMM list (wind models and makers), company order books]
+    policy: [National repowering policy, offshore wind VGF, hybrid tenders]
+
+  - id: battery_storage
+    name: Battery cells and energy storage
+    area: energy_transition
+    layer: upstream
+    definition: Makes lithium-ion (or other advanced chemistry) cells, battery packs, cathode/anode materials, or builds grid battery storage (BESS).
+    include: [ACC cell, lithium-ion cell, battery pack, BESS, cathode active material, anode, energy storage system, gigafactory]
+    exclude: [lead-acid automotive batteries only, battery trading]
+    min_exposure: 10
+    capacity: [PLI ACC beneficiaries (MHI), CEA / SECI BESS tenders, company GWh disclosures]
+    policy: [PLI advanced chemistry cell, VGF for BESS, energy storage obligation]
+
+  - id: pumped_storage_hydro
+    name: Pumped storage and hydro
+    area: energy_transition
+    layer: service
+    definition: Builds, owns or supplies equipment for hydro and pumped-storage plants (civil works, tunnels, turbines, generators).
+    include: [pumped storage, PSP, hydro project, hydroelectric, tunnelling for hydro, hydro turbine]
+    exclude: [general roads/infra contractors with no hydro orders]
+    min_exposure: 10
+    capacity: [CEA hydro and PSP status reports, company order books]
+    policy: [MoP pumped storage guidelines 2023, hydro purchase obligation, budget support for enabling infrastructure]
+
+  - id: green_hydrogen
+    name: Green hydrogen and electrolysers
+    area: energy_transition
+    layer: upstream
+    definition: Makes electrolysers or produces green hydrogen / green ammonia / derivatives for sale.
+    include: [electrolyser, green hydrogen, green ammonia, green methanol, SIGHT scheme]
+    exclude: [grey hydrogen in refining, industrial gases with no green capacity]
+    min_exposure: 10
+    capacity: [SECI SIGHT electrolyser and hydrogen awards, company MW / KTPA disclosures]
+    policy: [National Green Hydrogen Mission, SIGHT incentives, green hydrogen hubs]
+
+  - id: power_grid_equipment
+    name: Power grid equipment
+    area: energy_transition
+    layer: end_product
+    definition: Makes or installs transmission and distribution equipment -- transformers, switchgear, cables, conductors, towers, smart meters, HVDC -- or builds transmission lines.
+    include: [transformer, power transformer, switchgear, conductor, HT cable, EHV cable, transmission tower, transmission EPC, HVDC, smart meter, substation]
+    exclude: [housing wires only, consumer electricals]
+    min_exposure: 20
+    capacity: [CEA National Electricity Plan (transmission), PGCIL / ISTS tender awards, RDSS smart meter awards, company order books]
+    policy: [National Electricity Plan transmission capex, RDSS, green energy corridor]
+
+  # ---------------------------------------------------------------- digital infrastructure
+  - id: data_centres
+    name: Data centres (owners and builders)
+    area: digital_infrastructure
+    layer: service
+    definition: Owns, operates, develops or builds data centres (colocation, hyperscale campuses, edge), measured in MW.
+    include: [data centre, data center, colocation, hyperscale, IT load MW, DC campus]
+    exclude: [IT services firms with no owned DC capacity, cloud resellers]
+    min_exposure: 10
+    capacity: [company MW disclosures, state data-centre policy approvals]
+    policy: [MeitY data-centre policy, state DC policies (Maharashtra, Tamil Nadu, UP, Telangana), infrastructure status for DCs]
+
+  - id: dc_equipment
+    name: Data-centre equipment
+    area: digital_infrastructure
+    layer: end_product
+    definition: Supplies equipment sold largely into data centres -- cooling (precision/liquid), UPS and power backup, gensets, busways, racks, DC electrical EPC.
+    include: [precision cooling, liquid cooling, UPS, data centre cooling, genset for data centres, busway, rack, DC electrical EPC]
+    exclude: [generic HVAC for homes, generic cables]
+    min_exposure: 10
+    capacity: [company order books and DC revenue disclosures]
+    policy: [same as data_centres]
+
+  - id: telecom_equipment
+    name: Telecom equipment
+    area: digital_infrastructure
+    layer: end_product
+    definition: Makes telecom network equipment or its parts -- 4G/5G radios, routers, optical fibre and cable, towers equipment.
+    include: [5G radio, telecom equipment, optical fibre, optical fibre cable, router, network equipment, BharatNet]
+    exclude: [telecom operators, handset retail]
+    min_exposure: 20
+    capacity: [company capacity (fkm, units), PLI telecom beneficiaries]
+    policy: [PLI telecom and networking, BharatNet, trusted-source rules]
+
+  - id: ems
+    name: Electronics manufacturing (EMS / ODM / components)
+    area: digital_infrastructure
+    layer: midstream
+    definition: Manufactures electronics for others (EMS/ODM -- phones, consumer electronics, industrial boards) or electronic components (PCBs, display modules, passives).
+    include: [EMS, electronics manufacturing services, ODM, PCB, PCBA, box build, display module, electronic components, mobile phone manufacturing]
+    exclude: [electronics retail, own-brand trading with no factory]
+    min_exposure: 20
+    capacity: [PLI LSEM / IT hardware beneficiaries, ECMS approvals, company capacity disclosures]
+    policy: [PLI large-scale electronics, PLI IT hardware 2.0, Electronics Component Manufacturing Scheme 2025]
+
+  - id: semiconductors
+    name: Chips (packaging and design)
+    area: digital_infrastructure
+    layer: upstream
+    definition: Designs chips, runs chip packaging/testing (OSAT/ATMP) or a fab, or supplies semiconductor-specific materials or equipment.
+    include: [semiconductor, OSAT, ATMP, chip design, fabless, fab, wafer fab, VLSI, semiconductor equipment]
+    exclude: [electronics distributors, PCB assembly (that is ems)]
+    min_exposure: 10
+    capacity: [India Semiconductor Mission approved projects, DLI scheme beneficiaries]
+    policy: [India Semiconductor Mission, DLI scheme, state semiconductor policies]
+
+  # ---------------------------------------------------------------- make in India / state capex
+  - id: defence_platforms
+    name: Defence platforms
+    area: make_in_india
+    layer: end_product
+    definition: Makes defence platforms or their major systems -- aircraft, helicopters, missiles, armoured vehicles, artillery, ammunition, explosives.
+    include: [defence, missile, aircraft, helicopter, ammunition, explosives, artillery, armoured vehicle, MoD order]
+    exclude: [defence electronics (separate theme), shipbuilding (separate theme)]
+    min_exposure: 20
+    capacity: [DAC AoN approvals, MoD capital outlay (budget), company order books]
+    policy: [DAP 2020, positive indigenisation lists, defence capital budget, defence export target]
+
+  - id: defence_electronics
+    name: Defence electronics
+    area: make_in_india
+    layer: end_product
+    definition: Makes defence electronics -- radars, electronic warfare, avionics, communication, night vision, sensors, simulators.
+    include: [radar, electronic warfare, avionics, defence electronics, night vision, sonar, simulator, iDEX]
+    exclude: [civil electronics only]
+    min_exposure: 10
+    capacity: [DAC AoN approvals, company order books]
+    policy: [DAP 2020, positive indigenisation lists, iDEX]
+
+  - id: railways
+    name: Railways
+    area: make_in_india
+    layer: end_product
+    definition: Makes rolling stock or its parts (coaches, wagons, locomotives, wheels, brakes), railway signalling (incl. Kavach), or builds railway/metro track and electrification.
+    include: [wagon, coach, Vande Bharat, locomotive, rolling stock, signalling, Kavach, railway electrification, metro rail, track]
+    exclude: [general road EPC]
+    min_exposure: 20
+    capacity: [Railway budget capex, Indian Railways and metro tender awards, company order books]
+    policy: [Railway capital budget, Kavach rollout, Vande Bharat programme, dedicated freight corridors]
+
+  - id: shipbuilding
+    name: Shipbuilding
+    area: make_in_india
+    layer: end_product
+    definition: Builds or repairs ships, submarines or vessels, or makes marine equipment for them.
+    include: [shipbuilding, shipyard, ship repair, vessel, submarine, warship, marine engine]
+    exclude: [shipping lines (operators), ports]
+    min_exposure: 20
+    capacity: [company order books, dry dock capacity disclosures]
+    policy: [Shipbuilding Financial Assistance Policy, Maritime Development Fund, Maritime India Vision 2030]
+
+  - id: drones
+    name: Drones
+    area: make_in_india
+    layer: end_product
+    definition: Makes drones (UAVs) or their key parts (flight controllers, motors, payloads), or sells drone services.
+    include: [drone, UAV, unmanned aerial, counter-drone, loitering munition]
+    exclude: []
+    min_exposure: 10
+    capacity: [PLI drones beneficiaries, company order books]
+    policy: [PLI drones and drone components, Drone Rules 2021, Drone Shakti]
+
+  - id: water_infra
+    name: Water infrastructure
+    area: make_in_india
+    layer: service
+    definition: Builds water supply, treatment, desalination or sewage projects, or makes pipes, pumps and valves sold largely into them.
+    include: [water treatment, desalination, sewage treatment, STP, water supply project, Jal Jeevan, DI pipe, irrigation project]
+    exclude: [bottled water, plumbing retail only]
+    min_exposure: 20
+    capacity: [Jal Jeevan Mission dashboard, AMRUT 2.0, company order books]
+    policy: [Jal Jeevan Mission, AMRUT 2.0, Namami Gange]
+
+  # ---------------------------------------------------------------- consumption shifts
+  - id: quick_commerce_logistics
+    name: Quick commerce and logistics
+    area: consumption_shifts
+    layer: service
+    definition: Runs quick commerce / e-commerce, or provides the logistics behind it -- express delivery, warehousing, 3PL, cold chain.
+    include: [quick commerce, dark store, e-commerce, express logistics, warehousing, 3PL, last-mile delivery, cold chain]
+    exclude: [bulk freight, shipping lines]
+    min_exposure: 20
+    capacity: [company dark-store / warehouse sq ft disclosures]
+    policy: [National Logistics Policy, PM Gati Shakti, warehousing development]
+
+  - id: travel_hotels
+    name: Travel and hotels
+    area: consumption_shifts
+    layer: service
+    definition: Owns or runs hotels, airlines, airports, travel services or leisure destinations.
+    include: [hotel, rooms, airline, airport, travel, tourism, resort, hospitality]
+    exclude: [restaurants only (QSR)]
+    min_exposure: 20
+    capacity: [company room / fleet pipelines, AAI airport capacity, UDAN]
+    policy: [UDAN, airport privatisation, tourism promotion schemes, infrastructure status for hotels]
+
+  - id: organised_jewellery
+    name: Organised jewellery
+    area: consumption_shifts
+    layer: end_product
+    definition: Retails or makes branded jewellery (gold, diamond, lab-grown diamond) through organised stores or online.
+    include: [jewellery, jewelry, gold jewellery, diamond jewellery, lab-grown diamond, jewellery showroom]
+    exclude: [bullion trading, gold loans]
+    min_exposure: 20
+    capacity: [company store counts and sq ft]
+    policy: [BIS mandatory hallmarking, gold import duty changes]
+
+  - id: premium_alcohol
+    name: Premium alcohol
+    area: consumption_shifts
+    layer: end_product
+    definition: Makes or sells alcoholic beverages, with a growing share of premium brands (whisky, single malt, wine, beer).
+    include: [spirits, whisky, single malt, IMFL, brewery, beer, wine, premiumisation]
+    exclude: [ethanol for fuel blending only, industrial alcohol]
+    min_exposure: 20
+    capacity: [company distillation / bottling capacity]
+    policy: [state excise policy changes, India-UK FTA duty cuts]
+
+  # ---------------------------------------------------------------- health / industrials
+  - id: cdmo
+    name: Contract drug making (CDMO / CRAMS)
+    area: health_industrials
+    layer: service
+    definition: Develops or manufactures drugs, intermediates or biologics on contract for other pharma companies (CDMO/CRAMS/CRO).
+    include: [CDMO, CRAMS, contract manufacturing, CRO, custom synthesis, biologics manufacturing, peptide]
+    exclude: [own-brand generics only]
+    min_exposure: 20
+    capacity: [company reactor KL / capacity disclosures, USFDA facility approvals]
+    policy: [PLI pharma, bulk drug parks, US BIOSECURE Act (external demand)]
+
+  - id: medical_devices
+    name: Medical devices
+    area: health_industrials
+    layer: end_product
+    definition: Makes medical devices, implants, diagnostics equipment or consumables.
+    include: [medical device, implant, stent, diagnostic equipment, catheter, syringe, imaging equipment, IVD]
+    exclude: [hospitals, diagnostic labs (services), pharma distributors]
+    min_exposure: 20
+    capacity: [PLI medical devices beneficiaries, medical device parks]
+    policy: [PLI medical devices, medical device parks, National Medical Devices Policy 2023]
+
+  - id: specialty_chem_export
+    name: Specialty chemicals for export
+    area: health_industrials
+    layer: midstream
+    definition: Makes specialty chemicals (agrochem intermediates, fluorochemicals, pharma intermediates, performance chemicals) with a large export share.
+    include: [specialty chemicals, fluorochemicals, agrochemical intermediates, custom synthesis, performance chemicals, China plus one]
+    exclude: [commodity chemicals (caustic soda, soda ash), fertilisers]
+    min_exposure: 20
+    capacity: [company capex and capacity disclosures]
+    policy: [DGTR anti-dumping duties, PLI (where applicable), China+1 export demand]

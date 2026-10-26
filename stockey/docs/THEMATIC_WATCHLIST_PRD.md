@@ -138,6 +138,15 @@ public source for at least one of capacity or policy.
    new quarterly result, annual report or investor presentation. A company can enter a theme
    as its business shifts; the history is kept.
 
+**Evidence on hand (checked 2026-10-26).** No stored business descriptions or segment tables
+yet. What exists: OCR'd quarterly results PDFs for 1,321 companies (multi-segment companies
+print a segment revenue table in them) and OCR'd credit-rating rationales for 555 (these
+describe the business and often its revenue mix). Missing, to collect in step 2: a short
+business description per listed company (screener.in "About" / "Key points", already behind
+our login), and for theme candidates only (~1,000 companies) the latest annual report's
+segment note or investor presentation from the BSE/NSE filings. The LLM's own knowledge may
+nominate candidates but never sets an exposure.
+
 ### 4.3 Theme strength (four parts, each a rank across themes)
 
 | Part | Measure | Our data | New data needed |
