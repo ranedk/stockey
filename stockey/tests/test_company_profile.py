@@ -39,3 +39,16 @@ def test_commentary_keeps_the_segment_shares_and_drops_footnotes_and_boilerplate
 def test_a_full_page_in_place_of_the_commentary_is_a_failure_not_text():
     with pytest.raises(ValueError):
         cp.parse_commentary(PAGE)
+
+
+def test_slug_candidates_quote_the_symbol_and_fall_back_to_the_bse_code():
+    from fundamentals.collectors.company_profile import slug_candidates
+    assert slug_candidates("GET&D", "522275") == ["GET%26D", "522275"]
+    assert slug_candidates("544467-BOM", "544467") == ["544467"]
+    assert slug_candidates("TCS", None) == ["TCS"]
+
+
+def test_name_key_ignores_ltd_and_punctuation():
+    from fundamentals.collectors.company_profile import _name_key
+    assert _name_key("Eternal Ltd.") == _name_key("Eternal Ltd") == "eternal"
+    assert _name_key("GE Vernova T&D India Ltd.") == "gevernovatdindia"

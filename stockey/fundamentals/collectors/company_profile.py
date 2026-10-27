@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 import time
+from urllib.parse import quote
 from datetime import date, datetime, timezone
 
 import pandas as pd
@@ -61,6 +62,7 @@ _DDL = f"""
         peers_path TEXT,
         documents JSONB,
         error TEXT,
+        screener_slug TEXT,
         load_ts TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (company_master_id, fetched_on)
     )
@@ -73,6 +75,7 @@ def ensure_table() -> None:
     def _op() -> None:
         with db_session() as (_, cur):
             cur.execute(_DDL)
+            cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS screener_slug TEXT")
 
     execute_db_operation(_op, operation_name=f"{TABLE}:ensure_table")
 
@@ -156,10 +159,11 @@ def load_universe(as_of: date) -> pd.DataFrame:
             SELECT company_master_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY tv) AS median_tv
               FROM d GROUP BY 1
         )
-        SELECT m.company_master_id, m.median_tv,
+        SELECT m.company_master_id, m.median_tv, c.company_name, c.bse_scrip_code::text AS bse_code,
                coalesce(nullif(c.nse_ticker, ''), c.bse_scrip_code::text) AS ticker
           FROM m JOIN company_master c USING (company_master_id)
          WHERE m.median_tv >= %(floor)s
+           AND c.company_name !~* '(\\metf|\\mtrust)$'
            AND coalesce(nullif(c.nse_ticker, ''), c.bse_scrip_code::text) IS NOT NULL
          ORDER BY m.median_tv DESC
         """,
@@ -176,20 +180,59 @@ def due(universe: pd.DataFrame, as_of: date) -> pd.DataFrame:
     return universe[~universe["company_master_id"].isin(set(done["company_master_id"]))]
 
 
-def fetch_profile(session, ticker: str) -> dict:
+def _name_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"\b(ltd|limited)\b\.?", "", name.lower()))
+
+
+def slug_candidates(ticker: str, bse_code: str | None) -> list[str]:
+    """screener.in page names to try, in order: the NSE symbol (URL-quoted: GET&D), then the
+    BSE code -- our NSE symbol goes stale when a company renames (ZOMATO -> ETERNAL), and
+    BSE-only names carry a '-BOM' pseudo-symbol screener does not know."""
+    out = []
+    if ticker and not ticker.endswith("-BOM"):
+        out.append(quote(ticker, safe=""))
+    if bse_code:
+        out.append(str(bse_code))
+    return list(dict.fromkeys(out))
+
+
+def search_slug(session, company_name: str) -> str | None:
+    """The page of the search hit whose name matches ours exactly (ignoring 'Ltd' and
+    punctuation); a near miss is not taken."""
     with exchange_request_gate(domain="screenerin"):
-        r = session.get(f"{BASE}/company/{ticker}/", timeout=60)
-    if r.status_code == 404:
+        r = session.get(f"{BASE}/api/company/search/", params={"q": company_name, "v": 3}, timeout=60)
+    r.raise_for_status()
+    want = _name_key(company_name)
+    for hit in r.json():
+        m = re.match(r"/company/([^/]+)/", hit.get("url") or "")
+        if m and _name_key(hit.get("name") or "") == want:
+            return m.group(1)
+    return None
+
+
+def fetch_profile(session, ticker: str, bse_code: str | None = None, company_name: str | None = None) -> dict:
+    r, slug = None, None
+    for slug in slug_candidates(ticker, bse_code):
+        with exchange_request_gate(domain="screenerin"):
+            r = session.get(f"{BASE}/company/{slug}/", timeout=60)
+        if r.status_code != 404:
+            break
+    if (r is None or r.status_code == 404) and company_name:
+        slug = search_slug(session, company_name)
+        if slug:
+            with exchange_request_gate(domain="screenerin"):
+                r = session.get(f"{BASE}/company/{slug}/", timeout=60)
+    if r is None or r.status_code == 404:
         return {"status": "not_found"}
     r.raise_for_status()
     out = parse_company_page(r.text)
-    out["status"] = "ok"
+    out["status"], out["screener_slug"] = "ok", slug
     if out["screener_company_id"]:
         with exchange_request_gate(domain="screenerin"):
             c = session.get(
                 f"{BASE}/wiki/company/{out['screener_company_id']}/commentary/v2/", timeout=60,
                 headers={"X-Requested-With": "XMLHttpRequest", "HX-Request": "true",
-                         "Referer": f"{BASE}/company/{ticker}/"},
+                         "Referer": f"{BASE}/company/{slug}/"},
             )
         c.raise_for_status()
         out["key_points"], out["key_points_edited"], sources = parse_commentary(c.text)
@@ -215,9 +258,10 @@ def run(limit: int | None = None, as_of: date | None = None) -> dict:
         _wait_out_pipeline_window()
         base = {"company_master_id": row.company_master_id, "fetched_on": as_of, "ticker": row.ticker,
                 "screener_company_id": None, "about": None, "key_points": None,
-                "key_points_edited": None, "peers_path": None, "documents": None, "error": None}
+                "key_points_edited": None, "peers_path": None, "documents": None, "error": None,
+                "screener_slug": None}
         try:
-            got = fetch_profile(session, row.ticker)
+            got = fetch_profile(session, row.ticker, row.bse_code, row.company_name)
         except Exception as exc:  # one company failing must not stop the backfill
             got = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:500]}
             record_local_fallback_event(
