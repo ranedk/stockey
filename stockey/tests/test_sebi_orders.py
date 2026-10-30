@@ -28,3 +28,13 @@ def test_order_kinds_read_off_the_title():
     assert so.order_kind("Exemption Order in the matter of Allcargo Logistics Limited") == "exemption"
     assert so.order_kind("Final Order in the matter of X Ltd") == "final"
     assert so.order_kind("Recovery of dues from Y") == "other"
+
+
+def test_parties_are_the_in_respect_of_block_or_the_opening():
+    from fundamentals.collectors.sebi_orders import parties_of
+    titan = ("BEFORE THE ADJUDICATING OFFICER\nIn respect of:\n Noticee No. Name of the Noticee PAN\n 1  A Rathinappan  ADLPR8177K\n"
+             "(hereinafter collectively referred to as 'Noticees')\n\nIn the matter of Titan Company Limited\nFACTS")
+    assert parties_of(titan).startswith("Noticee No. Name of the Noticee PAN 1 A Rathinappan")
+    plain = "WHOLE TIME MEMBER ORDER under section 11 against XYZ Ltd in the matter of XYZ Ltd ..."
+    assert "against XYZ Ltd" in parties_of(plain)
+    assert parties_of("a scanned page with nothing useful") is None

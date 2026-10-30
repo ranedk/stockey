@@ -36,6 +36,7 @@ const (
 	BaseLookbackWeeks   = 26 // a breakout is a close above the prior 26-week high
 	BreakoutSearchWeeks = 13 // how far before the confirmed Stage 2 to look for it
 	HighWeeks           = 52
+	RetGapWeeks         = 2 // nearest close for a stock's RS when the exact week has none
 )
 
 // ThemeMember is one stock in one theme, as stockey's map gives it.
@@ -118,6 +119,23 @@ func breakoutLevel(c []float64, start int) float64 {
 	return maxClose(c, start-BaseLookbackWeeks, start-1)
 }
 
+// retNear is Ret for one stock's closes, taking the nearest close within RetGapWeeks of the
+// start week when that week has none (a suspension, or a week traded only in another series):
+// one missing bar must not leave a staged stock without relative strength.
+func retNear(c []float64, i, w int) float64 {
+	if i >= len(c) || math.IsNaN(c[i]) || c[i] <= 0 {
+		return math.NaN()
+	}
+	for d := 0; d <= RetGapWeeks; d++ {
+		for _, k := range []int{i - w - d, i - w + d} {
+			if k >= 0 && k < i && !math.IsNaN(c[k]) && c[k] > 0 {
+				return c[i]/c[k] - 1
+			}
+		}
+	}
+	return math.NaN()
+}
+
 func tierOf(cls stage.Classification, weeks int) int {
 	switch cls.Stage {
 	case stage.Stage2Advancing:
@@ -138,7 +156,7 @@ func BuildThemes(p *Panel, market Index, themes map[string][]ThemeMember, i int)
 	snap := ThemeSnapshot{AsOf: p.Weeks[i].Format("2006-01-02"), Missing: []string{}}
 	stocks := map[string]*ThemeStockView{}
 	cls := map[string][]stage.Classification{}
-	var rsKeys []string
+	var rsKeys, staged []string
 	ids := make([]string, 0, len(themes))
 	for id := range themes {
 		ids = append(ids, id)
@@ -172,7 +190,7 @@ func BuildThemes(p *Panel, market Index, themes map[string][]ThemeMember, i int)
 				continue
 			}
 			sv.WeeksInStage = weeksInSameStage(c, i)
-			sv.RS26Pct = pct(Ret(s.Close, i, RSWeeks) - Ret(market.Level, i, RSWeeks))
+			sv.RS26Pct = pct(retNear(s.Close, i, RSWeeks) - Ret(market.Level, i, RSWeeks))
 			sv.VolumeRatio = ptr(cur.VolumeRatio)
 			if cur.MA30 > 0 {
 				sv.AboveMA30Pct = pct(cur.Close/cur.MA30 - 1)
@@ -192,10 +210,16 @@ func BuildThemes(p *Panel, market Index, themes map[string][]ThemeMember, i int)
 				sv.FromBreakoutPct = pct(s.Close[i]/base - 1)
 			}
 			sv.Tier = tierOf(cur, sv.WeeksInStage)
+			staged = append(staged, m.Key)
 			if sv.RS26Pct != nil {
 				rsKeys = append(rsKeys, m.Key)
 			}
 		}
+	}
+	// a staged stock with no RS (too short a history) scores its tier alone
+	for _, k := range staged {
+		score := float64(stocks[k].Tier)
+		stocks[k].TrendScore = &score
 	}
 	// RS percentile among members with an RS (ties share the lower rank)
 	sort.Slice(rsKeys, func(a, b int) bool { return *stocks[rsKeys[a]].RS26Pct < *stocks[rsKeys[b]].RS26Pct })

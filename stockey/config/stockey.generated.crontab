@@ -233,11 +233,12 @@ LOG_DIR=/home/dev/code/trading/stockey/logs/cron
 # 03:30 UTC = 09:00 IST
 30 04 * * 2-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_option_data_daily.lock ./all_option_data_daily.sh >> "$LOG_DIR/option_data_daily.log" 2>&1
 
-# Theme watchlist (docs/THEMATIC_WATCHLIST_PRD.md step 4): SEBI orders, theme members' quarterly
-# results, then theme strength and the late flag. Mon-Sat morning, after the previous evening's
-# screener crawl; ~1-25 min (the member fetch is capped at 60 pages).
-# 03:30 UTC = 09:00 IST
-30 03 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_themes.lock ./all_fundamentals_themes.sh >> "$LOG_DIR/fundamentals_themes.log" 2>&1
+# Theme watchlist (docs/THEMATIC_WATCHLIST_PRD.md steps 4-6): SEBI orders, theme strength and the
+# late flag, the ranked watchlist, its written reasons (Claude CLI: must start inside the
+# 22:00-08:00 IST window), then theme members' quarterly results (capped at 60 pages). Mon-Sat,
+# after the previous evening's screener crawl and systrader's theme snapshot.
+# 00:45 UTC = 06:15 IST
+45 00 * * 1-6 dev cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_fundamentals_themes.lock ./all_fundamentals_themes.sh >> "$LOG_DIR/fundamentals_themes.log" 2>&1
 
 # Fundamentals screener pipeline: L1/L2 refresh, event collectors, OCR + structured
 # extraction, sector capital-cycle, L3 alerts (rule + LLM triage), descriptive

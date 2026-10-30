@@ -123,9 +123,27 @@ def ensure_table() -> None:
 
 # --- members ---------------------------------------------------------------------------------
 
+def _extra_sql() -> dict:
+    """The share finder's results (fundamentals/themes/share_finder.py), used after the annual
+    report and the tag: a share stated in a rating rationale or results filing, and the
+    sole-business check; empty columns before its table exists."""
+    if sql_to_df("SELECT to_regclass('fundamentals_theme_share_extra') AS t")["t"].iloc[0] is None:
+        return {"x_cte": "", "x_cols": "NULL::float AS xs_pct, NULL::float AS xo_pct, NULL::text AS xo_source", "x_join": ""}
+    q = """
+        {name} AS (
+            SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, exposure_pct, source_label
+              FROM fundamentals_theme_share_extra
+             WHERE theme_version = %(v)s AND status = 'quantified' AND method = '{method}' AND checked_at < %(cut)s
+             ORDER BY company_master_id, theme_id, checked_at DESC)"""
+    return {"x_cte": "," + q.format(name="xs", method="sole_business") + "," + q.format(name="xo", method="other_source"),
+            "x_cols": "xs.exposure_pct AS xs_pct, xo.exposure_pct AS xo_pct, xo.source_label AS xo_source",
+            "x_join": " LEFT JOIN xs USING (company_master_id, theme_id) LEFT JOIN xo USING (company_master_id, theme_id)"}
+
+
 def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
     """One row per (company, theme) kept tag known by the end of as_of, with its share and weight."""
     cutoff = pd.Timestamp(as_of).tz_localize("Asia/Kolkata") + pd.Timedelta(days=1)
+    x = _extra_sql()
     df = sql_to_df("""
         WITH t AS (
             SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, status, exposure_pct
@@ -140,15 +158,24 @@ def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
         p AS (
             SELECT DISTINCT ON (company_master_id) company_master_id, ticker, screener_slug, screener_company_id
               FROM fundamentals_company_profile WHERE status = 'ok'
-             ORDER BY company_master_id, fetched_on DESC)
+             ORDER BY company_master_id, fetched_on DESC){x_cte}
         SELECT t.company_master_id, t.theme_id, t.status AS tag_status, t.exposure_pct AS tag_pct,
                a.status AS ar_status, a.exposure_pct AS ar_pct, p.ticker,
-               coalesce(p.screener_slug, p.ticker) AS slug, p.screener_company_id
-          FROM t LEFT JOIN a USING (company_master_id, theme_id) LEFT JOIN p USING (company_master_id)
-         WHERE t.status IN ('quantified', 'unquantified') AND coalesce(a.status, '') <> 'below_min'""",
+               coalesce(p.screener_slug, p.ticker) AS slug, p.screener_company_id, {x_cols}
+          FROM t LEFT JOIN a USING (company_master_id, theme_id) LEFT JOIN p USING (company_master_id){x_join}
+         WHERE t.status IN ('quantified', 'unquantified') AND coalesce(a.status, '') <> 'below_min'""".replace("{x_cte}", x["x_cte"]).replace("{x_cols}", x["x_cols"]).replace("{x_join}", x["x_join"]),
                     params={"v": version, "p": PROMPT_VERSION, "cut": cutoff.to_pydatetime()})
-    df["share"] = np.where(df["ar_status"].eq("quantified"), df["ar_pct"],
-                           np.where(df["tag_status"].eq("quantified"), df["tag_pct"], np.nan)).astype(float)
+    # a stated share from another document first; "no other business" (100%) only where the
+    # annual-report reader did not already find the theme is not the whole company
+    ar_ok, tag_ok = df["ar_status"].eq("quantified"), df["tag_status"].eq("quantified")
+    xo_ok = df["xo_pct"].notna()
+    xs_ok = df["xs_pct"].notna() & ~df["ar_status"].isin(["not_separate", "disputed"])
+    df["share"] = np.select([ar_ok, tag_ok, xo_ok, xs_ok], [df["ar_pct"], df["tag_pct"], df["xo_pct"], df["xs_pct"]],
+                            np.nan).astype(float)
+    df["share_source"] = np.select([ar_ok, tag_ok, xo_ok, xs_ok],
+                                   ["annual report", "company profile",
+                                    df["xo_source"].astype(str).str.extract(r"^(.*?\d{4}-\d{2}-\d{2})", expand=False)
+                                    .fillna(df["xo_source"].astype(str)), "no other business"], None)
     df["weight"] = (df["share"] / 100.0).fillna(UNKNOWN_SHARE_WEIGHT)
     df["screener_company_id"] = pd.to_numeric(df["screener_company_id"], errors="coerce").astype("Int64")
     return df
@@ -353,22 +380,30 @@ def publish_members(members: pd.DataFrame, as_of: date, version: int) -> int:
     return len(rows)
 
 
-def fetch_breadth() -> dict[str, dict]:
-    """theme_id -> {stage2_pct, index_rs26_pct, week} from systrader's latest theme snapshot;
-    empty (and recorded) when it cannot be read or is stale."""
+def fetch_theme_snapshot(module: str = "fundamentals.themes.strength") -> dict | None:
+    """systrader's latest theme snapshot (`GET /api/themes`), or None (recorded) when it cannot
+    be read or was computed more than BREADTH_MAX_AGE_DAYS ago."""
     def miss(kind, reason):
-        record_local_fallback_event(module="fundamentals.themes.strength", fallback_type=kind, source="systrader",
+        record_local_fallback_event(module=module, fallback_type=kind, source="systrader",
                                     symbol=None, severity="warn", reason=reason[:500])
-        return {}
     try:
         with urllib.request.urlopen(f"{SYSTRADER_API}/api/themes", timeout=60) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-        return miss("breadth_unavailable", f"GET /api/themes failed: {exc!r}")
+        miss("breadth_unavailable", f"GET /api/themes failed: {exc!r}")
+        return None
     computed = pd.Timestamp(payload.get("computed_at"))
     if pd.Timestamp.now(tz="UTC") - computed > pd.Timedelta(days=BREADTH_MAX_AGE_DAYS):
-        return miss("breadth_stale", f"theme snapshot computed {computed}, older than {BREADTH_MAX_AGE_DAYS} days")
-    snap = payload.get("snapshot") or {}
+        miss("breadth_stale", f"theme snapshot computed {computed}, older than {BREADTH_MAX_AGE_DAYS} days")
+        return None
+    return payload.get("snapshot") or {}
+
+
+def fetch_breadth() -> dict[str, dict]:
+    """theme_id -> {stage2_pct, index_rs26_pct, week}; empty when the snapshot is unusable."""
+    snap = fetch_theme_snapshot()
+    if not snap:
+        return {}
     return {t["theme_id"]: {"stage2_pct": t.get("stage2_pct"), "index_rs26_pct": t.get("index_rs26_pct"),
                             "week": snap.get("as_of")} for t in snap.get("themes", [])}
 

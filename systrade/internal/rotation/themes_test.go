@@ -105,3 +105,13 @@ func TestThemeViewsRankAFreshBreakoutAboveExtendedRisersAndWeightBreadth(t *test
 		t.Fatalf("index RS: rise %v fall %v", *rise.IndexRS26Pct, *fall.IndexRS26Pct)
 	}
 }
+
+func TestRetNearBridgesOneMissingWeek(t *testing.T) {
+	c := []float64{100, math.NaN(), 110, 120}
+	if r := retNear(c, 3, 2); math.Abs(r-0.2) > 1e-9 {
+		t.Fatalf("a missing start week takes the nearest close within %d weeks: got %v", RetGapWeeks, r)
+	}
+	if r := retNear([]float64{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 5}, 4, 1); !math.IsNaN(r) {
+		t.Fatalf("no close nearby gives NaN, got %v", r)
+	}
+}

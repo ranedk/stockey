@@ -113,6 +113,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 06:50 | daily | `scripts/rotate_logs.sh` |
 | 07:10 | Mon–Sat | `complete_data.sh` — catch-up `download_runner --phase all` |
 | 07:30 | Mon–Sat | `all_data_readiness.sh` (`--fix`, bounded repairs) |
+| 06:15 | Mon–Sat | `all_fundamentals_themes.sh` — theme watchlist: SEBI orders, theme strength + late flag, ranked list, written reasons (Claude CLI, night window), theme members' quarters (60 pages max) (`fundamentals/themes/`) |
 | 06:55 | Mon–Sat | `all_dhan_auth_ensure.sh` — **the daily Dhan login; the only job allowed to mint a consent**. Before the 07:10/07:30 jobs so they never run on the last minutes of yesterday's token |
 | 07:35 | Mon–Fri | `all_dhan_auth_ensure.sh` — backstop; skips when the token has >12h left |
 | 07:40 | Mon–Sat | `all_ohlcv_reconcile.sh` |
@@ -123,7 +124,6 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 08:30/12:30/16:30/20:30 | Mon–Fri | `all_downloaders_queue.sh` + `all_external_workers.sh` (+5 min) |
 | 19:15 | Mon–Fri | `complete_data.sh` — evening EOD (NSE publishes ~18:00–19:00) |
 | 20:00 | Mon–Fri | `all_price_adjustment.sh` — depends on bhavcopy, not on the Dhan reconcile |
-| 09:00 | Mon–Sat | `all_fundamentals_themes.sh` — theme watchlist: SEBI orders, theme members' quarters (60 pages max), theme strength + late flag (`fundamentals/themes/strength.py`) |
 | 21:00 | Mon–Fri | `all_fundamentals_screener.sh` |
 | 22:00 | Mon–Fri | `all_portfolio_ruleset.sh` — exits → entries → forecast resolution → **action email** |
 | 23:15 | Mon–Fri | `all_ohlcv_reconcile.sh` — Dhan publishes staggered through the evening |

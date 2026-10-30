@@ -29,7 +29,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from fundamentals.api import queries
+from fundamentals.api import queries, themes_queries
 from fundamentals.screens.investor_classification import INVESTOR_TIERS
 
 app = FastAPI(title="Stockey Fundamentals Screener API")
@@ -117,6 +117,23 @@ def drafts() -> list[dict]:
 @app.get("/api/sectors")
 def sectors() -> list[dict]:
     return queries.get_sectors()
+
+
+@app.get("/api/themes")
+def themes() -> dict:
+    """The theme watchlist: themes by strength (shown / next up / late / out) and the top-10
+    stocks of each shown theme, with their written reasons (docs/THEMATIC_WATCHLIST_PRD.md)."""
+    return themes_queries.get_themes()
+
+
+@app.get("/api/themes/{theme_id}")
+def theme(theme_id: str) -> dict:
+    """One theme: its strength parts, policy table and every member -- ranked, unquantified
+    (no revenue share) and excluded, with the reason."""
+    out = themes_queries.get_theme(theme_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail=f"unknown theme {theme_id}")
+    return out
 
 
 @app.get("/api/story-scores")

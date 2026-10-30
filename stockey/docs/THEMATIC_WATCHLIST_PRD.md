@@ -270,6 +270,35 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
    snapshot is over 4 days old. First run (week to 2026-10-23): 318 stocks, 7 members with
    no price series (recent listings and one InvIT).
 6. **The ranked watchlist + /themes page.** (small)
+   **Built 2026-10-30.** `fundamentals/themes/watchlist.py` (daily tables
+   `fundamentals_theme_watchlist_theme` / `_stock`): top 5 non-late themes shown, 6-8 next
+   up, a shown theme kept while in the top 8; every theme's members ranked, unquantified or
+   excluded with the reason. Company rank = mean of four within-theme percentile ranks
+   (exposure; systrader's trend score; sales growth, the same against own pace and margin
+   change; capital work in progress and depreciation growth), rating A-E by fifth, top 10 on
+   the list. Gate over 5 years: a SEBI order AGAINST the company -- read from the order's own
+   "In respect of" parties (`sebi_orders.fetch_parties`), because most orders "in the matter
+   of" a listed company are against insiders or traders (Titan: 30 orders against employees);
+   an order whose parties cannot be read counts against it; auditor resignation; a rating cut
+   to default; promoter pledge > 10%; a story flaw. Not covered: promoter/director names and
+   fraud/forensic disclosures (no feed). Business floor: ROCE >= 8% and positive 3-year
+   operating cash flow. The SEBI name match keeps "Corp"/"Company" in names ("Delta Corp" had
+   matched "Delta Leasing and Finance"). `fundamentals/themes/theme_text.py` writes each shown
+   theme's and top-10 stock's reasoning and conclusion from the stored evidence; any number
+   not in the evidence rejects the text; rewritten only when a coarse fingerprint of the
+   evidence changes. Served at `GET /api/themes` and `/api/themes/{id}`; screener pages
+   `/themes` and `/themes/[id]`. The morning job moved to 06:15 IST so the writing starts in
+   the night window. Still to do: the web check of the 50 listed names (section 6).
+   **Operator, 2026-10-30, after the first list (21 stocks):** (1) a member with no revenue
+   share gets 100% when it has no other business, else the share is looked for in other
+   sources -- `fundamentals/themes/share_finder.py`: a sole-business check on the profile and
+   annual report (verbatim sentence checked), then the credit-rating rationales and latest
+   results filing (quotes and numbers checked, share computed in code); `load_members` uses
+   these after the annual report and the tag, and the page shows each share's source.
+   (2) Loss-making companies stay in when their quarterly losses are shrinking: the business
+   floor and the two loss story flaws are waived (noted on the row) when the company lost money
+   in one of the last four quarters, its net result improved in each of the last two, and the
+   latest quarter beats the same quarter a year ago.
 
 ## 6. Not judged -- but kept honest
 
