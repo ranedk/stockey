@@ -63,6 +63,7 @@ func main() {
 	mux.HandleFunc("GET /api/paper/{name}", handlePaperDetail(st))
 	mux.HandleFunc("GET /api/rotation", handleRotation(st))
 	mux.HandleFunc("GET /api/rotation/industry/{code}", handleRotationIndustry(st))
+	mux.HandleFunc("GET /api/themes", handleThemes(st))
 
 	addr := ":" + port
 	log.Printf("systrader api listening on %s", addr)
@@ -272,4 +273,23 @@ func loadRotation(w http.ResponseWriter, r *http.Request, st *store.Store) (rota
 		return snap, false
 	}
 	return snap, true
+}
+
+// handleThemes serves the latest theme snapshot from `cmd/rotation themes`: theme indices,
+// breadth and per-stock trend scores for stockey's theme watchlist, which reads it. computed_at
+// is sent so a caller can tell a stale snapshot from a fresh one.
+func handleThemes(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, _, computed, err := st.LatestThemeSnapshot(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no theme snapshot yet: run `go run ./cmd/rotation themes` (" + err.Error() + ")"})
+			return
+		}
+		var snap rotation.ThemeSnapshot
+		if err := json.Unmarshal(raw, &snap); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"computed_at": computed, "snapshot": snap})
+	}
 }

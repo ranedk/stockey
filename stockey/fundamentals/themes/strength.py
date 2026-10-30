@@ -12,7 +12,11 @@ Four parts, each a percentile rank across the themes (1.0 = strongest of the 26)
                 capacity and pipeline series
   fundamentals  members' sales growth in the latest quarter, the same against their own recent
                 pace, and the change in operating margin from a year ago
-  breadth       price breadth -- systrader's, build step 5; empty until then
+  breadth       price breadth, from systrader's theme views (`GET /api/themes`, build step 5):
+                the exposure-weighted share of members in Stage 2 and the theme index's
+                26-week return against the market. Empty when the snapshot is missing or
+                older than BREADTH_MAX_AGE_DAYS, or when run for a past date (it is not
+                point-in-time)
 Each part is the mean of the ranks of its measures that exist; strength is the mean of the
 parts that exist, with at least two, one of them fundamentals: a theme without enough listed
 members reporting results is not ranked, however strong its policy (PRD section 7: policy
@@ -38,7 +42,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 from datetime import date
 
 import numpy as np
@@ -49,9 +56,14 @@ from fundamentals.themes import catalog
 from fundamentals.themes.policy import CAPACITY_TABLE, POLICY_TABLE
 from fundamentals.themes.tagger import PROMPT_VERSION
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.fallback_telemetry import record_local_fallback_event
 
 TABLE = "fundamentals_theme_strength"
-STRENGTH_VERSION = 1
+MEMBER_TABLE = "fundamentals_theme_member"     # today's members, synced to systrader in full
+# 2 (2026-10-30): breadth from systrader joins the strength mean
+STRENGTH_VERSION = 2
+SYSTRADER_API = os.getenv("SYSTRADER_API_BASE", "http://127.0.0.1:8090")
+BREADTH_MAX_AGE_DAYS = 4        # computed_at; the snapshot itself is the last completed week
 UNKNOWN_SHARE_WEIGHT = 0.5
 MIN_MEMBERS = 5                 # a member measure needs this many members with the number (PRD 4.1: a theme needs 5 listed companies)
 LATE_GAP_PP = 15.0
@@ -75,6 +87,7 @@ _DDL = f"""
         sales_yoy_pct DOUBLE PRECISION, sales_vs_trend_pp DOUBLE PRECISION, margin_change_pp DOUBLE PRECISION,
         fundamentals_rank DOUBLE PRECISION,
         breadth_rank DOUBLE PRECISION,
+        breadth_stage2_pct DOUBLE PRECISION, index_rs26_pct DOUBLE PRECISION, breadth_week DATE,
         strength DOUBLE PRECISION, strength_order INT,
         late BOOLEAN NOT NULL, late_reasons TEXT,
         inputs_json TEXT,
@@ -83,10 +96,27 @@ _DDL = f"""
     )"""
 
 
+_MEMBER_DDL = f"""
+    CREATE TABLE IF NOT EXISTS {MEMBER_TABLE} (
+        theme_version INT NOT NULL,
+        theme_id TEXT NOT NULL,
+        company_master_id TEXT NOT NULL,
+        stage_key TEXT,                -- systrader's stage key: NSE symbol or "BSE:<scrip>"
+        share_pct DOUBLE PRECISION,    -- revenue share in the theme, when known
+        weight DOUBLE PRECISION NOT NULL,
+        as_of_date DATE NOT NULL,
+        PRIMARY KEY (theme_version, theme_id, company_master_id)
+    )"""
+
+
 def ensure_table() -> None:
     def _op() -> None:
         with db_session() as (_, cur):
             cur.execute(_DDL)
+            for col, typ in (("breadth_stage2_pct", "DOUBLE PRECISION"), ("index_rs26_pct", "DOUBLE PRECISION"),
+                             ("breadth_week", "DATE")):
+                cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {col} {typ}")
+            cur.execute(_MEMBER_DDL)
 
     execute_db_operation(_op, operation_name=f"{TABLE}:ensure_table")
 
@@ -290,9 +320,63 @@ def _mean_ranks(frame: pd.DataFrame, cols: list[str], min_n: int = 1) -> pd.Seri
     return r.mean(axis=1).where(r.notna().sum(axis=1) >= min_n)
 
 
-def compute(as_of: date, version: int = 1) -> pd.DataFrame:
+def stage_keys(members: pd.DataFrame) -> pd.Series:
+    """systrader's stage key per member: the NSE symbol, or "BSE:<scrip>" for a BSE-only company
+    (company_master holds those as "<scrip>-BOM")."""
+    cm = sql_to_df("SELECT company_master_id, nse_ticker, bse_scrip_code FROM company_master"
+                   " WHERE company_master_id = ANY(%(ids)s)",
+                   params={"ids": list(members["company_master_id"].unique())}).set_index("company_master_id")
+
+    def key(cmid):
+        if cmid not in cm.index:
+            return None
+        nse, bse = cm.at[cmid, "nse_ticker"], cm.at[cmid, "bse_scrip_code"]
+        if isinstance(nse, str) and nse and not nse.endswith("-BOM"):
+            return nse
+        return f"BSE:{bse}" if isinstance(bse, str) and bse else None
+
+    return members["company_master_id"].map(key)
+
+
+def publish_members(members: pd.DataFrame, as_of: date, version: int) -> int:
+    """Replace today's member list (one transaction, so systrader's sync never sees it half-written)."""
+    rows = [(version, r.theme_id, r.company_master_id, r.stage_key, None if pd.isna(r.share) else float(r.share),
+             float(r.weight), as_of) for r in members.itertuples(index=False)]
+
+    def _op() -> None:
+        with db_session() as (_, cur):
+            cur.execute(f"DELETE FROM {MEMBER_TABLE} WHERE theme_version = %s", (version,))
+            cur.executemany(f"INSERT INTO {MEMBER_TABLE} (theme_version, theme_id, company_master_id, stage_key,"
+                            f" share_pct, weight, as_of_date) VALUES (%s, %s, %s, %s, %s, %s, %s)", rows)
+
+    execute_db_operation(_op, operation_name=f"{MEMBER_TABLE}:publish")
+    return len(rows)
+
+
+def fetch_breadth() -> dict[str, dict]:
+    """theme_id -> {stage2_pct, index_rs26_pct, week} from systrader's latest theme snapshot;
+    empty (and recorded) when it cannot be read or is stale."""
+    def miss(kind, reason):
+        record_local_fallback_event(module="fundamentals.themes.strength", fallback_type=kind, source="systrader",
+                                    symbol=None, severity="warn", reason=reason[:500])
+        return {}
+    try:
+        with urllib.request.urlopen(f"{SYSTRADER_API}/api/themes", timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        return miss("breadth_unavailable", f"GET /api/themes failed: {exc!r}")
+    computed = pd.Timestamp(payload.get("computed_at"))
+    if pd.Timestamp.now(tz="UTC") - computed > pd.Timedelta(days=BREADTH_MAX_AGE_DAYS):
+        return miss("breadth_stale", f"theme snapshot computed {computed}, older than {BREADTH_MAX_AGE_DAYS} days")
+    snap = payload.get("snapshot") or {}
+    return {t["theme_id"]: {"stage2_pct": t.get("stage2_pct"), "index_rs26_pct": t.get("index_rs26_pct"),
+                            "week": snap.get("as_of")} for t in snap.get("themes", [])}
+
+
+def compute(as_of: date, version: int = 1, breadth: dict[str, dict] | None = None) -> pd.DataFrame:
     themes = catalog.load(version)
     members = load_members(as_of, version)
+    breadth = breadth or {}
     ids = [int(x) for x in members["screener_company_id"].dropna().unique()]
     quarters = results_reading.load_quarters(as_of)
     quarters = quarters[quarters["company_id"].isin(ids)]
@@ -331,6 +415,9 @@ def compute(as_of: date, version: int = 1) -> pd.DataFrame:
             "national_demand_growth_pct": nat_dem,
             "sales_yoy_pct": _wmed(m, "sales_yoy_pct"), "sales_vs_trend_pp": _wmed(m, "sales_vs_trend_pp"),
             "margin_change_pp": _wmed(m, "margin_change_pp"),
+            "breadth_stage2_pct": (breadth.get(t.id) or {}).get("stage2_pct"),
+            "index_rs26_pct": (breadth.get(t.id) or {}).get("index_rs26_pct"),
+            "breadth_week": (breadth.get(t.id) or {}).get("week"),
         }
         gap, gap_prev = _wmed(m, "gap"), _wmed(m, "gap_prev")
         mchg, mchg_prev = _wmed(m, "margin_chg"), _wmed(m, "margin_chg_prev")
@@ -353,7 +440,9 @@ def compute(as_of: date, version: int = 1) -> pd.DataFrame:
     out["policy_rank"] = _pct_rank(out["policy_score"])
     out["capacity_rank"] = _mean_ranks(out, ["members_dep_growth_pct", "members_cwip_ratio", "national_capacity_growth_pct"])
     out["fundamentals_rank"] = _mean_ranks(out, ["sales_yoy_pct", "sales_vs_trend_pp", "margin_change_pp"])
-    out["breadth_rank"] = np.nan
+    for c in ("breadth_stage2_pct", "index_rs26_pct"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out["breadth_rank"] = _mean_ranks(out, ["breadth_stage2_pct", "index_rs26_pct"]).where(out["breadth_stage2_pct"].notna())
     parts = out[["policy_rank", "capacity_rank", "fundamentals_rank", "breadth_rank"]]
     out["strength"] = parts.mean(axis=1).where((parts.notna().sum(axis=1) >= 2) & out["fundamentals_rank"].notna())
     out["strength_order"] = out["strength"].rank(ascending=False, method="first").astype("Int64")
@@ -362,10 +451,14 @@ def compute(as_of: date, version: int = 1) -> pd.DataFrame:
 
 
 def run(as_of: date | None = None, version: int = 1, dry_run: bool = False) -> pd.DataFrame:
-    as_of = as_of or pd.Timestamp.now(tz="Asia/Kolkata").date()
-    out = compute(as_of, version)
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    as_of = as_of or today
+    out = compute(as_of, version, breadth=fetch_breadth() if as_of == today else None)
     if not dry_run:
         ensure_table()
+        if as_of == today:
+            members = load_members(as_of, version)
+            publish_members(members.assign(stage_key=stage_keys(members)), as_of, version)
         upsert_to_db(out.assign(load_ts=pd.Timestamp.now(tz="UTC")), TABLE,
                      ["as_of_date", "theme_version", "theme_id", "strength_version"])
     return out
@@ -378,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     out = run(a.as_of, dry_run=a.dry_run)
     cols = ["strength_order", "theme_id", "strength", "policy_rank", "capacity_rank", "fundamentals_rank",
-            "n_members", "n_with_results", "late", "late_reasons"]
+            "breadth_rank", "n_members", "n_with_results", "late", "late_reasons"]
     print(out[cols].to_string(index=False))
     return 0
 

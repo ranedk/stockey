@@ -71,6 +71,11 @@ done
 # reporting only, ~20 s. Recomputed daily so the current week stays fresh.
 go run ./cmd/rotation snapshot
 
+# Theme views for stockey's theme watchlist (stockey docs/THEMATIC_WATCHLIST_PRD.md step 5): theme
+# indices, breadth and per-stock trend scores, served at /api/themes; stockey's 09:00 IST theme
+# job reads them. Reporting only, ~25 s. A failure must not stop the order sheets below.
+go run ./cmd/rotation themes || echo "rotation themes FAILED (exit $?)"
+
 go run ./cmd/dhan orders -strategy all
 
 echo "=== paper_daily done ==="

@@ -50,7 +50,8 @@ type Stock struct {
 	Symbol   string
 	Close    []float64
 	Volume   []float64
-	Eligible []bool // liquid at the END of that week (usable for the following week)
+	Eligible []bool    // liquid at the END of that week (usable for the following week)
+	Turnover []float64 // 60-bar median traded value at the end of that week (Rs), for other floors
 }
 
 // Panel is the weekly universe.
@@ -80,11 +81,11 @@ func WeekKey(t time.Time) int { y, w := t.ISOWeek(); return y*100 + w }
 type Builder struct {
 	weekIndex map[int]int
 	weekDate  map[int]time.Time
-	stocks    map[string]map[int][3]float64 // week key -> close, volume, eligible(0/1)
+	stocks    map[string]map[int][4]float64 // week key -> close, volume, eligible(0/1), median turnover
 }
 
 func NewBuilder() *Builder {
-	return &Builder{weekIndex: map[int]int{}, weekDate: map[int]time.Time{}, stocks: map[string]map[int][3]float64{}}
+	return &Builder{weekIndex: map[int]int{}, weekDate: map[int]time.Time{}, stocks: map[string]map[int][4]float64{}}
 }
 
 // Add folds one symbol's daily bars (ascending) into weekly rows.
@@ -93,7 +94,7 @@ func (b *Builder) Add(ser bars.Series) {
 		return
 	}
 	turnover := bars.MedianTurnover(ser.Bars, TurnoverWindow)
-	rows := map[int][3]float64{}
+	rows := map[int][4]float64{}
 	for i, bar := range ser.Bars {
 		k := WeekKey(bar.Date)
 		r := rows[k]
@@ -104,6 +105,7 @@ func (b *Builder) Add(ser bars.Series) {
 		r[0] = bar.Close
 		r[1] += bar.Vol
 		r[2] = elig
+		r[3] = turnover[i]
 		rows[k] = r
 		if d, ok := b.weekDate[k]; !ok || bar.Date.After(d) {
 			b.weekDate[k] = bar.Date
@@ -126,10 +128,10 @@ func (b *Builder) Panel() *Panel {
 	}
 	n := len(keys)
 	for sym, rows := range b.stocks {
-		s := &Stock{Symbol: sym, Close: nanSlice(n), Volume: nanSlice(n), Eligible: make([]bool, n)}
+		s := &Stock{Symbol: sym, Close: nanSlice(n), Volume: nanSlice(n), Eligible: make([]bool, n), Turnover: nanSlice(n)}
 		for k, r := range rows {
 			i := b.weekIndex[k]
-			s.Close[i], s.Volume[i], s.Eligible[i] = r[0], r[1], r[2] == 1
+			s.Close[i], s.Volume[i], s.Eligible[i], s.Turnover[i] = r[0], r[1], r[2] == 1, r[3]
 		}
 		p.Stocks[sym] = s
 	}

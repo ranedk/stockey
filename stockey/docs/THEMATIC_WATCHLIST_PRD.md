@@ -255,6 +255,20 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
    members sit outside the L1 crawl, so `fundamentals/themes/member_quarters.py` fetches
    their screener.in pages when a new quarter is due (60 a run).
 5. **systrader theme index, breadth and trend scores** for the map's members. (small)
+   **Done 2026-10-30.** stockey publishes today's members with systrader's stage key
+   (`fundamentals_theme_member`, synced in full); `go run ./cmd/rotation themes` (systrader
+   `internal/rotation/themes.go`, nightly in `paper_daily.sh` after the rotation snapshot)
+   builds, on the last completed week: an exposure-weighted theme index of members above
+   Rs 1 cr traded value (RS26 against the rotation view's market, stage, 13-week return),
+   breadth (exposure-weighted share in Stage 2 and above the 30-week average), and per
+   stock the stage, weeks in it, RS26, distance from the 30-week average, the 52-week high
+   and the breakout level (the high that the first 26-week closing high before Stage 2 beat),
+   and a trend-and-breakout score: tier (4 early Stage 2 = at most 13 weeks in and at most
+   25% above the average; 3 other Stage 2; 2 Stage 1; 1 Stage 3; 0 Stage 4) plus the RS26
+   percentile. Served at systrader `GET /api/themes`. Theme strength (v2) adds the breadth
+   part: mean rank of the Stage 2 share and the index RS26, dropped (and recorded) if the
+   snapshot is over 4 days old. First run (week to 2026-10-23): 318 stocks, 7 members with
+   no price series (recent listings and one InvIT).
 6. **The ranked watchlist + /themes page.** (small)
 
 ## 6. Not judged -- but kept honest

@@ -47,3 +47,22 @@ def test_policy_score_counts_support_size_and_freshness_and_subtracts_headwinds(
         {"direction": "support", "status": "active", "outlay_cr": None, "announced": "2027-01"},      # not yet known
     ])
     assert strength.policy_score(items, pd.Timestamp("2026-10-30").date()) == 2.0
+
+
+def test_stage_keys_use_the_nse_symbol_or_bse_scrip_for_bse_only_companies(monkeypatch):
+    cm = pd.DataFrame([{"company_master_id": "nse:WAAREEENER", "nse_ticker": "WAAREEENER", "bse_scrip_code": "544277"},
+                       {"company_master_id": "nse:544784-BOM", "nse_ticker": "544784-BOM", "bse_scrip_code": "544784"}])
+    monkeypatch.setattr(strength, "sql_to_df", lambda *a, **k: cm)
+    members = pd.DataFrame({"company_master_id": ["nse:WAAREEENER", "nse:544784-BOM", "nse:GONE"]})
+    assert strength.stage_keys(members).tolist() == ["WAAREEENER", "BSE:544784", None]
+
+
+def test_breadth_is_dropped_when_the_systrader_snapshot_is_stale(monkeypatch):
+    import io
+    import json as _json
+    old = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=10)).isoformat()
+    body = _json.dumps({"computed_at": old, "snapshot": {"as_of": "2026-10-16", "themes": [{"theme_id": "ems", "stage2_pct": 50}]}})
+    monkeypatch.setattr(strength.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(body.encode()))
+    seen = []
+    monkeypatch.setattr(strength, "record_local_fallback_event", lambda **k: seen.append(k["fallback_type"]))
+    assert strength.fetch_breadth() == {} and seen == ["breadth_stale"]

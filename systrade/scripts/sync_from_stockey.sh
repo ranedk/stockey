@@ -56,6 +56,7 @@ FULL_TABLES=(
   master_sharpely_equity    # sector / industry / basic-industry codes per stock (rotation view, 2026-10-01)
   fundamentals_sector_reference  # code -> name for those levels (rotation view, 2026-10-01)
   fundamentals_forward_track_holding  # stockey's frozen forward tracks' holdings per rebalance (quality v1 etc., LEDGER 46) -- read by systrader for momentum+quality (operator 2026-10-19, TODO D1)
+  fundamentals_theme_member          # stockey's theme map, today's members + stage keys -- for cmd/rotation themes (2026-10-30, THEMATIC_WATCHLIST_PRD step 5)
 )
 
 INCR_TABLES=(               # incremental on the "date" column + reconciliation
