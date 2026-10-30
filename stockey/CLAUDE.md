@@ -123,6 +123,7 @@ exists) and a **morning catch-up (Mon–Sat)** that is the actual guarantee.
 | 08:30/12:30/16:30/20:30 | Mon–Fri | `all_downloaders_queue.sh` + `all_external_workers.sh` (+5 min) |
 | 19:15 | Mon–Fri | `complete_data.sh` — evening EOD (NSE publishes ~18:00–19:00) |
 | 20:00 | Mon–Fri | `all_price_adjustment.sh` — depends on bhavcopy, not on the Dhan reconcile |
+| 09:00 | Mon–Sat | `all_fundamentals_themes.sh` — theme watchlist: SEBI orders, theme members' quarters (60 pages max), theme strength + late flag (`fundamentals/themes/strength.py`) |
 | 21:00 | Mon–Fri | `all_fundamentals_screener.sh` |
 | 22:00 | Mon–Fri | `all_portfolio_ruleset.sh` — exits → entries → forecast resolution → **action email** |
 | 23:15 | Mon–Fri | `all_ohlcv_reconcile.sh` — Dhan publishes staggered through the evening |

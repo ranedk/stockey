@@ -239,6 +239,21 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
    matches them to companies by whole-word name, with the role (subject / scrip / other).
    Promoters and directors are not matched yet (no names held).
 4. **Theme strength** and the late flag, daily. (small)
+   **Done 2026-10-30.** `fundamentals/themes/strength.py` writes `fundamentals_theme_strength`
+   each morning (`all_fundamentals_themes.sh`, 09:00 IST Mon-Sat), one row per theme and day.
+   Members are the kept v3 tags; their figures combine as an exposure-weighted median (a
+   member with no known share counts half). Policy: support items scored by status, size
+   (Rs 10,000 cr+) and freshness, minus headwinds. Capacity: members' depreciation growth
+   over four quarters (plant coming into use; no gross-block history is stored, and
+   depreciation follows it quarterly), capital work in progress / fixed assets from L2, and
+   the yearly growth of the national capacity and pipeline series. Fundamentals: latest
+   quarter's sales growth, the same against the company's own pace, margin change. Breadth
+   waits for step 5. A theme needs members' results to be ranked at all (policy alone never
+   qualifies one). Late: depreciation growth beating sales growth by 15+ pp two quarters
+   running, national capacity beating demand by 20+ pp now and a quarter ago, or margins
+   down 1+ pp on a year ago two quarters running while capacity grows 10%+. A third of the
+   members sit outside the L1 crawl, so `fundamentals/themes/member_quarters.py` fetches
+   their screener.in pages when a new quarter is due (60 a run).
 5. **systrader theme index, breadth and trend scores** for the map's members. (small)
 6. **The ranked watchlist + /themes page.** (small)
 
