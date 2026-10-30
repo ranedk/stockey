@@ -15,11 +15,12 @@ import json
 import pandas as pd
 
 from fundamentals.themes import catalog
+from fundamentals.themes.tagger import PROMPT_VERSION
 from utils.db import sql_to_df
 
 STRATA = {"profile_share": 10, "report_share": 15, "no_share": 25}
 PER_THEME = 3
-SEED = 26
+SEED = 26          # draw 1 (prompt v1), seen; later draws pass --seed
 
 
 def load_tags(version: int) -> pd.DataFrame:
@@ -40,7 +41,9 @@ def load_tags(version: int) -> pd.DataFrame:
           LEFT JOIN fundamentals_theme_exposure_ar a
             ON a.company_master_id = t.company_master_id AND a.theme_version = t.theme_version
            AND a.theme_id = t.theme_id
-         WHERE t.theme_version = %(v)s AND t.status IN ('quantified', 'unquantified')""", params={"v": version})
+         WHERE t.theme_version = %(v)s AND t.prompt_version = %(p)s
+           AND t.status IN ('quantified', 'unquantified')
+           AND coalesce(a.status, '') <> 'below_min'""", params={"v": version, "p": PROMPT_VERSION})
 
 
 def stratum(r) -> str:
@@ -51,9 +54,9 @@ def stratum(r) -> str:
     return "no_share"
 
 
-def draw(tags: pd.DataFrame) -> pd.DataFrame:
+def draw(tags: pd.DataFrame, seed: int = SEED) -> pd.DataFrame:
     tags = tags.assign(stratum=[stratum(r) for r in tags.itertuples()])
-    tags = tags.sample(frac=1.0, random_state=SEED)
+    tags = tags.sample(frac=1.0, random_state=seed)
     picked, per_theme = [], {}
     for name, n in STRATA.items():
         got = 0
@@ -97,11 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Draw the 50-tag hand-check sample.")
     ap.add_argument("--version", type=int, default=1)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--seed", type=int, default=SEED)
     a = ap.parse_args(argv)
-    sample = draw(load_tags(a.version))
+    sample = draw(load_tags(a.version), a.seed)
     items = to_items(sample, a.version)
     with open(a.out, "w") as fh:
-        json.dump({"version": a.version, "seed": SEED, "items": items}, fh, indent=1, default=str)
+        json.dump({"version": a.version, "seed": a.seed, "items": items}, fh, indent=1, default=str)
     print(json.dumps(sample["stratum"].value_counts().to_dict()), sample["theme_id"].nunique(), "themes")
     return 0
 

@@ -24,15 +24,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
-import tempfile
 from datetime import datetime, timezone
 
 import pandas as pd
 
+from fundamentals.collectors.annual_report_text import latest_report, pdf_pages
 from fundamentals.collectors.ocr_pipeline import DocumentFetchError, fetch_document_bytes_with_archive_fallback
 from fundamentals.themes import catalog
-from fundamentals.themes.tagger import MODEL, PROFILE_TABLE, TAG_TABLE, _norm, call_claude
+from fundamentals.themes.tagger import MODEL, PROFILE_TABLE, PROMPT_VERSION, TAG_TABLE, _norm, call_claude, quote_in
 from fundamentals.trigger_study.llm_runner import in_night_window
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
@@ -51,7 +50,7 @@ _DDL = f"""
         report_url TEXT NOT NULL,
         ticker TEXT NOT NULL,
         report_label TEXT,
-        status TEXT NOT NULL,          -- quantified | not_separate | disputed | invalid | no_text | fetch_error
+        status TEXT NOT NULL,          -- quantified | below_min | not_separate | disputed | invalid | no_text | fetch_error
         basis TEXT,                    -- segment | mdna_figure | single_segment | not_separate
         segment_name TEXT,
         fiscal_year TEXT,
@@ -80,25 +79,6 @@ def ensure_table() -> None:
 
 
 # --- the report -----------------------------------------------------------------------------
-
-def latest_report(documents: dict | None) -> tuple[str, str] | None:
-    """(label, url) of the newest BSE-hosted annual report on the profile; screener lists
-    them newest first."""
-    for item in (documents or {}).get("Annual reports") or []:
-        for link in item.get("links") or []:
-            url = link.get("url") or ""
-            if url.startswith("https://www.bseindia.com/"):
-                return link.get("label") or item.get("title"), url
-    return None
-
-
-def pdf_pages(pdf_bytes: bytes) -> list[str]:
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as fh:
-        fh.write(pdf_bytes)
-        fh.flush()
-        out = subprocess.run(["pdftotext", "-layout", fh.name, "-"], capture_output=True, text=True, timeout=300)
-    return out.stdout.split("\f") if out.returncode == 0 else []
-
 
 _SEGMENT_RX = re.compile(r"segment revenue|segment result|reportable segment|operating segment|ind as 108"
                          r"|segment information|single (business|reportable|operating) segment|one segment", re.I)
@@ -233,7 +213,7 @@ def validate_read(item: dict, text: str) -> tuple[dict, str | None]:
     if basis == "not_separate":
         return {**out, "status": "not_separate"}, None
     seg_q = (item.get("segment_quote") or "").strip()
-    if not seg_q or _norm(seg_q) not in _norm(text):
+    if not seg_q or not quote_in(seg_q, text):
         return {**out, "status": "invalid"}, "segment quote not in the report text"
     if not revs or len(revs) != len(quotes):
         return {**out, "status": "invalid"}, "theme revenues missing or not one quote each"
@@ -273,7 +253,8 @@ def due(version: int, limit: int | None, only: list[str] | None = None) -> pd.Da
           FROM {TAG_TABLE} t
           JOIN latest l ON l.company_master_id = t.company_master_id AND l.fetched_on = t.profile_fetched_on
           JOIN company_master c ON c.company_master_id = t.company_master_id
-         WHERE t.theme_version = %(v)s AND t.status = 'unquantified'""", params={"v": version})
+         WHERE t.theme_version = %(v)s AND t.prompt_version = %(p)s AND t.status = 'unquantified'""",
+        params={"v": version, "p": PROMPT_VERSION})
     if df.empty:
         return df
     try:
@@ -345,6 +326,8 @@ def read_company(r, version: int, by_id: dict[str, catalog.Theme]) -> tuple[list
             rows += _rows(r, version, [t], status="invalid", dropped="no answer for this theme", pages=page_list)
             continue
         fields, dropped = validate_read(item, text)
+        if fields["status"] == "quantified" and fields["exposure_pct"] < by_id[t].min_exposure:
+            fields["status"] = "below_min"
         rows += _rows(r, version, [t], **fields, dropped=dropped, pages=page_list)
         if fields["status"] == "quantified" and fields["basis"] != "single_segment":
             checks.append({"id": str(len(rows) - 1), "company": r.company_name, "theme_id": t,

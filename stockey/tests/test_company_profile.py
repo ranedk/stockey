@@ -52,3 +52,11 @@ def test_name_key_ignores_ltd_and_punctuation():
     from fundamentals.collectors.company_profile import _name_key
     assert _name_key("Eternal Ltd.") == _name_key("Eternal Ltd") == "eternal"
     assert _name_key("GE Vernova T&D India Ltd.") == "gevernovatdindia"
+
+
+def test_the_premium_notice_is_not_stored_as_key_points():
+    import pytest
+    from fundamentals.collectors.company_profile import KeyPointsLocked, parse_commentary
+    html = "<div><p>Please upgrade to premium to read more key insights.</p><p>Free users can access 20 free key-insights</p></div>"
+    with pytest.raises(KeyPointsLocked):
+        parse_commentary(html)

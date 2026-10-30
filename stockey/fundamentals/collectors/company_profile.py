@@ -125,6 +125,15 @@ def _block_text(soup) -> list[str]:
     return [re.sub(r"\s*\[\s*(edit|\d+)\s*\]", "", ln).strip() for ln in lines]
 
 
+# A free screener.in account gets 20 key-point views per 30 days; after that the endpoint
+# answers with this notice instead of the text (found 2026-10-27: 1,640 of 1,712 profiles).
+_PAYWALL = "upgrade to premium to read more key insights"
+
+
+class KeyPointsLocked(Exception):
+    pass
+
+
 def parse_commentary(html: str) -> tuple[str | None, str | None, list[str]]:
     """Key points text, the 'Last edited ...' note, and the footnote source links (the
     filings screener cites, e.g. an annual-report page) for the tagger to quote. A response that is a whole company
@@ -134,6 +143,8 @@ def parse_commentary(html: str) -> tuple[str | None, str | None, list[str]]:
         raise ValueError("commentary endpoint returned a full page")
     sources = list(dict.fromkeys(a["href"] for a in soup.select("sup a[href]")))
     lines = [ln for ln in _block_text(soup) if ln]
+    if any(_PAYWALL in ln.lower() for ln in lines):
+        raise KeyPointsLocked("screener.in key points need a premium account")
     edited = next((ln for ln in lines if ln.startswith("Last edited")), None)
     keep = [ln for ln in lines if not ln.startswith(("Last edited", "Request an update", "©"))]
     return ("\n".join(keep) or None), edited, sources
@@ -235,7 +246,15 @@ def fetch_profile(session, ticker: str, bse_code: str | None = None, company_nam
                          "Referer": f"{BASE}/company/{slug}/"},
             )
         c.raise_for_status()
-        out["key_points"], out["key_points_edited"], sources = parse_commentary(c.text)
+        try:
+            out["key_points"], out["key_points_edited"], sources = parse_commentary(c.text)
+        except KeyPointsLocked as exc:
+            # the rest of the page is still good; keep it, and say plainly what is missing
+            out["key_points"], out["error"], sources = None, str(exc), []
+            record_local_fallback_event(
+                module="fundamentals.collectors.company_profile", fallback_type="key_points_locked",
+                source="screener.in", symbol=slug, severity="warn", reason=str(exc),
+            )
         out["documents"]["Key point sources"] = [{"title": u, "links": [{"label": "source", "url": u}]} for u in sources]
     return out
 

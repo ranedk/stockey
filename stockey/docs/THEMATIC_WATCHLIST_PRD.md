@@ -237,6 +237,28 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
   names do?" without having to reconstruct it.
 - **Map quality is checked before the list goes live:** a sample of 50 tags hand-checked by
   the operator; target >= 90% agree, else fix the tagging first.
+- **First check (2026-10-27): 40 of 50 (80%) -- failed.** The operator asked for the check to
+  be done against web sources (company sites, filings, rating rationales, news) rather than
+  by hand; an independent web check per tag, shown with its sources on the check page. The
+  10 misses: plans counted as business (Reliance batteries, Solex cells), look-alikes and
+  side lines (power cables as telecom, agrochemicals as specialty chemicals, HCC water at 3%
+  of orders, GOCL after selling its explosives arm, Cupid's 2% diagnostics) and two shares
+  set at 100% that were ~85%. Root cause found on the way: screener.in shows Key Points to a
+  free account for 20 companies a month, so ~1,640 of 1,712 profiles had only the 2-3 line
+  About paragraph (the collector now detects the notice and records it). Fixes: the tagger
+  now reads each company's latest annual report (overview, MD&A, segment note;
+  `fundamentals/collectors/annual_report_text.py`); prompt v3 counts only current revenue,
+  only a main business or named segment, and the opposing check rejects side lines; a share
+  under the theme's `min_exposure` is `below_min`. On the 15 affected/control companies all
+  8 wrong themes cleared and the controls stayed. The re-check uses a NEW sample (the first
+  one has been seen).
+- **Second check (2026-10-29, prompt v3, fresh sample seed 27): 45 of 50 (90%) -- meets the
+  bar.** Misses: Vikran as railways (0.3% of revenue), Zetwerk as EMS (<= ~9%), HBL as
+  battery storage (lead-acid / Ni-Cd; tagged twice because company_master holds it under
+  two tickers), and Astra Microwave's share (~78%, not 100%: single-segment reports
+  overstate a theme when the segment also holds space/weather work).
+- **Every stock on the final watchlist gets a web check** (5 themes x 10 = 50 names), shown
+  with its sources: it catches what no filing yet says, e.g. a business sold last month.
 
 ## 7. Risks
 
