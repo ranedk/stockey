@@ -241,7 +241,10 @@ def validate_tag(tag: dict, text: str, theme_ids: set[str] | dict[str, float]) -
         if not quote_in(quote, text):
             dropped = "exposure quote not in the profile text"
         elif basis == "whole_business":
-            out.update(exposure_pct=100.0, exposure_quote=quote, exposure_basis=basis)
+            # kept as evidence but not a share: "X is a defence company" overstated Astra
+            # Microwave (~78% defence) and others; the segment reader's single-segment check
+            # decides whether all of the revenue is the theme
+            out.update(exposure_quote=quote, exposure_basis=basis)
         elif pct is None or not 0 < float(pct) <= 100:
             dropped = "exposure missing or out of range"
         elif not _number_in(pct, quote):

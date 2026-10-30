@@ -224,6 +224,20 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
    the main cost is LLM calls, run on the existing CLI budget overnight)
 3. **Policy table and capacity sources**, starting with themes that have public lists (solar
    ALMM, power, PLI sectors). (medium, partly hand-kept)
+   **Done 2026-10-30.** `fundamentals/themes/policy_v1.yaml` (184 items over all 26 themes,
+   support and headwinds, each dated with its source page) and `capacity_v1.yaml` (666 dated
+   points of national capacity / pipeline / demand for 23 themes; dense monthly series for
+   ALMM modules and cells, installed solar and wind, transmission ckm/MVA, 5G sites, air
+   passengers, JJM taps; thin elsewhere, and none for premium alcohol). Both researched on the
+   web by agents and loaded by `fundamentals/themes/policy.py`, which refuses an entry without
+   a source, a bad date or unit, or a duplicate. MNRE/CEA pages could not be scraped (the MNRE
+   site was rebuilt and old links 404; CEA PDFs 404), so the series are hand-kept and
+   refreshed by re-running the research into a new version file.
+   Management-gate source: `fundamentals/collectors/sebi_orders.py` collects every SEBI
+   enforcement order since 2021-10 (date, title, link, kind, "in the matter of" name;
+   ~31k orders listed in all), gated as domain "sebi"; `fundamentals/themes/sebi_match.py`
+   matches them to companies by whole-word name, with the role (subject / scrip / other).
+   Promoters and directors are not matched yet (no names held).
 4. **Theme strength** and the late flag, daily. (small)
 5. **systrader theme index, breadth and trend scores** for the map's members. (small)
 6. **The ranked watchlist + /themes page.** (small)
@@ -257,6 +271,12 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
   battery storage (lead-acid / Ni-Cd; tagged twice because company_master holds it under
   two tickers), and Astra Microwave's share (~78%, not 100%: single-segment reports
   overstate a theme when the segment also holds space/weather work).
+  Fixed 2026-10-30: renamed companies held twice in company_master (17 pairs: HBL,
+  Eternal/Zomato, Tata Motors, ...) are merged into one universe row by exact name
+  (`company_profile.merge_renamed`), duplicate rows removed; a single reported segment, or a
+  sentence saying the company does only this, no longer means 100% by itself -- a second
+  check asks whether the one business also sells outside the theme, and if so the tag stays
+  but without a share (27 of 51 such companies, Astra Microwave among them).
 - **Every stock on the final watchlist gets a web check** (5 themes x 10 = 50 names), shown
   with its sources: it catches what no filing yet says, e.g. a business sold last month.
 

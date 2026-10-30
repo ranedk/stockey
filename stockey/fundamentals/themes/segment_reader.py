@@ -114,7 +114,7 @@ READ_PROMPT = """You read pages from an Indian listed company's annual report (t
 For each theme in the input, decide:
 - basis "segment": the company reports one or more segments (segment note, Ind AS 108) whose business IS this theme (mostly or entirely). List each such segment's revenue for the latest year (several when the theme spans segments, e.g. freight and passenger rail), and the company's total revenue for the same year.
 - basis "mdna_figure": no segment matches, but the report states this theme's revenue in rupees elsewhere (e.g. "revenue from data centres was Rs 2,850 crore"). Copy it and the total revenue for the same year.
-- basis "single_segment": the company says it has one segment AND that one business is this theme. theme_revenues holds the total revenue once, and total_revenue is the same total.
+- basis "single_segment": the company says it has one segment AND that one business is this theme. theme_revenues holds the total revenue once, and total_revenue is the same total. If the report also splits that one business's revenue by end market, customer or product line (e.g. defence vs space vs civil, domestic vs export to other industries), use basis "mdna_figure" with the theme's part instead.
 - basis "not_separate": the theme sits inside a larger segment with other businesses, or no number is given. Numbers null.
 
 Rules:
@@ -147,6 +147,18 @@ READ_SCHEMA = {
 CHECK_PROMPT = """You are a sceptical reviewer. Each item says an Indian listed company's reported segment (or stated revenue line) IS an investment theme, so that the segment's revenue share can be counted as the company's exposure to the theme.
 Argue against it: does that segment also hold other, unrelated businesses big enough to overstate the exposure, or is it a different business that only sounds similar? Decide.
 verdict "keep" if the segment's revenue is fairly the theme's revenue; "reject" if not. reason: one short sentence."""
+
+SINGLE_CHECK_PROMPT = """You are a sceptical reviewer. Each item is an Indian listed company that reports a single business segment, and that business has been judged to be in an investment theme. Counting the whole company's revenue as the theme's would put its exposure at 100%.
+Argue against it: does the one segment also sell to customers or markets outside the theme (e.g. space or civil buyers for a defence maker, industrial buyers for an EV parts maker), or hold other product lines? Use the text and what you know of the company.
+verdict "all" if the theme is essentially all of the revenue (about 90% or more); "mostly" if the theme is the main business but other markets or lines are a real part of it; "reject" if the theme is not the main business. reason: one short sentence."""
+
+SINGLE_CHECK_SCHEMA = {
+    "type": "object", "required": ["items"],
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object", "required": ["id", "verdict", "reason"],
+        "properties": {"id": {"type": "string"}, "verdict": {"type": "string", "enum": ["all", "mostly", "reject"]},
+                       "reason": {"type": "string"}}}}},
+}
 
 CHECK_SCHEMA = {
     "type": "object", "required": ["items"],
@@ -239,6 +251,19 @@ def validate_read(item: dict, text: str) -> tuple[dict, str | None]:
     return {**out, "theme_revenue": theme, "total_revenue": total, "exposure_pct": pct, "status": "quantified"}, None
 
 
+def apply_verdict(row: dict, v: dict | None) -> None:
+    """keep/all: the share stands. mostly: the tag stands but the share is unknown, as if the
+    theme sat inside a larger segment. reject or no answer: disputed."""
+    if v is None:
+        row["status"], row["check_reason"] = "disputed", "no verdict returned"
+    elif v["verdict"] == "reject":
+        row["status"], row["check_reason"] = "disputed", v["reason"]
+    elif v["verdict"] == "mostly":
+        row.update(status="not_separate", theme_revenue=None, exposure_pct=None, check_reason=v["reason"])
+    else:
+        row["check_reason"] = v["reason"]
+
+
 # --- run ------------------------------------------------------------------------------------
 
 def due(version: int, limit: int | None, only: list[str] | None = None) -> pd.DataFrame:
@@ -319,7 +344,7 @@ def read_company(r, version: int, by_id: dict[str, catalog.Theme]) -> tuple[list
     if not res["ok"]:
         return [], res
     got = {str(x.get("theme_id")): x for x in res["items"]}
-    rows, checks = [], []
+    rows, checks, singles = [], [], []
     for t in r.themes:
         item = got.get(t)
         if item is None:
@@ -329,31 +354,29 @@ def read_company(r, version: int, by_id: dict[str, catalog.Theme]) -> tuple[list
         if fields["status"] == "quantified" and fields["exposure_pct"] < by_id[t].min_exposure:
             fields["status"] = "below_min"
         rows += _rows(r, version, [t], **fields, dropped=dropped, pages=page_list)
-        if fields["status"] == "quantified" and fields["basis"] != "single_segment":
-            checks.append({"id": str(len(rows) - 1), "company": r.company_name, "theme_id": t,
-                           "definition": by_id[t].definition, "exclusions": list(by_id[t].exclude),
-                           "segment": fields["segment_name"], "segment_text": fields["segment_quote"],
-                           "share_pct": fields["exposure_pct"]})
-        elif fields["status"] == "quantified":
-            # one segment for the whole company: the tag's own check already judged the
-            # company to be in the theme, the question here is only whether it is ALL of it
-            checks.append({"id": str(len(rows) - 1), "company": r.company_name, "theme_id": t,
-                           "definition": by_id[t].definition, "exclusions": list(by_id[t].exclude),
-                           "segment": "the whole company (single reported segment)",
-                           "segment_text": fields["segment_quote"], "share_pct": 100.0})
-    if checks:
-        chk = call_claude(CHECK_PROMPT, CHECK_SCHEMA, checks)
+        if fields["status"] != "quantified":
+            continue
+        c = {"id": str(len(rows) - 1), "company": r.company_name, "theme_id": t,
+             "definition": by_id[t].definition, "exclusions": list(by_id[t].exclude),
+             "segment": fields["segment_name"], "segment_text": fields["segment_quote"],
+             "share_pct": fields["exposure_pct"]}
+        if fields["basis"] != "single_segment":
+            checks.append(c)
+        else:
+            # one segment for the whole company proves it is one business, not that all of
+            # it is the theme (Astra Microwave: one segment, ~78% defence, the rest space)
+            singles.append({**c, "segment": "the whole company (single reported segment)", "text": text[:6000]})
+    for prompt, schema, items in ((CHECK_PROMPT, CHECK_SCHEMA, checks),
+                                  (SINGLE_CHECK_PROMPT, SINGLE_CHECK_SCHEMA, singles)):
+        if not items:
+            continue
+        chk = call_claude(prompt, schema, items)
         if not chk["ok"]:
             return [], chk
         verdicts = {str(x.get("id")): x for x in chk["items"]}
-        for c in checks:
+        for c in items:
             row, v = rows[int(c["id"])], verdicts.get(c["id"])
-            if v is None:
-                row["status"], row["check_reason"] = "disputed", "no verdict returned"
-            elif v["verdict"] == "reject":
-                row["status"], row["check_reason"] = "disputed", v["reason"]
-            else:
-                row["check_reason"] = v["reason"]
+            apply_verdict(row, v)
     return rows, None
 
 

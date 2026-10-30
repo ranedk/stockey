@@ -31,10 +31,11 @@ def test_a_share_without_a_quote_is_never_taken_from_the_model():
     assert out["exposure_pct"] is None and dropped == "exposure given without a quote"
 
 
-def test_whole_business_needs_its_sentence_and_counts_as_100():
+def test_whole_business_keeps_its_sentence_but_leaves_the_share_to_the_report_reader():
     out, _ = tagger.validate_tag(_tag(exposure_basis="whole_business", exposure_pct=None,
                                       exposure_quote="Polycab makes cables."), TEXT, IDS)
-    assert out["exposure_pct"] == 100.0
+    assert out["exposure_pct"] is None and out["exposure_basis"] == "whole_business"
+    assert tagger.status_of(out, 20) == "unquantified"
 
 
 def test_unknown_theme_is_dropped():

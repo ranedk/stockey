@@ -80,3 +80,15 @@ def test_words_far_from_the_number_do_not_count():
                  total_revenue="23,505", total_quote="Total  23,505", segment_quote="units shipped")
     out, _ = sr.validate_read(item, text)
     assert out["status"] == "invalid"
+
+
+def test_a_one_segment_company_that_also_sells_elsewhere_keeps_the_tag_but_not_the_100pct():
+    row = {"status": "quantified", "theme_revenue": 100.0, "exposure_pct": 100.0}
+    sr.apply_verdict(row, {"verdict": "mostly", "reason": "space and weather radars too"})
+    assert row["status"] == "not_separate" and row["exposure_pct"] is None and row["theme_revenue"] is None
+    row = {"status": "quantified", "exposure_pct": 100.0}
+    sr.apply_verdict(row, {"verdict": "all", "reason": "only defence"})
+    assert row["status"] == "quantified" and row["exposure_pct"] == 100.0
+    row = {"status": "quantified", "exposure_pct": 40.0}
+    sr.apply_verdict(row, None)
+    assert row["status"] == "disputed"

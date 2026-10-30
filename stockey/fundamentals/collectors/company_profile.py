@@ -150,12 +150,30 @@ def parse_commentary(html: str) -> tuple[str | None, str | None, list[str]]:
     return ("\n".join(keep) or None), edited, sources
 
 
+def merge_renamed(u: pd.DataFrame) -> pd.DataFrame:
+    """One row per company. After a rename company_master holds two rows with the same name
+    (ignoring 'Ltd'): the old one keeps the BSE code and the BSE trading, the new one the NSE
+    symbol (HBLPOWER/HBLENGINE, ZOMATO/ETERNAL). Keep the busier row that has a real NSE symbol,
+    give it the BSE code and the summed turnover, and list the dropped ids in merged_ids."""
+    u = u.assign(_k=u["company_name"].map(_name_key), _bom=u["ticker"].str.endswith("-BOM"))
+    rows = []
+    for _, g in u.groupby("_k", sort=False):
+        g = g.sort_values(["_bom", "median_tv"], ascending=[True, False])
+        keep = g.iloc[0].copy()
+        keep["bse_code"] = g["bse_code"].dropna().iloc[0] if g["bse_code"].notna().any() else None
+        keep["median_tv"] = g["median_tv"].sum()
+        keep["merged_ids"] = list(g["company_master_id"].iloc[1:])
+        rows.append(keep)
+    out = pd.DataFrame(rows).drop(columns=["_k", "_bom"])
+    return out.sort_values("median_tv", ascending=False).reset_index(drop=True)
+
+
 def load_universe(as_of: date) -> pd.DataFrame:
     """Companies with combined NSE+BSE median daily traded value >= Rs 1 cr over the last
     LIQUIDITY_DAYS calendar-day window's sessions, largest first, with the screener.in ticker
     (NSE symbol, else BSE scrip code)."""
     lo = (pd.Timestamp(as_of) - pd.Timedelta(days=int(LIQUIDITY_DAYS * 1.5))).date()
-    return sql_to_df(
+    return merge_renamed(sql_to_df(
         """
         WITH d AS (
             SELECT company_master_id, date, sum(total_value) AS tv FROM (
@@ -179,7 +197,7 @@ def load_universe(as_of: date) -> pd.DataFrame:
          ORDER BY m.median_tv DESC
         """,
         params={"lo": lo, "hi": as_of, "floor": MIN_MEDIAN_TRADED_VALUE},
-    )
+    ))
 
 
 def due(universe: pd.DataFrame, as_of: date) -> pd.DataFrame:

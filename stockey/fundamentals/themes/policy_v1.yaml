@@ -1,0 +1,2820 @@
+# Theme policy table v1 (docs/THEMATIC_WATCHLIST_PRD.md 4.3, build step 3), researched on the web
+# 2026-10-30 by four agents: every item has the page it came from; unconfirmed figures are null.
+# Hand-kept: a change is a new file (policy_v2.yaml) with the date and reason, never an edit here.
+# Load with: python -m fundamentals.themes.policy --version 1
+version: 1
+researched_on: '2026-10-30'
+items:
+- theme_id: solar_cells
+  name: ALMM List-II (solar cells) mandate
+  kind: mandate
+  direction: support
+  authority: MNRE
+  announced: 2024-12
+  outlay_cr: null
+  status: active
+  latest_figure: Cumulative ALMM List-II enlisted cell capacity reached 36,865 MW after MNRE added 1,397 MW.
+  latest_as_of: 2026-09
+  source_url: https://www.tndindia.com/use-of-domestic-solar-cells-mandatory-effective-june-1-2026/
+  source_title: Use of domestic solar cells mandatory effective June 1, 2026 (T&D India)
+  source_date: '2024-12-11'
+  note: 'From 2026-06-01 modules in government, net-metering and open-access projects must use cells from ALMM List-II, creating
+    a protected home market for Indian cell makers. also: https://mercomindia.com/solar-cell-capacity-under-almm-rises-to-36-9-gw'
+- theme_id: solar_cells
+  name: ALMM List-II exemption for already-bid projects (List-I(a))
+  kind: regulation
+  direction: headwind
+  authority: MNRE
+  announced: 2024-12
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.tndindia.com/use-of-domestic-solar-cells-mandatory-effective-june-1-2026/
+  source_title: Use of domestic solar cells mandatory effective June 1, 2026 (T&D India)
+  source_date: '2024-12-11'
+  note: Projects bid before the order can keep using non-List-II cells even if commissioned after 2026-06-01, which delays
+    the full pull on domestic cells.
+- theme_id: solar_cells
+  name: ALMM List-III (ingots and wafers) mandate
+  kind: mandate
+  direction: support
+  authority: MNRE
+  announced: 2026-03
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pv-magazine.com/2026/03/19/india-extends-solar-manufacturing-mandate-to-wafers-and-ingots/
+  source_title: India extends solar manufacturing mandate to wafers and ingots (pv magazine)
+  source_date: '2026-03-19'
+  note: Wafer mandate from 2028-06-01 for new bids, triggered once at least three wafer plants with 15 GW combined capacity
+    run in India; enlisted wafer makers need matching ingot capacity.
+- theme_id: solar_cells
+  name: PLI for high-efficiency solar PV modules (integrated cell/wafer/polysilicon capacity)
+  kind: pli
+  direction: support
+  authority: MNRE
+  announced: 2022-09
+  outlay_cr: 24000
+  status: active
+  latest_figure: About 10.5 GW of cell and 2 GW of ingot-wafer capacity set up out of 48,337 MW awarded; no incentive funds
+    released as of 2026-02-28.
+  latest_as_of: '2026-02-28'
+  source_url: https://www.theweek.in/wire-updates/business/2026/03/18/solar-manufacturers-got-no-funds-under-rs-24-000-cr-pli-scheme-till-feb-end-parl-told.html
+  source_title: 'Solar manufacturers got no funds under Rs 24,000-cr PLI scheme till Feb end: Parl told (PTI/The Week)'
+  source_date: '2026-03-18'
+  note: 'Pays incentives on sales for five years after commissioning to integrated makers; tranche II (Rs 19,500 crore, approved
+    2022-09-21) reserved most money for polysilicon-to-module and wafer-to-module plants. also: https://www.indiainfoline.com/article/news-top-story/government-approves-rs-19500-crore-pli-for-solar-modules-122092200215_1.html'
+- theme_id: solar_cells
+  name: Customs duty on imported solar cells (Budget 2025-26 restructure)
+  kind: duty
+  direction: support
+  authority: Ministry of Finance
+  announced: 2025-02
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.energetica-india.net/news/union-budget-2025-26-solar-cells-and-modules-duty-cut-to-20-percent
+  source_title: 'Union Budget 2025-26: solar cells and modules duty cut to 20 percent (Energetica India)'
+  source_date: '2025-02-03'
+  note: Cells now carry 20% customs duty plus 7.5% AIDC (and 2.5% SWS per the source) versus 25% before, keeping imported
+    cells costlier than local ones.
+- theme_id: solar_cells
+  name: Anti-dumping duty on Chinese solar cells (DGTR recommendation)
+  kind: trade
+  direction: support
+  authority: Ministry of Commerce (DGTR)
+  announced: 2025-10
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.outlookbusiness.com/news/comm-min-recommends-anti-dumping-duty-on-solar-cells-from-china-for-3-yrs
+  source_title: Comm Min recommends anti-dumping duty on solar cells from China for 3 yrs (Outlook Business/PTI)
+  source_date: '2025-10-04'
+  note: DGTR recommended 23% to 30% of CIF value for three years on Chinese cells whether or not assembled in modules; imposition
+    rests with the Finance Ministry and was not confirmed in sources found.
+- theme_id: solar_cells
+  name: PM Surya Ghar domestic content (DCR) requirement
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: '2024-02-29'
+  outlay_cr: 75021
+  status: active
+  latest_figure: Over 50.06 lakh households covered, 14.8 GW rooftop capacity commissioned, Rs 28,024 crore subsidy released.
+  latest_as_of: '2026-08-04'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294208
+  source_title: 'PM Surya Ghar: Muft Bijli Yojana Achieves Milestone of Over 50 Lakh Rooftop Solar Installations (PIB, MNRE)'
+  source_date: '2026-08-04'
+  note: Subsidised rooftop systems must pass DCR (domestic content) checks via a DCR portal, so the scheme's volume pulls
+    domestic cells.
+- theme_id: solar_modules
+  name: ALMM List-I (solar modules)
+  kind: mandate
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Cumulative ALMM List-I enlisted module capacity reached 228,524 MW after the September 2026 update.
+  latest_as_of: 2026-09
+  source_url: https://www.energetica-india.net/news/almm-update-solar-module-capacity-surpasses-228-gw-in-september-2026
+  source_title: 'ALMM update: solar module capacity surpasses 228 GW in September 2026 (Energetica India)'
+  source_date: '2026-09-18'
+  note: 'Only enlisted module makers can supply government, net-metering and open-access projects; but enlisted capacity is
+    several times annual solar additions (44.6 GW in FY2025-26 per PIB), so the field is crowded. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2296782'
+- theme_id: solar_modules
+  name: ALMM List-II cell sourcing rule for module makers
+  kind: mandate
+  direction: headwind
+  authority: MNRE
+  announced: 2024-12
+  outlay_cr: null
+  status: active
+  latest_figure: Enlisted cell capacity was 36,865 MW against about 228 GW of enlisted module capacity.
+  latest_as_of: 2026-09
+  source_url: https://www.tndindia.com/use-of-domestic-solar-cells-mandatory-effective-june-1-2026/
+  source_title: Use of domestic solar cells mandatory effective June 1, 2026 (T&D India)
+  source_date: '2024-12-11'
+  note: 'From 2026-06-01 modules stay in List-I only if they use List-II cells, which squeezes assemblers without their own
+    cell lines. also: https://mercomindia.com/solar-cell-capacity-under-almm-rises-to-36-9-gw'
+- theme_id: solar_modules
+  name: PLI for high-efficiency solar PV modules
+  kind: pli
+  direction: support
+  authority: MNRE
+  announced: 2022-09
+  outlay_cr: 24000
+  status: active
+  latest_figure: About 30 GW of module capacity set up out of 48,337 MW awarded; 4 GW integrated cell-module capacity declared
+    commissioned in October 2025; no funds released as of 2026-02-28.
+  latest_as_of: '2026-02-28'
+  source_url: https://www.theweek.in/wire-updates/business/2026/03/18/solar-manufacturers-got-no-funds-under-rs-24-000-cr-pli-scheme-till-feb-end-parl-told.html
+  source_title: 'Solar manufacturers got no funds under Rs 24,000-cr PLI scheme till Feb end: Parl told (PTI/The Week)'
+  source_date: '2026-03-18'
+  note: 'Incentive on sales for five years after commissioning favours integrated makers; payouts had not started by end-February
+    2026. also: https://www.indiainfoline.com/article/news-top-story/government-approves-rs-19500-crore-pli-for-solar-modules-122092200215_1.html'
+- theme_id: solar_modules
+  name: Customs duty on imported solar modules (Budget 2025-26 restructure)
+  kind: duty
+  direction: support
+  authority: Ministry of Finance
+  announced: 2025-02
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.energetica-india.net/news/union-budget-2025-26-solar-cells-and-modules-duty-cut-to-20-percent
+  source_title: 'Union Budget 2025-26: solar cells and modules duty cut to 20 percent (Energetica India)'
+  source_date: '2025-02-03'
+  note: Modules now carry 20% customs duty plus 20% AIDC (and 4% SWS per the source) versus 40% before, so import protection
+    stays roughly intact.
+- theme_id: solar_modules
+  name: 'PM Surya Ghar: Muft Bijli Yojana'
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: '2024-02-29'
+  outlay_cr: 75021
+  status: active
+  latest_figure: Over 50.06 lakh households covered, 14.8 GW rooftop capacity commissioned, Rs 28,024 crore subsidy released.
+  latest_as_of: '2026-08-04'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294208
+  source_title: 'PM Surya Ghar: Muft Bijli Yojana Achieves Milestone of Over 50 Lakh Rooftop Solar Installations (PIB, MNRE)'
+  source_date: '2026-08-04'
+  note: Large DCR-compliant rooftop demand for domestic modules; installs ran at about 16,328 a day in July 2026.
+- theme_id: solar_modules
+  name: PM-KUSUM (solar pumps and farm solar)
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: 34422
+  status: ended
+  latest_figure: 10,203 MW installed across components at Rs 7,106 crore (as of November; year not printed, article dated
+    2025-12-30).
+  latest_as_of: null
+  source_url: https://www.downtoearth.org.in/energy/centre-readies-pm-kusum-20-as-focus-shifts-to-feeder-level-solarisation
+  source_title: Centre readies PM-KUSUM 2.0 as focus shifts to feeder-level solarisation (Down To Earth)
+  source_date: '2025-12-30'
+  note: Current phase ran through March 2026 with no formal extension; a larger PM-KUSUM 2.0 was proposed but not confirmed
+    approved in sources found.
+- theme_id: solar_epc_ipp
+  name: 500 GW non-fossil capacity by 2030
+  kind: target
+  direction: support
+  authority: MNRE / Government of India
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Non-fossil capacity reached 300.50 GW (solar 164.59 GW) as on 2026-07-31; 55.29 GW added in FY2025-26.
+  latest_as_of: '2026-07-31'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2296782
+  source_title: India Achieves Landmark 300 GW Non-Fossil Fuel Power Capacity (PIB, MNRE)
+  source_date: '2026-08-09'
+  note: Sets the national build-out pace that drives tenders and EPC order books.
+- theme_id: solar_epc_ipp
+  name: REIA renewable tenders (SECI, NTPC, NHPC, SJVN) and 50 GW/year bid trajectory
+  kind: tender
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: REIAs had issued letters of award for about 69 GW; PPAs signed for about 24.3 GW of it.
+  latest_as_of: '2025-12-31'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2222473
+  source_title: Government Takes Multi-Pronged Steps to Scale Up Energy Storage Capacity in the Country (PIB, MNRE)
+  source_date: '2026-02-03'
+  note: 'The bidding trajectory of 50 GW a year from FY2023-24 to FY2027-28 keeps a large pipeline for developers and EPC
+    firms. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2223720'
+- theme_id: solar_epc_ipp
+  name: Unsigned PPA backlog and shift away from plain solar tenders
+  kind: other
+  direction: headwind
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Only about 24.3 GW of PPAs signed against about 69 GW awarded by REIAs.
+  latest_as_of: '2025-12-31'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2222473
+  source_title: Government Takes Multi-Pronged Steps to Scale Up Energy Storage Capacity in the Country (PIB, MNRE)
+  source_date: '2026-02-03'
+  note: Government notes reduced demand for plain solar/wind power and has asked REIAs to move to storage-linked, peak and
+    FDRE tenders, leaving awarded plain-solar capacity stranded without buyers.
+- theme_id: solar_epc_ipp
+  name: ISTS charge waiver phase-out
+  kind: regulation
+  direction: headwind
+  authority: Ministry of Power / CERC
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2223720
+  source_title: Non-Fossil Fuel Share In Total Installed Power Capacity (PIB, Ministry of Power)
+  source_date: '2026-02-05'
+  note: 'Full waiver only for solar/wind commissioned by 2025-06-30; waiver falls to 75%, 50%, 25% for commissioning by June
+    2026, 2027, 2028 and ends after, raising delivered cost of inter-state projects. also: https://www.legal500.com/intelligence/india/energy-and-natural-resources/a-delay-does-not-mean-a-denial-%E2%80%93-waiver-of-ists-charges-for-renewable-energy-projects-commissioned-after-june-30-2025'
+- theme_id: solar_epc_ipp
+  name: 'PM Surya Ghar: Muft Bijli Yojana'
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: '2024-02-29'
+  outlay_cr: 75021
+  status: active
+  latest_figure: Over 50.06 lakh households covered, 14.8 GW rooftop capacity commissioned, Rs 28,024 crore subsidy released.
+  latest_as_of: '2026-08-04'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294208
+  source_title: 'PM Surya Ghar: Muft Bijli Yojana Achieves Milestone of Over 50 Lakh Rooftop Solar Installations (PIB, MNRE)'
+  source_date: '2026-08-04'
+  note: Rooftop installers gain from a large subsidised order flow; 34,219 vendors registered under the scheme.
+- theme_id: solar_epc_ipp
+  name: PM-KUSUM (phase ending March 2026)
+  kind: subsidy
+  direction: headwind
+  authority: MNRE
+  announced: null
+  outlay_cr: 34422
+  status: ended
+  latest_figure: 10,203 MW installed across components at Rs 7,106 crore (as of November; year not printed); Component A only
+    667.3 MW of 9,964 MW sanctioned.
+  latest_as_of: null
+  source_url: https://www.downtoearth.org.in/energy/centre-readies-pm-kusum-20-as-focus-shifts-to-feeder-level-solarisation
+  source_title: Centre readies PM-KUSUM 2.0 as focus shifts to feeder-level solarisation (Down To Earth)
+  source_date: '2025-12-30'
+  note: The current phase ended in March 2026 without formal extension, pausing new farm-solar EPC work until a successor
+    is approved.
+- theme_id: solar_epc_ipp
+  name: PM-KUSUM 2.0
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: 2026-01
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.businesstoday.in/union-budget/story/budget-2026-may-roll-out-pm-kusum-20-with-nearly-45-funding-hike-to-deepen-farm-solarisation-513437-2026-01-29
+  source_title: Budget 2026 may roll out PM-KUSUM 2.0 with nearly 45% funding hike (Business Today)
+  source_date: '2026-01-29'
+  note: Proposed successor reported at around Rs 50,000 crore (printed figure, not confirmed) with focus on feeder-level solarisation
+    and decentralised plants.
+- theme_id: solar_epc_ipp
+  name: ALMM List-II (domestic cells) for new projects
+  kind: mandate
+  direction: headwind
+  authority: MNRE
+  announced: 2024-12
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.tndindia.com/use-of-domestic-solar-cells-mandatory-effective-june-1-2026/
+  source_title: Use of domestic solar cells mandatory effective June 1, 2026 (T&D India)
+  source_date: '2024-12-11'
+  note: From 2026-06-01 new projects must use modules with ALMM-listed domestic cells, raising module cost and supply risk
+    for developers.
+- theme_id: wind_components
+  name: 100 GW wind capacity by 2030
+  kind: target
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Installed wind capacity 58.14 GW as on 2026-07-31; 6,057 MW added in FY2025-26, a record.
+  latest_as_of: '2026-07-31'
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/jun/doc2026614892601.pdf
+  source_title: 'Global Wind Day 2026: Charting India''s Path to 100 GW and Beyond (PIB backgrounder)'
+  source_date: '2026-06-14'
+  note: 'Backgrounder cites 100 GW by 2030 and 156 GW by 2036, with 28 GW more under implementation, a long order runway for
+    turbine makers. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2296782'
+- theme_id: wind_components
+  name: National Repowering and Life Extension Policy for Wind Power Projects 2023
+  kind: regulation
+  direction: support
+  authority: MNRE
+  announced: '2023-12-07'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.energetica-india.net/news/mnre-issues-national-repowering-and-life-extension-policy-for-wind-projects
+  source_title: MNRE issues National Repowering and Life Extension Policy for wind projects (Energetica India)
+  source_date: '2023-12-07'
+  note: Allows old turbines (below 2 MW or past design life, after 15 years) to be repowered or refurbished; NIWE puts repowering
+    potential at 25.406 GW.
+- theme_id: wind_components
+  name: Offshore wind Viability Gap Funding
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: '2024-06-19'
+  outlay_cr: 7453
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2026699
+  source_title: Cabinet approves Viability Gap Funding (VGF) scheme for implementation of Offshore Wind Energy Projects (PIB)
+  source_date: '2024-06-19'
+  note: Rs 6,853 crore for 1 GW (500 MW each off Gujarat and Tamil Nadu) plus Rs 600 crore for port upgrades; no award or
+    tariff found in fetched sources.
+- theme_id: wind_components
+  name: ALMM (Wind) and ALMM (Wind Turbine Components) list
+  kind: mandate
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Wind turbine manufacturing capacity about 24 GW as of March 2026, with 70-80% indigenisation.
+  latest_as_of: 2026-03
+  source_url: https://www.constructionworld.in/amp/energy-infrastructure/power-and-renewable-energy/mnre-renames-rlmm--tightens-wind-turbine-rules/77020
+  source_title: MNRE renames RLMM, tightens wind turbine rules (Construction World)
+  source_date: '2025-08-01'
+  note: 'RLMM renamed ALMM (Wind); blades, towers, gearboxes, generators and main/pitch/yaw bearings must come from a listed
+    component makers list, favouring domestic component suppliers. also: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/jun/doc2026614892601.pdf'
+- theme_id: wind_components
+  name: Wind Generation Based Incentive (GBI)
+  kind: subsidy
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Rs 500 crore disbursed under the GBI scheme during 2025-26.
+  latest_as_of: 2026-03
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/jun/doc2026614892601.pdf
+  source_title: 'Global Wind Day 2026: Charting India''s Path to 100 GW and Beyond (PIB backgrounder)'
+  source_date: '2026-06-14'
+  note: Cash support per unit generated helps wind farm owners' returns.
+- theme_id: wind_components
+  name: Hybrid, RTC and FDRE tenders
+  kind: tender
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2222473
+  source_title: Government Takes Multi-Pronged Steps to Scale Up Energy Storage Capacity in the Country (PIB, MNRE)
+  source_date: '2026-02-03'
+  note: REIAs have been told to shift from plain RE to storage-linked, peak-supply and FDRE tenders, which need wind alongside
+    solar.
+- theme_id: wind_components
+  name: Contracts for Difference pilot (wind)
+  kind: tender
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: A 500 MW pilot project launched under Contracts for Difference.
+  latest_as_of: 2026-06
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/jun/doc2026614892601.pdf
+  source_title: 'Global Wind Day 2026: Charting India''s Path to 100 GW and Beyond (PIB backgrounder)'
+  source_date: '2026-06-14'
+  note: Price-floor style contracts give wind developers revenue certainty.
+- theme_id: wind_components
+  name: ISTS charge waiver phase-out (onshore wind) / offshore waiver to 2032
+  kind: regulation
+  direction: headwind
+  authority: Ministry of Power / CERC
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2223720
+  source_title: Non-Fossil Fuel Share In Total Installed Power Capacity (PIB, Ministry of Power)
+  source_date: '2026-02-05'
+  note: 'Onshore wind loses the full waiver after 2025-06-30 (graded 75/50/25% to June 2028), while offshore wind keeps 100%
+    waiver for projects commissioned till December 2032. also: https://www.legal500.com/intelligence/india/energy-and-natural-resources/a-delay-does-not-mean-a-denial-%E2%80%93-waiver-of-ists-charges-for-renewable-energy-projects-commissioned-after-june-30-2025'
+- theme_id: battery_storage
+  name: PLI for Advanced Chemistry Cell (ACC) battery storage
+  kind: pli
+  direction: support
+  authority: Ministry of Heavy Industries
+  announced: '2021-05-12'
+  outlay_cr: 18100
+  status: active
+  latest_figure: 40 GWh of the 50 GWh target awarded to four firms; only 1 GWh installed (Ola Cell Technologies).
+  latest_as_of: '2026-03-27'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2246037
+  source_title: ACC Battery Production-Linked Incentive (PLI) Scheme (PIB, Ministry of Heavy Industries)
+  source_date: '2026-03-27'
+  note: Domestic cell supply is still mostly imported; slow plant commissioning delays local-cell sourcing for pack and BESS
+    makers.
+- theme_id: battery_storage
+  name: VGF for BESS - tranche I
+  kind: subsidy
+  direction: support
+  authority: Ministry of Power
+  announced: 2023-09
+  outlay_cr: 3760
+  status: active
+  latest_figure: 13.22 GWh of BESS under implementation under the scheme.
+  latest_as_of: 2026-02
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2223720
+  source_title: Non-Fossil Fuel Share In Total Installed Power Capacity (PIB, Ministry of Power)
+  source_date: '2026-02-05'
+  note: 'VGF of Rs 27 lakh per MWh for 13,220 MWh (PIB 2026-02-03 dates approval to March 2024) underwrites early grid-scale
+    battery orders. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2222473'
+- theme_id: battery_storage
+  name: VGF for BESS - tranche II (30 GWh, PSDF)
+  kind: subsidy
+  direction: support
+  authority: Ministry of Power
+  announced: 2025-06
+  outlay_cr: 5400
+  status: active
+  latest_figure: 35.8 GWh of BESS capacity under construction nationally (all schemes).
+  latest_as_of: '2026-03-30'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2295696
+  source_title: Electrification of Transport and Other Sectors (PIB, Ministry of Power)
+  source_date: '2026-08-06'
+  note: 'Rs 5,400 crore from PSDF at Rs 18 lakh per MWh for 30 GWh across 15 states and NTPC; a big tender pipeline for BESS
+    integrators and cell suppliers. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2246898'
+- theme_id: battery_storage
+  name: BESS requirement in National Electricity Plan
+  kind: target
+  direction: support
+  authority: Ministry of Power / CEA
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Existing BESS (projects above 1 MWh) totalled 798 MWh, with 35.8 GWh under construction.
+  latest_as_of: '2026-03-30'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2246898
+  source_title: Development of Battery Energy Storage Systems (PIB, Ministry of Power)
+  source_date: '2026-03-30'
+  note: CEA projects 208 GWh of BESS needed by 2030, far above current installed base.
+- theme_id: battery_storage
+  name: Energy Storage Obligation (ESO)
+  kind: mandate
+  direction: support
+  authority: Ministry of Power
+  announced: '2022-07-22'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://fiinews.com/?p=41941
+  source_title: Energy Storage Obligation trajectory till 2029-30 has been notified (FII News, citing Parliament reply)
+  source_date: null
+  note: Obliges discoms and consumers to take a rising share of energy via storage through 2029-30, creating mandated demand.
+- theme_id: battery_storage
+  name: ISTS charge waiver for co-located BESS
+  kind: regulation
+  direction: support
+  authority: Ministry of Power
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2222473
+  source_title: Government Takes Multi-Pronged Steps to Scale Up Energy Storage Capacity in the Country (PIB, MNRE)
+  source_date: '2026-02-03'
+  note: 100% waiver for co-located BESS commissioned by 2028-06-30; projects after that date lose it.
+- theme_id: battery_storage
+  name: BCD exemption on capital goods for Li-ion cell making (extended to BESS cells)
+  kind: duty
+  direction: support
+  authority: Ministry of Finance
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.indianchemicalnews.com/policy/budget-202627-capital-goods-for-li-ion-and-sodium-antimonate-exempted-from-bcd-29135
+  source_title: 'Budget 2026-27: Capital goods for Li-ion and sodium antimonate exempted from BCD (Indian Chemical News)'
+  source_date: '2026-02-01'
+  note: Budget 2026-27 extends the customs duty exemption on cell-making machinery to cells for BESS until March 2028, cutting
+    capex for cell plants.
+- theme_id: battery_storage
+  name: CEA co-location advisory (storage with solar)
+  kind: regulation
+  direction: support
+  authority: CEA
+  announced: 2025-02
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2246898
+  source_title: Development of Battery Energy Storage Systems (PIB, Ministry of Power)
+  source_date: '2026-03-30'
+  note: Recommends storage of at least 10% of solar capacity for two hours at new solar projects, broadening BESS demand.
+- theme_id: pumped_storage_hydro
+  name: MoP Guidelines to Promote Development of Pumped Storage Projects
+  kind: regulation
+  direction: support
+  authority: Ministry of Power
+  announced: 2023-04
+  outlay_cr: null
+  status: active
+  latest_figure: 7.43 GW of PSP operational (10 projects), 15.87 GW under construction (11 projects), 10.40 GW concurred or
+    appraised (8 projects).
+  latest_as_of: 2026-08
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/oct/doc_10207_20261019_11104901.pdf
+  source_title: 'Pumped Storage Hydropower: Powering India''s Clean Energy Transition (PIB backgrounder)'
+  source_date: '2026-10-19'
+  note: Policy framework that speeds PSP allotment and approvals, feeding civil and equipment orders.
+- theme_id: pumped_storage_hydro
+  name: CEA PSP roadmap to 2035-36
+  kind: target
+  direction: support
+  authority: CEA
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: CEA envisages 100.81 GW of PSP commissioning by 2035-36, taking cumulative capacity to 105.56 GW.
+  latest_as_of: 2026-10
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/oct/doc_10207_20261019_11104901.pdf
+  source_title: 'Pumped Storage Hydropower: Powering India''s Clean Energy Transition (PIB backgrounder)'
+  source_date: '2026-10-19'
+  note: Planned additions jump to 13.5 GW in 2029-30 and 21.19 GW in 2030-31, a large civil works and turbine pipeline.
+- theme_id: pumped_storage_hydro
+  name: Budgetary support for enabling infrastructure of hydro projects
+  kind: budget
+  direction: support
+  authority: Ministry of Power
+  announced: '2024-09-11'
+  outlay_cr: 12461
+  status: active
+  latest_figure: Kamala HEP (1,720 MW) sanctioned Rs 1,340 crore under enabling-infrastructure support.
+  latest_as_of: '2026-04-08'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2053886
+  source_title: Cabinet approves Modification of the scheme of Budgetary Support for the cost of Enabling Infrastructure for
+    Hydro Electric Projects (PIB)
+  source_date: '2024-09-11'
+  note: 'Covers roads, bridges, transmission lines, ropeways, rail sidings for hydro above 25 MW and all PSPs (about 31,350
+    MW incl. 15,000 MW PSP) awarded by 2028-06-30. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2250050'
+- theme_id: pumped_storage_hydro
+  name: Hydro Purchase Obligation (HPO)
+  kind: mandate
+  direction: support
+  authority: Ministry of Power
+  announced: '2021-01-29'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1744435
+  source_title: Measures taken to promote Hydro Power in India (PIB, Ministry of Power)
+  source_date: '2021-08-10'
+  note: 'Trajectory 2021-22 to 2029-30 obliges discoms to buy hydro power; now part of the Renewable Consumption Obligation
+    with penalties. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2223720'
+- theme_id: pumped_storage_hydro
+  name: ISTS charge waiver for pumped storage
+  kind: regulation
+  direction: support
+  authority: Ministry of Power
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/oct/doc_10207_20261019_11104901.pdf
+  source_title: 'Pumped Storage Hydropower: Powering India''s Clean Energy Transition (PIB backgrounder)'
+  source_date: '2026-10-19'
+  note: 100% ISTS waiver for 25 years for PSPs awarded for construction by 2028-06-30.
+- theme_id: pumped_storage_hydro
+  name: Central financial assistance for NE state equity in hydro projects
+  kind: subsidy
+  direction: support
+  authority: Ministry of Power
+  announced: '2024-08-28'
+  outlay_cr: 4136
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2049320
+  source_title: Cabinet approves Central Financial Assistance towards Equity Participation by NER States for Hydro Electric
+    Projects (PIB)
+  source_date: '2024-08-28'
+  note: Funds up to 24% of equity (max Rs 750 crore per project) for NE states in CPSU hydro JVs, about 15,000 MW supported
+    to FY2031-32.
+- theme_id: pumped_storage_hydro
+  name: Kamala Hydro Electric Project approval (NHPC JV)
+  kind: other
+  direction: support
+  authority: CCEA / Ministry of Power
+  announced: '2026-04-08'
+  outlay_cr: 26069.5
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2250050
+  source_title: Cabinet approves Investment Proposal for construction of 1720 MW Kamala Hydro Electric Project (PIB)
+  source_date: '2026-04-08'
+  note: Rs 26,069.50 crore 1,720 MW project with 96-month build, a large civil and electro-mechanical order.
+- theme_id: pumped_storage_hydro
+  name: Higher CEA concurrence threshold and off-stream PSP exemption
+  kind: regulation
+  direction: support
+  authority: Ministry of Power
+  announced: '2025-08-01'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/oct/doc_10207_20261019_11104901.pdf
+  source_title: 'Pumped Storage Hydropower: Powering India''s Clean Energy Transition (PIB backgrounder)'
+  source_date: '2026-10-19'
+  note: Hydro schemes need CEA concurrence only above Rs 3,000 crore and off-stream closed-loop PSPs are exempt, cutting approval
+    time.
+- theme_id: green_hydrogen
+  name: National Green Hydrogen Mission
+  kind: target
+  direction: support
+  authority: MNRE
+  announced: '2023-01-04'
+  outlay_cr: 19744
+  status: active
+  latest_figure: About 8,000 tonnes per annum of green hydrogen capacity commissioned.
+  latest_as_of: 2026-02
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2329321
+  source_title: 'Green Hydrogen: Emerging Pillar of India''s Clean Energy Transition (PIB Backgrounder)'
+  source_date: '2026-10-28'
+  note: 'Targets at least 5 MMT a year of green hydrogen by 2030 with about 125 GW of linked renewables. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1888545'
+- theme_id: green_hydrogen
+  name: SIGHT - electrolyser manufacturing incentive
+  kind: pli
+  direction: support
+  authority: MNRE / SECI
+  announced: '2023-01-04'
+  outlay_cr: 17490
+  status: active
+  latest_figure: 3,000 MW per annum of electrolyser manufacturing capacity awarded to 15 companies.
+  latest_as_of: '2026-03-24'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2244663
+  source_title: Government Drives Green Hydrogen Expansion and Strengthens Clean Energy Transition (PIB, MNRE)
+  source_date: '2026-03-24'
+  note: Outlay shown is the whole SIGHT programme (both components) up to 2029-30; electrolyser makers get capacity-linked
+    incentives.
+- theme_id: green_hydrogen
+  name: SIGHT - green hydrogen production incentive
+  kind: pli
+  direction: support
+  authority: MNRE / SECI
+  announced: '2023-01-04'
+  outlay_cr: 17490
+  status: active
+  latest_figure: 8,62,000 tonnes per annum of green hydrogen production capacity awarded to 18 companies.
+  latest_as_of: '2026-03-24'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2244663
+  source_title: Government Drives Green Hydrogen Expansion and Strengthens Clean Energy Transition (PIB, MNRE)
+  source_date: '2026-03-24'
+  note: Outlay shown is the whole SIGHT programme; production incentives back the first large green hydrogen and ammonia plants.
+- theme_id: green_hydrogen
+  name: SECI green ammonia demand aggregation auction
+  kind: tender
+  direction: support
+  authority: SECI / MNRE
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Agreements signed for supply of 6.7 lakh MTPA of green ammonia to 11 fertiliser plants.
+  latest_as_of: '2026-06-17'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2274212
+  source_title: Union Minister Shri Pralhad Joshi Launches Green Hydrogen Certification Portal (PIB, MNRE)
+  source_date: '2026-06-17'
+  note: 'Prices were discovered for 7,24,000 MTPA for 13 fertiliser units, giving producers long-term offtake. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2244663'
+- theme_id: green_hydrogen
+  name: Green hydrogen supply tenders for refineries
+  kind: tender
+  direction: support
+  authority: MNRE / oil PSUs
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Contracts awarded for 30,000 MTPA of green hydrogen to IOCL, BPCL, HPCL and NRL.
+  latest_as_of: '2026-06-17'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2274212
+  source_title: Union Minister Shri Pralhad Joshi Launches Green Hydrogen Certification Portal (PIB, MNRE)
+  source_date: '2026-06-17'
+  note: Guaranteed refinery offtake for electrolyser and hydrogen project developers.
+- theme_id: green_hydrogen
+  name: Green Hydrogen Hubs and Hydrogen Valley Innovation Clusters
+  kind: budget
+  direction: support
+  authority: MNRE
+  announced: null
+  outlay_cr: 400
+  status: active
+  latest_figure: Deendayal (Kandla), V.O. Chidambaranar and Paradip ports recognised as hubs; four HVICs awarded.
+  latest_as_of: 2026-10
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2329321
+  source_title: 'Green Hydrogen: Emerging Pillar of India''s Clean Energy Transition (PIB Backgrounder)'
+  source_date: '2026-10-28'
+  note: Rs 400 crore up to 2025-26 for hubs; hub projects can access central and state scheme benefits.
+- theme_id: green_hydrogen
+  name: ISTS waiver for green hydrogen and ammonia plants
+  kind: regulation
+  direction: support
+  authority: Ministry of Power
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2329321
+  source_title: 'Green Hydrogen: Emerging Pillar of India''s Clean Energy Transition (PIB Backgrounder)'
+  source_date: '2026-10-28'
+  note: Plants commissioned by 2030-12-31 are exempt from ISTS charges for 25 years, lowering power cost, the main input.
+- theme_id: green_hydrogen
+  name: NGHM pilot and hub earmarks running only to 2025-26
+  kind: budget
+  direction: headwind
+  authority: MNRE
+  announced: null
+  outlay_cr: null
+  status: ended
+  latest_figure: 'Mobility pilots: Rs 41.582 crore released of about Rs 410.77 crore allocated.'
+  latest_as_of: '2026-07-29'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2291541
+  source_title: Centre Launches 12 Pilot Projects Under National Green Hydrogen Mission for Deployment of 70 Hydrogen-Powered
+    Vehicles (PIB, MNRE)
+  source_date: '2026-07-29'
+  note: 'Mobility (Rs 496 crore), shipping (Rs 115 crore) and hub (Rs 400 crore) earmarks were set only up to 2025-26 (PIB
+    backgrounder); no renewal found. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2329321'
+- theme_id: power_grid_equipment
+  name: National Electricity Plan (Transmission) 2022-32
+  kind: target
+  direction: support
+  authority: Ministry of Power / CEA
+  announced: '2024-10-14'
+  outlay_cr: 916142
+  status: active
+  latest_figure: 154 inter-state transmission projects (39,792 ckm of lines, 4,01,510 MVA) and intra-state projects of 30,387
+    ckm and 1,18,194 MVA are under construction.
+  latest_as_of: '2026-07-27'
+  source_url: https://www.powermin.gov.in/static/uploads/2026/07/f59419a881df9acc24bed8753f6d9fda.pdf
+  source_title: 'Rajya Sabha Unstarred Q 956 (Ministry of Power): Power demand projections, grid infrastructure and capacity
+    expansion'
+  source_date: '2026-07-27'
+  note: 'The plan needs about Rs 9,16,142 crore of lines and substations at 220 kV and above, a ten-year order book for transformer,
+    conductor, tower and cable makers; network to grow from 5.09 lakh ckm (June 2026) to 6.48 lakh ckm by 2032. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2291650&lang=1&reg=17
+    ; launch date: https://www.newsonair.gov.in/union-minister-manohar-lal-calls-for-collaboration-to-achieve-2100-gw-power-generation-by-2047'
+- theme_id: power_grid_equipment
+  name: Revamped Distribution Sector Scheme (RDSS) - smart meters and loss reduction
+  kind: subsidy
+  direction: support
+  authority: 'Ministry of Power (nodal: PFC, REC)'
+  announced: 2021-07
+  outlay_cr: 303758
+  status: active
+  latest_figure: 5.73 crore of 20.33 crore sanctioned smart meters installed under RDSS (7.24 crore across all schemes).
+  latest_as_of: '2026-06-30'
+  source_url: https://www.powermin.gov.in/static/uploads/2026/07/f59419a881df9acc24bed8753f6d9fda.pdf
+  source_title: 'Rajya Sabha Unstarred Q 943/950 (Ministry of Power): Delay in smart meter installation'
+  source_date: '2026-07-27'
+  note: Central support of Rs 97,631 crore; Rs 1.31 lakh crore of smart-metering works and Rs 1.53 lakh crore of loss-reduction
+    works sanctioned; scheme sunset 31 March 2028, so roughly 14.6 crore meters remain to be installed in under two years.
+- theme_id: power_grid_equipment
+  name: RDSS smart-meter rollout lagging in large states
+  kind: other
+  direction: headwind
+  authority: Ministry of Power
+  announced: '2026-07-27'
+  outlay_cr: null
+  status: active
+  latest_figure: Tamil Nadu has installed 9,746 of 3.05 crore sanctioned meters, Punjab 14,662 of 89.8 lakh, Kerala 1.93 lakh
+    of 1.34 crore.
+  latest_as_of: '2026-06-30'
+  source_url: https://www.powermin.gov.in/static/uploads/2026/07/f59419a881df9acc24bed8753f6d9fda.pdf
+  source_title: 'Rajya Sabha Unstarred Q 943 (Ministry of Power): Delay in smart meter installation - state annexure'
+  source_date: '2026-07-27'
+  note: The ministry cites late tenders, delayed contracts and payment-security agreements and weak consumer engagement; slow
+    states push meter and AMI-service revenue later.
+- theme_id: power_grid_equipment
+  name: Green Energy Corridor Phase-III (intra-state transmission + 50 GWh BESS)
+  kind: subsidy
+  direction: support
+  authority: Ministry of New and Renewable Energy (Union Cabinet)
+  announced: '2026-09-30'
+  outlay_cr: 186405
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasepage.aspx?PRID=2316948&reg=48&lang=1
+  source_title: Cabinet approves Green Energy Corridor Phase-III scheme for Development of Intra-State Transmission System
+    with Battery Energy Storage Systems
+  source_date: '2026-09-30'
+  note: 'Rs 1,36,378 crore of state transmission lines and substations plus Rs 50,000 crore of battery storage to evacuate
+    up to 135 GW by FY 2032-33, with Rs 54,082 crore central support; earlier phase II was Rs 12,031 crore for 10,750 ckm.
+    also: https://pib.gov.in/PressReleasePage.aspx?PRID=1788010'
+- theme_id: power_grid_equipment
+  name: ISTS renewable-linked transmission schemes approved and bid out
+  kind: tender
+  direction: support
+  authority: Ministry of Power / CEA / CTUIL
+  announced: '2026-01-16'
+  outlay_cr: 38849
+  status: active
+  latest_figure: Of about 335 GW of ISTS network needed by 2030, 48 GW completed, 172 GW under construction and 18.5 GW under
+    bidding; 96.5 GW still to be approved.
+  latest_as_of: 2025-11
+  source_url: https://www.pib.gov.in/PressReleseDetailm.aspx?PRID=2215187&reg=20&lang=1
+  source_title: Year End Review of Ministry of Power - 2025
+  source_date: '2026-01-16'
+  note: 25.8 GW of RE-linked inter-state projects costing Rs 38,849 crore were approved Jan-Nov 2025; the un-approved 96.5
+    GW is the future tender pipeline for EPC and equipment firms.
+- theme_id: power_grid_equipment
+  name: Right-of-way compensation guidelines for transmission lines
+  kind: regulation
+  direction: support
+  authority: Ministry of Power
+  announced: 2024-06
+  outlay_cr: null
+  status: active
+  latest_figure: Tower-base compensation raised from 85% to 200% of land value; corridor compensation from 15% to 30%.
+  latest_as_of: 2025-12
+  source_url: https://www.pib.gov.in/PressReleseDetailm.aspx?PRID=2215187&reg=20&lang=1
+  source_title: Year End Review of Ministry of Power - 2025
+  source_date: '2026-01-16'
+  note: 'Land disputes are the main cause of line delays; higher compensation (further guidelines 21.03.2025 and 15.12.2025)
+    should speed line building. also: https://www.powermin.gov.in/static/uploads/2026/07/f59419a881df9acc24bed8753f6d9fda.pdf'
+- theme_id: power_grid_equipment
+  name: Prior permission and testing for imported power-system equipment (China/'prior reference' countries)
+  kind: trade
+  direction: support
+  authority: Ministry of Power
+  announced: '2020-07-02'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://bhel.com/sites/default/files/mop-order-dt-02-07-2020-%26-23-07-2020-1601875618.pdf
+  source_title: Ministry of Power Order No. 25-11/6/2018-PG dated 02.07.2020
+  source_date: '2020-07-02'
+  note: Imports from land-border countries need government permission and all imported grid equipment must be lab-tested,
+    shielding Indian transformer, meter and switchgear makers; current status not re-checked after 2020.
+- theme_id: power_grid_equipment
+  name: Transmission project delays (TBCB execution)
+  kind: other
+  direction: headwind
+  authority: ICRA (on CEA / central nodal agency data)
+  announced: 2026-06
+  outlay_cr: null
+  status: active
+  latest_figure: Only 12% of TBCB-awarded projects were commissioned on time; median delay over 10 months, some up to 3 years.
+  latest_as_of: 2026-06
+  source_url: https://www.icra.in/Rating/DownloadResearchSpecialCommentReport?id=6961
+  source_title: 'ICRA - Indian Power Sector: Sharp ramp-up in transmission capacity'
+  source_date: 2026-06
+  note: 'Delays from right-of-way, forest clearance and supply chain slow revenue recognition for line builders; line additions
+    averaged 13-14,000 ckm a year in FY22-26 vs 18-19,000 in FY18-21. also: https://www.constructionworld.in/energy-infrastructure/power-and-renewable-energy/right-of-way-issues-delay-14-interstate-transmission-projects/70481'
+- theme_id: data_centres
+  name: Infrastructure status for data centres (Harmonised Master List)
+  kind: regulation
+  direction: support
+  authority: Ministry of Finance
+  announced: '2022-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: Installed data-centre capacity grew from about 375 MW in 2020 to 1.57 GW as of August 2026; projected near
+    8 GW by 2030.
+  latest_as_of: 2026-08
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1794165&reg=48&lang=2
+  source_title: Highlights of the Union Budget 2022-23
+  source_date: '2022-02-01'
+  note: 'Infrastructure status gives data centres access to cheaper long-term infrastructure loans. also: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/sep/doc_9859_20260914_10550401.pdf'
+- theme_id: data_centres
+  name: Tax holiday till 2047 for foreign cloud providers using Indian data centres
+  kind: budget
+  direction: support
+  authority: Ministry of Finance / MeitY
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: About USD 70 billion of data-centre investment is underway in India and about USD 90 billion more announced.
+  latest_as_of: '2026-02-01'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2221894&reg=3&lang=1
+  source_title: Budget 2026-27 lays strong foundation for AI Data Centres and Semiconductor Ecosystem
+  source_date: '2026-02-01'
+  note: 'Covers tax years 2026-27 to 2046-47 for notified foreign firms buying DC services from an Indian DC company; 15%
+    cost-plus safe harbour for related Indian DC operators - a demand driver for Indian colocation capacity. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2227953&reg=48&lang=2'
+- theme_id: data_centres
+  name: Digital Personal Data Protection Rules 2025
+  kind: regulation
+  direction: support
+  authority: MeitY
+  announced: '2025-11-14'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2190014&reg=3&lang=2
+  source_title: Government notifies DPDP Rules to empower citizens and protect privacy
+  source_date: '2025-11-14'
+  note: '18-month phased compliance; Significant Data Fiduciaries must follow government restrictions on certain data categories
+    ''including localisation where required'' - a possible, not general, local-storage push; separately, RBI has required
+    payment-system data to be stored only in India since its 6 April 2018 circular. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2241783&reg=3&lang=2'
+- theme_id: data_centres
+  name: CEA projection of data-centre power demand
+  kind: target
+  direction: support
+  authority: Central Electricity Authority / MeitY
+  announced: '2026-08-12'
+  outlay_cr: null
+  status: active
+  latest_figure: Installed DC capacity about 1,575 MW, against a projected power demand of about 17 GW by 2031-32.
+  latest_as_of: 2026-08
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2298108&reg=3&lang=1
+  source_title: Government Promotes Sustainable Growth of Data Centres through Energy-Efficient and Clean Energy Measures
+  source_date: '2026-08-12'
+  note: 'The official demand path implies roughly a tenfold build-out; the Ministry of Power separately projects 26.3 GW of
+    extra AI-data-centre load by 2031-32. also: https://www.powermin.gov.in/static/uploads/2026/07/f59419a881df9acc24bed8753f6d9fda.pdf'
+- theme_id: data_centres
+  name: Uttar Pradesh Data Centre Policy 2026
+  kind: subsidy
+  direction: support
+  authority: Government of Uttar Pradesh
+  announced: '2026-07-09'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://uplc.up.gov.in/downloadmedia/siteContent/202608230935077722DC-policy-2026-English_230826.pdf
+  source_title: UP Data Centre Policy 2026 (G.O. No. 536/78-2-2026/E-105226)
+  source_date: '2026-07-09'
+  note: Five-year policy targeting 2 GW+ of new capacity and over Rs 2 lakh crore of investment, with interest and capital
+    subsidies, 10-year electricity-duty exemption and 25-year power-purchase/transmission benefits; replaces the 2021 policy.
+- theme_id: data_centres
+  name: Maharashtra Integrated Green Data Centre Parks policy - statewide expansion
+  kind: subsidy
+  direction: support
+  authority: Government of Maharashtra
+  announced: 2026-06
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.whalesbook.com/news/English/real-estate/Maharashtra-Expands-Green-Data-Centre-Policy-Investor-Impact/6a30b10ad017fdb509977cc9
+  source_title: 'Maharashtra Expands Green Data Centre Policy: Investor Impact (Whalesbook)'
+  source_date: '2026-06-16'
+  note: 'Eligible parks raised from 3 to 20 and extended beyond the Mumbai region; mandatory green power for core DC load
+    cut from 100% to 51%; parks with Rs 30,000 crore investment get a Re 1/unit tariff concession for 10 years. also: https://navbharatlive.com/maharashtra/mumbai/maharashtra-green-data-center-policy-mumbai-investment-boost-1789957.html'
+- theme_id: data_centres
+  name: Draft National Data Centre Policy 2025
+  kind: regulation
+  direction: support
+  authority: MeitY
+  announced: 2025-09
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.business-standard.com/industry/news/govt-20yr-tax-holiday-gst-credit-data-centre-policy-125091400441_1.html
+  source_title: Govt proposes tax exemption of up to 20 years for data centre developers (Business Standard)
+  source_date: '2025-09-14'
+  note: Draft offers up to 20-year tax exemption tied to capacity, PUE and jobs targets, GST input credit on DC capital assets,
+    and PE status for foreign firms leasing 100 MW+; not yet final as far as found.
+- theme_id: data_centres
+  name: IndiaAI Mission - subsidised GPU compute
+  kind: budget
+  direction: support
+  authority: MeitY (IndiaAI)
+  announced: null
+  outlay_cr: 10371.92
+  status: active
+  latest_figure: Shared compute pool of 45,000+ GPUs; 237 projects used 93.18 lakh subsidised GPU hours by August 2026.
+  latest_as_of: 2026-08
+  source_url: https://www.pib.gov.in/FactsheetDetails.aspx?Id=150860&reg=5&lang=16
+  source_title: 'PIB Factsheet: Semiconductor and AI Revolution'
+  source_date: '2026-08-13'
+  note: 'Government-paid GPU capacity is hosted by empanelled providers, adding AI-ready DC demand; outlay Rs 10,371.92 crore
+    per PIB DC backgrounder (approval date not on fetched pages). also: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/sep/doc_9859_20260914_10550401.pdf'
+- theme_id: dc_equipment
+  name: Tax holiday till 2047 for foreign cloud providers using Indian data centres
+  kind: budget
+  direction: support
+  authority: Ministry of Finance / MeitY
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: About USD 70 billion of data-centre investment is underway in India and about USD 90 billion more announced.
+  latest_as_of: '2026-02-01'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2221894&reg=3&lang=1
+  source_title: Budget 2026-27 lays strong foundation for AI Data Centres and Semiconductor Ecosystem
+  source_date: '2026-02-01'
+  note: More hyperscale capacity built in India means more orders for cooling, UPS, gensets, busways and racks.
+- theme_id: dc_equipment
+  name: CEA projection of data-centre power demand
+  kind: target
+  direction: support
+  authority: Central Electricity Authority / MeitY
+  announced: '2026-08-12'
+  outlay_cr: null
+  status: active
+  latest_figure: Installed DC capacity about 1,575 MW, against a projected power demand of about 17 GW by 2031-32.
+  latest_as_of: 2026-08
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2298108&reg=3&lang=1
+  source_title: Government Promotes Sustainable Growth of Data Centres through Energy-Efficient and Clean Energy Measures
+  source_date: '2026-08-12'
+  note: Every MW of IT load needs power-backup, cooling and distribution gear; the release also notes a shift to liquid, adiabatic
+    and immersion cooling and high-density racks.
+- theme_id: dc_equipment
+  name: Draft National Data Centre Policy 2025 - GST input credit on DC equipment
+  kind: regulation
+  direction: support
+  authority: MeitY
+  announced: 2025-09
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.business-standard.com/industry/news/govt-20yr-tax-holiday-gst-credit-data-centre-policy-125091400441_1.html
+  source_title: Govt proposes tax exemption of up to 20 years for data centre developers (Business Standard)
+  source_date: '2025-09-14'
+  note: Draft proposes GST input tax credit on capital assets incl. HVAC and electrical systems, which would cut the cost
+    of the equipment these firms sell.
+- theme_id: dc_equipment
+  name: Uttar Pradesh Data Centre Policy 2026
+  kind: subsidy
+  direction: support
+  authority: Government of Uttar Pradesh
+  announced: '2026-07-09'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://uplc.up.gov.in/downloadmedia/siteContent/202608230935077722DC-policy-2026-English_230826.pdf
+  source_title: UP Data Centre Policy 2026 (G.O. No. 536/78-2-2026/E-105226)
+  source_date: '2026-07-09'
+  note: Targets 2 GW+ of new DC capacity in five years with capital and interest subsidies - a regional equipment demand pipeline.
+- theme_id: dc_equipment
+  name: Maharashtra Integrated Green Data Centre Parks policy - statewide expansion
+  kind: subsidy
+  direction: support
+  authority: Government of Maharashtra
+  announced: 2026-06
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.whalesbook.com/news/English/real-estate/Maharashtra-Expands-Green-Data-Centre-Policy-Investor-Impact/6a30b10ad017fdb509977cc9
+  source_title: 'Maharashtra Expands Green Data Centre Policy: Investor Impact (Whalesbook)'
+  source_date: '2026-06-16'
+  note: Up to 20 incentivised parks statewide; the green-power floor of 51% also supports on-site solar/storage equipment.
+- theme_id: dc_equipment
+  name: PLI Scheme 2.0 for IT Hardware (incl. servers)
+  kind: pli
+  direction: support
+  authority: MeitY
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Cumulative production Rs 24,385.89 crore, investment Rs 1,056.36 crore, 5,216 direct jobs.
+  latest_as_of: '2026-07-29'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2291171&reg=48&lang=2
+  source_title: Production Linked Incentive Schemes Strengthen India's Electronics Manufacturing Ecosystem
+  source_date: '2026-07-29'
+  note: Incentive for local manufacture of laptops, tablets and servers; launched in 2023 per the release; outlay not on fetched
+    pages.
+- theme_id: dc_equipment
+  name: Anti-dumping duty recommended on copper data cables from China
+  kind: trade
+  direction: support
+  authority: DGTR (Ministry of Commerce)
+  announced: '2026-09-16'
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://dgtr.gov.in/sites/default/files/2026-10/Corrigendum%20CDC%20English.pdf
+  source_title: DGTR Corrigendum to Final Findings, Copper Data Cables from China PR (Case AD(OI)-39/2025)
+  source_date: '2026-10-21'
+  note: Recommends US$86/km for 5 years on structured copper data cables (CAT5e-CAT7A, patch cords) from China (nil for four
+    named producers); helps Indian structured-cabling makers once the Finance Ministry notifies it.
+- theme_id: telecom_equipment
+  name: PLI Scheme for Telecom and Networking Products
+  kind: pli
+  direction: support
+  authority: Department of Telecommunications
+  announced: '2021-02-24'
+  outlay_cr: 12195
+  status: active
+  latest_figure: 42 companies (28 MSMEs) approved with committed investment of Rs 4,115 crore; expected incremental sales
+    Rs 2.45 lakh crore.
+  latest_as_of: '2022-10-31'
+  source_url: https://dot.gov.in/cms/wp-json/wp/v2/schemes_and_services?slug=pli-scheme
+  source_title: 'DoT scheme page: Production Linked Incentive (PLI) scheme'
+  source_date: '2025-07-21'
+  note: 'Outlay includes Rs 2,500 crore for MSMEs plus a 1% extra incentive for design-led products; no newer disbursement
+    figure was found. also: https://www.dot.gov.in/static/uploads/2025/07/a9c97ae16804526029c3a32700a9a6b6.pdf'
+- theme_id: telecom_equipment
+  name: BharatNet / Amended BharatNet Programme
+  kind: tender
+  direction: support
+  authority: Department of Telecommunications / Digital Bharat Nidhi
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: 2.21 lakh gram panchayats service-ready; BharatNet PoPs operational at 80,472 GPs; 24,784 DBN-funded mobile
+    towers commissioned.
+  latest_as_of: '2026-06-30'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294910&reg=48&lang=2
+  source_title: Government Highlights Digital India Initiatives for Strengthening Digital Infrastructure, Cyber Security and
+    Data Protection
+  source_date: '2026-08-05'
+  note: 'Rural fibre build drives demand for optical fibre, cable and GPON/router gear; a state-led model was signed with
+    Jharkhand in Sep 2026; programme outlay not found on fetched pages. also: https://www.dot.gov.in/static/uploads/2026/10/7055c08dd8b1aeab78e2f8590f320054.pdf'
+- theme_id: telecom_equipment
+  name: Telecom Manufacturing Zone, Gwalior
+  kind: subsidy
+  direction: support
+  authority: Department of Telecommunications / Government of Madhya Pradesh
+  announced: '2026-09-14'
+  outlay_cr: 493.44
+  status: proposed
+  latest_figure: 50 applications proposing over Rs 5,500 crore of investment and 22,500+ jobs received across three investor
+    roundtables.
+  latest_as_of: 2026-09
+  source_url: https://www.dot.gov.in/static/uploads/2026/09/d9f064686fb76fb49475dae90b342146.pdf
+  source_title: Telecom Manufacturing Zone Gwalior 2026 (DoT / MP Industrial Policy deck)
+  source_date: '2026-09-14'
+  note: 'Rs 493.44 crore is DoT''s proposed indicative grant for test labs and plug-and-play infrastructure in India''s first
+    integrated telecom manufacturing zone; land-use change still under way. also: https://www.dot.gov.in/static/uploads/2026/10/7055c08dd8b1aeab78e2f8590f320054.pdf'
+- theme_id: telecom_equipment
+  name: ECMS approvals for optical transceivers and telecom components
+  kind: pli
+  direction: support
+  authority: MeitY
+  announced: '2025-04-08'
+  outlay_cr: 40000
+  status: active
+  latest_figure: 106 ECMS projects approved with Rs 69,548 crore investment; capacity for optical transceivers (SFP) now about
+    350% of domestic demand.
+  latest_as_of: '2026-08-17'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2300625&reg=48&lang=1
+  source_title: 'ECMS Accelerates Electronics Manufacturing: 38 Plants Operational, 16 in Advanced Construction Stages'
+  source_date: '2026-08-17'
+  note: SFP transceiver approvals went to SFO Technologies, GX Quantum Photonics and Huber Suhner; antennas, filters, connectors
+    also covered - local supply for telecom gear makers.
+- theme_id: telecom_equipment
+  name: Anti-dumping duty on single-mode optical fibre from China, Indonesia, Korea
+  kind: trade
+  direction: support
+  authority: DGTR (Ministry of Commerce)
+  announced: '2023-05-05'
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.dgtr.gov.in/en/anti-dumping-cases/anti-dumping-investigation-concerning-imports-dispersion-unshifted-single-mode
+  source_title: 'DGTR case page and Final Findings: Dispersion Unshifted Single-mode Optical Fibre (File 6/1/2022-DGTR)'
+  source_date: '2023-05-05'
+  note: DGTR recommended duties of US$122.41-807.88 per thousand fibre-km; whether and until when the Finance Ministry imposed
+    them was not confirmed from a fetched page.
+- theme_id: telecom_equipment
+  name: Anti-dumping duty recommended on copper data cables from China
+  kind: trade
+  direction: support
+  authority: DGTR (Ministry of Commerce)
+  announced: '2026-09-16'
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://dgtr.gov.in/sites/default/files/2026-10/Corrigendum%20CDC%20English.pdf
+  source_title: DGTR Corrigendum to Final Findings, Copper Data Cables from China PR (Case AD(OI)-39/2025)
+  source_date: '2026-10-21'
+  note: US$86/km for 5 years on CAT5e-CAT7A copper data cables and patch cords from China (nil for four named producers);
+    pending Finance Ministry notification.
+- theme_id: ems
+  name: PLI for Large Scale Electronics Manufacturing (mobile phones)
+  kind: pli
+  direction: support
+  authority: MeitY
+  announced: null
+  outlay_cr: 40995
+  status: ended
+  latest_figure: 'Cumulative till March 2026: investment Rs 20,587 crore, production Rs 11,61,581 crore, exports Rs 6,43,323
+    crore (all above 5-year targets).'
+  latest_as_of: 2026-03
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2291171&reg=48&lang=2
+  source_title: Production Linked Incentive Schemes Strengthen India's Electronics Manufacturing Ecosystem
+  source_date: '2026-07-29'
+  note: 'Launched in 2020; paid 4-6% on incremental sales; about Rs 15,554 crore disbursed under electronics PLIs (LSEM +
+    IT Hardware 2.0) by Dec 2025; the Rs 40,995 crore plan expired March 2026. also: https://www.outlookbusiness.com/economy-and-policy/centre-likely-to-extend-or-launch-new-pli-scheme-for-mobile-manufacturing-says-meity-secretary'
+- theme_id: ems
+  name: PLI-LSEM expiry; successor pays lower rates
+  kind: other
+  direction: headwind
+  authority: MeitY / Union Cabinet
+  announced: 2026-03
+  outlay_cr: null
+  status: ended
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.outlookbusiness.com/economy-and-policy/centre-likely-to-extend-or-launch-new-pli-scheme-for-mobile-manufacturing-says-meity-secretary
+  source_title: Centre Likely to Extend or Launch New PLI Scheme for Mobile Manufacturing, Says Meity Secretary (Outlook Business)
+  source_date: '2026-01-02'
+  note: 'The 4-6% LSEM incentive lapsed in March 2026; the replacement Mobile Phone Manufacturing Scheme pays 2.25-5%, so
+    per-unit support for assemblers falls. also: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/aug/doc2026814958601.pdf'
+- theme_id: ems
+  name: Mobile Phone Manufacturing Scheme (FY27-FY31)
+  kind: pli
+  direction: support
+  authority: Union Cabinet
+  announced: '2026-07-15'
+  outlay_cr: 62500
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/aug/doc2026814958601.pdf
+  source_title: 'Manufacturing Momentum: Building a Self-Reliant India (PIB)'
+  source_date: '2026-08-14'
+  note: Five-year scheme FY2026-27 to FY2030-31 with 2.25-5% incentives plus extra support for local sourcing, Indian brands
+    and design/R&D - keeps phone EMS volumes subsidised.
+- theme_id: ems
+  name: Electronics Components Manufacturing Scheme (ECMS)
+  kind: pli
+  direction: support
+  authority: MeitY
+  announced: '2025-04-08'
+  outlay_cr: 40000
+  status: active
+  latest_figure: 106 projects approved across 15 states with Rs 69,548 crore investment; 38 plants producing, 16 more in advanced
+    construction.
+  latest_as_of: 2026-08
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/sep/doc_9893_20260917_12411701.pdf
+  source_title: 'Electronics Components Manufacturing Scheme: Building India''s Electronics Backbone (PIB)'
+  source_date: '2026-09-17'
+  note: 'Outlay raised from Rs 22,919 crore to Rs 40,000 crore in Budget 2026-27; capex and turnover support for PCBs, camera/display
+    modules, passives and materials. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2221894&reg=3&lang=1'
+- theme_id: ems
+  name: PLI Scheme 2.0 for IT Hardware
+  kind: pli
+  direction: support
+  authority: MeitY
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Cumulative production Rs 24,385.89 crore, investment Rs 1,056.36 crore, 5,216 direct jobs.
+  latest_as_of: '2026-07-29'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2291171&reg=48&lang=2
+  source_title: Production Linked Incentive Schemes Strengthen India's Electronics Manufacturing Ecosystem
+  source_date: '2026-07-29'
+  note: Supports local assembly of laptops, tablets and servers; output so far is small next to mobiles; outlay not on fetched
+    pages.
+- theme_id: ems
+  name: Safe harbour for component warehousing in bonded warehouses
+  kind: budget
+  direction: support
+  authority: Ministry of Finance
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/feb/doc202621776101.pdf
+  source_title: PIB Summary of Union Budget 2026-27
+  source_date: '2026-02-01'
+  note: Non-residents keeping components in Indian bonded warehouses taxed at a 2% margin on invoice value (about 0.7% effective
+    tax), easing just-in-time supply for EMS plants.
+- theme_id: semiconductors
+  name: Semicon India Programme 1.0 (India Semiconductor Mission)
+  kind: subsidy
+  direction: support
+  authority: MeitY / India Semiconductor Mission
+  announced: 2021-12
+  outlay_cr: 76000
+  status: active
+  latest_figure: 12 manufacturing units approved with over Rs 1.64 lakh crore investment; Micron, Kaynes and CG Semi in commercial
+    production.
+  latest_as_of: 2026-07
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/aug/doc2026814958601.pdf
+  source_title: 'Manufacturing Momentum: Building a Self-Reliant India (PIB)'
+  source_date: '2026-08-14'
+  note: Approved units are one silicon fab, one SiC fab, a GaN micro-LED display fab and nine packaging (OSAT/ATMP) units;
+    one more expected to start in 2026.
+- theme_id: semiconductors
+  name: Semicon 2.0
+  kind: subsidy
+  direction: support
+  authority: Union Cabinet / MeitY
+  announced: '2026-07-15'
+  outlay_cr: 127500
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2284784&reg=48&lang=2
+  source_title: Cabinet approves Semicon 2.0
+  source_date: '2026-07-15'
+  note: Six pillars - design, equipment and materials, more fabs, OSAT/ATMP, R&D, talent; extends fiscal support to equipment,
+    chemicals and gas makers for the first time.
+- theme_id: semiconductors
+  name: ISM 2.0 budget provision FY2026-27
+  kind: budget
+  direction: support
+  authority: MeitY
+  announced: '2026-02-01'
+  outlay_cr: 1000
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2221894&reg=3&lang=1
+  source_title: Budget 2026-27 lays strong foundation for AI Data Centres and Semiconductor Ecosystem
+  source_date: '2026-02-01'
+  note: First-year provision is small (Rs 1,000 crore) relative to the Rs 1,27,500 crore Semicon 2.0 outlay, so cash flows
+    are back-ended.
+- theme_id: semiconductors
+  name: Design Linked Incentive (DLI) scheme and Chips to Startup
+  kind: subsidy
+  direction: support
+  authority: MeitY / India Semiconductor Mission
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: 24 chip-design projects approved for support and 105 startups/MSMEs given EDA tools.
+  latest_as_of: '2026-07-15'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2284784&reg=48&lang=2
+  source_title: Cabinet approves Semicon 2.0
+  source_date: '2026-07-15'
+  note: 'Supports Indian fabless designers (telecom, smart-meter, IoT, AI chips); 211 chips taped out by 75 institutions by
+    April 2026. also: https://www.pib.gov.in/FactsheetDetails.aspx?Id=150860&reg=5&lang=16'
+- theme_id: semiconductors
+  name: First Indian fab not before 2028
+  kind: other
+  direction: headwind
+  authority: MeitY / Union Cabinet
+  announced: '2026-07-15'
+  outlay_cr: null
+  status: active
+  latest_figure: First fab scheduled to be commissioned in 2028.
+  latest_as_of: '2026-07-15'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2284784&reg=48&lang=2
+  source_title: Cabinet approves Semicon 2.0
+  source_date: '2026-07-15'
+  note: Front-end fab revenue and local wafer supply for designers and OSATs are still about two years away; ISM 1.0 output
+    so far is from packaging units.
+- theme_id: defence_platforms
+  name: Defence capital outlay 2026-27
+  kind: budget
+  direction: support
+  authority: Ministry of Defence
+  announced: '2026-02-01'
+  outlay_cr: 219306.47
+  status: active
+  latest_figure: Of over Rs 2.19 lakh crore capital, Rs 1.85 lakh crore is for capital acquisition (about 24% more than 2025-26);
+    Rs 1.39 lakh crore is earmarked for buying from domestic industry.
+  latest_as_of: '2026-02-03'
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/feb/doc202623778301.pdf
+  source_title: Defence in Union Budget 2026-27 (PIB Research)
+  source_date: '2026-02-03'
+  note: 'Biggest single source of orders for aircraft, missiles, vehicles and ammunition makers; about 75% of acquisition
+    money is reserved for Indian firms. also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf'
+- theme_id: defence_platforms
+  name: Capital budget use and contracts FY2025-26
+  kind: tender
+  direction: support
+  authority: Ministry of Defence
+  announced: 2026-03
+  outlay_cr: null
+  status: ended
+  latest_figure: Capital outlay of Rs 1.86 lakh crore (RE) fully used in FY2025-26; 503 capital procurement contracts worth
+    Rs 2.28 lakh crore signed.
+  latest_as_of: 2026-03
+  source_url: https://www.aviation-defence-universe.com/ministry-of-defence-achieves-full-utilization-of-capital-budget-of-rs-1-86-lakh-crore-for-fy-2025-26
+  source_title: Ministry of Defence achieves full utilization of capital budget of Rs 1.86 lakh crore for FY 2025-26 (Aviation
+    & Defence Universe)
+  source_date: null
+  note: Shows the budget is actually turning into signed contracts, which feed order books.
+- theme_id: defence_platforms
+  name: DAC acceptance-of-necessity approvals
+  kind: tender
+  direction: support
+  authority: Defence Acquisition Council, Ministry of Defence
+  announced: '2026-10-26'
+  outlay_cr: null
+  status: active
+  latest_figure: On 26 Oct 2026 the DAC cleared about Rs 2.12 lakh crore of proposals, about 82% to be sourced from Indian
+    industry; in FY2025-26 it cleared 55 proposals worth Rs 6,73,000 crore.
+  latest_as_of: '2026-10-26'
+  source_url: https://www.gktoday.in/dac-approves-%e2%82%b92-12-lakh-crore-defence-procurement-package/
+  source_title: DAC Approves Rs 2.12 Lakh Crore Defence Procurement Package (GKToday)
+  source_date: '2026-10-27'
+  note: 'Approvals listed include about 200 light multi-role helicopters, self-propelled tracked guns, high-mobility vehicles,
+    S-400 missiles, Dhanush guns and tank ammunition (March 2026); AoN is only the first step before a contract. also: https://www.newsonair.gov.in/defence-minister-rajnath-singh-clears-proposals-worth-over-two-lakh-crore-to-augment-defence-capabilities'
+- theme_id: defence_platforms
+  name: Defence Acquisition Procedure 2026 (draft)
+  kind: regulation
+  direction: support
+  authority: Ministry of Defence
+  announced: 2026-02
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.newsonair.gov.in/dap-2026-has-been-designed-to-bolster-self-reliance-accelerate-acquisition-timelines-empower-indian-defence-industrial-ecosystem-ministry-of-defence
+  source_title: DAP 2026 designed to bolster self-reliance (All India Radio News)
+  source_date: '2026-02-13'
+  note: Draft would replace DAP 2020, raise the indigenous-content bar for Buy (Indian-IDDM) from 50% to 60%, cut categories
+    from five to four and give five years of assured orders to Make/iDEX projects; final version not confirmed.
+- theme_id: defence_platforms
+  name: Positive Indigenisation Lists (5th PIL for DPSUs)
+  kind: mandate
+  direction: support
+  authority: Department of Defence Production, Ministry of Defence
+  announced: '2024-07-16'
+  outlay_cr: null
+  status: active
+  latest_figure: Fifth list of 346 items (import substitution worth over Rs 1,000 crore); more than 12,300 items indigenised
+    in the three years before.
+  latest_as_of: '2024-07-16'
+  source_url: https://www.newsonair.gov.in/government-notifies-fifth-pil-consisting-of-346-items-to-minimize-imports-boost-self-reliance-in-defence
+  source_title: Government notifies fifth PIL consisting of 346 items (All India Radio News)
+  source_date: '2024-07-16'
+  note: Items on these lists can only be bought from Indian suppliers, which locks in demand for domestic makers and their
+    suppliers.
+- theme_id: defence_platforms
+  name: Defence export target Rs 50,000 crore by 2029
+  kind: target
+  direction: support
+  authority: Ministry of Defence
+  announced: '2025-03-29'
+  outlay_cr: null
+  status: active
+  latest_figure: Defence exports hit a record Rs 38,424 crore in FY2025-26, up from Rs 23,622 crore the year before.
+  latest_as_of: '2026-04-02'
+  source_url: https://ianslive.in/india-aims-rs-3-lakh-cr-in-defence-production-by-2029-with-rs-50000-cr-in-exports--20250329184504
+  source_title: India aims Rs 3 lakh cr in defence production by 2029 with Rs 50,000 cr in exports (IANS)
+  source_date: '2025-03-29'
+  note: 'Export orders add demand beyond the Indian forces for platform and ammunition makers. also: https://www.newsonair.gov.in/ministry-of-defence-reports-record-defence-exports-of-%e2%82%b938424-crore-in-fy-2025-26'
+- theme_id: defence_platforms
+  name: Defence production target Rs 3 lakh crore by 2029
+  kind: target
+  direction: support
+  authority: Ministry of Defence
+  announced: '2025-03-29'
+  outlay_cr: null
+  status: active
+  latest_figure: Defence production reached a record Rs 1.78 lakh crore in FY2025-26 (up 15.6%); private sector share about
+    24% (about Rs 42,000 crore).
+  latest_as_of: '2026-06-17'
+  source_url: https://ianslive.in/india-aims-rs-3-lakh-cr-in-defence-production-by-2029-with-rs-50000-cr-in-exports--20250329184504
+  source_title: India aims Rs 3 lakh cr in defence production by 2029 with Rs 50,000 cr in exports (IANS)
+  source_date: '2025-03-29'
+  note: 'Sets the scale the government wants the domestic industry to reach, with a rising private share. also: https://www.businesstoday.in/india/story/indias-defence-production-surges-to-all-time-high-to-rs-1-78-lakh-crore-537399-2026-06-17'
+- theme_id: defence_platforms
+  name: Customs duty exemption on raw materials for defence aircraft MRO
+  kind: duty
+  direction: support
+  authority: Ministry of Finance
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.indiabudget.gov.in/doc/budget_speech.pdf
+  source_title: Budget 2026-2027 Speech of Nirmala Sitharaman
+  source_date: '2026-02-01'
+  note: Budget 2026-27 exempts basic customs duty on raw materials imported to make aircraft parts for maintenance, repair
+    and overhaul by defence-sector units, cutting their input costs.
+- theme_id: defence_electronics
+  name: Mission Sudarshan Chakra (national air and missile defence shield)
+  kind: target
+  direction: support
+  authority: Prime Minister / Ministry of Defence (DRDO lead)
+  announced: '2025-08-15'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.iasgyan.in/daily-current-affairs/mission-sudarshan-chakra-strengthening-air-defence
+  source_title: 'Mission Sudarshan Chakra: Strengthening Air Defence (IAS Gyan)'
+  source_date: null
+  note: 'A layered shield due for full capability by 2035; reported scope links 6,000 to 7,000 radars and 52 new surveillance
+    satellites by 2030, a large market for radar, sensor and command-system makers. also: https://www.gktoday.in/mission-sudarshan-chakra'
+- theme_id: defence_electronics
+  name: Defence capital outlay 2026-27
+  kind: budget
+  direction: support
+  authority: Ministry of Defence
+  announced: '2026-02-01'
+  outlay_cr: 219306.47
+  status: active
+  latest_figure: Of over Rs 2.19 lakh crore capital, Rs 1.85 lakh crore is for capital acquisition (about 24% more than 2025-26);
+    Rs 1.39 lakh crore is earmarked for buying from domestic industry.
+  latest_as_of: '2026-02-03'
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/feb/doc202623778301.pdf
+  source_title: Defence in Union Budget 2026-27 (PIB Research)
+  source_date: '2026-02-03'
+  note: 'Capital acquisition money pays for radars, EW, communication and avionics fits on new platforms; about 75% is reserved
+    for Indian firms. also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf'
+- theme_id: defence_electronics
+  name: DAC acceptance-of-necessity approvals
+  kind: tender
+  direction: support
+  authority: Defence Acquisition Council, Ministry of Defence
+  announced: '2026-10-26'
+  outlay_cr: null
+  status: active
+  latest_figure: On 26 Oct 2026 the DAC cleared about Rs 2.12 lakh crore of proposals, about 82% to be sourced from Indian
+    industry; in FY2025-26 it cleared 55 proposals worth Rs 6,73,000 crore.
+  latest_as_of: '2026-10-26'
+  source_url: https://www.gktoday.in/dac-approves-%e2%82%b92-12-lakh-crore-defence-procurement-package/
+  source_title: DAC Approves Rs 2.12 Lakh Crore Defence Procurement Package (GKToday)
+  source_date: '2026-10-27'
+  note: 'Approvals listed include counter-drone systems, surveillance UAVs, an integrated surveillance and strike system,
+    active offboard decoys for the Navy (Oct 2026) and high-capacity radio relay (March 2026). also: https://www.newsonair.gov.in/defence-minister-rajnath-singh-clears-proposals-worth-over-two-lakh-crore-to-augment-defence-capabilities'
+- theme_id: defence_electronics
+  name: iDEX and ADITI 4.0 (defence innovation grants)
+  kind: subsidy
+  direction: support
+  authority: Department of Defence Production, Ministry of Defence
+  announced: '2026-03-19'
+  outlay_cr: null
+  status: active
+  latest_figure: 548 iDEX contracts signed since 2018; 58 prototypes cleared for procurement worth Rs 3,853 crore; 45 procurement
+    contracts worth Rs 2,326 crore.
+  latest_as_of: '2026-03-19'
+  source_url: https://www.angelone.in/news/market-updates/3-853-crore-defence-prototypes-cleared-as-idex-ecosystem-expands
+  source_title: Rs 3,853 Crore Defence Prototypes Cleared as iDEX Ecosystem Expands (Angel One)
+  source_date: '2026-03-19'
+  note: Grants and assured follow-on orders help small electronics and sensor firms get into defence supply; ADITI 4.0 was
+    launched at the 2026 conclave.
+- theme_id: defence_electronics
+  name: DRDO budget 2026-27
+  kind: budget
+  direction: support
+  authority: Ministry of Defence (DRDO)
+  announced: '2026-02-01'
+  outlay_cr: 29100.25
+  status: active
+  latest_figure: DRDO allocation rose to Rs 29,100.25 crore in 2026-27 from Rs 26,816.82 crore; Rs 17,250.25 crore of it is
+    capital spending.
+  latest_as_of: '2026-02-03'
+  source_url: https://static.pib.gov.in/WriteReadData/specificdocs/documents/2026/feb/doc202623778301.pdf
+  source_title: Defence in Union Budget 2026-27 (PIB Research)
+  source_date: '2026-02-03'
+  note: DRDO designs most Indian radars, EW and missile seekers and hands production to industry partners.
+- theme_id: defence_electronics
+  name: Defence Acquisition Procedure 2026 (draft)
+  kind: regulation
+  direction: support
+  authority: Ministry of Defence
+  announced: 2026-02
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.newsonair.gov.in/dap-2026-has-been-designed-to-bolster-self-reliance-accelerate-acquisition-timelines-empower-indian-defence-industrial-ecosystem-ministry-of-defence
+  source_title: DAP 2026 designed to bolster self-reliance (All India Radio News)
+  source_date: '2026-02-13'
+  note: Draft raises indigenous content for Buy (Indian-IDDM) from 50% to 60% and gives Make/iDEX projects spiral development
+    and five years of assured orders; final version not confirmed.
+- theme_id: defence_electronics
+  name: Positive Indigenisation Lists (5th PIL for DPSUs)
+  kind: mandate
+  direction: support
+  authority: Department of Defence Production, Ministry of Defence
+  announced: '2024-07-16'
+  outlay_cr: null
+  status: active
+  latest_figure: Fifth list of 346 items (import substitution worth over Rs 1,000 crore); more than 12,300 items indigenised
+    in the three years before.
+  latest_as_of: '2024-07-16'
+  source_url: https://www.newsonair.gov.in/government-notifies-fifth-pil-consisting-of-346-items-to-minimize-imports-boost-self-reliance-in-defence
+  source_title: Government notifies fifth PIL consisting of 346 items (All India Radio News)
+  source_date: '2024-07-16'
+  note: Lists cover sub-systems, line-replacement units and components bought by defence PSUs, a direct market for electronics
+    suppliers.
+- theme_id: railways
+  name: Railways capital outlay 2026-27
+  kind: budget
+  direction: support
+  authority: Ministry of Railways
+  announced: '2026-02-01'
+  outlay_cr: 277830.0
+  status: active
+  latest_figure: 'Allocations for 2026-27: about Rs 1.20 lakh crore for safety, Rs 52,109 crore for rolling stock, Rs 7,500
+    crore for signalling and telecom, Rs 36,722 crore for new lines; total capex including internal and extra-budget sources
+    Rs 2.93 lakh crore.'
+  latest_as_of: '2026-02-02'
+  source_url: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf
+  source_title: Expenditure Budget 2026-2027 (Notes on Demands for Grants)
+  source_date: '2026-02-01'
+  note: 'Record capital budget is the main source of orders for wagon, coach, signalling and track contractors. also: https://www.millenniumpost.in/business/record-rs-293-lakh-crore-capex-anchors-railways-budget-fy27-646519'
+- theme_id: railways
+  name: Kavach 4.0 automatic train protection rollout
+  kind: tender
+  direction: support
+  authority: Ministry of Railways
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Kavach 4.0 was in place on 2,633 route km as of 20 Aug 2026; Rs 223 crore approved on 28 Sep 2026 for another
+    614.75 route km.
+  latest_as_of: '2026-09-28'
+  source_url: https://www.gktoday.in/indian-railways-approves-%e2%82%b9223-crore-for-kavach-4-0/
+  source_title: Indian Railways Approves Rs 223 Crore for Kavach 4.0 (GKToday)
+  source_date: '2026-09-29'
+  note: 'Steady sanctions keep work flowing to signalling and Kavach equipment suppliers; a record 472 route km was commissioned
+    on 30 Jan 2026. also: https://www.newsonair.gov.in/indian-railways-speeds-up-kavach-4-0-safety-rollout-with-472-km-commissioned-across-three-sections'
+- theme_id: railways
+  name: Vande Bharat train programme
+  kind: other
+  direction: support
+  authority: Ministry of Railways
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: 162 Vande Bharat train services running, per a Lok Sabha reply; the first Vande Bharat Sleeper (Howrah-Kamakhya)
+    began regular service in January 2026.
+  latest_as_of: '2026-07-22'
+  source_url: https://newsonair.gov.in/162-vande-bharat-train-services-currently-operating-across-country-says-govt/
+  source_title: 162 Vande Bharat train services currently operating across country, says Govt (All India Radio News)
+  source_date: '2026-07-22'
+  note: Each new train set means orders for coach builders and makers of propulsion, brakes, seats and interiors.
+- theme_id: railways
+  name: Dankuni-Surat dedicated freight corridor
+  kind: budget
+  direction: support
+  authority: Ministry of Finance / Ministry of Railways
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: proposed
+  latest_figure: 'Western DFC finished: trial runs on the last 102 km (JNPT-New Saphale) held 31 Mar 2026; DFCCIL gets Rs
+    500 crore in 2026-27.'
+  latest_as_of: '2026-03-31'
+  source_url: https://www.indiabudget.gov.in/doc/budget_speech.pdf
+  source_title: Budget 2026-2027 Speech of Nirmala Sitharaman
+  source_date: '2026-02-01'
+  note: 'A new east-west freight corridor would restart big track, electrification and signalling orders now that the Western
+    corridor is complete. also: https://www.constructionworld.in/transport-infrastructure/metro-rail-and-railways-infrastructure/western-dedicated-freight-corridor-fully-completed/89492'
+- theme_id: railways
+  name: Jaipur Metro Phase 2 cabinet approval
+  kind: tender
+  direction: support
+  authority: Union Cabinet / Ministry of Housing and Urban Affairs
+  announced: 2026-04
+  outlay_cr: 13037.66
+  status: active
+  latest_figure: 41 km corridor with 36 stations approved; completion targeted for September 2031.
+  latest_as_of: '2026-04-09'
+  source_url: https://knnindia.co.in/news/newsdetails/state/rajasthan/cabinet-approves-rs-13037-cr-jaipur-metro-phase-2-project
+  source_title: Cabinet approves Rs 13,037 cr Jaipur Metro Phase 2 project (KNN India)
+  source_date: '2026-04-09'
+  note: Metro approvals turn into civil, coach and signalling contracts over several years.
+- theme_id: railways
+  name: Gap in fresh wagon orders
+  kind: tender
+  direction: headwind
+  authority: Ministry of Railways
+  announced: '2026-01-22'
+  outlay_cr: null
+  status: active
+  latest_figure: No fresh wagon procurement orders since the first phase; the expected second order for more than 200,000
+    wagons has not come.
+  latest_as_of: '2026-01-22'
+  source_url: https://www.devdiscourse.com/article/business/3778789-uncertain-tracks-ahead-railways-wagon-procurement-delays-stir-industry-concerns
+  source_title: 'Uncertain Tracks Ahead: Railways'' Wagon Procurement Delays Stir Industry Concerns (Devdiscourse/PTI)'
+  source_date: '2026-01-22'
+  note: Wagon makers that added capacity for the National Rail Plan face idle lines until new orders are placed.
+- theme_id: railways
+  name: Planned Rs 40,000 crore wagon tender
+  kind: tender
+  direction: support
+  authority: Ministry of Railways
+  announced: '2026-05-26'
+  outlay_cr: 40000.0
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://swarajyamag.com/amp/story/news-brief%2Findian-railways-set-to-float-rs-40000-crore-wagon-tender-for-one-lakh-units-report
+  source_title: 'Indian Railways set to float Rs 40,000 crore wagon tender for one lakh units: report (Swarajya)'
+  source_date: '2026-05-26'
+  note: About one lakh wagons over three to four years (35,000-40,000 a year), first orders expected July-September 2026;
+    not confirmed as floated.
+- theme_id: shipbuilding
+  name: Shipbuilding Financial Assistance Scheme (revamped SBFAS)
+  kind: subsidy
+  direction: support
+  authority: Ministry of Ports, Shipping and Waterways
+  announced: '2025-09-24'
+  outlay_cr: 24736.0
+  status: active
+  latest_figure: Under the earlier policy, 288 contracts worth Rs 19,748 crore (456 vessels) got in-principle approval and
+    Rs 620.57 crore was paid to 23 shipyards for 204 delivered vessels; Rs 515 crore is budgeted for SBFAS and the National
+    Shipbuilding Mission in 2026-27.
+  latest_as_of: '2026-03-14'
+  source_url: https://www.dtnext.in/news/national/cabinet-approves-rs-69725-cr-package-to-revitalise-shipbuilding-maritime-ecosystem-847578
+  source_title: Cabinet approves Rs 69,725 cr package to revitalise shipbuilding, maritime ecosystem (DT Next)
+  source_date: '2025-09-24'
+  note: 'Pays Indian yards 15-25% of a ship''s value to offset their cost gap, running to 31 Mar 2036, and includes a Rs 4,001
+    crore shipbreaking credit note. also: https://ianslive.in/shipbuilding-centre-clears-288-contracts-worth-rs-19748-crore-covering-456-vessels--20260314101736'
+- theme_id: shipbuilding
+  name: Slow payout under the 2016-2026 shipbuilding aid policy
+  kind: subsidy
+  direction: headwind
+  authority: Ministry of Ports, Shipping and Waterways
+  announced: '2026-03-14'
+  outlay_cr: null
+  status: ended
+  latest_figure: Only Rs 620.57 crore disbursed against Rs 19,748 crore of approved contracts.
+  latest_as_of: '2026-03-14'
+  source_url: https://ianslive.in/shipbuilding-centre-clears-288-contracts-worth-rs-19748-crore-covering-456-vessels--20260314101736
+  source_title: 'Shipbuilding: Centre clears 288 contracts worth Rs 19,748 crore covering 456 vessels (IANS)'
+  source_date: '2026-03-14'
+  note: Aid is paid on delivery and has reached yards slowly, so the headline corpus overstates near-term cash for shipbuilders.
+- theme_id: shipbuilding
+  name: Maritime Development Fund
+  kind: budget
+  direction: support
+  authority: Ministry of Ports, Shipping and Waterways
+  announced: '2025-02-01'
+  outlay_cr: 25000.0
+  status: active
+  latest_figure: SBI Ventures appointed fund manager for the Rs 20,000 crore Maritime Investment Fund on 26 May 2026; Rs 1,000
+    crore budgeted for the MDF in 2026-27.
+  latest_as_of: '2026-05-26'
+  source_url: https://superkalam.com/current-affairs/29-07-2026/shipbuilding-financial-assistance-policy-and-maritime-development-fund-97dd2a4b-2c39-46e9-b6ef-82bcfb9e31df
+  source_title: Shipbuilding Financial Assistance Policy and Maritime Development Fund (SuperKalam, PIB summary)
+  source_date: '2026-07-29'
+  note: 'Long-term, cheaper finance for shipyards and ship buyers: Rs 20,000 crore investment fund plus Rs 5,000 crore interest
+    support, up to 49% from government. also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf also: https://www.indiabudget.gov.in/budget2025-26/doc/budget_speech.pdf'
+- theme_id: shipbuilding
+  name: Shipbuilding Development Scheme (clusters and yard expansion)
+  kind: subsidy
+  direction: support
+  authority: Ministry of Ports, Shipping and Waterways
+  announced: '2025-09-24'
+  outlay_cr: 19989.0
+  status: active
+  latest_figure: Guidelines issued; Rs 250 crore budgeted in 2026-27 for clusters, brownfield expansion and risk cover.
+  latest_as_of: '2026-02-01'
+  source_url: https://www.theweek.in/news/maritime/2025/12/28/explained-or-centre-rolls-out-rs-44700-crore-push-to-boost-domestic-shipbuilding.html
+  source_title: 'Explained: Centre rolls out Rs 44,700 crore push to boost domestic shipbuilding (The Week)'
+  source_date: null
+  note: 'Pays 100% of common infrastructure in new greenfield clusters (50:50 Centre-state SPV) and 25% of brownfield yard
+    expansion. also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf'
+- theme_id: shipbuilding
+  name: Customs duty exemption on shipbuilding inputs extended 10 years
+  kind: duty
+  direction: support
+  authority: Ministry of Finance
+  announced: '2025-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.indiabudget.gov.in/budget2025-26/doc/budget_speech.pdf
+  source_title: Budget 2025-2026 Speech of Nirmala Sitharaman
+  source_date: '2025-02-01'
+  note: Keeps raw materials, components and parts for building (and breaking) ships free of basic customs duty for another
+    ten years.
+- theme_id: shipbuilding
+  name: Maritime Amrit Kaal Vision 2047
+  kind: target
+  direction: support
+  authority: Ministry of Ports, Shipping and Waterways
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.aslindia.net/newsletters/govt-aims-to-make-india-5th-largest-shipping-nation-by-2047-minister-sonowal
+  source_title: 'Govt aims to make India 5th largest shipping nation by 2047: Minister Sonowal (ASL)'
+  source_date: '2026-01-30'
+  note: 'Long-range goal of making India the fifth-largest shipping nation (shipbuilding and ownership) by 2047, the policy
+    basis for the support schemes. also: https://indianmasterminds.com/news/india-shipbuilding-vision-2030-145036/'
+- theme_id: shipbuilding
+  name: Inland-waterway ship repair hubs and Coastal Cargo Promotion Scheme
+  kind: budget
+  direction: support
+  authority: Ministry of Finance / Ministry of Ports, Shipping and Waterways
+  announced: '2026-02-01'
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.indiabudget.gov.in/doc/budget_speech.pdf
+  source_title: Budget 2026-2027 Speech of Nirmala Sitharaman
+  source_date: '2026-02-01'
+  note: Budget 2026-27 proposes ship repair facilities at Varanasi and Patna and a scheme to raise inland and coastal shipping's
+    cargo share from 6% to 12% by 2047, adding repair and small-vessel demand.
+- theme_id: drones
+  name: Drone Rules 2021
+  kind: regulation
+  direction: support
+  authority: Ministry of Civil Aviation
+  announced: '2021-08-25'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://pib.gov.in/PressReleasePage.aspx?PRID=1749154
+  source_title: Ministry of Civil Aviation notifies liberalised Drone Rules, 2021 (PIB)
+  source_date: '2021-08-26'
+  note: 'Replaced the restrictive UAS Rules: forms cut from 25 to 5, many approvals abolished, no permission needed to fly
+    in green zones.'
+- theme_id: drones
+  name: PLI for drones and drone components (lapsed)
+  kind: pli
+  direction: headwind
+  authority: Ministry of Civil Aviation
+  announced: '2021-09-15'
+  outlay_cr: 120.0
+  status: ended
+  latest_figure: Rs 93 crore paid out for drones under PLI as of December 2025; no allocation in the 2025-26 or 2026-27 budgets.
+  latest_as_of: 2025-12
+  source_url: https://pib.gov.in/PressReleasePage.aspx?PRID=1755157
+  source_title: Government Approves PLI Scheme for Drones and Drone Components (PIB)
+  source_date: '2021-09-15'
+  note: 'The Rs 120 crore, three-year incentive has run out with no successor yet approved, removing a direct subsidy to drone
+    makers. also: https://www.millenniumpost.in/business/govt-disburses-incentives-worth-rs-15554-cr-so-far-under-pli-scheme-for-electronics-sector-653648'
+- theme_id: drones
+  name: Ban on import of foreign drones
+  kind: trade
+  direction: support
+  authority: Directorate General of Foreign Trade (Ministry of Commerce)
+  announced: '2022-02-09'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.importlicensing.wto.org/node/101160
+  source_title: 'India: Notification No. 54/2015-2020 (WTO import licensing database)'
+  source_date: '2022-02-09'
+  note: Imports of complete drones (CBU/CKD/SKD) are prohibited except for R&D, defence and security, which shields Indian
+    makers; components stay free to import.
+- theme_id: drones
+  name: Drone Shakti
+  kind: other
+  direction: support
+  authority: Ministry of Finance
+  announced: '2022-02-01'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.indiabudget.gov.in/budget2022-23/doc/Budget_Speech.pdf
+  source_title: Budget 2022-2023 Speech of Nirmala Sitharaman
+  source_date: '2022-02-01'
+  note: Budget 2022-23 promised startup support for drone applications and Drone-as-a-Service, plus drone courses in ITIs.
+- theme_id: drones
+  name: Namo Drone Didi
+  kind: subsidy
+  direction: support
+  authority: Department of Agriculture and Farmers Welfare
+  announced: '2023-11-29'
+  outlay_cr: 1261.0
+  status: active
+  latest_figure: 500 drones distributed under the scheme; 2025-26 spending revised to Rs 100 crore from a budget of Rs 676.85
+    crore, with Rs 676.85 crore budgeted again for 2026-27.
+  latest_as_of: '2026-03-26'
+  source_url: https://pib.gov.in/PressReleasePage.aspx?PRID=1980681
+  source_title: Cabinet approves Central Sector Scheme for providing Drones to the Women Self Help Groups (PIB)
+  source_date: '2023-11-29'
+  note: 'Aims to give drones to 15,000 women SHGs with 80% subsidy (up to Rs 8 lakh), a government-funded market for farm
+    drones, but spending has been far below plan. also: https://www.indianchemicalnews.com/fertilizer/500-drones-distributed-under-namo-drone-didi-scheme-29824
+    also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf'
+- theme_id: drones
+  name: Planned Rs 2,000 crore drone incentive
+  kind: pli
+  direction: support
+  authority: Ministry of Civil Aviation / Ministry of Defence
+  announced: '2025-07-04'
+  outlay_cr: 2000.0
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.dawn.com/news/1922059/india-plans-230-million-drone-incentive-after-pakistan-conflict-sources-say
+  source_title: India plans $230m drone incentive after Pakistan conflict, sources say (Reuters via Dawn)
+  source_date: '2025-07-04'
+  note: Reported plan of 20 billion rupees (about $234 million) over three years for drones, components, software and counter-drone
+    systems; no approval found.
+- theme_id: drones
+  name: Military drone and counter-drone approvals (DAC)
+  kind: tender
+  direction: support
+  authority: Defence Acquisition Council, Ministry of Defence
+  announced: '2026-10-26'
+  outlay_cr: null
+  status: active
+  latest_figure: Oct 2026 approvals include surveillance UAVs, long-range kamikaze drones, long-range Brick UAS and counter-drone
+    systems; March 2026 included remotely piloted strike aircraft.
+  latest_as_of: '2026-10-26'
+  source_url: https://www.gktoday.in/dac-approves-%e2%82%b92-12-lakh-crore-defence-procurement-package/
+  source_title: DAC Approves Rs 2.12 Lakh Crore Defence Procurement Package (GKToday)
+  source_date: '2026-10-27'
+  note: 'Military buying is now the largest visible demand for Indian drone and anti-drone makers; AoN is only the first step
+    before a contract. also: https://www.newsonair.gov.in/defence-minister-rajnath-singh-clears-proposals-worth-over-two-lakh-crore-to-augment-defence-capabilities'
+- theme_id: water_infra
+  name: Jal Jeevan Mission extended to Dec 2028 (JJM 2.0)
+  kind: budget
+  direction: support
+  authority: Ministry of Jal Shakti (Department of Drinking Water and Sanitation)
+  announced: 2026-03
+  outlay_cr: 869000.0
+  status: active
+  latest_figure: 15,93,64,282 rural households (82.34%) had tap connections as on 31 Aug 2026.
+  latest_as_of: '2026-08-31'
+  source_url: https://www.angelone.in/news/government-schemes/cabinet-approves-8-69-lakh-crore-extension-for-jal-jeevan-mission-until-2028
+  source_title: Cabinet Approves Rs 8.69 Lakh Crore Extension for Jal Jeevan Mission Until 2028 (Angel One)
+  source_date: '2026-03-11'
+  note: 'Total outlay Rs 8.69 lakh crore with Rs 3.59 lakh crore central assistance; extension was first announced in Budget
+    2025-26. also: https://jaljeevanmission.gov.in/sites/default/files/2026-10/Jal-Jeevan-Samvad-August-2026.pdf also: https://www.indiabudget.gov.in/budget2025-26/doc/budget_speech.pdf'
+- theme_id: water_infra
+  name: Jal Jeevan Mission budget cut in 2025-26
+  kind: budget
+  direction: headwind
+  authority: Ministry of Jal Shakti (Department of Drinking Water and Sanitation)
+  announced: '2026-02-01'
+  outlay_cr: 67670.0
+  status: active
+  latest_figure: '2025-26 revised to Rs 17,000 crore from a budget of Rs 67,000 crore (actual 2024-25: Rs 22,615.05 crore);
+    2026-27 budget Rs 67,670 crore; Rs 6,150 crore released to states by 6 Aug 2026.'
+  latest_as_of: '2026-08-06'
+  source_url: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf
+  source_title: Expenditure Budget 2026-2027 (Notes on Demands for Grants)
+  source_date: '2026-02-01'
+  note: 'The Centre spent about a quarter of the money it budgeted, so pipe, pump and EPC firms saw far less cash than the
+    headline budget. also: https://www.thecore.in/opinion/the-plinth/businessinfrastructurejal-jeevan-mission-2-payment-delays-contractors-state-funding-869745'
+- theme_id: water_infra
+  name: Jal Jeevan Mission contractor payment delays
+  kind: other
+  direction: headwind
+  authority: Ministry of Jal Shakti / state governments
+  announced: '2026-08-28'
+  outlay_cr: null
+  status: active
+  latest_figure: Contractors owed an estimated Rs 30,000-35,000 crore (industry estimate); some firms (Ion Exchange, VA Tech
+    Wabag) avoid new state-paid JJM work.
+  latest_as_of: '2026-08-28'
+  source_url: https://www.thecore.in/opinion/the-plinth/businessinfrastructurejal-jeevan-mission-2-payment-delays-contractors-state-funding-869745
+  source_title: 'Jal Jeevan Mission 2.0: payment delays, contractors and state funding (The Core, The Plinth)'
+  source_date: '2026-08-28'
+  note: Unpaid bills hit receivables and margins of JJM contractors and pipe makers; the figure is an industry estimate, not
+    an official one.
+- theme_id: water_infra
+  name: JJM 2.0 shift to service delivery (no new schemes)
+  kind: regulation
+  direction: headwind
+  authority: Ministry of Jal Shakti (Department of Drinking Water and Sanitation)
+  announced: 2026-08
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://jaljeevanmission.gov.in/sites/default/files/2026-10/Jal-Jeevan-Samvad-August-2026.pdf
+  source_title: Jal Jeevan Samvad, 71st edition, August 2026 (National Jal Jeevan Mission)
+  source_date: null
+  note: States were told JJM 2.0 does not envisage new schemes except for uncovered tribal habitations, moving money from
+    building pipelines to operation and maintenance.
+- theme_id: water_infra
+  name: AMRUT 2.0 (urban water supply and sewerage)
+  kind: budget
+  direction: support
+  authority: Ministry of Housing and Urban Affairs
+  announced: '2021-10-01'
+  outlay_cr: 287000.0
+  status: active
+  latest_figure: 2025-26 revised to Rs 7,500 crore from a budget of Rs 10,000 crore; 2026-27 budget Rs 8,000 crore.
+  latest_as_of: '2026-02-01'
+  source_url: https://pib.gov.in/PressReleasePage.aspx?PRID=1759593
+  source_title: PM to launch Swachh Bharat Mission-Urban 2.0 and AMRUT 2.0 on 1st October (PIB)
+  source_date: '2021-09-30'
+  note: 'Outlay of around Rs 2.87 lakh crore for about 2.68 crore urban tap connections and 2.64 crore sewer connections;
+    yearly central funding has been trimmed. also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf'
+- theme_id: water_infra
+  name: Namami Gange Mission-II
+  kind: budget
+  direction: support
+  authority: Ministry of Jal Shakti (National Mission for Clean Ganga)
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: 4,263 MLD of sewage treatment capacity created as of June 2026; 219 sewerage projects worth Rs 35,970 crore
+    sanctioned for 6,610 MLD, 146 completed; 2026-27 budget Rs 3,100 crore (2025-26 revised Rs 2,687 crore).
+  latest_as_of: 2026-06
+  source_url: https://www.nbmcw.com/news/infra-development/namami-gange-creates-4-263-mld-sewage-treatment-capacity-25-stps-commissioned-in-2025.html
+  source_title: Namami Gange Creates 4,263 MLD Sewage Treatment Capacity; 25 STPs Commissioned in 2025 (NBM&CW)
+  source_date: '2026-08-07'
+  note: 'Steady source of sewage treatment plant and sewer contracts in the Ganga basin. also: https://www.indiabudget.gov.in/doc/eb/allsbe.pdf'
+- theme_id: quick_commerce_logistics
+  name: National Logistics Policy
+  kind: target
+  direction: support
+  authority: Ministry of Commerce & Industry (DPIIT)
+  announced: '2022-09-17'
+  outlay_cr: null
+  status: active
+  latest_figure: NCAER assessment for DPIIT puts India's logistics cost at about 7.97% of GDP (old commonly cited figure 13-14%).
+  latest_as_of: '2025-09-20'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2168995
+  source_title: Union Minister of Commerce and Industry, Shri Piyush Goyal launches report on Assessment of Logistics Cost
+    in India
+  source_date: '2025-09-20'
+  note: 'Policy aims to cut logistics cost and get India into the top 25 of the Logistics Performance Index by 2030, lowering
+    costs for 3PL, warehousing and delivery firms; also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1957407'
+- theme_id: quick_commerce_logistics
+  name: PM GatiShakti National Master Plan
+  kind: other
+  direction: support
+  authority: Ministry of Commerce & Industry (DPIIT)
+  announced: 2021-10
+  outlay_cr: null
+  status: active
+  latest_figure: 396 infrastructure projects worth about Rs 18.66 lakh crore evaluated by the Network Planning Group; 256
+    sanctioned, 198 under implementation.
+  latest_as_of: '2026-08-11'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2297818
+  source_title: PM GatiShakti National Master Plan Enables Integrated and Coordinated Infrastructure Planning
+  source_date: '2026-08-11'
+  note: Planning framework with no budget of its own that coordinates roads, rail and ports, aiding faster, cheaper freight
+    for logistics companies.
+- theme_id: quick_commerce_logistics
+  name: PM GatiShakti cargo terminals
+  kind: other
+  direction: support
+  authority: Ministry of Railways
+  announced: 2021-10
+  outlay_cr: null
+  status: active
+  latest_figure: 139 terminals operational under the PM Gati Shakti framework, with 300 more locations approved.
+  latest_as_of: '2026-06-09'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2270740
+  source_title: Infrastructure at the Core of India's Development (PIB Backgrounder)
+  source_date: '2026-06-09'
+  note: More rail cargo terminals widen multimodal options for warehousing and 3PL operators.
+- theme_id: quick_commerce_logistics
+  name: Code on Social Security - aggregator levy for gig workers
+  kind: regulation
+  direction: headwind
+  authority: Ministry of Labour & Employment
+  announced: '2025-11-21'
+  outlay_cr: null
+  status: active
+  latest_figure: Around 11.5 lakh platform workers registered on the e-Shram portal.
+  latest_as_of: '2026-08-25'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2200767
+  source_title: 'Labour Reforms: Formalising and Safeguarding India''s Gig & Platform Workforce'
+  source_date: '2025-12-09'
+  note: 'Aggregators must pay 1-2% of annual turnover (capped at 5% of payouts to gig workers) into a social security fund,
+    a direct cost for quick-commerce and delivery platforms; codes effective 21 Nov 2025; also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2192463
+    and https://www.pib.gov.in/PressReleasePage.aspx?PRID=2303053'
+- theme_id: quick_commerce_logistics
+  name: CCI preliminary inquiry into quick commerce (AICPDF complaint)
+  kind: regulation
+  direction: headwind
+  authority: Competition Commission of India
+  announced: 2025-06
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.business-standard.com/companies/start-ups/cci-conducts-preliminary-probe-into-plaints-against-3-qcom-companies-125061700983_1.html
+  source_title: In a first, CCI probes allegations against quick-commerce companies
+  source_date: '2025-06-17'
+  note: Distributors allege deep discounting and exclusive deals by Blinkit, Zepto and Instamart; a formal DG probe could
+    follow, and no 2026 order was found.
+- theme_id: quick_commerce_logistics
+  name: FDI allowed in inventory-based e-commerce for exports (Press Note 3, 2026)
+  kind: regulation
+  direction: support
+  authority: DPIIT / Ministry of Finance
+  announced: '2026-07-23'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.ey.com/en_in/technical/alerts-hub/2026/09/dpiit-permits-foreign-investment-in-export-oriented
+  source_title: DPIIT permits foreign investment in export-oriented inventory-based e-commerce model
+  source_date: '2026-09-25'
+  note: Foreign-funded e-commerce firms may now hold inventory for exporting India-made goods (effective 3 Sep 2026), but
+    the inventory ban for domestic sales stays.
+- theme_id: travel_hotels
+  name: Modified UDAN (Regional Connectivity Scheme)
+  kind: subsidy
+  direction: support
+  authority: Ministry of Civil Aviation
+  announced: '2026-03-25'
+  outlay_cr: 28840
+  status: active
+  latest_figure: Scheme launched 4 July 2026; plans 100 airports from unserved airstrips (Rs 12,159 crore) and 200 helipads;
+    Rs 10,043 crore viability gap funding for airlines over 10 years.
+  latest_as_of: '2026-07-17'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2245471
+  source_title: Cabinet Approves Modified UDAN to Deepen Regional Connectivity and Expand Inclusive Air Access Across India
+  source_date: '2026-03-25'
+  note: 'Ten-year (FY27-FY36) budget support for regional routes and airports widens the market for airlines and airport operators;
+    also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2285671'
+- theme_id: travel_hotels
+  name: UDAN regional connectivity scheme (original)
+  kind: subsidy
+  direction: support
+  authority: Ministry of Civil Aviation
+  announced: 2016-10
+  outlay_cr: null
+  status: active
+  latest_figure: 679 routes operational across 95 airports, heliports and water aerodromes; over 1.68 crore passengers; 165
+    operational airports as of 15 July 2026.
+  latest_as_of: '2026-07-15'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2285671
+  source_title: 'Modified UDAN: Strengthening India''s Regional Aviation Network (PIB Backgrounder)'
+  source_date: '2026-07-17'
+  note: Subsidised regional routes feed traffic to airlines and smaller airports.
+- theme_id: travel_hotels
+  name: GST on hotel rooms up to Rs 7,500 cut to 5% (no ITC)
+  kind: duty
+  direction: support
+  authority: GST Council / Ministry of Finance
+  announced: '2025-09-03'
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2169427
+  source_title: GST Reforms to Strengthen Hospitality, Transport and Cultural Sectors
+  source_date: '2025-09-22'
+  note: 'Rooms at or below Rs 7,500 a day moved from 12% to 5% GST from 22 Sep 2025, cheaper for guests but without input
+    tax credit for the hotel; announced at the 56th GST Council meeting; also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2163555'
+- theme_id: travel_hotels
+  name: Top 50 tourist destinations; hotels there in infrastructure HML
+  kind: budget
+  direction: support
+  authority: Ministry of Finance / Ministry of Tourism
+  announced: '2025-02-01'
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2098371
+  source_title: Union Budget 2025-26 identifies tourism as a sector for employment-led growth
+  source_date: '2025-02-01'
+  note: Hotels in the 50 chosen destinations get infrastructure-lending status (cheaper, longer loans), with states providing
+    land; no progress figure found.
+- theme_id: travel_hotels
+  name: SASCI - Iconic Tourist Centres to Global Scale
+  kind: budget
+  direction: support
+  authority: Ministry of Tourism / Ministry of Finance
+  announced: null
+  outlay_cr: 3295.76
+  status: active
+  latest_figure: 40 projects across 23 states sanctioned for Rs 3,295.76 crore as 50-year interest-free loans to states.
+  latest_as_of: '2026-01-08'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2212575
+  source_title: Ministry of Tourism Completes 75 Projects under Swadesh Darshan Scheme Launched in 2015 (Year End Review)
+  source_date: '2026-01-08'
+  note: Builds out iconic tourist sites, lifting demand for nearby hotels and travel. Outlay is the amount sanctioned so far.
+- theme_id: travel_hotels
+  name: Swadesh Darshan 2.0
+  kind: budget
+  direction: support
+  authority: Ministry of Tourism
+  announced: 2015-01
+  outlay_cr: null
+  status: active
+  latest_figure: 53 projects sanctioned for Rs 2,208.27 crore under SD2.0; under the original scheme 75 of 76 projects (Rs
+    5,290.33 crore) completed.
+  latest_as_of: '2026-01-08'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2212575
+  source_title: Ministry of Tourism Completes 75 Projects under Swadesh Darshan Scheme Launched in 2015 (Year End Review)
+  source_date: '2026-01-08'
+  note: Central funding for destination infrastructure supports tourist flows to hotels and travel firms.
+- theme_id: travel_hotels
+  name: Airport leasing under National Monetisation Pipeline
+  kind: tender
+  direction: support
+  authority: Ministry of Civil Aviation / AAI
+  announced: null
+  outlay_cr: null
+  status: active
+  latest_figure: Cabinet extended AAI land lease so Nagpur airport can be handed to GMR for 30 years.
+  latest_as_of: '2026-05-13'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1982289
+  source_title: 14 airports operating under PPP in the country
+  source_date: '2023-12-04'
+  note: '25 AAI airports were earmarked for private leasing over 2022-2025 (14 run under PPP as of Dec 2023), a pipeline for
+    private airport operators; no 2026 round found; also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2260629'
+- theme_id: travel_hotels
+  name: Airfare caps and FDTL crew-rule enforcement after IndiGo disruption
+  kind: regulation
+  direction: headwind
+  authority: Ministry of Civil Aviation / DGCA
+  announced: '2025-12-06'
+  outlay_cr: null
+  status: active
+  latest_figure: Disruption of 3-5 Dec 2025 cancelled 2,507 and delayed 1,852 IndiGo flights; DGCA took action against IndiGo
+    officials.
+  latest_as_of: '2026-01-17'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2199755
+  source_title: MoCA Action on IndiGo Operational Crisis - Air Fare Regulation
+  source_date: '2025-12-06'
+  note: 'Ministry imposed fare caps ''until the situation fully stabilises'' and stricter pilot rest rules raise crew costs;
+    whether caps are still in force was not confirmed; also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2215709'
+- theme_id: organised_jewellery
+  name: Mandatory gold hallmarking (HUID)
+  kind: mandate
+  direction: support
+  authority: Ministry of Consumer Affairs / Bureau of Indian Standards
+  announced: '2021-06-23'
+  outlay_cr: null
+  status: active
+  latest_figure: Mandatory hallmarking covers 392 districts (amendment of 03 Aug 2026); over 65 crore gold articles hallmarked
+    with HUID since July 2021; 2,36,624 registered jewellers as on 15 Oct 2026.
+  latest_as_of: '2026-10-15'
+  source_url: https://www.bis.gov.in/wp-content/uploads/2020/12/brief-on-Hallmarking.pdf
+  source_title: Brief on Hallmarking Scheme - Updated as on 01 October 2026 (BIS)
+  source_date: '2026-10-19'
+  note: 'Each new phase pushes unorganised jewellers toward certified purity, which narrows the trust gap that branded chains
+    sell on; phase 6 (7 districts, total 380, from 2 Mar 2026) per PIB. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2239540'
+- theme_id: organised_jewellery
+  name: HUID for hallmarked silver
+  kind: regulation
+  direction: support
+  authority: Bureau of Indian Standards
+  announced: '2025-09-01'
+  outlay_cr: null
+  status: active
+  latest_figure: Over 90 lakh silver articles hallmarked with HUID since 1 Sep 2025.
+  latest_as_of: '2026-10-15'
+  source_url: https://www.bis.gov.in/wp-content/uploads/2020/12/brief-on-Hallmarking.pdf
+  source_title: Brief on Hallmarking Scheme - Updated as on 01 October 2026 (BIS)
+  source_date: '2026-10-19'
+  note: 'Silver hallmarking stays voluntary but any hallmarked piece must carry a traceable HUID, extending the purity-trust
+    edge of organised sellers to silver. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2198764'
+- theme_id: organised_jewellery
+  name: Gold/silver customs duty cut to 6% (Budget 2024-25)
+  kind: duty
+  direction: support
+  authority: Ministry of Finance
+  announced: '2024-07-23'
+  outlay_cr: null
+  status: ended
+  latest_figure: Gold bar duty cut from 15% to 6% and gold dore from 14.35% to 5.35%, effective 24 Jul 2024; reversed by the
+    May 2026 hike.
+  latest_as_of: '2024-07-24'
+  source_url: https://www.indiabudget.gov.in/doc/bspeech/bs2024_25.pdf
+  source_title: Budget 2024-2025 Speech of Nirmala Sitharaman (with customs annex)
+  source_date: '2024-07-23'
+  note: Lower duty cut the gold-loan-to-smuggling price gap and input cost for jewellers; it has since been superseded by
+    the 2026 increase.
+- theme_id: organised_jewellery
+  name: Gold/silver import duty raised (BCD 5% to 10%)
+  kind: duty
+  direction: headwind
+  authority: Ministry of Finance (CBIC), Notification 15/2026-Customs
+  announced: '2026-05-12'
+  outlay_cr: null
+  status: active
+  latest_figure: Effective duty on gold and silver about 15% from 13 May 2026; IBJA gold demand about 7.5 tonnes in the fortnight
+    to 27 May vs about 25 tonnes a year earlier.
+  latest_as_of: '2026-05-27'
+  source_url: https://www.businesstoday.in/latest/economy/story/government-raises-gold-import-duty-to-15-will-it-cool-indias-appetite-for-bullion-534099-2026-05-31
+  source_title: 'Government raises gold import duty to 15%: Will it cool India''s appetite for bullion?'
+  source_date: '2026-05-31'
+  note: 'Higher landed gold cost lifts retail prices and dampens volumes, and widens the incentive for smuggled gold that
+    undercuts organised chains. also: https://taxguru.in/?p=1043159'
+- theme_id: organised_jewellery
+  name: InCent-LGD research grant (IIT Madras)
+  kind: budget
+  direction: support
+  authority: Department of Commerce
+  announced: '2023-02-01'
+  outlay_cr: 242.96
+  status: active
+  latest_figure: Five commercial CVD machines and two commercial HPHT machines installed; indigenous HPHT machine design finalised.
+  latest_as_of: '2025-12-10'
+  source_url: https://www.pib.gov.in/PressReleaseIframePage.aspx?PRID=2201284
+  source_title: 2025 Year End Review for Department of Commerce
+  source_date: '2025-12-10'
+  note: 'Aims to make lab-grown diamond seeds and machines in India, lowering costs for jewellers adding LGD lines. also:
+    https://www.pib.gov.in/PressReleasePage.aspx?PRID=1895817'
+- theme_id: organised_jewellery
+  name: Lab-grown diamond naming standard IS 19469:2025
+  kind: regulation
+  direction: support
+  authority: Bureau of Indian Standards
+  announced: 2026-01
+  outlay_cr: null
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://deshgujarat.com/2026/01/01/bis-issues-new-norms-for-lab-grown-diamonds-mandates-clear-labelling/
+  source_title: BIS issues new norms for lab-grown diamonds, mandates clear labelling
+  source_date: '2026-01-01'
+  note: Reserves 'diamond' for natural stones and requires 'laboratory-grown diamond' labels, which protects natural-diamond
+    pricing and favours retailers with disclosure systems; whether it is mandatory was not stated in the source.
+- theme_id: premium_alcohol
+  name: India-UK CETA whisky duty cut
+  kind: trade
+  direction: support
+  authority: Ministry of Commerce and Industry
+  announced: 2025-07
+  outlay_cr: null
+  status: active
+  latest_figure: Duty on UK whisky cut from 150% to 75% on entry into force 15 Jul 2026, falling to 40% by year 10; other
+    spirits 110% in year 1 to 75% by year 10.
+  latest_as_of: '2026-07-15'
+  source_url: https://www.india-briefing.com/news/india-uk-ceta-scotch-whisky-other-alcohol-tariffs-46047.html
+  source_title: 'Exporting Alcohol to India: A Guide to the India-UK CETA Tariff Schedules and MIP Rules'
+  source_date: '2026-07-15'
+  note: 'Cheaper Scotch lowers costs for Indian makers that blend or bottle imported malt and for imported premium brands,
+    but also adds import competition for Indian premium whisky. also: https://www.gov.uk/government/news/the-countdown-begins-uk-india-fta-enters-into-force-on-july-15th'
+- theme_id: premium_alcohol
+  name: India-EU FTA wine, spirits and beer tariffs
+  kind: trade
+  direction: support
+  authority: Ministry of Commerce and Industry / European Commission
+  announced: '2026-01-27'
+  outlay_cr: null
+  status: proposed
+  latest_figure: Concluded 27 Jan 2026; Commission sent signature proposals to the Council on 11 Sep 2026; not yet in force.
+  latest_as_of: '2026-09-11'
+  source_url: https://policy.trade.ec.europa.eu/eu-trade-relationships-country-and-region/countries-and-regions/india/eu-india-agreements/factsheet-eu-india-free-trade-agreement-eu-agri-food-exports_en
+  source_title: 'Factsheet - EU-India Free Trade Agreement: EU agri-food exports'
+  source_date: null
+  note: 'Indian tariffs fall from 150% to 20-30% on wine, from up to 150% to 40% on spirits and from 110% to 50% on beer,
+    cheapening EU premium imports and adding competition for domestic wine and spirits. also: https://policy.trade.ec.europa.eu/eu-trade-relationships-country-and-region/countries-and-regions/india/eu-india-agreements_en'
+- theme_id: premium_alcohol
+  name: Maharashtra IMFL excise hike and MML category
+  kind: duty
+  direction: headwind
+  authority: Government of Maharashtra (State Excise)
+  announced: 2025-06
+  outlay_cr: null
+  status: active
+  latest_figure: IMFL duty raised 50% (3x to 4.5x of manufacturing cost); state expects about Rs 14,000 crore more excise
+    a year.
+  latest_as_of: '2025-06-11'
+  source_url: https://www.newsonair.gov.in/maharashtra-hikes-liquor-duty-imfl-prices-to-rise-by-50
+  source_title: Maharashtra hikes liquor duty; IMFL prices to rise by 50%
+  source_date: '2025-06-11'
+  note: Big price rises in a top spirits market hurt IMFL and premium brand volumes, while the new low-priced Maharashtra
+    Made Liquor category is exempt.
+- theme_id: premium_alcohol
+  name: Karnataka Alcohol-in-Beverage (AIB) excise slabs
+  kind: duty
+  direction: support
+  authority: Government of Karnataka (Excise Department)
+  announced: '2026-05-11'
+  outlay_cr: null
+  status: active
+  latest_figure: Excise slabs cut from 16 to 8; premium and imported labels projected 16-20% cheaper, budget 180 ml liquor
+    20-30% dearer.
+  latest_as_of: '2026-05-14'
+  source_url: https://www.thenewsminute.com/amp/story/karnataka/karnataka-becomes-first-indian-state-to-tie-liquor-tax-to-alcohol-content-in-major-policy-shift
+  source_title: Karnataka becomes first Indian state to tie liquor tax to alcohol content in major policy shift
+  source_date: '2026-05-14'
+  note: Taxing by alcohol content and fewer price slabs lowers the tax load on premium brands, helping premiumisation in a
+    large southern market.
+- theme_id: premium_alcohol
+  name: Andhra Pradesh liquor policy 2024-26 (private retail)
+  kind: regulation
+  direction: support
+  authority: Government of Andhra Pradesh (Excise Department)
+  announced: '2024-10-01'
+  outlay_cr: null
+  status: active
+  latest_figure: Excise revenue Rs 29,042 crore in 2025-26.
+  latest_as_of: '2026-04-17'
+  source_url: https://deccanchronicle.com/southern-states/andhra-pradesh/andhra-pradesh-notifies-new-liquor-policy-to-allow-private-retailers-1827360
+  source_title: AP Govt. Notifies New Liquor Policy, Allows Private Retailers
+  source_date: '2024-10-01'
+  note: 'Private shops, 12 premium store licences and a stated push to bring back reputed national brands reopened AP to big
+    spirits companies; licences ran to 30 Sep 2026 and any renewal terms were not confirmed. also: https://www.deccanchronicle.com/southern-states/andhra-pradesh/excise-wing-earns-revenue-of-rs-29042-crore-in-202526-in-andhra-pradesh-1951155'
+- theme_id: premium_alcohol
+  name: Delhi new excise policy (draft)
+  kind: regulation
+  direction: support
+  authority: Government of NCT of Delhi (Excise Department)
+  announced: 2026-09
+  outlay_cr: null
+  status: proposed
+  latest_figure: Final draft ready, awaiting Cabinet and LG approval; current margin caps Rs 50/bottle IMFL and Rs 100 foreign
+    liquor.
+  latest_as_of: '2026-09-28'
+  source_url: https://www.businesstoday.in/india/story/delhi-new-liquor-policy-to-roll-out-soon-prices-may-increase-more-premium-stores-likely-558128-2026-09-28
+  source_title: 'Delhi new liquor policy to roll out soon: prices may increase, more premium stores likely'
+  source_date: '2026-09-28'
+  note: Higher retail margins and more premium stores would help imported and premium brands get shelf space, though a possible
+    excise increase could raise prices; notification not confirmed as of late Oct 2026.
+- theme_id: cdmo
+  name: PLI Scheme for Pharmaceuticals
+  kind: pli
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2021-02-24'
+  outlay_cr: 15000
+  status: active
+  latest_figure: Rs 46,744 crore invested (target Rs 17,275 crore); cumulative sales Rs 4,02,869 crore incl. exports Rs 2,57,370
+    crore; 55 applicants selected.
+  latest_as_of: 2026-06
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2314746&reg=48&lang=2
+  source_title: Production Linked Incentive Schemes have Strengthened India's Pharmaceutical, Bulk Drugs and Medical Devices
+    Manufacturing Ecosystem
+  source_date: '2026-09-25'
+  note: 'Pays incentives on sales of complex generics, biologics and other high-value drugs, rewarding large Indian makers
+    that also run contract manufacturing; scheme runs FY2020-21 to FY2028-29. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1700433'
+- theme_id: cdmo
+  name: PLI Scheme for Bulk Drugs (KSM/DI/API)
+  kind: pli
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2020-03-21'
+  outlay_cr: 6940
+  status: active
+  latest_figure: 48 projects approved, 39 commissioned for 28 APIs/KSMs; Rs 5,210.74 crore invested; sales Rs 3,792.49 crore
+    incl. exports Rs 560.16 crore.
+  latest_as_of: 2026-06
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2314746&reg=48&lang=2
+  source_title: Production Linked Incentive Schemes have Strengthened India's Pharmaceutical, Bulk Drugs and Medical Devices
+    Manufacturing Ecosystem
+  source_date: '2026-09-25'
+  note: 'Builds domestic supply of key starting materials and APIs that contract drug makers otherwise import from China.
+    also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1607483'
+- theme_id: cdmo
+  name: Bulk Drug Parks scheme
+  kind: subsidy
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2020-03-21'
+  outlay_cr: 3000
+  status: active
+  latest_figure: Three parks (Andhra Pradesh, Gujarat, Himachal Pradesh) at various stages of development; total project cost
+    over Rs 6,306.68 crore, central aid Rs 1,000 crore each.
+  latest_as_of: '2026-03-27'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2246068&reg=3&lang=2
+  source_title: Production Linked Incentive Scheme for Pharmaceuticals
+  source_date: '2026-03-27'
+  note: 'Shared utilities and effluent treatment at subsidised rates lower setup cost for API and intermediate plants; PLI
+    bulk-drug products get priority in land allotment. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=1607483'
+- theme_id: cdmo
+  name: PRIP (Promotion of Research and Innovation in Pharma MedTech)
+  kind: subsidy
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2023-08-17'
+  outlay_cr: 5000
+  status: active
+  latest_figure: 710 industry/startup/MSME projects received in round 1 (closed 19.11.2025); Rs 183.46 crore released for
+    7 NIPER centres of excellence till 31.1.2026; second call for applications announced 28 Aug 2026.
+  latest_as_of: '2026-08-28'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2304134&lang=1&reg=3
+  source_title: Second Call for Applications Under Rs 5,000 Crore PRIP Scheme to Boost Pharma & MedTech Innovation announced
+  source_date: '2026-08-28'
+  note: 'Co-funds R&D (up to Rs 100 crore per later-stage project) in new drugs, complex generics and biosimilars, helping
+    firms move up from pure manufacturing; gazette-notified 17 Aug 2023, launched 26 Sep 2023 (PIB PRID 1960812), amended
+    1.10.2025. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2225734&reg=48&lang=2'
+- theme_id: cdmo
+  name: Biopharma SHAKTI (Budget 2026-27)
+  kind: budget
+  direction: support
+  authority: Ministry of Finance / Department of Pharmaceuticals
+  announced: '2026-02-01'
+  outlay_cr: 10000
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.indiabudget.gov.in/doc/budget_speech.pdf
+  source_title: Budget 2026-2027 Speech of Nirmala Sitharaman, Minister of Finance
+  source_date: '2026-02-01'
+  note: Rs 10,000 crore over 5 years for biologics and biosimilars, 1000+ accredited clinical trial sites and a faster CDSCO,
+    which widens the biologics manufacturing and clinical research pool; no cabinet approval or guidelines found.
+- theme_id: cdmo
+  name: US BIOSECURE provisions (NDAA FY2026 sec. 851)
+  kind: regulation
+  direction: support
+  authority: US Congress / Office of Management and Budget
+  announced: '2025-12-18'
+  outlay_cr: null
+  status: active
+  latest_figure: Enacted as sec. 851 of Public Law 119-60 on 18 Dec 2025; OMB must publish the list of biotechnology companies
+    of concern within one year of enactment.
+  latest_as_of: '2025-12-18'
+  source_url: https://www.congress.gov/119/plaws/publ60/PLAW-119publ60.pdf
+  source_title: Public Law 119-60, National Defense Authorization Act for Fiscal Year 2026
+  source_date: '2025-12-18'
+  note: Bars US federal contracts with designated Chinese biotech providers, a demand tailwind for Indian CDMOs as US drug
+    makers diversify; prohibitions only bite 60-90 days after the FAR is revised, and no list is out yet.
+- theme_id: cdmo
+  name: US Section 232 tariff on patented pharmaceuticals (Proclamation 11020)
+  kind: duty
+  direction: headwind
+  authority: The White House (US President) / US Department of Commerce
+  announced: '2026-04-02'
+  outlay_cr: null
+  status: active
+  latest_figure: 100% duty on patented drugs and their ingredients (20% for firms with approved US onshoring plans), effective
+    31 Jul 2026 for Annex III companies and 29 Sep 2026 for others; generics and biosimilars exempt for now, to be reviewed
+    within 1 year.
+  latest_as_of: '2026-09-29'
+  source_url: https://www.whitehouse.gov/presidential-actions/2026/04/adjusting-imports-of-pharmaceuticals-and-pharmaceutical-ingredients-into-the-united-states/
+  source_title: Adjusting Imports of Pharmaceuticals and Pharmaceutical Ingredients into the United States
+  source_date: '2026-04-02'
+  note: Patented drugs and APIs that Indian CDMOs make for innovators face a 100% US duty unless the innovator onshores or
+    has a pricing deal; India's generics exports are spared for now.
+- theme_id: medical_devices
+  name: PLI Scheme for Medical Devices
+  kind: pli
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2020-03-20'
+  outlay_cr: 3420
+  status: active
+  latest_figure: 28 applicants approved, Rs 157.15 crore paid to 7; 24 greenfield projects commissioned, 57 products in production;
+    cumulative sales Rs 13,624.52 crore incl. exports Rs 6,425.48 crore.
+  latest_as_of: 2025-12
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2239576&reg=1&lang=1
+  source_title: Medical Devices Manufacturers
+  source_date: '2026-03-13'
+  note: '5% incentive on extra sales of locally made imaging, cancer-care, cardio/anaesthesia and implant devices for FY2022-23
+    to FY2026-27; scheme closes March 2027 and no new rounds are planned. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2314746&reg=48&lang=2'
+- theme_id: medical_devices
+  name: Medical Device Parks scheme
+  kind: subsidy
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2020-03-20'
+  outlay_cr: 400
+  status: active
+  latest_figure: Rs 210 crore disbursed to three parks (Greater Noida, Ujjain, Kanchipuram); 199 manufacturers allotted 306.64
+    acres and 34 units building plants (Dec 2025).
+  latest_as_of: '2026-03-13'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2239576&reg=1&lang=1
+  source_title: Medical Devices Manufacturers
+  source_date: '2026-03-13'
+  note: 'Common testing labs and infrastructure cut costs for device makers; original Rs 400 crore scheme (4 parks x Rs 100
+    crore) now runs three parks with Rs 100 crore each. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2243248&reg=3&lang=2'
+- theme_id: medical_devices
+  name: National Medical Devices Policy 2023
+  kind: target
+  direction: support
+  authority: Union Cabinet / Department of Pharmaceuticals
+  announced: '2023-04-26'
+  outlay_cr: null
+  status: active
+  latest_figure: Medical device exports rose to USD 4,014 million in FY2024-25 from USD 2,532 million in FY2020-21.
+  latest_as_of: 2025-03
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2239576&reg=1&lang=1
+  source_title: Medical Devices Manufacturers
+  source_date: '2026-03-13'
+  note: 'Policy targets growing the sector from USD 11 bn to USD 50 bn across six strategies (regulation, infrastructure,
+    R&D, investment, skills, branding). also: https://www.pib.gov.in/PressReleaseIframePage.aspx?PRID=1919984'
+- theme_id: medical_devices
+  name: Scheme for Strengthening the Medical Device Industry
+  kind: subsidy
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2024-11-08'
+  outlay_cr: 500
+  status: active
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://www.pib.gov.in/PressReleaseIframePage.aspx?PRID=2071850
+  source_title: Union Minister for Chemicals and Fertilizers Shri JP Nadda launches Scheme for Strengthening the Medical Device
+    Industry
+  source_date: '2024-11-08'
+  note: Funds component manufacturing, clusters' common facilities, clinical studies and skills, helping smaller device makers
+    cut import dependence; no disbursement figure found.
+- theme_id: medical_devices
+  name: PRIP (Promotion of Research and Innovation in Pharma MedTech)
+  kind: subsidy
+  direction: support
+  authority: Department of Pharmaceuticals, Ministry of Chemicals and Fertilizers
+  announced: '2023-08-17'
+  outlay_cr: 5000
+  status: active
+  latest_figure: 710 projects received in round 1 (closed 19.11.2025); second call for applications announced 28 Aug 2026,
+    with novel medical devices a priority area.
+  latest_as_of: '2026-08-28'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2304134&lang=1&reg=3
+  source_title: Second Call for Applications Under Rs 5,000 Crore PRIP Scheme to Boost Pharma & MedTech Innovation announced
+  source_date: '2026-08-28'
+  note: 'Co-funds development of novel devices (incl. AI/ML devices) and their clinical validation; NIPER Ahmedabad hosts
+    a Rs 110 crore device centre of excellence. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2203001&reg=1&lang=1'
+- theme_id: medical_devices
+  name: NPPA ceiling price on coronary stents
+  kind: regulation
+  direction: headwind
+  authority: National Pharmaceutical Pricing Authority (NPPA)
+  announced: 2026-04
+  outlay_cr: null
+  status: active
+  latest_figure: Ceiling revised from 1 April 2026 to Rs 39,186.03 per drug-eluting stent and Rs 10,762.15 per bare-metal
+    stent (WPI rise 0.64956%).
+  latest_as_of: 2026-04
+  source_url: https://medicaldialogues.in/news/industry/medical-devices/nppa-revises-coronary-stent-prices-des-at-rs-39186-and-bms-at-rs-10762-from-april-2026-168192
+  source_title: NPPA Revises Coronary Stent Prices, DES at Rs 39,186 and BMS at Rs 10,762 from April 2026
+  source_date: '2026-04-07'
+  note: Price cap (order S.O. 1587(E)) only rises with wholesale inflation, limiting margins for stent makers; trade press
+    used because the NPPA order page was not fetched.
+- theme_id: medical_devices
+  name: NPPA ceiling price on knee implants
+  kind: regulation
+  direction: headwind
+  authority: National Pharmaceutical Pricing Authority (NPPA)
+  announced: '2025-09-15'
+  outlay_cr: null
+  status: active
+  latest_figure: Cap extended by one year to November 2026 despite industry requests to remove or relax it.
+  latest_as_of: '2025-11-17'
+  source_url: https://www.business-standard.com/industry/news/nppa-extends-knee-implant-price-ceiling-november-2026-125111701358_1.html
+  source_title: NPPA extends knee implant price ceiling by one year till November 2026
+  source_date: '2025-11-17'
+  note: Caps limit pricing for orthopaedic implant makers; the article body quotes 'till November 15, 2025' while its headline
+    says November 2026, and no decision on the post-November 2026 cap was found.
+- theme_id: medical_devices
+  name: Curbs on refurbished medical device imports
+  kind: regulation
+  direction: support
+  authority: CDSCO (Ministry of Health and Family Welfare); MoEFCC
+  announced: '2025-01-16'
+  outlay_cr: null
+  status: active
+  latest_figure: CDSCO says refurbished devices cannot be imported for sale (Jan 2025), but an MoEFCC expert committee cleared
+    some refurbished CT, MRI and robotic units in Nov 2025; Health Ministry set up a policy committee in Feb 2026.
+  latest_as_of: 2026-02
+  source_url: https://business-standard.com/health/cdsco-to-disallow-import-of-pre-owned-refurbished-med-devices-into-india-125011601409_1.html
+  source_title: CDSCO to disallow import of pre-owned, refurbished med devices into India
+  source_date: '2025-01-16'
+  note: 'Blocking cheap second-hand imaging imports protects domestic makers, but conflicting MoEFCC clearances keep the rule
+    unsettled. also: https://www.nextias.com/ca/current-affairs/16-02-2026/refurbished-medical-devices'
+- theme_id: specialty_chem_export
+  name: US IEEPA tariffs on India (25% reciprocal + 25% Russia-oil penalty)
+  kind: trade
+  direction: headwind
+  authority: US President (White House)
+  announced: '2025-08-06'
+  outlay_cr: null
+  status: ended
+  latest_figure: The extra 25% Russia-oil duty (EO 14329, in force from 2025-08-27) was removed from 2026-02-07, and all IEEPA
+    duties, including the reciprocal tariff, were ended by an order of 2026-02-20.
+  latest_as_of: '2026-02-20'
+  source_url: https://www.whitehouse.gov/presidential-actions/2025/08/addressing-threats-to-the-united-states-by-the-government-of-the-russian-federation/
+  source_title: Addressing Threats to The United States by the Government of the Russian Federation (EO 14329)
+  source_date: '2025-08-06'
+  note: 'This put Indian chemical exports to the US at a combined 50% (the 25% reciprocal rate set 2025-07-31 plus the 25%
+    penalty) from Aug 2025 to Feb 2026, and that is now over. also: https://www.whitehouse.gov/presidential-actions/2026/02/modifying-duties-to-address-threats-to-the-united-states-by-the-government-of-the-russian-federation-04b2/
+    also: https://www.whitehouse.gov/presidential-actions/2026/02/ending-certain-tariff-actions/ also: https://www.whitehouse.gov/presidential-actions/2025/07/further-modifying-the-reciprocal-tariff-rates/'
+- theme_id: specialty_chem_export
+  name: US Section 301 forced-labour duty on India (10%)
+  kind: trade
+  direction: headwind
+  authority: USTR
+  announced: '2026-07-23'
+  outlay_cr: null
+  status: active
+  latest_figure: India was put at the 10% Section 301 rate (the lower tier, given its new forced-labour import ban), effective
+    2026-07-24, with exceptions in the annexes.
+  latest_as_of: '2026-07-23'
+  source_url: https://ustr.gov/about/policy-offices/press-office/press-releases/2026/july/ustr-takes-action-forced-labor-section-301-investigations
+  source_title: USTR Takes Action in Forced Labor Section 301 Investigations
+  source_date: '2026-07-23'
+  note: 'This is the US tariff currently in force on most Indian chemical exports; it is lower than the 2025 rate but still
+    above zero. also: https://www.federalregister.gov/documents/2026/07/28/2026-15274/actions-by-the-united-states-in-the-investigations-under-section-301-of-the-trade-act-of-1974-of-the
+    also: https://www.whitehouse.gov/presidential-actions/2026/02/imposing-a-temporary-import-surcharge-to-address-fundamental-international-payments-problems/
+    (a 10% Section 122 surcharge ran from 2026-02-24 until 2026-07-24 in between)'
+- theme_id: specialty_chem_export
+  name: US Section 301 excess-capacity investigation (16 economies incl. India)
+  kind: trade
+  direction: headwind
+  authority: USTR
+  announced: '2026-03-11'
+  outlay_cr: null
+  status: proposed
+  latest_figure: null
+  latest_as_of: null
+  source_url: https://ustr.gov/about/policy-offices/press-office/press-releases/2026/march/ustr-initiates-section-301-investigations-relating-structural-excess-capacity-and-production
+  source_title: USTR Initiates Section 301 Investigations Relating to Structural Excess Capacity and Production in Manufacturing
+    Sectors
+  source_date: '2026-03-11'
+  note: This open case could add more US duties; according to search snippets of the Federal Register notice (not fetched),
+    it names petrochemicals among India's excess capacity, and I found no outcome yet.
+- theme_id: specialty_chem_export
+  name: India-US interim trade framework (18% reciprocal rate)
+  kind: trade
+  direction: support
+  authority: Ministry of Commerce & Industry / USTR
+  announced: '2026-02-06'
+  outlay_cr: null
+  status: proposed
+  latest_figure: The framework set an 18% US rate on Indian goods including organic chemicals; the Interim Agreement was still
+    being negotiated, with talks in April 2026 and a Goyal US visit planned for 29 Sep-5 Oct 2026.
+  latest_as_of: 2026-10
+  source_url: https://www.whitehouse.gov/briefings-statements/2026/02/united-states-india-joint-statement/
+  source_title: United States-India Joint Statement
+  source_date: '2026-02-06'
+  note: 'A signed deal would fix the US tariff for Indian chemical exporters; for now the 18% rate is moot because the IEEPA
+    tariffs ended, and the deal is not concluded. also: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2255255&reg=3&lang=2'
+- theme_id: specialty_chem_export
+  name: BHAVYA Rasayan chemical parks scheme
+  kind: subsidy
+  direction: support
+  authority: Union Cabinet / Department of Chemicals and Petrochemicals
+  announced: '2026-07-24'
+  outlay_cr: 3030
+  status: active
+  latest_figure: Approved for three chemical parks, with a central grant of up to Rs 1,000 crore per park and a state share
+    of at least Rs 500 crore, running FY2026-27 to FY2030-31.
+  latest_as_of: '2026-07-24'
+  source_url: https://www.pib.gov.in/PressReleasePage.aspx?PRID=2288863&reg=48&lang=1
+  source_title: Cabinet approves scheme of Chemical Parks Bharat Audyogik Vikas Yojana Rasayan (BHAVYA Rasayan)
+  source_date: '2026-07-24'
+  note: Plug-and-play parks with shared effluent treatment, waste disposal and solvent recovery cut capex and compliance costs
+    for new specialty chemical plants; the scheme was announced in Budget 2026-27.
+- theme_id: specialty_chem_export
+  name: Organic & inorganic chemicals export growth (government trade data)
+  kind: other
+  direction: support
+  authority: Ministry of Commerce & Industry
+  announced: '2026-10-15'
+  outlay_cr: null
+  status: active
+  latest_figure: Organic & inorganic chemicals exports rose 24.21%, from US$ 2.37 billion in September 2025 to US$ 2.94 billion
+    in September 2026.
+  latest_as_of: 2026-09
+  source_url: https://www.pib.gov.in/PressReleseDetailm.aspx?PRID=2323944&lang=1&reg=3
+  source_title: India's foreign trade, September 2026 (cumulative exports April-September 2026-27 US$ 476.20 billion)
+  source_date: '2026-10-15'
+  note: Official trade data showing chemical exports growing fast in 2026, which is evidence of demand for Indian chemicals
+    (China+1).
+- theme_id: specialty_chem_export
+  name: Anti-dumping duty on titanium dioxide from China
+  kind: duty
+  direction: support
+  authority: Ministry of Finance (on DGTR findings of 2026-08-03)
+  announced: '2026-10-24'
+  outlay_cr: null
+  status: active
+  latest_figure: Notification 26/2026-Customs (ADD) imposed the duty for five years; food, pharma, cosmetic and textile uses
+    are exempt.
+  latest_as_of: '2026-10-24'
+  source_url: https://teamleaseregtech.com/updates/article/60678/mof-notified-regarding-the-anti-dumping-duty-on-titanium-dioxide-impor/
+  source_title: MoF notified regarding the Anti-Dumping Duty on Titanium Dioxide Imports from China PR
+  source_date: '2026-10-26'
+  note: This shields Indian TiO2 makers from cheap Chinese imports but raises input costs for paint makers; per-tonne rates
+    are not in the fetched text.
+- theme_id: specialty_chem_export
+  name: Anti-dumping duty on sulphenamide rubber accelerators (China, EU, US)
+  kind: duty
+  direction: support
+  authority: Ministry of Finance (on DGTR findings)
+  announced: '2026-06-19'
+  outlay_cr: null
+  status: active
+  latest_figure: Duties of $75 to $1,748 per tonne were imposed for five years.
+  latest_as_of: '2026-06-19'
+  source_url: https://www.angelone.in/news/economy/india-enforces-anti-dumping-duty-on-chemical-imports-from-china-eu-us
+  source_title: India Enforces Anti-Dumping Duty on Chemical Imports from China, EU, US
+  source_date: '2026-06-22'
+  note: 'This protects Indian makers of rubber chemicals used by tyre companies against dumped imports. also: https://worldtradescanner.com/08-Cus(ADD)-22.05.2026.htm
+    (MIPA from China, USD 290/t, Notification 08/2026-Customs (ADD), 2026-05-22)'

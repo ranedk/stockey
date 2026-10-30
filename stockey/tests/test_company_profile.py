@@ -60,3 +60,20 @@ def test_the_premium_notice_is_not_stored_as_key_points():
     html = "<div><p>Please upgrade to premium to read more key insights.</p><p>Free users can access 20 free key-insights</p></div>"
     with pytest.raises(KeyPointsLocked):
         parse_commentary(html)
+
+
+def test_a_renamed_company_listed_twice_becomes_one_row_with_both_codes():
+    import pandas as pd
+    u = pd.DataFrame({
+        "company_master_id": ["nse:HBLENGINE", "nse:HBLPOWER", "nse:544395-BOM", "nse:STLNETWORK", "nse:X"],
+        "median_tv": [7e8, 7e7, 2e8, 1e8, 5e8],
+        "company_name": ["HBL Engineering", "HBL Engineering Ltd.", "STL Networks Ltd.", "STL Networks", "X Ltd."],
+        "bse_code": [None, "517271", "544395", None, "1"],
+        "ticker": ["HBLENGINE", "HBLPOWER", "544395-BOM", "STLNETWORK", "X"],
+    })
+    out = cp.merge_renamed(u).set_index("ticker")
+    assert list(out.index) == ["HBLENGINE", "X", "STLNETWORK"]
+    assert out.loc["HBLENGINE", "bse_code"] == "517271" and out.loc["HBLENGINE", "median_tv"] == 7.7e8
+    assert out.loc["HBLENGINE", "merged_ids"] == ["nse:HBLPOWER"]
+    assert out.loc["STLNETWORK", "bse_code"] == "544395"
+    assert out.loc["X", "merged_ids"] == []
