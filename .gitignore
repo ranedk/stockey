@@ -3,3 +3,4 @@
 .claude/
 # Go build outputs dropped at systrade's root by `go build ./cmd/...`
 /systrade/costs
+__pycache__
