@@ -84,3 +84,11 @@ seeing a return sends this back to exploration as a new row.
 ## 7. Ledger
 
 LEDGER row 84, trials = 2.
+
+## Change log (before any return was computed)
+
+- 2026-11-02, parsing: the prefilter also drops the exchange's own volume/price-movement query
+  text (it always contains "in order to"), the phrase "in order to", and orders passed AGAINST
+  the company (court, tax, assessment, tribunal, NCLT, SEBI, demand, penalty orders). Pilot on 3
+  companies: 60 candidates -> 27, every order win kept. A company's reply to a price-movement
+  query that cites an order is still a candidate.
