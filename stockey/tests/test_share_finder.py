@@ -35,3 +35,17 @@ def test_a_total_or_continuing_operations_line_is_not_a_theme_line():
         got = sf.validate_source({"result": "found", "theme_revenue": raw, "total_revenue": "18,335.08",
                                   "theme_quote": tq, "total_quote": "(a) Revenue from operations 18,335.08 10,887.31"}, text)
         assert got["status"] == "invalid", tq
+
+
+def test_several_theme_lines_are_added_up_in_code():
+    text = ("Optics and Optronic Systems 7,465\nDefence Engineering - electronics 2,800\n"
+            "Revenue from Operations 14,732")
+    got = sf.validate_source({"result": "found", "theme_revenue": None, "total_revenue": "14,732",
+                              "theme_lines": [{"name": "Optics", "amount": "7,465", "quote": "Optics and Optronic Systems 7,465"},
+                                              {"name": "Electronics", "amount": "2,800", "quote": "Defence Engineering - electronics 2,800"}],
+                              "total_quote": "Revenue from Operations 14,732"}, text)
+    assert got["status"] == "quantified" and got["exposure_pct"] == round(100 * 10265 / 14732, 1)
+    bad = sf.validate_source({"result": "found", "theme_revenue": None, "total_revenue": "14,732",
+                              "theme_lines": [{"name": "x", "amount": "9,999", "quote": "Optics and Optronic Systems 9,999"}],
+                              "total_quote": "Revenue from Operations 14,732"}, text)
+    assert bad["status"] == "invalid"

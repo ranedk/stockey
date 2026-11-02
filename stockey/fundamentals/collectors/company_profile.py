@@ -156,6 +156,15 @@ def merge_renamed(u: pd.DataFrame) -> pd.DataFrame:
     symbol (HBLPOWER/HBLENGINE, ZOMATO/ETERNAL). Keep the busier row that has a real NSE symbol,
     give it the BSE code and the summed turnover, and list the dropped ids in merged_ids."""
     u = u.assign(_k=u["company_name"].map(_name_key), _bom=u["ticker"].str.endswith("-BOM"))
+    # A BSE-only row whose name differs only by "India" ("Siemens Energy India Ltd." on BSE,
+    # "Siemens Energy" on NSE, 2026-10-31) joins the NSE row -- but only when exactly one NSE row
+    # matches, since "X India" and "X" can be two companies.
+    k2 = u["_k"].str.replace("india", "", regex=False)
+    nse_by_k2 = u[~u["_bom"]].assign(_k2=k2).groupby("_k2")["_k"].agg(list)
+    for i in u.index[u["_bom"]]:
+        hits = nse_by_k2.get(k2[i], [])
+        if len(hits) == 1 and hits[0] != u.at[i, "_k"]:
+            u.at[i, "_k"] = hits[0]
     rows = []
     for _, g in u.groupby("_k", sort=False):
         g = g.sort_values(["_bom", "median_tv"], ascending=[True, False])

@@ -37,7 +37,11 @@ from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.fallback_telemetry import record_local_fallback_event
 
 TABLE = "fundamentals_theme_share_extra"
-FINDER_VERSION = 1
+# 2 (2026-10-31), after the web check of v1's 47 shares agreed on 33: the theme's exclusions
+# go into both prompts (RR Kabel's house wires); the filing pass adds up every line inside the
+# definition and never uses a geographic split (Vinati's export share); every "sole" verdict
+# gets a sceptical second check (Cohance sells APIs on the open market).
+FINDER_VERSION = 2
 BATCH = 3
 TEXT_CHARS = 24000
 SOURCE_CHARS = 14000          # per document in pass 2
@@ -64,13 +68,13 @@ def ensure_table() -> None:
     execute_db_operation(_op, operation_name=f"{TABLE}:ensure_table")
 
 
-SOLE_PROMPT = """You check Indian listed companies against an investment theme. Each item gives a company, a theme (name and definition: what a company must make or sell to count) and text about the company (its profile and pages from its latest annual report).
+SOLE_PROMPT = """You check Indian listed companies against an investment theme. Each item gives a company, a theme (name, definition: what a company must make or sell to count, and "not_in_theme": look-alikes that do NOT count) and text about the company (its profile and pages from its latest annual report).
 
 Decide whether ALL of the company's revenue comes from products or services inside the theme's definition.
 - "sole": the text shows the company does only this -- one business, and that business is inside the theme. Give a verbatim sentence from the text that shows it (e.g. "The Company is engaged solely in the manufacture of transformers").
 - "other": the company also earns revenue outside the theme (another product line, segment, trading, services, exports of other goods...). Name those other businesses briefly, and give a verbatim sentence that shows one of them.
 - "unclear": the text does not say enough.
-Be strict: a company "focused on" or "primarily" in the theme, or with any second product line, is "other". Copy quotes exactly from the text. Keep the item "id" unchanged."""
+Be strict: a company "focused on" or "primarily" in the theme, or with any second product line, or with any revenue from a "not_in_theme" look-alike, is "other". A company that does not fit the definition at all (e.g. an unbranded wholesale maker for a branded-retail theme) is "other". Copy quotes exactly from the text. Keep the item "id" unchanged."""
 
 SOLE_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
     "type": "object", "properties": {
@@ -78,9 +82,18 @@ SOLE_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "item
         "quote": {"type": "string"}, "other_business": {"type": "string"}},
     "required": ["id", "verdict", "quote"]}}}, "required": ["items"]}
 
-SOURCE_PROMPT = """You find how much of an Indian listed company's revenue comes from an investment theme. Each item gives the company, the theme (name and definition) and documents: credit-rating rationales and a quarterly results filing (OCR text, tables may be garbled).
+SOLE_CHECK_PROMPT = """You are a sceptical reviewer. Each item says an Indian listed company earns ALL its revenue inside an investment theme (definition given, plus "not_in_theme" look-alikes that do NOT count), so its theme share would be 100%. Use the text given and what you know about the company.
 
-Look for a stated split of revenue: a percentage of revenue (or of sales / turnover / income from operations) that comes from the theme's products, or the revenue of the theme's products together with the total revenue for the same period and unit. A segment counts only if what it sells is inside the theme's definition.
+Argue against it. "confirm" only if you find no material revenue line (roughly 10% of revenue or more) outside the definition or in a "not_in_theme" look-alike, and the company fits the definition itself (for example a branded-retail theme needs a branded retailer, not a wholesale maker). Otherwise "reject", naming the outside line or the misfit in "reason". Keep the item "id" unchanged."""
+
+SOLE_CHECK_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
+    "type": "object", "properties": {"id": {"type": "string"}, "verdict": {"type": "string", "enum": ["confirm", "reject"]},
+                                     "reason": {"type": "string"}},
+    "required": ["id", "verdict", "reason"]}}}, "required": ["items"]}
+
+SOURCE_PROMPT = """You find how much of an Indian listed company's revenue comes from an investment theme. Each item gives the company, the theme (name, definition, and "not_in_theme": look-alikes that do NOT count) and documents: credit-rating rationales and a quarterly results filing (OCR text, tables may be garbled).
+
+Look for a stated split of revenue BY PRODUCT OR BUSINESS: a percentage of revenue (or of sales / turnover / income from operations) that comes from the theme's products, or the revenue of the theme's products together with the total revenue for the same period and unit. A segment counts only if what it sells is inside the theme's definition; if several segments or lines are inside it, report them together: give "theme_lines" (each line's name and amount exactly as printed) and "theme_revenue" as null, and the code adds them. A segment that mixes theme products with a "not_in_theme" look-alike (e.g. "Wires & Cables" when house wires are excluded) does not count unless the documents split it. Never use a geographic split (exports vs domestic, overseas sales): the share is about what the company sells, not where.
 Answer per item:
 - "found": "pct" (the stated percentage) with "pct_quote" (the verbatim sentence holding it), OR "theme_revenue" and "total_revenue" (numbers exactly as printed) with "theme_quote" and "total_quote" (verbatim lines holding each), plus "period" and "document" (which document).
 - "none": no such split in the documents.
@@ -92,6 +105,9 @@ SOURCE_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "it
         "pct": {"type": ["number", "null"]}, "pct_quote": {"type": ["string", "null"]},
         "theme_revenue": {"type": ["string", "null"]}, "total_revenue": {"type": ["string", "null"]},
         "theme_quote": {"type": ["string", "null"]}, "total_quote": {"type": ["string", "null"]},
+        "theme_lines": {"type": ["array", "null"], "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "amount": {"type": "string"}, "quote": {"type": "string"}},
+            "required": ["name", "amount", "quote"]}},
         "period": {"type": ["string", "null"]}, "document": {"type": ["string", "null"]}},
     "required": ["id", "result"]}}}, "required": ["items"]}
 
@@ -128,12 +144,22 @@ def validate_source(x: dict, text: str) -> dict:
         if not (0 < pct <= 100 and _pct_in(float(pct), pq) and quote_in(pq, text)):
             return {"status": "invalid", "note": "percentage not in its quote, or the quote not in the documents"}
         return {"status": "quantified", "exposure_pct": float(pct), "quote": pq, "source_label": label}
+    lines = x.get("theme_lines") or []
+    if lines and not x.get("theme_revenue"):
+        amounts, quotes = [], []
+        for ln in lines:
+            v, q = parse_amount(ln.get("amount")), (ln.get("quote") or "").strip()
+            if v is None or not grounded(q, ln["amount"], text) or _NOT_A_LINE.search(q[:60]):
+                return {"status": "invalid", "note": f"line {ln.get('name')!r} not grounded or not a business line"}
+            amounts.append(v)
+            quotes.append(q)
+        x = {**x, "theme_revenue": str(sum(amounts)), "theme_quote": " + ".join(quotes), "_summed": True}
     a, b = parse_amount(x.get("theme_revenue")), parse_amount(x.get("total_revenue"))
     tq, sq = (x.get("theme_quote") or "").strip(), (x.get("total_quote") or "").strip()
-    if a is None or b is None or b <= 0 or not (grounded(tq, x["theme_revenue"], text)
+    if a is None or b is None or b <= 0 or not ((x.get("_summed") or grounded(tq, x["theme_revenue"], text))
                                                   and grounded(sq, x["total_revenue"], text)):
         return {"status": "invalid", "note": "amounts not grounded in the documents"}
-    if _NOT_A_LINE.search(tq.split("  ")[0][:60]) or tq == sq:
+    if not x.get("_summed") and (_NOT_A_LINE.search(tq.split("  ")[0][:60]) or tq == sq):
         return {"status": "invalid", "note": "the theme's line is a total or continuing operations, not a business line"}
     share = 100.0 * a / b
     if not 0 < share <= 100:
@@ -165,7 +191,10 @@ def targets(as_of: date, version: int = 1) -> pd.DataFrame:
     from fundamentals.themes.strength import load_members
 
     m = load_members(as_of, version)
-    return m[m["share"].isna()][["company_master_id", "theme_id"]].drop_duplicates()
+    # every member without a share from its own report or profile -- including those holding one
+    # from an earlier finder version, which a new version must re-examine
+    own = m["share_source"].isin(["annual report", "company profile"])
+    return m[~own][["company_master_id", "theme_id"]].drop_duplicates()
 
 
 def company_text(ids: list[str]) -> dict[str, str]:
@@ -245,7 +274,8 @@ def run(as_of: date | None = None, limit: int | None = None, any_time: bool = Fa
         if not batch:
             continue
         ask = [{"id": str(k), "company": r.company_master_id, "theme": themes[r.theme_id].name,
-                "definition": themes[r.theme_id].definition, "text": texts[r.company_master_id]}
+                "definition": themes[r.theme_id].definition, "not_in_theme": list(themes[r.theme_id].exclude),
+                "text": texts[r.company_master_id]}
                for k, r in enumerate(batch)]
         res = call_claude(SOLE_PROMPT, SOLE_SCHEMA, ask)
         if not res["ok"]:
@@ -253,9 +283,22 @@ def run(as_of: date | None = None, limit: int | None = None, any_time: bool = Fa
                 return {**counts, "stopped": res["message"][:200]}
             continue
         got = {str(x.get("id")): x for x in res["items"]}
-        _store([{"company_master_id": r.company_master_id, "theme_id": r.theme_id, "method": "sole_business",
+        rows = [{"company_master_id": r.company_master_id, "theme_id": r.theme_id, "method": "sole_business",
                  **validate_sole(got.get(str(k), {}), texts[r.company_master_id]),
-                 "source_label": "profile and annual report"} for k, r in enumerate(batch)])
+                 "source_label": "profile and annual report"} for k, r in enumerate(batch)]
+        sole = [(k, row) for k, row in enumerate(rows) if row["status"] == "quantified"]
+        if sole:
+            chk = call_claude(SOLE_CHECK_PROMPT, SOLE_CHECK_SCHEMA,
+                              [{**ask[k], "claim": "all revenue is inside the theme"} for k, _ in sole])
+            verdicts = {str(x.get("id")): x for x in chk["items"]} if chk["ok"] else {}
+            for k, row in sole:
+                v = verdicts.get(str(k))
+                if v is None:
+                    row.update(status="unclear", exposure_pct=None, note="sceptical check did not answer")
+                elif v.get("verdict") != "confirm":
+                    row.update(status="other_business", exposure_pct=None,
+                               other_business=v.get("reason"), note="sceptical check rejected the sole-business claim")
+        _store(rows)
     s1 = _done("sole_business")
     counts["sole"] = s1["status"].value_counts().to_dict()
 
@@ -276,6 +319,7 @@ def run(as_of: date | None = None, limit: int | None = None, any_time: bool = Fa
         res = call_claude(SOURCE_PROMPT, SOURCE_SCHEMA, [{"id": "0", "company": r.company_master_id,
                                                           "theme": themes[r.theme_id].name,
                                                           "definition": themes[r.theme_id].definition,
+                                                          "not_in_theme": list(themes[r.theme_id].exclude),
                                                           "documents": text}])
         if not res["ok"]:
             if res["kind"] == "limit":

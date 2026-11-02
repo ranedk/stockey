@@ -3,6 +3,8 @@ latest day's theme list and top-10 stocks, and one theme's full membership, each
 written reasons. Read-only."""
 from __future__ import annotations
 
+import json
+
 from fundamentals.api.queries import _clean_records
 from utils.db import sql_to_df
 
@@ -33,11 +35,39 @@ _STOCK_SQL = """
     WITH x AS (
         SELECT DISTINCT ON (theme_id, company_master_id) theme_id, company_master_id, reasoning, conclusion, written_at
           FROM fundamentals_theme_text WHERE kind = 'stock' AND status = 'ok'
-         ORDER BY theme_id, company_master_id, written_at DESC)
-    SELECT w.*, x.reasoning, x.conclusion, x.written_at
+         ORDER BY theme_id, company_master_id, written_at DESC),
+    c AS ({web})
+    SELECT w.*, x.reasoning, x.conclusion, x.written_at, c.verdict AS web_verdict, c.checked_at AS web_checked_at,
+           c.summary AS web_summary, c.recent_changes AS web_recent_changes, c.red_flags AS web_red_flags,
+           c.sources AS web_sources
       FROM fundamentals_theme_watchlist_stock w LEFT JOIN x USING (theme_id, company_master_id)
+      LEFT JOIN c USING (theme_id, company_master_id)
      WHERE w.as_of_date = (SELECT max(as_of_date) FROM fundamentals_theme_watchlist_stock) AND {where}
      ORDER BY w.theme_id, w.position NULLS LAST, w.status, w.share_pct DESC NULLS LAST"""
+
+
+_WEB_SQL = """SELECT DISTINCT ON (theme_id, company_master_id) theme_id, company_master_id, verdict, checked_at,
+                     summary, recent_changes, red_flags, sources
+                FROM fundamentals_theme_web_check WHERE status = 'ok'
+                 AND check_version = (SELECT max(check_version) FROM fundamentals_theme_web_check)
+               ORDER BY theme_id, company_master_id, checked_at DESC"""
+_NO_WEB_SQL = """SELECT NULL::text AS theme_id, NULL::text AS company_master_id, NULL::text AS verdict,
+                        NULL::timestamptz AS checked_at, NULL::text AS summary, NULL::text AS recent_changes,
+                        NULL::text AS red_flags, NULL::text AS sources WHERE false"""
+
+
+def _stock_sql(where: str) -> str:
+    has = not sql_to_df("SELECT 1 FROM information_schema.tables WHERE table_name = 'fundamentals_theme_web_check'").empty
+    return _STOCK_SQL.replace("{web}", _WEB_SQL if has else _NO_WEB_SQL).replace("{where}", where)
+
+
+def _sources(rows: list[dict]) -> list[dict]:
+    for r in rows:
+        try:
+            r["web_sources"] = json.loads(r["web_sources"]) if r.get("web_sources") else []
+        except ValueError:
+            r["web_sources"] = []
+    return rows
 
 
 def _names() -> dict:
@@ -57,8 +87,8 @@ def get_themes() -> dict:
         return {"as_of": None, "themes": [], "stocks": []}
     themes = _with_names(_clean_records(sql_to_df(_THEME_SQL.format(where=""))))
     shown = [t["theme_id"] for t in themes if t["status"] == "shown"]
-    stocks = _clean_records(sql_to_df(_STOCK_SQL.format(where="w.on_watchlist AND w.theme_id = ANY(%(ids)s)"),
-                                      params={"ids": shown})) if shown else []
+    stocks = _sources(_clean_records(sql_to_df(_stock_sql("w.on_watchlist AND w.theme_id = ANY(%(ids)s)"),
+                                               params={"ids": shown}))) if shown else []
     return {"as_of": themes[0]["as_of_date"] if themes else None, "themes": themes, "stocks": stocks}
 
 
@@ -67,7 +97,7 @@ def get_theme(theme_id: str) -> dict | None:
                                                 params={"id": theme_id})))
     if not rows:
         return None
-    stocks = _clean_records(sql_to_df(_STOCK_SQL.format(where="w.theme_id = %(id)s"), params={"id": theme_id}))
+    stocks = _sources(_clean_records(sql_to_df(_stock_sql("w.theme_id = %(id)s"), params={"id": theme_id})))
     policy = _clean_records(sql_to_df(
         "SELECT name, kind, direction, authority, announced, outlay_cr, status, latest_figure, source_url"
         " FROM fundamentals_theme_policy WHERE theme_id = %(id)s"

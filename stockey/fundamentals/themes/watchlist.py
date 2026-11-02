@@ -19,6 +19,8 @@ business (sales growth, the same against the company's own pace, margin change);
 drops out of the mean; exposure and trend are always present. Rating A-E = the fifth of the
 theme's ranked members the company falls in. The top TOP_N are the watchlist.
 
+A web check of each listed stock (fundamentals/themes/web_check.py) adds to the gate: a
+red_flag, or "no longer in the theme's business", excludes; "watch" is a note.
 Management gate (hard, 5 years): a SEBI enforcement order AGAINST the company -- the order
 names it in its parties ("In respect of ..."), read from the order itself, since a title
 "in the matter of Titan Company" is as often an insider-trading order against ten employees
@@ -48,7 +50,7 @@ import pandas as pd
 from fundamentals.collectors import sebi_orders
 from fundamentals.collectors.company_profile import load_universe
 from fundamentals.screens import results_reading
-from fundamentals.themes import catalog, sebi_match
+from fundamentals.themes import catalog, sebi_match, web_check
 from fundamentals.themes.strength import (STRENGTH_VERSION, TABLE as STRENGTH_TABLE, fetch_theme_snapshot,
                                           load_members, member_numbers, stage_keys)
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
@@ -299,6 +301,7 @@ def compute(as_of: date, version: int = 1, snapshot: dict | None = None,
     gate = gate_reasons(co.assign(flaws=co.get("flaws")), as_of)
     co = co.set_index("company_master_id")
 
+    webc = {(w.company_master_id, w.theme_id): w for w in web_check.latest_checks().itertuples()}
     stocks = {s["key"]: s for s in (snapshot or {}).get("stocks", [])}
     week = (snapshot or {}).get("as_of")
     rows = []
@@ -327,6 +330,19 @@ def compute(as_of: date, version: int = 1, snapshot: dict | None = None,
         }
         why = list(gate.get(r.company_master_id, []))
         hard = excluded(why)
+        disputed_share = None
+        wc = webc.get((r.company_master_id, r.theme_id))
+        if wc is not None:
+            when = pd.Timestamp(wc.checked_at).date()
+            if wc.verdict == "red_flag":
+                hard.append(f"web check ({when}): {wc.red_flags or wc.summary}"[:400])
+            elif not wc.in_theme:
+                hard.append(f"web check ({when}): no longer in the theme's business -- {wc.recent_changes or wc.summary}"[:400])
+            elif pd.notna(r.share) and pd.notna(wc.share_estimate_pct) \
+                    and r.share - wc.share_estimate_pct > web_check.SHARE_DISPUTE_PP:
+                disputed_share = f"web check ({when}) puts the theme share near {wc.share_estimate_pct:.0f}%, not {r.share:.0f}%"
+            if wc.verdict == "watch" and wc.in_theme:
+                why.append(f"note: web check ({when}): {wc.recent_changes or wc.red_flags or wc.summary}"[:400])
         if not (row["median_tv_cr"] >= 1.0):
             hard.append("traded value under Rs 1 cr a day")
         if row["roce_pct"] is not None and pd.notna(row["roce_pct"]) and row["roce_pct"] < ROCE_FLOOR:
@@ -343,8 +359,10 @@ def compute(as_of: date, version: int = 1, snapshot: dict | None = None,
         notes = [x for x in why if x.startswith("note: ")]
         if hard:
             row["status"] = "excluded"
-        elif pd.isna(r.share):
+        elif pd.isna(r.share) or disputed_share:
             row["status"] = "unquantified"
+            if disputed_share:
+                notes.append(f"note: share disputed -- {disputed_share}")
         elif r.share < t.min_exposure:
             row["status"], hard = "excluded", [f"revenue share {r.share:.0f}% under the theme's {t.min_exposure:.0f}%"]
         else:
@@ -392,6 +410,15 @@ def run(as_of: date | None = None, version: int = 1, dry_run: bool = False) -> t
     if not dry_run:
         ensure_tables()
         now = pd.Timestamp.now(tz="UTC")
+        # a rerun replaces the day: a company dropped since (merged away, untagged) must not keep
+        # its earlier row from the same day
+        def _clear() -> None:
+            with db_session() as (_, cur):
+                for t in (THEME_TABLE, STOCK_TABLE):
+                    cur.execute(f"DELETE FROM {t} WHERE as_of_date = %s AND theme_version = %s AND watchlist_version = %s",
+                                (as_of, version, WATCHLIST_VERSION))
+
+        execute_db_operation(_clear, operation_name=f"{STOCK_TABLE}:clear_day")
         upsert_to_db(th.assign(load_ts=now), THEME_TABLE, ["as_of_date", "theme_version", "theme_id", "watchlist_version"])
         upsert_to_db(st.assign(load_ts=now), STOCK_TABLE,
                      ["as_of_date", "theme_version", "theme_id", "company_master_id", "watchlist_version"])

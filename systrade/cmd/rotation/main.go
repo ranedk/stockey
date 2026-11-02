@@ -122,9 +122,9 @@ func lastCompletedWeek(p *rotation.Panel) int {
 }
 
 // runThemes builds the theme views for stockey's theme map (fundamentals_theme_member, synced).
-// NSE EQ names come from the same stream as the rotation view; members outside it (BSE-only
-// "BSE:<scrip>" keys, BE/SME series) are read through the stage API's series. The market index
-// is built from the EQ stream alone, so RS matches the rotation view exactly.
+// The market index is built from the same EQ stream as the rotation view; every member is then
+// read through the stage API's merged series (BE/SME weeks, BSE-only "BSE:<scrip>" keys), so a
+// member's own BE weeks also enter the market average -- a handful of names among ~2,200.
 func runThemes(ctx context.Context, st *store.Store) error {
 	started := time.Now()
 	rows, err := st.ThemeMembers(ctx)
@@ -147,7 +147,10 @@ func runThemes(ctx context.Context, st *store.Store) error {
 	extra := map[string]bool{}
 	for _, r := range rows {
 		themes[r.ThemeID] = append(themes[r.ThemeID], rotation.ThemeMember{Key: r.StageKey, Weight: r.Weight})
-		if !streamed[r.StageKey] && !extra[r.StageKey] {
+		// Every member is read through the stage API's merged series (all NSE equity series,
+		// BSE history before the NSE listing), replacing its EQ-only copy: HFCL and STLTECH moved
+		// to the BE series in 2026 and showed no recent weeks at all from the EQ stream.
+		if !extra[r.StageKey] {
 			extra[r.StageKey] = true
 			closes, vols, err := st.StageSeries(ctx, r.StageKey)
 			if err != nil {
@@ -184,7 +187,7 @@ func runThemes(ctx context.Context, st *store.Store) error {
 	if err := st.SaveThemeSnapshot(ctx, p.Weeks[last], snap); err != nil {
 		return err
 	}
-	fmt.Printf("theme snapshot %s: %d themes, %d stocks (%d outside the EQ stream, %d with no series), %s\n",
-		snap.AsOf, len(snap.Themes), len(snap.Stocks), len(extra), len(snap.Missing), time.Since(started).Round(time.Second))
+	fmt.Printf("theme snapshot %s: %d themes, %d stocks (%d with no series), %s\n",
+		snap.AsOf, len(snap.Themes), len(snap.Stocks), len(snap.Missing), time.Since(started).Round(time.Second))
 	return nil
 }

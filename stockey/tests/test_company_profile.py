@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 from fundamentals.collectors import company_profile as cp
@@ -77,3 +78,15 @@ def test_a_renamed_company_listed_twice_becomes_one_row_with_both_codes():
     assert out.loc["HBLENGINE", "merged_ids"] == ["nse:HBLPOWER"]
     assert out.loc["STLNETWORK", "bse_code"] == "544395"
     assert out.loc["X", "merged_ids"] == []
+
+
+def test_a_bse_only_row_named_with_india_joins_its_single_nse_twin():
+    u = pd.DataFrame([
+        {"company_master_id": "nse:ENRIN", "ticker": "ENRIN", "company_name": "Siemens Energy", "bse_code": None, "median_tv": 1.2e9},
+        {"company_master_id": "nse:544390-BOM", "ticker": "544390-BOM", "company_name": "Siemens Energy India Ltd.",
+         "bse_code": "544390", "median_tv": 6e7},
+        {"company_master_id": "nse:SIEMENS", "ticker": "SIEMENS", "company_name": "Siemens Ltd.", "bse_code": "500550", "median_tv": 2e9},
+    ])
+    out = cp.merge_renamed(u).set_index("company_master_id")
+    assert list(out.index) == ["nse:SIEMENS", "nse:ENRIN"]
+    assert out.at["nse:ENRIN", "bse_code"] == "544390" and out.at["nse:ENRIN", "merged_ids"] == ["nse:544390-BOM"]

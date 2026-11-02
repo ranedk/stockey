@@ -335,8 +335,34 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
   sentence saying the company does only this, no longer means 100% by itself -- a second
   check asks whether the one business also sells outside the theme, and if so the tag stays
   but without a share (27 of 51 such companies, Astra Microwave among them).
+- **Third check (2026-10-31, the share finder's 47 new shares): 33 of 47 (70%) -- failed.**
+  Overstated: Cohance 100% (about 43%: APIs sold on the open market), RR Kabel 92% (about 25%:
+  the segment is mostly house wires, which the theme excludes), Deepa (an unbranded wholesale
+  maker, not a branded retailer). Understated: shares taken from one segment when others also
+  belong (Paras, Laxmi Dental, Apar, Texmaco) and an export share used as the theme share
+  (Vinati, Vishnu). Fixed in finder v2: the theme's exclusions in both prompts; the filing pass
+  adds every line inside the definition and never uses a geographic split; a sceptical second
+  check on every "no other business" verdict. On the same 47, v2 gives 23 shares: 20 right,
+  3 understated, none overstated; it withholds 24 (about half of them were right -- the
+  sceptic is strict; kept, since a withheld share only leaves a company unranked).
+  **Fresh check of v2's other 10 shares: 9 of 10 agree** (Salasar 71% vs about 55%).
 - **Every stock on the final watchlist gets a web check** (5 themes x 10 = 50 names), shown
   with its sources: it catches what no filing yet says, e.g. a business sold last month.
+  **Built 2026-10-31**: `fundamentals/themes/web_check.py`, Claude CLI with WebSearch and
+  WebFetch only, every listed stock when it joins the list and every 60 days, in the morning
+  job (then the ranking runs again). Verdict clear / watch / red_flag, every point with its
+  URLs; the hard red flags match the gate (qualified opinion, auditor resignation, tax/ED/CBI
+  action WITH findings, SEBI/RBI order against the company or promoters, default, promoter
+  charged). v1 had called Polycab's Rs 1,000 cr unaccounted-sales finding and Amber's
+  qualified opinion "watch"; v2 spells the rules out. A red flag or "no longer in the theme"
+  excludes; a web share more than 25 points under ours makes the share "not known" (Birla
+  Cable: about 60%, not 100%). First run: 4 red flags (Polycab, Amber, Biocon -- a 2022 CBI
+  bribery arrest of a Biocon Biologics executive -- and Akums -- tax assessments after a 2025
+  search); the last two are close calls, shown with sources.
+  Found on the way: members that moved to the BE (trade-to-trade) series, HFCL and STLTECH,
+  had no recent weeks in systrader's theme view (it read the EQ series only; every member now
+  reads the merged series), and Siemens Energy was listed twice (a BSE-only row named "...
+  India Ltd."; merged, and a same-day rerun of the ranking now replaces the day's rows).
 
 ## 7. Risks
 

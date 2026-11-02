@@ -18,3 +18,7 @@ export function stageText(stage: number | null, weeks: number | null, tier: numb
   const w = weeks ? ` · ${weeks}w` : ''
   return `${stageShort(stage)}${w}${tier === 4 ? ' · early' : ''}`
 }
+
+export const WEB_TONE: Record<string, 'good' | 'warn' | 'bad'> = { clear: 'good', watch: 'warn', red_flag: 'bad' }
+export const WEB_LABEL: Record<string, string> = { clear: 'web: clear', watch: 'web: watch', red_flag: 'web: red flag' }
+export function host(u: string): string { try { return new URL(u).hostname.replace(/^www\./, '') } catch { return u } }

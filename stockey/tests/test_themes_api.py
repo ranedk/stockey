@@ -13,7 +13,7 @@ def test_only_shown_themes_bring_their_stocks(monkeypatch):
                            {"theme_id": "cdmo", "status": "next", "as_of_date": "2026-10-30"}])
     stocks = pd.DataFrame([{"theme_id": "ems", "company_master_id": "nse:X", "position": 1}])
     seen = []
-    calls = iter([pd.DataFrame([{"x": 1}]), themes, stocks])
+    calls = iter([pd.DataFrame([{"x": 1}]), themes, pd.DataFrame([{"x": 1}]), stocks])
 
     def fake(q, *a, **k):
         seen.append(k.get("params"))

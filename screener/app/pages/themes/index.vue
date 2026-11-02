@@ -86,6 +86,7 @@ function toggle(k: string) { open.value[k] = !open.value[k] }
                     <div class="font-medium">{{ s.company_name }}</div>
                     <div class="text-xs text-slate-500">{{ s.ticker }}</div>
                     <div v-if="s.conclusion" class="mt-1 text-xs text-slate-700">{{ s.conclusion }}</div>
+                    <BadgePill v-if="s.web_verdict" class="mt-1" :label="WEB_LABEL[s.web_verdict] ?? s.web_verdict" :tone="WEB_TONE[s.web_verdict] ?? 'neutral'" />
                   </td>
                   <td class="px-3 py-2 text-right">{{ s.share_pct === null ? '—' : `${Math.round(s.share_pct)}%` }}<div v-if="s.share_source" class="text-xs text-slate-400">{{ s.share_source }}</div></td>
                   <td class="px-3 py-2">
@@ -102,6 +103,15 @@ function toggle(k: string) { open.value[k] = !open.value[k] }
                   <td colspan="6" class="px-3 py-2 text-sm text-slate-700">
                     <p>{{ s.reasoning ?? 'No write-up yet (written overnight).' }}</p>
                     <p v-if="s.reasons" class="mt-1 text-xs text-slate-500">{{ s.reasons.replaceAll('note: ', '') }}</p>
+                    <div v-if="s.web_verdict" class="mt-2 text-xs text-slate-600">
+                      <span class="font-medium">Web check {{ formatDate(s.web_checked_at) }}:</span>
+                      {{ s.web_summary }} <span v-if="s.web_recent_changes">{{ s.web_recent_changes }}</span>
+                      <span v-if="s.web_red_flags" class="text-rose-700">{{ s.web_red_flags }}</span>
+                      <span class="ml-1">
+                        <a v-for="u in s.web_sources" :key="u" :href="u" target="_blank" rel="noopener" class="mr-2 text-slate-500 underline">{{ host(u) }}</a>
+                      </span>
+                    </div>
+                    <p v-else class="mt-2 text-xs text-slate-400">Web check pending (runs overnight).</p>
                   </td>
                 </tr>
               </template>

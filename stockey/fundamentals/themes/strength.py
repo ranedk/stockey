@@ -134,6 +134,7 @@ def _extra_sql() -> dict:
             SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, exposure_pct, source_label
               FROM fundamentals_theme_share_extra
              WHERE theme_version = %(v)s AND status = 'quantified' AND method = '{method}' AND checked_at < %(cut)s
+               AND finder_version = (SELECT max(finder_version) FROM fundamentals_theme_share_extra)
              ORDER BY company_master_id, theme_id, checked_at DESC)"""
     return {"x_cte": "," + q.format(name="xs", method="sole_business") + "," + q.format(name="xo", method="other_source"),
             "x_cols": "xs.exposure_pct AS xs_pct, xo.exposure_pct AS xo_pct, xo.source_label AS xo_source",

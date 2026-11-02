@@ -63,6 +63,12 @@ export interface ThemeStock {
   cwip_ratio: number | null
   reasoning: string | null
   conclusion: string | null
+  web_verdict: 'clear' | 'watch' | 'red_flag' | null
+  web_checked_at: string | null
+  web_summary: string | null
+  web_recent_changes: string | null
+  web_red_flags: string | null
+  web_sources: string[]
 }
 
 export interface ThemesResponse { as_of: string | null, themes: ThemeRow[], stocks: ThemeStock[] }
