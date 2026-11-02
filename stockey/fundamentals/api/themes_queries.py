@@ -84,12 +84,16 @@ def _with_names(rows: list[dict]) -> list[dict]:
 def get_themes() -> dict:
     exists = sql_to_df("SELECT 1 FROM information_schema.tables WHERE table_name = 'fundamentals_theme_watchlist_stock'")
     if exists.empty:
-        return {"as_of": None, "themes": [], "stocks": []}
+        return {"as_of": None, "themes": [], "stocks": [], "also_strong": []}
     themes = _with_names(_clean_records(sql_to_df(_THEME_SQL.format(where=""))))
     shown = [t["theme_id"] for t in themes if t["status"] == "shown"]
     stocks = _sources(_clean_records(sql_to_df(_stock_sql("w.on_watchlist AND w.theme_id = ANY(%(ids)s)"),
                                                params={"ids": shown}))) if shown else []
-    return {"as_of": themes[0]["as_of_date"] if themes else None, "themes": themes, "stocks": stocks}
+    also = _sources(_clean_records(sql_to_df(_stock_sql("w.also_strong"))))
+    names = {t["theme_id"]: t.get("name") for t in themes}
+    for a in also:
+        a["theme_name"] = names.get(a["theme_id"])
+    return {"as_of": themes[0]["as_of_date"] if themes else None, "themes": themes, "stocks": stocks, "also_strong": also}
 
 
 def get_theme(theme_id: str) -> dict | None:

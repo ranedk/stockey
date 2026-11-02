@@ -583,6 +583,24 @@ judge on the unused 2024-11..2026-10 check period.
 - [ ] **Live intraday plumbing** -- live feed, intraday scheduler, kill switch -- only for
   what passes forward paper trading.
 
+## H. Thematic watchlist (stockey/docs/THEMATIC_WATCHLIST_PRD.md, built 2026-10-26..31)
+
+Live at /themes, refreshed 06:15 IST Mon-Sat (`all_fundamentals_themes.sh`). Steps 1-6 and the
+web check are done; what is left:
+- [ ] **Revenue share for the ~90 members without one** -- a web pass (like the stock web check,
+  with quoted sources) for companies whose share no filing states. The shown themes are thin
+  because of it (telecom equipment lists 1 stock).
+- [ ] **Share finder's sceptic is strict** -- it withholds about half of correct 100% calls (Supreme
+  Power, Thangamayil). Any loosening needs a fresh check sample (the 47 used so far are seen).
+- [ ] **Profitable companies with negative operating cash flow** (Kaynes) stay excluded by the
+  business floor; only loss-makers with improving results are waived. Operator's call.
+- [ ] **Promoter and director names** for the SEBI gate (none held), and a fraud/forensic-audit
+  feed -- the gate's two uncovered items.
+- [ ] **Thin capacity series** for several themes (the research agents hit the web-search limit);
+  refresh into capacity_v2.yaml.
+- [ ] **Read the history at 12 months** (2027-10): how did the top-rated names do? No pass/kill
+  rule (PRD section 6).
+
 ## F. Closed — do not re-open without new evidence
 
 - [-] **Short-interval / swing TA (2-10 day holds).** Twice rejected on

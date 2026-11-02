@@ -66,3 +66,10 @@ def test_breadth_is_dropped_when_the_systrader_snapshot_is_stale(monkeypatch):
     seen = []
     monkeypatch.setattr(strength, "record_local_fallback_event", lambda **k: seen.append(k["fallback_type"]))
     assert strength.fetch_breadth() == {} and seen == ["breadth_stale"]
+
+
+def test_theme_figures_weigh_members_by_theme_revenue_not_purity():
+    # a small pure player cannot outvote a large company with a smaller share
+    df = pd.DataFrame({"margin_chg": [-9.0, 2.0, 1.0, 3.0, 0.5], "weight": [0.81, 0.27, 0.5, 0.5, 0.5],
+                       "sales_ttm_cr": [400.0, 8000.0, 300.0, 200.0, 250.0]})
+    assert strength._wmed(df, "margin_chg") == 2.0

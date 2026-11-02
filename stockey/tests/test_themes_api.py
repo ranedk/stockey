@@ -5,7 +5,7 @@ from fundamentals.api import themes_queries as tq
 
 def test_themes_empty_before_the_first_watchlist_run(monkeypatch):
     monkeypatch.setattr(tq, "sql_to_df", lambda q, *a, **k: pd.DataFrame())
-    assert tq.get_themes() == {"as_of": None, "themes": [], "stocks": []}
+    assert tq.get_themes() == {"as_of": None, "themes": [], "stocks": [], "also_strong": []}
 
 
 def test_only_shown_themes_bring_their_stocks(monkeypatch):
@@ -13,7 +13,8 @@ def test_only_shown_themes_bring_their_stocks(monkeypatch):
                            {"theme_id": "cdmo", "status": "next", "as_of_date": "2026-10-30"}])
     stocks = pd.DataFrame([{"theme_id": "ems", "company_master_id": "nse:X", "position": 1}])
     seen = []
-    calls = iter([pd.DataFrame([{"x": 1}]), themes, pd.DataFrame([{"x": 1}]), stocks])
+    calls = iter([pd.DataFrame([{"x": 1}]), themes, pd.DataFrame([{"x": 1}]), stocks, pd.DataFrame([{"x": 1}]),
+                  pd.DataFrame([{"theme_id": "cdmo", "company_master_id": "nse:Y", "web_sources": None}])])
 
     def fake(q, *a, **k):
         seen.append(k.get("params"))
@@ -21,4 +22,5 @@ def test_only_shown_themes_bring_their_stocks(monkeypatch):
     monkeypatch.setattr(tq, "sql_to_df", fake)
     out = tq.get_themes()
     assert [t["theme_id"] for t in out["themes"]] == ["ems", "cdmo"] and out["themes"][0]["name"]
-    assert seen[-1] == {"ids": ["ems"]} and len(out["stocks"]) == 1
+    assert seen[3] == {"ids": ["ems"]} and len(out["stocks"]) == 1
+    assert out["also_strong"][0]["theme_name"] == "Contract drug making (CDMO / CRAMS)"

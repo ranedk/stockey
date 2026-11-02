@@ -48,6 +48,8 @@ export interface ThemeStock {
   position: number | null
   rating: string | null
   on_watchlist: boolean
+  also_strong?: boolean
+  theme_name?: string | null
   stage: number | null
   weeks_in_stage: number | null
   tier: number | null
@@ -71,7 +73,7 @@ export interface ThemeStock {
   web_sources: string[]
 }
 
-export interface ThemesResponse { as_of: string | null, themes: ThemeRow[], stocks: ThemeStock[] }
+export interface ThemesResponse { as_of: string | null, themes: ThemeRow[], stocks: ThemeStock[], also_strong: ThemeStock[] }
 
 export interface ThemePolicy {
   name: string, kind: string, direction: 'support' | 'headwind', authority: string | null, announced: string | null

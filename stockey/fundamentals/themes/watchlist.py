@@ -17,7 +17,9 @@ Stage 2 above extended Stage 2 above Stage 1 above 3 and 4, then relative streng
 business (sales growth, the same against the company's own pace, margin change); capacity
 (capital work in progress against fixed assets, depreciation growth). A missing measure
 drops out of the mean; exposure and trend are always present. Rating A-E = the fifth of the
-theme's ranked members the company falls in. The top TOP_N are the watchlist.
+theme's ranked members the company falls in. The top TOP_N are the watchlist. The top
+ALSO_STRONG_TOP of every other ranked, not-late theme that are in Stage 2 are listed as "also
+strong", so a good name in the sixth theme is not hidden (Solar Industries, 2026-11-02).
 
 A web check of each listed stock (fundamentals/themes/web_check.py) adds to the gate: a
 red_flag, or "no longer in the theme's business", excludes; "watch" is a note.
@@ -60,6 +62,8 @@ STOCK_TABLE = "fundamentals_theme_watchlist_stock"
 WATCHLIST_VERSION = 1
 SHOWN, NEXT_UP, KEEP_WITHIN = 5, 3, 8
 TOP_N = 10
+ALSO_STRONG_TOP = 3          # operator, 2026-11-02: "we should not be missing good names" --
+                             # the best rising stocks of themes NOT shown (not late) are listed too
 GATE_YEARS = 5
 PLEDGE_MAX_PCT = 10.0
 ROCE_FLOOR = 8.0
@@ -87,6 +91,7 @@ _DDL = [f"""
         exposure_rank DOUBLE PRECISION, trend_rank DOUBLE PRECISION, business_rank DOUBLE PRECISION,
         capacity_rank DOUBLE PRECISION, combined DOUBLE PRECISION, position INT, rating TEXT,
         on_watchlist BOOLEAN NOT NULL DEFAULT false,
+        also_strong BOOLEAN NOT NULL DEFAULT false,
         stage INT, weeks_in_stage INT, tier INT, trend_score DOUBLE PRECISION, rs26_pct DOUBLE PRECISION,
         above_ma30_pct DOUBLE PRECISION, from_52w_high_pct DOUBLE PRECISION, breakout_level DOUBLE PRECISION,
         from_breakout_pct DOUBLE PRECISION, price_week DATE,
@@ -104,6 +109,7 @@ def ensure_tables() -> None:
             for ddl in _DDL:
                 cur.execute(ddl)
             cur.execute(f"ALTER TABLE {STOCK_TABLE} ADD COLUMN IF NOT EXISTS share_source TEXT")
+            cur.execute(f"ALTER TABLE {STOCK_TABLE} ADD COLUMN IF NOT EXISTS also_strong BOOLEAN NOT NULL DEFAULT false")
 
     execute_db_operation(_op, operation_name=f"{STOCK_TABLE}:ensure_tables")
 
@@ -185,7 +191,10 @@ def gate_reasons(companies: pd.DataFrame, as_of: date) -> dict[str, list[str]]:
         if pd.notna(c.pledge_pct) and c.pledge_pct > PLEDGE_MAX_PCT:
             out[c.company_master_id].append(f"promoter pledge {c.pledge_pct:.0f}%")
         if isinstance(c.flaws, str) and c.flaws.strip() and c.flaws.strip() != "[]":
-            out[c.company_master_id].extend(f"story flaw: {f.strip()}" for f in c.flaws.split(";") if f.strip())
+            # an auditor CHANGE is not the gate's test (PSU auditors are rotated by the C&AG every
+            # year: HAL and BDL were excluded for it); the gate checks resignations itself
+            out[c.company_master_id].extend(f"story flaw: {f.strip()}" for f in c.flaws.split(";")
+                                            if f.strip() and not f.strip().startswith("auditor change"))
     return {c: [*dict.fromkeys(out[c])] + [f"note: {n}" for n in dict.fromkeys(notes[c])] for c in ids}
 
 
@@ -384,6 +393,9 @@ def compute(as_of: date, version: int = 1, snapshot: dict | None = None,
                          f" (SELECT max(as_of_date) FROM {STRENGTH_TABLE} WHERE strength_version = %(v)s AND as_of_date <= %(d)s)",
                          params={"v": STRENGTH_VERSION, "tv": version, "d": as_of})
     th = choose_themes(strength, previously_shown or set())
+    others = set(th.loc[th["status"].isin(["next", "out"]), "theme_id"])
+    st_df["also_strong"] = (st_df["status"].eq("ranked") & st_df["theme_id"].isin(others)
+                            & (st_df["position"] <= ALSO_STRONG_TOP) & (st_df["tier"] >= 3)).astype(bool)
     counts = st_df.groupby(["theme_id", "status"]).size().unstack(fill_value=0)
     for col, status in (("n_ranked", "ranked"), ("n_unquantified", "unquantified"), ("n_excluded", "excluded")):
         th[col] = th["theme_id"].map(counts[status] if status in counts else {}).fillna(0).astype(int)

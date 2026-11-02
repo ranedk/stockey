@@ -123,6 +123,52 @@ function toggle(k: string) { open.value[k] = !open.value[k] }
         </div>
       </section>
 
+      <section v-if="data.also_strong?.length" class="mt-6 rounded-lg border border-slate-200 bg-white">
+        <div class="border-b border-slate-100 p-4">
+          <h2 class="text-lg font-semibold">Also strong</h2>
+          <p class="mt-1 text-sm text-slate-600">
+            The best rising stocks (Stage 2, top 3 of their theme) in themes outside the top five that are not late —
+            so a good name is not hidden because its theme ranks sixth.
+          </p>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase text-slate-500">
+              <tr>
+                <th class="px-3 py-2">Theme</th><th class="px-3 py-2">Company</th><th class="px-3 py-2 text-right">Share</th>
+                <th class="px-3 py-2">Stage</th><th class="px-3 py-2 text-right">RS 26w</th><th class="px-3 py-2 text-right">Sales YoY</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template v-for="s in data.also_strong" :key="s.theme_id + s.company_master_id">
+                <tr class="cursor-pointer border-b border-slate-100 align-top hover:bg-slate-50" @click="toggle('also' + s.theme_id + s.company_master_id)">
+                  <td class="px-3 py-2"><NuxtLink :to="`/themes/${s.theme_id}`" class="hover:underline" @click.stop>{{ s.theme_name ?? s.theme_id }}</NuxtLink>
+                    <div class="text-xs text-slate-400">#{{ s.position }} in theme · {{ s.rating }}</div></td>
+                  <td class="px-3 py-2"><div class="font-medium">{{ s.company_name }}</div><div class="text-xs text-slate-500">{{ s.ticker }}</div>
+                    <div v-if="s.conclusion" class="mt-1 text-xs text-slate-700">{{ s.conclusion }}</div>
+                    <BadgePill v-if="s.web_verdict" class="mt-1" :label="WEB_LABEL[s.web_verdict] ?? s.web_verdict" :tone="WEB_TONE[s.web_verdict] ?? 'neutral'" /></td>
+                  <td class="px-3 py-2 text-right">{{ s.share_pct === null ? '—' : `${Math.round(s.share_pct)}%` }}</td>
+                  <td class="px-3 py-2"><BadgePill :label="stageText(s.stage, s.weeks_in_stage, s.tier)" :tone="s.tier === 4 ? 'good' : STAGE_TONE[s.stage ?? 0]" /></td>
+                  <td class="px-3 py-2 text-right">{{ signed(s.rs26_pct) }}</td>
+                  <td class="px-3 py-2 text-right">{{ signed(s.sales_yoy_pct) }}</td>
+                </tr>
+                <tr v-if="open['also' + s.theme_id + s.company_master_id]" class="border-b border-slate-100 bg-slate-50">
+                  <td />
+                  <td colspan="5" class="px-3 py-2 text-sm text-slate-700">
+                    <p>{{ s.reasoning ?? 'No write-up yet (written overnight).' }}</p>
+                    <div v-if="s.web_verdict" class="mt-2 text-xs text-slate-600">
+                      <span class="font-medium">Web check {{ formatDate(s.web_checked_at) }}:</span> {{ s.web_summary }}
+                      <span v-if="s.web_red_flags" class="text-rose-700">{{ s.web_red_flags }}</span>
+                      <a v-for="u in s.web_sources" :key="u" :href="u" target="_blank" rel="noopener" class="ml-2 text-slate-500 underline">{{ host(u) }}</a>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <div class="mt-8 grid gap-4 md:grid-cols-2">
         <section class="rounded-lg border border-slate-200 bg-white p-4">
           <h2 class="text-sm font-semibold uppercase text-slate-500">Next up</h2>

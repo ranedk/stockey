@@ -364,6 +364,22 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
   reads the merged series), and Siemens Energy was listed twice (a BSE-only row named "...
   India Ltd."; merged, and a same-day rerun of the ranking now replaces the day's rows).
 
+- **Solar Industries was missing (operator, 2026-11-02: "we should not be missing good names
+  like these").** It ranked first in defence platforms, but the theme was marked late and so
+  never shown. Three causes: (1) theme figures were weighted by revenue SHARE only, so Premier
+  Explosives (81% of a small company; margins -9 pp) outvoted Solar (27% of a business twenty
+  times larger) -- now weighted by theme revenue (share x four quarters' sales), strength v3;
+  (2) HAL and BDL were excluded for the story flaw "auditor change in the last year", which
+  for government companies is the C&AG's routine rotation -- the gate now tests only auditor
+  resignations, as section 4.4 says; (3) only the top 5 themes show stocks -- now an "also
+  strong" list carries the top 3 rising (Stage 2) stocks of every other theme that is not
+  late, web-checked and written up like the main list. Also: the guard that kept a
+  "no other business" 100% from overriding the annual-report reader now applies only to the
+  reader's single-segment "mostly" verdict (it had blocked BDL). The price side was not blind:
+  Solar sat in 15 of systrader's 22 momentum paper tracks. Order wins are not collected at all
+  (the live filings feed skips them, ET news carries few); a test of "large order relative to
+  revenue + Stage 2" on the 2015-23 NSE filings would need its own LEDGER pre-registration.
+
 ## 7. Risks
 
 | Risk | Mitigation |

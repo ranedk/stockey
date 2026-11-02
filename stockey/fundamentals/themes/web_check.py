@@ -131,13 +131,13 @@ def validate(out: dict) -> tuple[dict, str | None]:
 
 
 def due(limit: int | None = None) -> pd.DataFrame:
-    """Stocks on a shown theme's list whose last good check is older than RECHECK_DAYS."""
+    """Stocks on a shown theme's list or "also strong" whose last good check is older than RECHECK_DAYS."""
     st = sql_to_df("""
         SELECT s.company_master_id, s.theme_id, s.company_name, s.ticker
           FROM fundamentals_theme_watchlist_stock s
           JOIN fundamentals_theme_watchlist_theme t USING (as_of_date, theme_version, theme_id, watchlist_version)
          WHERE s.as_of_date = (SELECT max(as_of_date) FROM fundamentals_theme_watchlist_stock)
-           AND s.on_watchlist AND t.status = 'shown'
+           AND ((s.on_watchlist AND t.status = 'shown') OR s.also_strong)
          ORDER BY t.position, s.position""")
     if table_exists():
         last = sql_to_df(f"SELECT company_master_id, theme_id, max(checked_at) AS last FROM {TABLE}"  # noqa: S608

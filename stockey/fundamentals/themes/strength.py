@@ -23,8 +23,8 @@ members reporting results is not ranked, however strong its policy (PRD section 
 alone never qualifies a theme).
 
 Members are the theme's kept tags (prompt v3, not below the theme's minimum share). Member
-figures are combined as an exposure-weighted median: weight = revenue share in the theme, or
-UNKNOWN_SHARE_WEIGHT when no share is known (the company is in the theme but how much is not).
+figures are combined as a median weighted by theme revenue: the revenue share in the theme
+(UNKNOWN_SHARE_WEIGHT when no share is known) times the company's last four quarters' sales.
 
 Late (the capital-cycle brake: themes marked late are not shown, PRD 4.4) when any of:
   members   members' depreciation growth beats their sales growth by more than LATE_GAP_PP,
@@ -61,7 +61,10 @@ from utils.fallback_telemetry import record_local_fallback_event
 TABLE = "fundamentals_theme_strength"
 MEMBER_TABLE = "fundamentals_theme_member"     # today's members, synced to systrader in full
 # 2 (2026-10-30): breadth from systrader joins the strength mean
-STRENGTH_VERSION = 2
+# 3 (2026-11-02): member figures weighted by THEME REVENUE (share x the company's last four
+#   quarters' sales), not by share alone -- Premier Explosives (81% share, a small company) set
+#   defence platforms' "late" flag over Solar Industries (27% of a business twenty times larger)
+STRENGTH_VERSION = 3
 SYSTRADER_API = os.getenv("SYSTRADER_API_BASE", "http://127.0.0.1:8090")
 BREADTH_MAX_AGE_DAYS = 4        # computed_at; the snapshot itself is the last completed week
 UNKNOWN_SHARE_WEIGHT = 0.5
@@ -152,7 +155,7 @@ def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
              WHERE theme_version = %(v)s AND prompt_version = %(p)s AND dropped IS NULL AND tagged_at < %(cut)s
              ORDER BY company_master_id, theme_id, tagged_at DESC),
         a AS (
-            SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, status, exposure_pct
+            SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, status, exposure_pct, basis
               FROM fundamentals_theme_exposure_ar
              WHERE theme_version = %(v)s AND dropped IS NULL AND read_at < %(cut)s
              ORDER BY company_master_id, theme_id, read_at DESC),
@@ -161,7 +164,7 @@ def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
               FROM fundamentals_company_profile WHERE status = 'ok'
              ORDER BY company_master_id, fetched_on DESC){x_cte}
         SELECT t.company_master_id, t.theme_id, t.status AS tag_status, t.exposure_pct AS tag_pct,
-               a.status AS ar_status, a.exposure_pct AS ar_pct, p.ticker,
+               a.status AS ar_status, a.exposure_pct AS ar_pct, a.basis AS ar_basis, p.ticker,
                coalesce(p.screener_slug, p.ticker) AS slug, p.screener_company_id, {x_cols}
           FROM t LEFT JOIN a USING (company_master_id, theme_id) LEFT JOIN p USING (company_master_id){x_join}
          WHERE t.status IN ('quantified', 'unquantified') AND coalesce(a.status, '') <> 'below_min'""".replace("{x_cte}", x["x_cte"]).replace("{x_cols}", x["x_cols"]).replace("{x_join}", x["x_join"]),
@@ -170,7 +173,10 @@ def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
     # annual-report reader did not already find the theme is not the whole company
     ar_ok, tag_ok = df["ar_status"].eq("quantified"), df["tag_status"].eq("quantified")
     xo_ok = df["xo_pct"].notna()
-    xs_ok = df["xs_pct"].notna() & ~df["ar_status"].isin(["not_separate", "disputed"])
+    # blocked only by the reader's own single-segment verdict ("one segment, but it also sells
+    # outside the theme") or a dispute -- not by "no separate segment" (BDL, 2026-11-02)
+    single_mostly = df["ar_status"].eq("not_separate") & df["ar_basis"].eq("single_segment")
+    xs_ok = df["xs_pct"].notna() & ~single_mostly & ~df["ar_status"].eq("disputed")
     df["share"] = np.select([ar_ok, tag_ok, xo_ok, xs_ok], [df["ar_pct"], df["tag_pct"], df["xo_pct"], df["xs_pct"]],
                             np.nan).astype(float)
     df["share_source"] = np.select([ar_ok, tag_ok, xo_ok, xs_ok],
@@ -215,6 +221,9 @@ def member_numbers(q: pd.DataFrame, as_of: date) -> dict | None:
     out = {"sales_yoy_pct": reading["sales_yoy_pct"], "sales_vs_trend_pp": reading["sales_vs_trend_pp"],
            "margin_change_pp": reading["margin_change_pp"]}
     latest = len(q) - 1
+    last4 = [idx.get(q["period_end"].iloc[latest] - pd.offsets.MonthEnd(3 * k)) for k in range(4)]
+    out["sales_ttm_cr"] = float(sum(q["sales"].iloc[i] for i in last4)) \
+        if all(i is not None and pd.notna(q["sales"].iloc[i]) for i in last4) else np.nan
     prev = idx.get(q["period_end"].iloc[latest] - pd.offsets.MonthEnd(3))
     for tag, i in (("", latest), ("_prev", prev)):
         if i is None:
@@ -240,9 +249,17 @@ def weighted_median(values, weights) -> float:
 
 
 def _wmed(df: pd.DataFrame, col: str) -> float:
-    """Exposure-weighted median of a member column; NaN with fewer than MIN_MEMBERS values."""
+    """Theme-revenue-weighted median of a member column (weight = share in the theme x the last
+    four quarters' sales); NaN with fewer than MIN_MEMBERS values. A member without four
+    quarters of sales falls back to its share alone, scaled to the smallest known revenue so it
+    counts but cannot dominate."""
     have = df[df[col].notna()]
-    return weighted_median(have[col], have["weight"]) if len(have) >= MIN_MEMBERS else np.nan
+    if len(have) < MIN_MEMBERS:
+        return np.nan
+    sales = pd.to_numeric(have.get("sales_ttm_cr"), errors="coerce") if "sales_ttm_cr" in have else pd.Series(np.nan, index=have.index)
+    floor = sales[sales > 0].min() if (sales > 0).any() else 1.0
+    w = have["weight"] * sales.where(sales > 0, floor)
+    return weighted_median(have[col], w)
 
 
 # --- national series -------------------------------------------------------------------------
@@ -426,7 +443,7 @@ def compute(as_of: date, version: int = 1, breadth: dict[str, dict] | None = Non
                      params={"cut": pd.Timestamp(as_of) + pd.Timedelta(days=1), "ids": ids})
     members = members.merge(cwip.rename(columns={"company_id": "screener_company_id"}), on="screener_company_id", how="left")
     if "sales_yoy_pct" not in members:      # no member had quarters (tests, an empty table)
-        for c in ("sales_yoy_pct", "sales_vs_trend_pp", "margin_change_pp", "dep_ttm_yoy", "sales_ttm_yoy",
+        for c in ("sales_yoy_pct", "sales_vs_trend_pp", "margin_change_pp", "dep_ttm_yoy", "sales_ttm_yoy", "sales_ttm_cr",
                   "margin_chg", "dep_ttm_yoy_prev", "sales_ttm_yoy_prev", "margin_chg_prev"):
             members[c] = np.nan
     members["gap"] = members["dep_ttm_yoy"] - members["sales_ttm_yoy"]

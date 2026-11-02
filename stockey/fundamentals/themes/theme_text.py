@@ -197,7 +197,7 @@ def due(limit: int | None = None) -> list[dict]:
     policy = sql_to_df("SELECT theme_id, name, outlay_cr FROM fundamentals_theme_policy WHERE direction = 'support'"
                        " AND status = 'active' AND version = (SELECT max(version) FROM fundamentals_theme_policy)")
     st = sql_to_df(f"SELECT * FROM {STOCK_TABLE} WHERE watchlist_version = %(w)s AND as_of_date = %(d)s"  # noqa: S608
-                   " AND on_watchlist", params={"w": WATCHLIST_VERSION, "d": as_of})
+                   " AND (on_watchlist OR also_strong)", params={"w": WATCHLIST_VERSION, "d": as_of})
     src = sql_to_df("""SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, segment_name,
                               fiscal_year, report_label FROM fundamentals_theme_exposure_ar
                         WHERE status = 'quantified' ORDER BY company_master_id, theme_id, read_at DESC""")
@@ -216,7 +216,7 @@ def due(limit: int | None = None) -> list[dict]:
         if ("theme", t.theme_id, "", fp) not in have:
             items.append({"kind": "theme", "theme_id": t.theme_id, "company_master_id": "", "fingerprint": fp, "evidence": e})
     n_ranked = dict(zip(th["theme_id"], th["n_ranked"]))
-    on_shown = st[st["theme_id"].isin(shown.loc[shown["status"] == "shown", "theme_id"])]
+    on_shown = st[st["theme_id"].isin(shown.loc[shown["status"] == "shown", "theme_id"]) | st["also_strong"]]
     for row in on_shown.sort_values(["theme_id", "position"]).to_dict("records"):
         r = SimpleNamespace(**row, n_ranked=n_ranked[row["theme_id"]])
         e = stock_evidence(r, themes[r.theme_id].name,
