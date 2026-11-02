@@ -62,3 +62,10 @@ def test_mean_p_charges_the_cost_and_clusters_by_month():
                       "A60": [0.05, 0.07, 0.04, 0.06] * 5})
     gap, p, n = ot.mean_p(d, "A60")
     assert round(gap, 4) == round(0.055 - 0.005, 4) and p < 0.01 and n == 20
+
+
+def test_a_range_takes_its_lower_bound_and_k_is_not_counted_twice():
+    fx = {"usd": 80.0}
+    assert orders.to_crore("125-150", "crore", "INR", fx) == 125.0
+    assert orders.to_crore("100+", "crore", "INR", fx) == 100.0
+    assert orders.to_crore("96K", "thousand", "USD", fx) == 96 * 1e-4 * 80.0

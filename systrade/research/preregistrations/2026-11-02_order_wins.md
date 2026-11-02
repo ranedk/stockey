@@ -92,3 +92,10 @@ LEDGER row 84, trials = 2.
   the company (court, tax, assessment, tribunal, NCLT, SEBI, demand, penalty orders). Pilot on 3
   companies: 60 candidates -> 27, every order win kept. A company's reply to a price-movement
   query that cites an order is still a candidate.
+- 2026-11-03, data: NSE's summary text states the order value for only 37% of the 5,398 order
+  wins (49% in 2018-22, 21-25% in 2024-25), which would leave the check years thin and selected
+  differently from the in-sample years. For every win without a value, the filing's attached
+  PDF (zipped before ~2019) is read -- text layer only, first 3 pages, no OCR of scans, the same
+  rule for both periods -- and the same classifier and checks are run on summary + PDF; the
+  row records `value_source = attachment`. Also: a stated range takes its lower bound, and "96K"
+  with the unit "thousand" is not counted twice. No return had been computed.
