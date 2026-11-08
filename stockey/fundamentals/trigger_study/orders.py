@@ -46,16 +46,16 @@ _ORDER_RX = re.compile(r"\b(orders?|contracts?|letters? of (award|acceptance|int
                        r"purchase orders?|bagged|secured|awarded|award of)\b", re.I)
 
 
-def ensure_tables() -> None:
+def ensure_tables(cand_table: str = CANDIDATE_TABLE, fetch_table: str = FETCH_TABLE) -> None:
     with db_session() as (_, cur):
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {CANDIDATE_TABLE} (
+            CREATE TABLE IF NOT EXISTS {cand_table} (
                 filing_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, announced_at TIMESTAMP NOT NULL,
                 nse_category TEXT, text TEXT, attachment_url TEXT, company_name TEXT,
                 fetched_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
-        cur.execute(f"CREATE INDEX IF NOT EXISTS {CANDIDATE_TABLE}_sym_dt ON {CANDIDATE_TABLE} (symbol, announced_at)")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS {cand_table}_sym_dt ON {cand_table} (symbol, announced_at)")
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {FETCH_TABLE} (
+            CREATE TABLE IF NOT EXISTS {fetch_table} (
                 symbol TEXT PRIMARY KEY, fetched_at TIMESTAMPTZ NOT NULL, filings INT, candidates INT, error TEXT)""")
 
 
@@ -90,12 +90,13 @@ def is_candidate(category: str | None, text: str | None) -> bool:
     return bool(_ORDER_RX.search(_NOT_RX.sub(" ", f"{category or ''} {t}")))
 
 
-def _rows(symbol: str, payload: list[dict]) -> pd.DataFrame:
+def _rows(symbol: str, payload: list[dict], keep=None) -> pd.DataFrame:
+    keep = keep or is_candidate
     out = []
     for r in payload:
         when = pd.to_datetime(r.get("an_dt") or r.get("sort_date"), format="mixed", dayfirst=True, errors="coerce")
         text = (r.get("attchmntText") or "").strip()
-        if pd.isna(when) or not is_candidate(r.get("desc"), text):
+        if pd.isna(when) or not keep(r.get("desc"), text):
             continue
         key = "|".join([symbol, str(when), r.get("desc") or "", r.get("attchmntFile") or "", text])
         out.append({"filing_id": hashlib.sha1(key.encode()).hexdigest(), "symbol": symbol,
@@ -104,9 +105,10 @@ def _rows(symbol: str, payload: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(out).drop_duplicates("filing_id") if out else pd.DataFrame()
 
 
-def fetch(limit: int | None = None) -> dict:
-    ensure_tables()
-    done = set(sql_to_df(f"SELECT symbol FROM {FETCH_TABLE} WHERE error IS NULL")["symbol"])  # noqa: S608
+def fetch(limit: int | None = None, keep=None, cand_table: str = CANDIDATE_TABLE, fetch_table: str = FETCH_TABLE) -> dict:
+    """`keep` / the tables default to row 84's; row 89 (l1_bids) passes its L1 prefilter and tables."""
+    ensure_tables(cand_table, fetch_table)
+    done = set(sql_to_df(f"SELECT symbol FROM {fetch_table} WHERE error IS NULL")["symbol"])  # noqa: S608
     todo = [s for s in universe() if s not in done]
     todo = todo[:limit] if limit else todo
     if not todo:
@@ -133,16 +135,16 @@ def fetch(limit: int | None = None) -> dict:
                         err = f"HTTP {payload.get('__error')}"
                     else:
                         n_all = len(payload or [])
-                        df = _rows(sym, payload or [])
+                        df = _rows(sym, payload or [], keep)
                         n_cand = len(df)
                         if n_cand:
-                            upsert_to_db(df, CANDIDATE_TABLE, ["filing_id"])
+                            upsert_to_db(df, cand_table, ["filing_id"])
                 except Exception as exc:  # noqa: BLE001 -- one company's failure must not stop the rest
                     err = str(exc)[:200]
                 counts["failed" if err else "fetched"] += 1
                 counts["candidates"] += n_cand
                 upsert_to_db(pd.DataFrame([{"symbol": sym, "fetched_at": pd.Timestamp.now(tz="UTC"), "filings": n_all,
-                                            "candidates": n_cand, "error": err}]), FETCH_TABLE, ["symbol"])
+                                            "candidates": n_cand, "error": err}]), fetch_table, ["symbol"])
         finally:
             page.close()
     return counts
@@ -303,17 +305,18 @@ def _pdf_from_zip(data: bytes) -> bytes:
         return b""
 
 
-def attachments(limit: int | None = None) -> dict:
+def attachments(limit: int | None = None, classified_table: str = CLASSIFIED_TABLE, cand_table: str = CANDIDATE_TABLE,
+                attach_table: str = ATTACH_TABLE, flag: str = "order_win") -> dict:
     with db_session() as (_, cur):
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {ATTACH_TABLE} (
+            CREATE TABLE IF NOT EXISTS {attach_table} (
                 filing_id TEXT PRIMARY KEY, status TEXT NOT NULL, text TEXT, error TEXT,
                 fetched_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
-    todo = sql_to_df(f"""SELECT k.filing_id, c.attachment_url FROM {CLASSIFIED_TABLE} k
-                           JOIN {CANDIDATE_TABLE} c USING (filing_id)
-                          WHERE k.classify_version = %(v)s AND k.order_win AND k.value_cr IS NULL
+    todo = sql_to_df(f"""SELECT k.filing_id, c.attachment_url FROM {classified_table} k
+                           JOIN {cand_table} c USING (filing_id)
+                          WHERE k.classify_version = %(v)s AND k.{flag} AND k.value_cr IS NULL
                             AND c.attachment_url LIKE 'http%%'
-                            AND NOT EXISTS (SELECT 1 FROM {ATTACH_TABLE} a WHERE a.filing_id = k.filing_id
+                            AND NOT EXISTS (SELECT 1 FROM {attach_table} a WHERE a.filing_id = k.filing_id
                                              AND a.status IN ('ok', 'no_text', 'not_pdf'))
                           ORDER BY k.announced_at""", params={"v": CLASSIFY_VERSION})  # noqa: S608
     todo = todo.head(limit) if limit else todo
@@ -349,13 +352,15 @@ def attachments(limit: int | None = None) -> dict:
                 except Exception as exc:  # noqa: BLE001 -- one file must not stop the rest
                     row["error"] = str(exc)[:200]
                 counts["ok" if row["status"] == "ok" else "no_text" if row["status"] in ("no_text", "not_pdf") else "failed"] += 1
-                upsert_to_db(pd.DataFrame([{**row, "fetched_at": pd.Timestamp.now(tz="UTC")}]), ATTACH_TABLE, ["filing_id"])
+                upsert_to_db(pd.DataFrame([{**row, "fetched_at": pd.Timestamp.now(tz="UTC")}]), attach_table, ["filing_id"])
         finally:
             page.close()
     return counts
 
 
-def classify_attachments(limit: int | None = None, any_time: bool = False) -> dict:
+def classify_attachments(limit: int | None = None, any_time: bool = False, classified_table: str = CLASSIFIED_TABLE,
+                         cand_table: str = CANDIDATE_TABLE, attach_table: str = ATTACH_TABLE, flag: str = "order_win",
+                         prompt: str | None = None, schema: dict | None = None, validate=None) -> dict:
     """Re-read the wins without a value with the PDF's text added; same prompt and checks. The
     value (and its sentence) may now come from the PDF; the row records value_source."""
     from datetime import datetime, timezone
@@ -365,12 +370,12 @@ def classify_attachments(limit: int | None = None, any_time: bool = False) -> di
     if not any_time and not in_night_window(datetime.now(timezone.utc)):
         return {"skipped": "outside the 22:00-08:00 IST window (use --any-time)"}
     with db_session() as (_, cur):
-        cur.execute(f"ALTER TABLE {CLASSIFIED_TABLE} ADD COLUMN IF NOT EXISTS value_source TEXT")
+        cur.execute(f"ALTER TABLE {classified_table} ADD COLUMN IF NOT EXISTS value_source TEXT")
     todo = sql_to_df(f"""SELECT k.filing_id, k.symbol, k.announced_at, c.nse_category, c.text, a.text AS pdf
-                           FROM {CLASSIFIED_TABLE} k JOIN {CANDIDATE_TABLE} c USING (filing_id)
-                           JOIN {ATTACH_TABLE} a USING (filing_id)
-                          WHERE k.classify_version = %(v)s AND k.order_win AND k.value_cr IS NULL
-                            AND a.status = 'ok' AND k.value_source IS NULL
+                           FROM {classified_table} k JOIN {cand_table} c USING (filing_id)
+                           JOIN {attach_table} a USING (filing_id)
+                          WHERE k.classify_version = %(v)s AND k.{flag} AND k.value_cr IS NULL
+                            AND a.status = 'ok' AND k.value_source IS DISTINCT FROM 'attachment'
                           ORDER BY k.filing_id""", params={"v": CLASSIFY_VERSION})  # noqa: S608
     todo = todo.head(limit) if limit else todo
     if todo.empty:
@@ -381,7 +386,7 @@ def classify_attachments(limit: int | None = None, any_time: bool = False) -> di
     for i in range(0, len(rows), 8):
         batch = rows[i:i + 8]
         texts = [f"{r.text or ''}\n\nATTACHED LETTER:\n{r.pdf}" for r in batch]
-        res = call_claude(CLASSIFY_PROMPT, CLASSIFY_SCHEMA,
+        res = call_claude(prompt or CLASSIFY_PROMPT, schema or CLASSIFY_SCHEMA,
                           [{"id": str(k), "category": r.nse_category, "text": t} for k, (r, t) in enumerate(zip(batch, texts))])
         if not res["ok"]:
             counts["failed_calls"] += 1
@@ -394,13 +399,13 @@ def classify_attachments(limit: int | None = None, any_time: bool = False) -> di
         for k, (r, t) in enumerate(zip(batch, texts)):
             if str(k) not in got:
                 continue
-            v = validate_classified(got[str(k)], t, fx.get(pd.Timestamp(r.announced_at).normalize(), {}))
+            v = (validate or validate_classified)(got[str(k)], t, fx.get(pd.Timestamp(r.announced_at).normalize(), {}))
             out.append({"filing_id": r.filing_id, "classify_version": CLASSIFY_VERSION, "symbol": r.symbol,
                         "announced_at": r.announced_at, **v, "value_source": "attachment",
                         "classified_at": pd.Timestamp.now(tz="UTC")})
             counts["with_value"] += v["value_cr"] is not None
         if out:
-            upsert_to_db(pd.DataFrame(out), CLASSIFIED_TABLE, ["filing_id", "classify_version"])
+            upsert_to_db(pd.DataFrame(out), classified_table, ["filing_id", "classify_version"])
         counts["done"] += len(out)
     return counts
 

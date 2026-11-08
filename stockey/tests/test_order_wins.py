@@ -69,3 +69,37 @@ def test_a_range_takes_its_lower_bound_and_k_is_not_counted_twice():
     assert orders.to_crore("125-150", "crore", "INR", fx) == 125.0
     assert orders.to_crore("100+", "crore", "INR", fx) == 100.0
     assert orders.to_crore("96K", "thousand", "USD", fx) == 96 * 1e-4 * 80.0
+
+
+def test_the_l1_prefilter_keeps_lowest_bidder_news_and_drops_other_l1_uses():
+    from fundamentals.trigger_study.l1_bids import is_l1_candidate
+    assert is_l1_candidate(None, "DBL has emerged as L-1 bidder for a new HAM project")
+    assert is_l1_candidate(None, "The company is the lowest bidder for the NHAI package")
+    assert is_l1_candidate("Bagging/Receiving of orders/contracts", "declared L1 in the tender")
+    assert not is_l1_candidate(None, "Level 1 certification received")
+    assert not is_l1_candidate(None, "Regulation 30 of SEBI LODR: Q1 results")
+    assert not is_l1_candidate(None, "Significant increase in volume has been observed in L1 bidder news")
+
+
+def test_l1_validation_uses_the_order_value_checks():
+    from fundamentals.trigger_study.l1_bids import validate
+    text = "XYZ has been declared L1 bidder for a project worth Rs. 1,060 Crores."
+    ok = validate({"l1": True, "value": "1,060", "unit": "crore", "currency": "INR",
+                   "quote": "declared L1 bidder for a project worth Rs. 1,060 Crores"}, text, {})
+    assert ok["l1"] and ok["value_cr"] == 1060.0
+    bad = validate({"l1": True, "value": "2,000", "unit": "crore", "currency": "INR", "quote": "not in the text"}, text, {})
+    assert bad["value_cr"] is None and "not found" in bad["value_note"]
+    assert validate({"l1": False}, text, {})["l1"] is False
+
+
+def test_l1_evaluate_applies_bh_and_the_year_rule():
+    import numpy as np
+    import pandas as pd
+    from fundamentals.trigger_study import l1_test
+    rng = np.random.default_rng(0)
+    entry = pd.to_datetime([f"{y}-{m:02d}-10" for y in range(2018, 2023) for m in range(1, 13)])
+    ev = pd.DataFrame({"entry": entry, **{f"L{h}": 0.05 + rng.normal(0, 0.01, len(entry)) for h in l1_test.HORIZONS}})
+    out = l1_test.evaluate(ev)
+    assert all(out["members"][f"L1-{h}"]["pass"] for h in l1_test.HORIZONS)
+    ev2 = ev.assign(**{f"L{h}": 0.0 for h in l1_test.HORIZONS})
+    assert not any(l1_test.evaluate(ev2)["members"][f"L1-{h}"]["pass"] for h in l1_test.HORIZONS)
