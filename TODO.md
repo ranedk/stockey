@@ -605,6 +605,18 @@ web check are done; what is left:
 - [ ] **Read the history at 12 months** (2027-10): how did the top-rated names do? No pass/kill
   rule (PRD section 6).
 
+## I. Scale-out: central orchestrator, crawl fleet, GPU OCR, research tasks (stockey/docs/SCALE_OUT_PRD.md, 2026-11-09)
+
+Caps: Hetzner 8 servers (worker project key), RunPod 3 GPUs. One task per worker at a time;
+Claude stays for all reading. Built for the open research interface.
+- [ ] Measure per-stage time and backlog.
+- [ ] Orchestrator + task tables + worker loop (one task, heartbeat, report), local worker first.
+- [ ] Worker image, CPU and GPU variants.
+- [ ] RunPod: 100-page OCR trial, then the 2,385-filing backlog.
+- [ ] Hetzner: 2-server pilot (50 companies, block detector checked), then 8; history run.
+- [ ] Research task kinds: search API, GDELT/news, page fetch, board/founder; public-interface PRD.
+- [ ] Before open release: gitleaks over history, Anthropic API for public use, data terms.
+
 ## F. Closed — do not re-open without new evidence
 
 - [-] **Short-interval / swing TA (2-10 day holds).** Twice rejected on
