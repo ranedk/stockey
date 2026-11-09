@@ -93,10 +93,10 @@ def table_exists() -> bool:
     return sql_to_df(f"SELECT to_regclass('{TABLE}') AS t")["t"].iloc[0] is not None  # noqa: S608
 
 
-def call(item: dict) -> dict:
+def call(item: dict, prompt: str = PROMPT, schema: dict = SCHEMA) -> dict:
     cmd = [CLAUDE_BIN, "-p", "--model", MODEL, "--tools", "WebSearch,WebFetch", "--allowedTools", "WebSearch,WebFetch",
            "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence",
-           "--system-prompt", PROMPT, "--json-schema", json.dumps(SCHEMA), "--output-format", "json"]
+           "--system-prompt", prompt, "--json-schema", json.dumps(schema), "--output-format", "json"]
     with tempfile.TemporaryDirectory(prefix="theme_web_check_") as cwd:
         try:
             proc = subprocess.run(cmd, input=json.dumps(item, ensure_ascii=False), capture_output=True, text=True,

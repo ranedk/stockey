@@ -295,6 +295,12 @@ cannot be bought; holdings in them exit on the next review. This is the solar-mo
    annual report (verbatim sentence checked), then the credit-rating rationales and latest
    results filing (quotes and numbers checked, share computed in code); `load_members` uses
    these after the annual report and the tag, and the page shows each share's source.
+   **Third pass, the web (2026-11-09)** -- `fundamentals/themes/share_web.py`, for members both
+   passes leave without a share: the model searches public pages for a stated split by product
+   and names the page and the company's documents; the code downloads them itself (NSE/BSE
+   through the request gates) and runs the filing pass's checks on its own copy, so a share is
+   used only when its numbers are on a page we hold. Order of use: annual report, profile,
+   filing, web, then "no other business".
    (2) Loss-making companies stay in when their quarterly losses are shrinking: the business
    floor and the two loss story flaws are waived (noted on the row) when the company lost money
    in one of the last four quarters, its net result improved in each of the last two, and the

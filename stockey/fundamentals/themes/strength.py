@@ -131,7 +131,8 @@ def _extra_sql() -> dict:
     report and the tag: a share stated in a rating rationale or results filing, and the
     sole-business check; empty columns before its table exists."""
     if sql_to_df("SELECT to_regclass('fundamentals_theme_share_extra') AS t")["t"].iloc[0] is None:
-        return {"x_cte": "", "x_cols": "NULL::float AS xs_pct, NULL::float AS xo_pct, NULL::text AS xo_source", "x_join": ""}
+        return {"x_cte": "", "x_cols": "NULL::float AS xs_pct, NULL::float AS xo_pct, NULL::text AS xo_source, "
+                "NULL::float AS xw_pct, NULL::text AS xw_source", "x_join": ""}
     q = """
         {name} AS (
             SELECT DISTINCT ON (company_master_id, theme_id) company_master_id, theme_id, exposure_pct, source_label
@@ -139,9 +140,11 @@ def _extra_sql() -> dict:
              WHERE theme_version = %(v)s AND status = 'quantified' AND method = '{method}' AND checked_at < %(cut)s
                AND finder_version = (SELECT max(finder_version) FROM fundamentals_theme_share_extra)
              ORDER BY company_master_id, theme_id, checked_at DESC)"""
-    return {"x_cte": "," + q.format(name="xs", method="sole_business") + "," + q.format(name="xo", method="other_source"),
-            "x_cols": "xs.exposure_pct AS xs_pct, xo.exposure_pct AS xo_pct, xo.source_label AS xo_source",
-            "x_join": " LEFT JOIN xs USING (company_master_id, theme_id) LEFT JOIN xo USING (company_master_id, theme_id)"}
+    return {"x_cte": "," + ",".join(q.format(name=n, method=m) for n, m in
+                                    (("xs", "sole_business"), ("xo", "other_source"), ("xw", "web"))),
+            "x_cols": "xs.exposure_pct AS xs_pct, xo.exposure_pct AS xo_pct, xo.source_label AS xo_source, "
+                      "xw.exposure_pct AS xw_pct, xw.source_label AS xw_source",
+            "x_join": "".join(f" LEFT JOIN {n} USING (company_master_id, theme_id)" for n in ("xs", "xo", "xw"))}
 
 
 def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
@@ -173,16 +176,18 @@ def load_members(as_of: date, version: int = 1) -> pd.DataFrame:
     # annual-report reader did not already find the theme is not the whole company
     ar_ok, tag_ok = df["ar_status"].eq("quantified"), df["tag_status"].eq("quantified")
     xo_ok = df["xo_pct"].notna()
+    xw_ok = df["xw_pct"].notna()          # a split stated on a web page, checked against the page (share_web)
     # blocked only by the reader's own single-segment verdict ("one segment, but it also sells
     # outside the theme") or a dispute -- not by "no separate segment" (BDL, 2026-11-02)
     single_mostly = df["ar_status"].eq("not_separate") & df["ar_basis"].eq("single_segment")
     xs_ok = df["xs_pct"].notna() & ~single_mostly & ~df["ar_status"].eq("disputed")
-    df["share"] = np.select([ar_ok, tag_ok, xo_ok, xs_ok], [df["ar_pct"], df["tag_pct"], df["xo_pct"], df["xs_pct"]],
-                            np.nan).astype(float)
-    df["share_source"] = np.select([ar_ok, tag_ok, xo_ok, xs_ok],
+    df["share"] = np.select([ar_ok, tag_ok, xo_ok, xw_ok, xs_ok],
+                            [df["ar_pct"], df["tag_pct"], df["xo_pct"], df["xw_pct"], df["xs_pct"]], np.nan).astype(float)
+    df["share_source"] = np.select([ar_ok, tag_ok, xo_ok, xw_ok, xs_ok],
                                    ["annual report", "company profile",
                                     df["xo_source"].astype(str).str.extract(r"^(.*?\d{4}-\d{2}-\d{2})", expand=False)
-                                    .fillna(df["xo_source"].astype(str)), "no other business"], None)
+                                    .fillna(df["xo_source"].astype(str)), df["xw_source"].astype(str),
+                                    "no other business"], None)
     df["weight"] = (df["share"] / 100.0).fillna(UNKNOWN_SHARE_WEIGHT)
     df["screener_company_id"] = pd.to_numeric(df["screener_company_id"], errors="coerce").astype("Int64")
     return df

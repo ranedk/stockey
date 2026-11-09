@@ -135,6 +135,30 @@ def _pct_in(pct: float, quote: str) -> bool:
     return any(abs(float(n) - pct) < 0.51 for n in re.findall(r"(\d+(?:\.\d+)?)\s*%", quote))
 
 
+def _row_line(quote: str, text: str) -> str:
+    """The text's line holding the quote (the quote may be cut short), else the quote itself."""
+    from fundamentals.themes.tagger import _norm
+    head = _norm(quote)[:60]
+    return next((ln for ln in text.splitlines() if head and head in _norm(ln)), quote)
+
+
+def _same_column(tq: str, traw: str, sq: str, sraw: str, text: str) -> bool:
+    """A table row prints several years side by side: the theme's amount and the total must sit
+    in the same column, counted from the right (labels on the left can carry note numbers).
+    Acutaas, 2026-11-09: one year's intermediates over another year's total gave 88.8%."""
+    from fundamentals.themes.segment_reader import _NUM_RX, _digits
+    la, lb = _row_line(tq, text), _row_line(sq, text)
+    if la == lb:                                  # one sentence holding both: prose, not columns
+        return True
+    a, b = ([n.replace(",", "") for n in _NUM_RX.findall(ln)] for ln in (la, lb))
+    if len(a) < 2 and len(b) < 2:
+        return True
+    da, db = _digits(traw), _digits(sraw)
+    if da not in a or db not in b:
+        return False
+    return len(a) - a.index(da) == len(b) - b.index(db)
+
+
 def validate_source(x: dict, text: str) -> dict:
     if x.get("result") != "found":
         return {"status": "not_found"}
@@ -161,6 +185,8 @@ def validate_source(x: dict, text: str) -> dict:
         return {"status": "invalid", "note": "amounts not grounded in the documents"}
     if not x.get("_summed") and (_NOT_A_LINE.search(tq.split("  ")[0][:60]) or tq == sq):
         return {"status": "invalid", "note": "the theme's line is a total or continuing operations, not a business line"}
+    if not x.get("_summed") and not _same_column(tq, x["theme_revenue"], sq, x["total_revenue"], text):
+        return {"status": "invalid", "note": "the theme's amount and the total come from different columns"}
     share = 100.0 * a / b
     if not 0 < share <= 100:
         return {"status": "invalid", "note": f"share {share:.1f}% out of range"}

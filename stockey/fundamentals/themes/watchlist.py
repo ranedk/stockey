@@ -34,7 +34,11 @@ Not covered: promoter and director names (none held), fraud or forensic-audit di
 over three years (screener.in snapshot). Operator, 2026-10-30: a loss-making company failing the
 floor (or carrying the story flaws "cash burn with losses" / "loss-making both of the last 2
 years") is kept when its quarterly losses are shrinking (`losses_shrinking`); the waiver is
-noted on the row. It never waives the SEBI, auditor, default or pledge checks.
+noted on the row. Operator, 2026-11-09: a company profitable in both of the last 2 years with
+sales up OCF_WAIVE_SALES_GROWTH% or more (12 months, or the latest quarter on a year ago) is kept
+despite negative operating cash flow
+(`growing_on_working_capital`; the ROCE floor still applies). Neither waiver touches the SEBI,
+auditor, default or pledge checks.
 
     python -m fundamentals.themes.watchlist [--as-of YYYY-MM-DD] [--dry-run]
 """
@@ -67,6 +71,12 @@ ALSO_STRONG_TOP = 3          # operator, 2026-11-02: "we should not be missing g
 GATE_YEARS = 5
 PLEDGE_MAX_PCT = 10.0
 ROCE_FLOOR = 8.0
+# Operator, 2026-11-09: a profitable company growing fast is kept when its operating cash flow is
+# negative (Kaynes) -- profit with cash going out means the cash went into the business (stock,
+# receivables). Profit in both of the last 2 years, and sales growth at least this over 12 months
+# OR in the latest quarter against a year ago (Kaynes: 11% over 12 months, 23% in the quarter --
+# operator: such cases still hold good value).
+OCF_WAIVE_SALES_GROWTH = 20.0
 RATINGS = "ABCDE"
 
 _DDL = [f"""
@@ -245,6 +255,22 @@ def losses_shrinking(q: pd.DataFrame) -> str | None:
             + f" cr over the last three quarters (to {end.date()})")
 
 
+def growing_on_working_capital(c, n: dict) -> str | None:
+    """Profit in both of the last 2 years, and sales up OCF_WAIVE_SALES_GROWTH% or more over 12
+    months or in the latest quarter against a year ago; the figures as a note, or None."""
+    if c is None:
+        return None
+    p1, p2 = c.get("profit_y1"), c.get("profit_y2")
+    if any(v is None or pd.isna(v) for v in (p1, p2)) or not (p1 > 0 and p2 > 0):
+        return None
+    grew = [f"{label} up {g:.0f}%" for label, g in (("12-month sales", n.get("sales_ttm_yoy")),
+                                                   ("latest quarter's sales", n.get("sales_yoy_pct")))
+            if g is not None and pd.notna(g) and g >= OCF_WAIVE_SALES_GROWTH]
+    if not grew:
+        return None
+    return f"profitable growth: net profit Rs {p2:.0f} cr, then Rs {p1:.0f} cr; {', '.join(grew)}"
+
+
 def excluded(reasons: list[str]) -> list[str]:
     return [r for r in reasons if not r.startswith("note: ")]
 
@@ -294,7 +320,7 @@ def compute(as_of: date, version: int = 1, snapshot: dict | None = None,
     for r in uni.itertuples():
         for cid in [r.company_master_id, *(r.merged_ids if isinstance(r.merged_ids, list) else [])]:
             tv[cid] = r.median_tv
-    snap = _latest("fundamentals_snapshot_daily", "roce_pct, ocf_3y_total, promoter_pledged_pct",
+    snap = _latest("fundamentals_snapshot_daily", "roce_pct, ocf_3y_total, promoter_pledged_pct, profit_y1, profit_y2",
                    cmids, "company_master_id", "as_of_date", as_of)
     story = _latest("fundamentals_story_score", "flaws", cmids, "company_master_id", "as_of_date", as_of)
     ids = [int(x) for x in m["screener_company_id"].dropna().unique()]
@@ -358,6 +384,11 @@ def compute(as_of: date, version: int = 1, snapshot: dict | None = None,
             hard.append(f"business floor: ROCE {row['roce_pct']:.0f}%")
         if row["ocf_3y_cr"] is not None and pd.notna(row["ocf_3y_cr"]) and row["ocf_3y_cr"] <= 0:
             hard.append(f"business floor: 3-year operating cash flow Rs {row['ocf_3y_cr']:.0f} cr")
+        growing = growing_on_working_capital(c, n)
+        cash_floor = [h for h in hard if h.startswith("business floor: 3-year operating cash flow")]
+        if growing and cash_floor:
+            hard = [h for h in hard if h not in cash_floor]
+            why.append(f"note: cash-flow floor waived -- {growing} ({cash_floor[0].removeprefix('business floor: ')})")
         waivable = [h for h in hard if h.startswith("business floor") or h in LOSS_FLAWS]
         improving = shrink.get(int(r.screener_company_id)) if pd.notna(r.screener_company_id) else None
         if waivable and improving:

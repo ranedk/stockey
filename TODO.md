@@ -590,6 +590,10 @@ web check are done; what is left:
 - [ ] **Revenue share for the ~90 members without one** -- a web pass (like the stock web check,
   with quoted sources) for companies whose share no filing states. The shown themes are thin
   because of it (telecom equipment lists 1 stock).
+  Built 2026-11-09: `fundamentals/themes/share_web.py` (search the web, then download the cited
+  page or the documents the search names -- NSE/BSE PDFs the model cannot open -- and check the
+  numbers on our own copy); 12 a morning, not-found retried after 90 days. Also: a theme amount
+  and its total must come from the same table column (share_finder). First full pass running.
 - [ ] **Share finder's sceptic is strict** -- it withholds about half of correct 100% calls (Supreme
   Power, Thangamayil). Any loosening needs a fresh check sample (the 47 used so far are seen).
 - [ ] **Profitable companies with negative operating cash flow** (Kaynes) stay excluded by the
@@ -616,6 +620,13 @@ web check are done; what is left:
   the handcrafted 48/52 split.
 - [-] **Market cap as a slicing trait.** Rows 27-28: 8.8% coverage, no
   full-history source. Liquidity is the size axis.
+- [-] **Trading company announcements: order wins, lowest-bidder (L1) news, quarterly results.**
+  Rows 56-57 (results passed 2018-22, failed the 2023-24 check) and 84-89 (2026-11): orders >= 10%
+  of revenue, L1 bids >= 5%, every entry after the news -- next open, one minute after the
+  filing, close -- lost to the industry over 1-60 sessions; the move comes in the 20 sessions
+  before and on the day. No sector, size or liquidity slice stood out. 2023-25 unread for
+  orders and L1. Not covered: SME boards (no data). Reopening needs a new data source or an
+  entry BEFORE the news, stated in advance.
 - [-] **Worrying about the crawl/LLM bill while choosing the universe.**
   Operator, 2026-09-23: get it right first. Revisit only if a run actually
   fails on cost or rate limits.

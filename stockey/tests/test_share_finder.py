@@ -49,3 +49,21 @@ def test_several_theme_lines_are_added_up_in_code():
                               "theme_lines": [{"name": "x", "amount": "9,999", "quote": "Optics and Optronic Systems 9,999"}],
                               "total_quote": "Revenue from Operations 14,732"}, text)
     assert bad["status"] == "invalid"
+
+
+def test_theme_amount_and_total_must_come_from_the_same_column():
+    table = ("Particulars            FY24     FY25     FY26\n"
+             "Advance Intermediates  1,345    2,061    2,927\n"
+             "Revenue from Operations 3,297   4,100    5,000\n")
+    mixed = sf.validate_source({"result": "found", "theme_revenue": "2,927", "total_revenue": "3,297",
+                                "theme_quote": "Advance Intermediates  1,345    2,061    2,927",
+                                "total_quote": "Revenue from Operations 3,297"}, table)
+    assert mixed["status"] == "invalid" and "columns" in mixed["note"]
+    same = sf.validate_source({"result": "found", "theme_revenue": "2,927", "total_revenue": "5,000",
+                               "theme_quote": "Advance Intermediates  1,345    2,061    2,927",
+                               "total_quote": "Revenue from Operations 3,297"}, table)
+    assert same["status"] == "invalid"           # 5,000 is not in the quote given
+    ok = sf.validate_source({"result": "found", "theme_revenue": "2,927", "total_revenue": "5,000",
+                             "theme_quote": "Advance Intermediates  1,345    2,061    2,927",
+                             "total_quote": "Revenue from Operations 3,297   4,100    5,000"}, table)
+    assert ok["status"] == "quantified" and ok["exposure_pct"] == 58.5

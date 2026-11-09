@@ -49,3 +49,14 @@ def test_losses_shrinking_needs_a_loss_two_better_quarters_and_a_better_year():
     assert w.losses_shrinking(_q([-30, -50, -20, -25, -10])) is None  # one quarter went the wrong way
     assert w.losses_shrinking(_q([-5, -50, -40, -25, -10])) is None   # worse than a year ago
     assert w.losses_shrinking(_q([10, 12, 14, 16, 18])) is None       # no losses: nothing to waive
+
+
+def test_profitable_fast_growth_waives_only_the_cash_flow_floor():
+    c = pd.Series({"profit_y1": 290.0, "profit_y2": 180.0})
+    assert "12-month sales up 45%" in w.growing_on_working_capital(c, {"sales_ttm_yoy": 45.0})
+    assert w.growing_on_working_capital(c, {"sales_ttm_yoy": 12.0, "sales_yoy_pct": 8.0}) is None   # not growing fast
+    kaynes = w.growing_on_working_capital(c, {"sales_ttm_yoy": 10.6, "sales_yoy_pct": 22.6})  # the quarter is enough
+    assert "latest quarter's sales up 23%" in kaynes and "12-month" not in kaynes
+    assert w.growing_on_working_capital(pd.Series({"profit_y1": 50.0, "profit_y2": -10.0}), {"sales_ttm_yoy": 60.0}) is None
+    assert w.growing_on_working_capital(c, {}) is None                                # growth unknown
+    assert w.growing_on_working_capital(None, {"sales_ttm_yoy": 60.0}) is None

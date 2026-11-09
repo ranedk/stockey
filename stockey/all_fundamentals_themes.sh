@@ -21,6 +21,7 @@ fi
 failed=0
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "theme_sebi_orders" "${PYTHON_BIN}" -m fundamentals.collectors.sebi_orders || failed=1
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "theme_share_finder" "${PYTHON_BIN}" -m fundamentals.themes.share_finder || failed=1
+"${SCRIPT_DIR}/scripts/run_with_markers.sh" "theme_share_web" "${PYTHON_BIN}" -m fundamentals.themes.share_web --limit 12 || failed=1
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "theme_strength" "${PYTHON_BIN}" -m fundamentals.themes.strength || failed=1
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "theme_watchlist" "${PYTHON_BIN}" -m fundamentals.themes.watchlist || failed=1
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "theme_web_check" "${PYTHON_BIN}" -m fundamentals.themes.web_check || failed=1
