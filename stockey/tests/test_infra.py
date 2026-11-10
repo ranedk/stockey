@@ -132,3 +132,70 @@ def test_passages_cover_the_whole_text():
     parts = records.chunks(text)
     assert all(len(p) <= records.CHUNK_CHARS for p in parts)
     assert "".join(parts).replace("\n", "") == text.replace("\n", "")
+
+
+def test_runpod_low_balance_emails_once_until_topped_up(monkeypatch, tmp_path):
+    from datetime import timedelta
+    monkeypatch.setattr(fleet, "BALANCE_STATE", tmp_path / "b.json")
+    sent, bal = [], {"v": 30.0}
+    monkeypatch.setattr(fleet, "runpod_balance", lambda: bal["v"])
+    t = datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc)
+    send = lambda subj, body: sent.append(subj) or True
+    for v in (30.0, 19.0, 15.0, 40.0, 18.0):
+        bal["v"] = v
+        t += timedelta(minutes=fleet.BALANCE_CHECK_MIN + 1)
+        fleet.check_runpod_balance(t, send)
+    assert len(sent) == 2 and "19.00" in sent[0] and "18.00" in sent[1]
+    bal["v"] = 1.0
+    assert fleet.check_runpod_balance(t + timedelta(minutes=1), send)["balance"] == 18.0   # not re-read within 30 min
+
+
+class _Cur:
+    def __init__(self):
+        self.sql = []
+
+    def execute(self, sql, args=None):
+        self.sql.append((" ".join(sql.split()), args))
+        self.rowcount = 1
+
+
+def _fake_session(monkeypatch, cur):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def session(*a, **k):
+        yield None, cur
+    monkeypatch.setattr(records, "db_session", session)
+
+
+def test_a_record_the_category_called_routine_is_reread_when_its_content_is_not(monkeypatch):
+    cur = _Cur()
+    _fake_session(monkeypatch, cur)
+    rec = {"record_key": "k", "symbol": "KAYNES", "routine": True, "text": "Order worth Rs 50 crore received."}
+    n, promoted = records._store(rec, {"kind": "order", "summary": "s", "facts": []}, {}, 2500, True)
+    assert promoted and any("status" in q and "pending" in (a or ()) for q, a in cur.sql)
+    n, promoted = records._store({**rec}, {"kind": "newspaper_copy", "summary": "s",
+                                           "facts": [{"type": "other_material", "summary": "x", "quote": "Order"}]},
+                                 {}, 2500, True)
+    assert not promoted and n == 0          # routine kinds keep no facts
+
+
+def test_a_partial_scan_gets_its_remaining_pages_only_when_claude_asks(monkeypatch):
+    cur, queued = _Cur(), []
+    _fake_session(monkeypatch, cur)
+    monkeypatch.setattr(records.tasks, "enqueue", lambda ts, c=None: queued.extend(ts))
+    rec = {"record_key": "k", "symbol": "KAYNES", "routine": False, "text": "t",
+           "partial": {"url": "https://bse/x.pdf", "blob_key": "infra/docs/x.pdf", "pages": 12}}
+    records._store(rec, {"kind": "investor_presentation", "summary": "s", "facts": [], "read_more": True}, {}, 1, False)
+    assert queued[0]["payload"]["first_page"] == tasks.OCR_PROBE_PAGES + 1 and queued[0]["pool"] == "runpod"
+    records._store(rec, {"kind": "board_outcome", "summary": "s", "facts": [], "read_more": False}, {}, 1, False)
+    assert len(queued) == 1 and cur.sql[-1][1][0] == "rest_skipped"
+
+
+def test_the_catalogue_reaches_the_prompt_and_the_doc():
+    from infra import catalog
+    prompt = records.PROMPT.format(kinds=catalog.prompt_kinds(), types=catalog.prompt_facts())
+    doc = catalog.markdown()
+    for k in list(catalog.KINDS) + list(catalog.FACT_TYPES):
+        assert f"- {k}:" in prompt and f"`{k}`" in doc
+    assert records.VERSION == catalog.VERSION and "allottee_category" in prompt

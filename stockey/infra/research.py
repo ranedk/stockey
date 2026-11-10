@@ -23,7 +23,7 @@ import pandas as pd
 from fundamentals.themes.tagger import call_claude
 from infra import embed as emb
 from infra import schema
-from infra.records import FACT_TYPES
+from infra.catalog import FACT_TYPES
 from utils.db import db_session, sql_to_df
 
 MAX_FACTS = 300
@@ -107,7 +107,7 @@ def ask(symbol: str, question: str) -> dict:
     if not n_records:
         return {"error": f"no extracted records for {symbol}"}
     today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    plan = call_claude(PLAN_PROMPT.format(types="\n".join(f"- {k}: {v}" for k, v in FACT_TYPES.items()), today=today),
+    plan = call_claude(PLAN_PROMPT.format(types="\n".join(f"- {k}: {what}" for k, (what, _) in FACT_TYPES.items()), today=today),
                        PLAN_SCHEMA, [{"company": symbol, "question": question}])
     if not plan["ok"]:
         return {"error": plan["message"]}

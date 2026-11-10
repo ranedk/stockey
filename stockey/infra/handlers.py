@@ -216,12 +216,13 @@ def _fetch_one(url: str, ctx: Context) -> tuple[dict, bytes | None]:
 # --- OCR (GPU) ---------------------------------------------------------------------------------
 
 def ocr_pdf(p: dict, ctx: Context, pdf: bytes) -> tuple[dict, None]:
-    """GLM-OCR on every page (up to max_pages), with the local CPU path's prompt and image size."""
+    """GLM-OCR on pages first_page..max_pages, with the local CPU path's prompt and image size."""
     import torch
     from pdf2image import convert_from_bytes
     processor, model = ctx.ocr_model()
     started = time.monotonic()
-    pages = convert_from_bytes(pdf, dpi=150, last_page=p.get("max_pages") or None)
+    first = p.get("first_page") or 1
+    pages = convert_from_bytes(pdf, dpi=150, first_page=first, last_page=p.get("max_pages") or None)
     out = []
     for img in pages:
         img = img.convert("RGB")
@@ -233,7 +234,7 @@ def ocr_pdf(p: dict, ctx: Context, pdf: bytes) -> tuple[dict, None]:
         with torch.inference_mode():
             ids = model.generate(**inputs, max_new_tokens=OCR_MAX_NEW_TOKENS)
         out.append(processor.decode(ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip())
-    return {"pages": len(out), "text": "\n\n".join(f"--- page {i + 1} ---\n{t}" for i, t in enumerate(out)),
+    return {"pages": len(out), "text": "\n\n".join(f"--- page {first + i} ---\n{t}" for i, t in enumerate(out)),
             "seconds": round(time.monotonic() - started, 1), "model": OCR_MODEL,
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"}, None
 

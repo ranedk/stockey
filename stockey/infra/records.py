@@ -23,11 +23,11 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+from infra import catalog, schema, tasks
 from infra import embed as emb
-from infra import schema
 from utils.db import db_session, sql_to_df
 
-VERSION = 1
+VERSION = catalog.VERSION     # a catalogue change re-reads older records
 CHUNK_CHARS = 1200
 HEAD_CHARS = 12_000          # a long document: its opening ...
 EXTRA_CHARS = 18_000         # ... plus the passages most like a fact, up to this much more
@@ -40,47 +40,16 @@ WORKERS = 3
 ROUTINE = re.compile(r"trading window|newspaper|reg\.? ?74 ?\(5\)|depositories and participants|commercial paper"
                      r"|loss of share certificate|duplicate share|transfer of shares|investor complaints", re.I)
 
-FACT_TYPES = {
-    "order_won": "a new order, contract, LoA/LoI or work order received (counterparty = customer)",
-    "order_book": "the order book / unexecuted orders stated as of a date (period = as-of date)",
-    "l1_bid": "declared lowest bidder (L1) in a tender, not yet awarded",
-    "results": "reported revenue / profit for a period (amount = revenue; details: profit, ebitda, margin)",
-    "guidance": "management's forecast of revenue, margin, order inflow or capex",
-    "preferential_issue": "shares allotted or proposed on a preferential basis (counterparty = allottee; price_inr, shares)",
-    "warrants": "convertible warrants issued, allotted or converted",
-    "public_issue": "QIP, IPO, FPO, OFS or rights issue",
-    "debt_raise": "loans, NCDs, commercial paper or other borrowing raised or repaid",
-    "esop": "employee stock options granted, vested or allotted",
-    "buyback": "share buyback",
-    "dividend": "dividend declared or recommended (amount = per share in Rs, put it in details too)",
-    "bonus_split": "bonus issue or stock split",
-    "promoter_stake": "promoter / founder holding change: buy, sell, transfer, creeping acquisition (pct = new holding)",
-    "pledge": "promoter shares pledged, released or invoked",
-    "insider_trade": "director, KMP or other insider buying or selling shares",
-    "major_holder": "a non-promoter crossing or changing a disclosed holding (SAST 29, FII, fund)",
-    "investment": "money put into a subsidiary, associate or other company, or a strategic stake taken",
-    "acquisition": "buying a company, business or asset (counterparty = target)",
-    "divestment": "selling a company, business, stake or asset",
-    "subsidiary_jv": "a new subsidiary, joint venture or partnership entity formed or closed",
-    "capex": "new plant, capacity expansion, capital spending approved or commissioned",
-    "partnership": "MoU, technology tie-up, distribution or supply agreement without an order value",
-    "product_approval": "product launch, certification, licence, regulatory approval",
-    "credit_rating": "credit rating assigned, upgraded, downgraded or reaffirmed (counterparty = agency)",
-    "director_joined": "director appointed or re-appointed (person, role)",
-    "director_left": "director resigned, retired or ceased (person, role, details.reason)",
-    "kmp_joined": "CEO, CFO, company secretary or other senior manager appointed",
-    "kmp_left": "CEO, CFO, company secretary or other senior manager left",
-    "auditor_change": "statutory or other auditor appointed, resigned or replaced",
-    "litigation": "legal case, arbitration, tax demand or penalty against or by the company",
-    "regulatory_action": "SEBI, exchange or other regulator action, inspection or show-cause",
-    "related_party": "material related-party transaction",
-    "other_material": "any other fact an investor would care about",
-}
+FACT_TYPES = catalog.FACT_TYPES
 
-PROMPT = """You read Indian stock-exchange filings for one listed company and turn each into a record an analyst can query later. For each item (id, date, category, headline, text):
+PROMPT = """You read Indian stock-exchange filings for one listed company and turn each into a record an analyst can query later. Each item has id, date, the exchange's category, headline, text, and "partial" (true when only the first pages of a scanned document were read).
 
-1. "summary": 2-4 plain sentences saying what the filing discloses, with the key numbers and dates. For a routine notice one sentence is enough.
-2. "facts": every material fact in the filing, each with one "type" from this list:
+The exchange's category is often WRONG. Decide what the filing is from its text.
+
+1. "kind": one of these filing kinds (with what its summary must say):
+{kinds}
+2. "summary": 2-4 plain sentences saying what the filing discloses, as its kind asks, with the key numbers and dates. Routine kinds: one sentence.
+3. "facts": every material fact, each with one "type" from this list (with the "details" fields to fill when stated):
 {types}
 
 For each fact fill what the filing states and leave the rest null:
@@ -88,15 +57,17 @@ For each fact fill what the filing states and leave the rest null:
 - "event_date" (YYYY-MM-DD: when it happened or takes effect; null if not stated), "period" (e.g. "Q2 FY26", "as of 2025-09-30").
 - "amount_value" EXACTLY as printed (e.g. "1,250.5"), "amount_unit" ("crore", "lakh", "million", "billion", "thousand" or "" if written in full), "currency" (INR, USD, EUR ...).
 - "pct", "shares", "price_inr" as plain numbers when stated.
-- "counterparty" (customer, allottee, target, investee, agency), "person" and "role" (for people), "direction" (increase / decrease / new / exit).
-- "details": other short key-value facts (strings).
+- "counterparty", "person" and "role", "direction" (increase / decrease / new / exit) as the type's note says.
+- "details": the type's detail fields that the filing states (short strings); anything else useful may be added.
 - "quote": the sentence from the text that states the fact, copied verbatim. Every number you give must appear in this quote.
+4. "read_more" (only when "partial" is true): true if the remaining pages probably hold material facts (results tables, order or allotment details, a presentation, an agreement); false if the first pages already show it is routine or complete (a one-page letter, a newspaper copy, a certificate).
 
-Rules: use only the item's text, never memory. One fact per order, person or allotment; if a total is given, add it as its own fact. A repeat of something already announced is still a fact (add details.repeat = "yes"). Results filings: one "results" fact per period with revenue as the amount. Routine notices (trading window, newspaper copies, depository certificates) have no facts. Keep each "id" unchanged."""
+Rules: use only the item's text, never memory. One fact per order, person or allotment; if a total is given, add it as its own fact. A repeat of something already announced is still a fact (details.repeat = "yes"). Routine kinds have no facts. Keep each "id" unchanged."""
 
 SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
     "type": "object", "properties": {
-        "id": {"type": "string"}, "summary": {"type": "string"},
+        "id": {"type": "string"}, "kind": {"type": "string", "enum": list(catalog.KINDS)},
+        "summary": {"type": "string"}, "read_more": {"type": ["boolean", "null"]},
         "facts": {"type": "array", "items": {"type": "object", "properties": {
             "type": {"type": "string", "enum": list(FACT_TYPES)}, "summary": {"type": "string"},
             "event_date": {"type": ["string", "null"]}, "period": {"type": ["string", "null"]},
@@ -108,7 +79,7 @@ SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
             "details": {"type": ["object", "null"], "additionalProperties": {"type": "string"}},
             "quote": {"type": "string"}},
             "required": ["type", "summary", "quote"]}}},
-    "required": ["id", "summary", "facts"]}}}, "required": ["items"]}
+    "required": ["id", "kind", "summary", "facts"]}}}, "required": ["items"]}
 
 # what "material" looks like, for picking a long document's passages
 FACT_PROBES = [
@@ -146,7 +117,8 @@ def record_key(r) -> str:
 
 def _filings(symbol: str) -> pd.DataFrame:
     return sql_to_df(f"""SELECT a.source, a.filing_id, a.symbol, a.announced_at, a.category, a.subject, a.text,
-                                a.attachment_url, d.text_layer, d.ocr_text, d.bytes, d.pages
+                                a.attachment_url, d.text_layer, d.ocr_text, d.bytes, d.pages,
+                                d.ocr_status, d.blob_key
                            FROM {schema.ANNOUNCEMENT} a LEFT JOIN {schema.DOCUMENT} d ON d.url = a.attachment_url
                           WHERE a.symbol = %(s)s ORDER BY a.announced_at""", params={"s": symbol})
 
@@ -166,13 +138,17 @@ def group(df: pd.DataFrame) -> list[dict]:
         subject = head.subject if head.source == "bse" else (notes[0][:300] if notes else head.subject)
         text = "\n".join(notes + ([doc] if doc else []))
         cat = " / ".join(dict.fromkeys(c for c in g.category if isinstance(c, str)))
+        probe = next((r for r in g.itertuples() if getattr(r, "ocr_status", None) == "probe_done"), None)
         out.append({"record_key": key, "symbol": head.symbol, "announced_at": g.announced_at.min(),
                     "category": cat or None, "subject": subject,
                     "sources": [{"source": r.source, "filing_id": r.filing_id, "url": r.attachment_url}
                                 for r in g.itertuples()],
                     "doc_url": next((u for u in g.attachment_url if isinstance(u, str) and u.startswith("http")), None),
                     "routine": bool(ROUTINE.search(f"{cat} {subject or ''}")),
-                    "text": text, "text_sha": hashlib.sha1(text.encode()).hexdigest(), "text_chars": len(text)})
+                    "text": text, "text_sha": hashlib.sha1(text.encode()).hexdigest(), "text_chars": len(text),
+                    # a scan of which only the first pages were OCR'd: Claude says whether to read the rest
+                    "partial": None if probe is None else {"url": probe.attachment_url, "blob_key": probe.blob_key,
+                                                           "pages": int(probe.pages or 0)}})
     return out
 
 
@@ -188,7 +164,8 @@ def build(symbols: list[str]) -> dict:
                                 ON CONFLICT (record_key) DO UPDATE SET
                                   announced_at = EXCLUDED.announced_at, category = EXCLUDED.category,
                                   subject = EXCLUDED.subject, sources = EXCLUDED.sources, doc_url = EXCLUDED.doc_url,
-                                  routine = EXCLUDED.routine, text_sha = EXCLUDED.text_sha,
+                                  routine = CASE WHEN x.kind IS NULL THEN EXCLUDED.routine ELSE x.routine END,
+                                  text_sha = EXCLUDED.text_sha,
                                   text_chars = EXCLUDED.text_chars,
                                   status = CASE WHEN x.text_sha IS DISTINCT FROM EXCLUDED.text_sha
                                                 THEN 'pending' ELSE x.status END,
@@ -364,8 +341,14 @@ _FACT_COLS = ["record_key", "symbol", "fact_type", "event_date", "period", "summ
               "details", "quote", "verified", "note", "version"]
 
 
-def _store(rec: dict, out: dict, fx: dict, read_chars: int, truncated: bool) -> int:
-    facts = [validate(f, rec["text"], fx) for f in out.get("facts") or []]
+def _store(rec: dict, out: dict, fx: dict, read_chars: int, truncated: bool) -> tuple[int, bool]:
+    """Save one record's summary and facts. Returns (facts, promoted): promoted when the record
+    was read as routine (from the exchange's category) but its content says otherwise, so it
+    must be read again in full."""
+    kind = out.get("kind") if out.get("kind") in catalog.KINDS else "other"
+    routine = kind in catalog.ROUTINE_KINDS
+    promoted = rec["routine"] and not routine and truncated
+    facts = [] if routine else [validate(f, rec["text"], fx) for f in out.get("facts") or []]
     with db_session() as (_, cur):
         cur.execute(f"DELETE FROM {schema.FACT} WHERE record_key = %s", (rec["record_key"],))
         for f in facts:
@@ -373,11 +356,20 @@ def _store(rec: dict, out: dict, fx: dict, read_chars: int, truncated: bool) -> 
                    "details": json.dumps(f["details"]) if f["details"] else None}
             cur.execute(f"INSERT INTO {schema.FACT} ({', '.join(_FACT_COLS)}) VALUES ({', '.join(['%s'] * len(_FACT_COLS))})",
                         [row[c] for c in _FACT_COLS])
-        cur.execute(f"""UPDATE {schema.RECORD} SET summary = %s, status = 'done', version = %s, chars_read = %s,
+        cur.execute(f"""UPDATE {schema.RECORD} SET summary = %s, kind = %s, routine = %s,
+                               status = %s, version = %s, chars_read = %s,
                                truncated = %s, extracted_at = now(), error = NULL, updated_at = now()
                          WHERE record_key = %s""",
-                    (out.get("summary"), VERSION, read_chars, truncated, rec["record_key"]))
-    return len(facts)
+                    (out.get("summary"), kind, routine, "pending" if promoted else "done", VERSION, read_chars,
+                     truncated, rec["record_key"]))
+        part = rec.get("partial")
+        if part:
+            more = bool(out.get("read_more")) and part["pages"] > tasks.OCR_PROBE_PAGES
+            if more:
+                tasks.enqueue([tasks.ocr_rest(part["url"], part["blob_key"])], cur)
+            cur.execute(f"UPDATE {schema.DOCUMENT} SET ocr_status = %s, updated_at = now() WHERE url = %s",
+                        ("more_queued" if more else "rest_skipped", part["url"]))
+    return len(facts), promoted
 
 
 def _fail(keys: list[str], why: str) -> None:
@@ -387,16 +379,14 @@ def _fail(keys: list[str], why: str) -> None:
 
 
 def extract(symbols: list[str], limit: int | None = None, any_time: bool = False) -> dict:
-    from fundamentals.themes.tagger import call_claude
     from fundamentals.trigger_study.llm_runner import in_night_window
-    from fundamentals.trigger_study.orders import _fx
     if not any_time and not in_night_window(datetime.now(timezone.utc)):
         return {"skipped": "outside the 22:00-08:00 IST window (use --any-time)"}
-    prompt = PROMPT.format(types="\n".join(f"- {k}: {v}" for k, v in FACT_TYPES.items()))
+    prompt = PROMPT.format(kinds=catalog.prompt_kinds(), types=catalog.prompt_facts())
     probes = emb.embed(FACT_PROBES, query=True)
-    counts = {"records": 0, "facts": 0, "failed": 0, "calls": 0}
+    counts = {"records": 0, "facts": 0, "failed": 0, "calls": 0, "promoted": 0, "ocr_more": 0}
     for sym in symbols:
-        todo = sql_to_df(f"""SELECT record_key FROM {schema.RECORD} WHERE symbol = %(s)s
+        todo = sql_to_df(f"""SELECT record_key, routine FROM {schema.RECORD} WHERE symbol = %(s)s
                                AND (status IN ('pending', 'failed') OR version IS DISTINCT FROM %(v)s)
                              ORDER BY announced_at""", params={"s": sym, "v": VERSION})
         if limit:
@@ -404,45 +394,64 @@ def extract(symbols: list[str], limit: int | None = None, any_time: bool = False
         if todo.empty:
             continue
         recs = _records(sym)
-        items = []
-        for key in todo.record_key:
-            r = recs.get(key)
-            if r is None:
-                continue
-            text, cut = reading(r, probes)
-            items.append({**r, "text_read": text, "truncated": cut})
-        fx = _fx(sorted({r["announced_at"].date() for r in items if r["announced_at"] is not None}))
-
-        def run(batch: list[dict]) -> tuple[list[dict], dict]:
-            payload = [{"id": f"R{i + 1}", "date": str(r["announced_at"])[:10], "category": r["category"],
-                        "headline": r["subject"], "routine": r["routine"], "text": r["text_read"]}
-                       for i, r in enumerate(batch)]
-            return batch, call_claude(prompt, SCHEMA, payload)
-
-        sized = [{**it, "text": it["text_read"]} for it in items]          # batches() sizes by what is read
-        full = {it["record_key"]: it["text"] for it in items}
-        with ThreadPoolExecutor(WORKERS) as pool:
-            for batch, res in pool.map(run, batches(sorted(sized, key=lambda x: x["routine"]))):
-                counts["calls"] += 1
-                keys = [r["record_key"] for r in batch]
-                if not res["ok"]:
-                    _fail(keys, f"{res['kind']}: {res['message']}")
-                    counts["failed"] += len(keys)
-                    if res["kind"] == "limit":
-                        counts["stopped"] = res["message"][:200]
-                    continue
-                got = {o.get("id"): o for o in res["items"]}
-                for i, r in enumerate(batch):
-                    out = got.get(f"R{i + 1}")
-                    if out is None:
-                        _fail([r["record_key"]], "missing from the answer")
-                        counts["failed"] += 1
-                        continue
-                    rec = {**r, "text": full[r["record_key"]]}
-                    d = r["announced_at"].date() if r["announced_at"] is not None else None
-                    counts["facts"] += _store(rec, out, fx.get(d, {}), len(r["text_read"]), r["truncated"])
-                    counts["records"] += 1
+        routine = dict(zip(todo.record_key, todo.routine))
+        keys = [k for k in todo.record_key if k in recs]
+        for _ in range(2):                       # the second pass re-reads records promoted out of routine
+            if not keys:
+                break
+            keys = _extract_pass(prompt, [{**recs[k], "routine": bool(routine[k])} for k in keys], probes, counts)
+            for k in keys:
+                routine[k] = False
+            counts["promoted"] += len(keys)
+        if counts.get("stopped"):
+            break
     return counts
+
+
+def _extract_pass(prompt: str, recs: list[dict], probes: np.ndarray, counts: dict) -> list[str]:
+    from fundamentals.themes.tagger import call_claude
+    from fundamentals.trigger_study.orders import _fx
+    items = []
+    for r in recs:
+        text, cut = reading(r, probes)
+        items.append({**r, "text_read": text, "truncated": cut})
+    fx = _fx(sorted({r["announced_at"].date() for r in items if r["announced_at"] is not None}))
+
+    def run(batch: list[dict]) -> tuple[list[dict], dict]:
+        payload = [{"id": f"R{i + 1}", "date": str(r["announced_at"])[:10], "category": r["category"],
+                    "headline": r["subject"], "partial": bool(r.get("partial")), "text": r["text_read"]}
+                   for i, r in enumerate(batch)]
+        return batch, call_claude(prompt, SCHEMA, payload)
+
+    sized = [{**it, "text": it["text_read"]} for it in items]          # batches() sizes by what is read
+    full = {it["record_key"]: it["text"] for it in items}
+    promoted = []
+    with ThreadPoolExecutor(WORKERS) as pool:
+        for batch, res in pool.map(run, batches(sorted(sized, key=lambda x: x["routine"]))):
+            counts["calls"] += 1
+            keys = [r["record_key"] for r in batch]
+            if not res["ok"]:
+                _fail(keys, f"{res['kind']}: {res['message']}")
+                counts["failed"] += len(keys)
+                if res["kind"] == "limit":
+                    counts["stopped"] = res["message"][:200]
+                continue
+            got = {o.get("id"): o for o in res["items"]}
+            for i, r in enumerate(batch):
+                out = got.get(f"R{i + 1}")
+                if out is None:
+                    _fail([r["record_key"]], "missing from the answer")
+                    counts["failed"] += 1
+                    continue
+                rec = {**r, "text": full[r["record_key"]]}
+                d = r["announced_at"].date() if r["announced_at"] is not None else None
+                n, up = _store(rec, out, fx.get(d, {}), len(r["text_read"]), r["truncated"])
+                counts["facts"] += n
+                counts["records"] += 1
+                counts["ocr_more"] += bool(r.get("partial") and out.get("read_more"))
+                if up:
+                    promoted.append(r["record_key"])
+    return promoted
 
 
 def main(argv: list[str] | None = None) -> int:

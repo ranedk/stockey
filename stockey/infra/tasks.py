@@ -16,6 +16,7 @@ from utils.db import db_session, upsert_to_db
 
 TEXT_LAYER_MIN_CHARS_PER_PAGE = 200      # below this a PDF is a scan and needs OCR
 OCR_MAX_PAGES = 40                       # long annual reports: the first 40 pages
+OCR_PROBE_PAGES = 3                      # a scan is OCR'd this far first; Claude decides on the rest
 BSE_LIVE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
 BSE_HIS = "https://www.bseindia.com/xml-data/corpfiling/AttachHis/"
 
@@ -140,18 +141,33 @@ def _ingest_attachment(task: dict, result: dict, file: bytes | None) -> list[dic
                    ocr_status=("pending" if needs_ocr and p.get("ocr", True) else
                                "skipped" if needs_ocr else "not_needed"))
         if row["ocr_status"] == "pending":
-            kids.append(_child(task, "ocr_pdf", {"url": p["url"], "blob_key": key, "max_pages": OCR_MAX_PAGES},
-                               f"ocr:{p['url']}"))
+            kids.append(_child(task, "ocr_pdf", {"url": p["url"], "blob_key": key, "first_page": 1,
+                                                 "max_pages": OCR_PROBE_PAGES, "probe": True}, f"ocr:{p['url']}"))
     upsert_to_db(pd.DataFrame([row]), schema.DOCUMENT, ["url"])
     return kids
 
 
+def ocr_rest(url: str, blob_key: str) -> dict:
+    """The pages after the probe, when Claude found the first ones worth continuing
+    (infra/records.py)."""
+    return new_task("ocr_pdf", {"url": url, "blob_key": blob_key, "first_page": OCR_PROBE_PAGES + 1,
+                                "max_pages": OCR_MAX_PAGES}, dedup_key=f"ocr-rest:{url}")
+
+
 def _ingest_ocr(task: dict, result: dict, _file: bytes | None) -> list[dict]:
+    """A probe stores its pages as 'probe_done' when the PDF has more; the rest is appended."""
+    p = task["payload"]
+    rest = (p.get("first_page") or 1) > 1
     with db_session() as (_, cur):
-        cur.execute(f"""UPDATE {schema.DOCUMENT} SET ocr_status = 'done', ocr_text = %s, ocr_pages = %s,
-                               ocr_seconds = %s, ocr_model = %s, updated_at = now() WHERE url = %s""",
-                    (result.get("text"), result.get("pages"), result.get("seconds"),
-                     f"{result.get('model')} on {result.get('gpu')}", task["payload"]["url"]))
+        cur.execute(f"""UPDATE {schema.DOCUMENT} SET
+                               ocr_text = CASE WHEN %(rest)s THEN coalesce(ocr_text || E'\n\n', '') || %(t)s ELSE %(t)s END,
+                               ocr_pages = CASE WHEN %(rest)s THEN coalesce(ocr_pages, 0) + %(n)s ELSE %(n)s END,
+                               ocr_status = CASE WHEN %(probe)s AND coalesce(pages, 0) > %(n)s THEN 'probe_done' ELSE 'done' END,
+                               ocr_seconds = coalesce(ocr_seconds, 0) + coalesce(%(sec)s, 0), ocr_model = %(m)s,
+                               updated_at = now()
+                         WHERE url = %(u)s""",
+                    {"rest": rest, "t": result.get("text"), "n": result.get("pages") or 0, "probe": bool(p.get("probe")),
+                     "sec": result.get("seconds"), "m": f"{result.get('model')} on {result.get('gpu')}", "u": p["url"]})
     return []
 
 

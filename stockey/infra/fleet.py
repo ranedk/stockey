@@ -20,6 +20,7 @@ import math
 import random
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from environs import Env
@@ -169,6 +170,57 @@ class RunPod:
 PROVIDERS = {"hetzner": Hetzner, "runpod": RunPod}
 
 
+# --- RunPod balance ------------------------------------------------------------------------------
+
+RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
+BALANCE_ALERT_USD = 20.0          # email the operator once when the prepaid balance drops below this
+BALANCE_REARM_USD = 25.0          # ... and again only after it has been topped up past this
+BALANCE_FLOOR_USD = 5.0           # no new pods below this
+BALANCE_CHECK_MIN = 30
+BALANCE_STATE = Path(__file__).resolve().parent.parent / ".cache" / "infra_runpod_balance.json"
+
+
+def runpod_balance() -> float:
+    r = requests.post(RUNPOD_GRAPHQL, json={"query": "query { myself { clientBalance } }"},
+                      headers={"Authorization": f"Bearer {env('RUNPOD_API_KEY')}"}, timeout=30)
+    r.raise_for_status()
+    return float(r.json()["data"]["myself"]["clientBalance"])
+
+
+def _balance_state() -> dict:
+    try:
+        return json.loads(BALANCE_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def check_runpod_balance(now: datetime, send=None) -> dict:
+    """Every BALANCE_CHECK_MIN: read the balance; below BALANCE_ALERT_USD email once (re-armed
+    by a top-up). Returns the state, whose "balance" gates new pods."""
+    st = _balance_state()
+    if st.get("checked_at") and (now - datetime.fromisoformat(st["checked_at"])).total_seconds() < BALANCE_CHECK_MIN * 60:
+        return st
+    try:
+        bal = runpod_balance()
+    except Exception as exc:  # noqa: BLE001 -- a failed read keeps the last known balance
+        record_local_fallback_event(module="infra.fleet", fallback_type="balance_unread", source="runpod",
+                                    severity="warn", reason=str(exc)[:300])
+        return st
+    st.update(balance=bal, checked_at=now.isoformat())
+    if bal >= BALANCE_REARM_USD:
+        st["alerted"] = False
+    elif bal < BALANCE_ALERT_USD and not st.get("alerted"):
+        if send is None:
+            from utils.ops_alert import send_ops_alert as send
+        st["alerted"] = bool(send(f"RunPod balance ${bal:.2f} -- below ${BALANCE_ALERT_USD:.0f}",
+                                  f"The RunPod prepaid balance is ${bal:.2f}. New GPU pods stop below "
+                                  f"${BALANCE_FLOOR_USD:.0f}; running pods stop at $0.\n"
+                                  "Top up at https://www.runpod.io/console/user/billing"))
+    BALANCE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    BALANCE_STATE.write_text(json.dumps(st))
+    return st
+
+
 # --- spend ---------------------------------------------------------------------------------------
 
 def month_spend(pool: str) -> float:
@@ -290,6 +342,11 @@ def tick(pools=("hetzner", "runpod")) -> dict:
         if need > 0 and _refused_recently(pool):
             acts.append("not creating: the provider refused a recent create (see infra_machine.note)")
             need = 0
+        if pool == "runpod":
+            bal = check_runpod_balance(now).get("balance")
+            if need > 0 and bal is not None and bal < BALANCE_FLOOR_USD:
+                acts.append(f"not creating: RunPod balance ${bal:.2f}")
+                need = 0
         for _ in range(max(need, 0)):
             hourly_all = float(alive["hourly_usd"].sum()) + (RUNPOD_FALLBACK_USD_HR if pool == "runpod" else 0.02)
             if spend + hourly_all > MONTHLY_CAP_USD:

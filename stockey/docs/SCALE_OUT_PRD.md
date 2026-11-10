@@ -185,6 +185,21 @@ built yet.
 
 Extraction runs in the 22:00-08:00 IST window like the other Claude jobs.
 
+**The catalogue** (`infra/catalog.py`, rendered to `docs/ANNOUNCEMENT_CATALOG.md`) lists the
+filing kinds with what each summary must say, and the fact types with the detail fields to
+capture. It is expected to change: a new kind of filing or a field that keeps landing in
+"other" gets added, the version goes up, and records read under an older version are read
+again. The exchange's category is not trusted (NSE's tags are often wrong): Claude decides the
+kind from the content, and a record the category called routine but whose content is not is
+read again in full.
+
+**Scans are OCR'd 3 pages first.** Claude reads those pages with the record; only if it says
+the rest probably holds material facts is the remainder (up to page 40) OCR'd, and the record
+re-read when it arrives. Otherwise the document is marked `rest_skipped`.
+
+**RunPod balance**: the fleet reads it every 30 minutes, emails the operator once when it drops
+below USD 20 (again only after a top-up past USD 25), and creates no pods below USD 5.
+
 ## 5. Before the public service
 
 1. **Secrets.** The repo stays private; workers still get no keys (2.5), and the site never

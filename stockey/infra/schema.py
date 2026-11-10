@@ -72,7 +72,7 @@ _DDL = [
         status TEXT NOT NULL,                  -- fetched / not_found / not_pdf / failed
         blob_key TEXT, bytes INT, pages INT,
         text_layer TEXT, text_layer_chars INT,
-        ocr_status TEXT,                       -- pending / done / failed / not_needed
+        ocr_status TEXT,                       -- pending / probe_done / more_queued / rest_skipped / done / failed / not_needed
         ocr_text TEXT, ocr_pages INT, ocr_seconds DOUBLE PRECISION, ocr_model TEXT,
         task_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
     # One record per disclosure: the NSE and BSE copies of the same document are merged.
@@ -88,6 +88,7 @@ _DDL = [
         embedded_sha TEXT,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
     f"CREATE INDEX IF NOT EXISTS {RECORD}_sym ON {RECORD} (symbol, announced_at)",
+    f"ALTER TABLE {RECORD} ADD COLUMN IF NOT EXISTS kind TEXT",      # decided from content (infra/catalog.py)
     f"""CREATE TABLE IF NOT EXISTS {FACT} (
         id BIGSERIAL PRIMARY KEY,
         record_key TEXT NOT NULL REFERENCES {RECORD}(record_key) ON DELETE CASCADE,
