@@ -620,6 +620,17 @@ Claude stays for all reading. Built for the open research interface.
   records/embedding steps wired into the crawl (today they are run by hand).
 - [ ] Before open release: gitleaks over history, Anthropic API for public use, data terms.
 
+## J. SaaS: screener, research and alerts (SAAS_PRD.md, 2026-11-10)
+
+- [ ] Phase 0 decisions: legal opinion (SEBI RA line, showing backtests), fundamentals source
+  (XBRL vs vendor), NSE data licence, Anthropic API account, brand/domain.
+- [x] XBRL sample (97 filings, 13 companies): findings and parser design in
+  `stockey/docs/XBRL_FUNDAMENTALS.md`; matches screener.in standalone within 3% almost everywhere.
+- [ ] Phase 1: XBRL fundamentals (2020 on) replacing screener.in; NSE industry classes; metric catalogue
+  with licence tags; serving schema on a separate box; 2-year filings for the whole universe.
+- [ ] Phases 2-5: private beta (screener, company pages, alerts) -> research questions -> screen
+  backtests with controls -> paid launch.
+
 ## F. Closed — do not re-open without new evidence
 
 - [-] **Short-interval / swing TA (2-10 day holds).** Twice rejected on
