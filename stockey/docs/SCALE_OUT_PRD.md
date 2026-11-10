@@ -12,9 +12,11 @@ Written 2026-11-09 and revised the same day with the operator's decisions:
 - **Workers live in a separate Hetzner project** with their own token (`HETZNER_KEY`, checked
   2026-11-09: it sees no servers, so it cannot touch `stockey-ubuntu`). GPUs use
   `RUNPOD_API_KEY`.
-- **The project will be released openly with an analysis and research interface.** People will
-  ask for deep analysis of companies, their announcements, boards and founders, which needs
-  web search and global news as well. The same orchestrator runs those tasks.
+- **The code stays private; the output becomes a service.** People ask questions on a site that
+  answers from our data: deep analysis of companies, their announcements, boards and founders,
+  with web search and global news. The same orchestrator runs those tasks.
+- **Spend caps: under USD 100 a month for each pool** (Hetzner, RunPod).
+- **Search uses free sources** and the local Chrome; first test on a couple of stocks.
 
 Status: proposal. Nothing here is built.
 
@@ -140,15 +142,53 @@ every claim linked to its source.
 |---|---|---|
 | filings for a company | our tables; NSE/BSE fetch if missing | hetzner |
 | board and founders | exchange filings (director changes, shareholding), annual reports, SEBI orders (`sebi_orders`), MCA public data | hetzner |
-| web search | a search API (Google Programmable Search, Brave or Serper) -- not scraped Google pages, which Google blocks and its terms forbid | hetzner |
+| web search | free sources: Google Programmable Search JSON API (100 queries/day free), Wikipedia, company websites; not scraped Google result pages (Google blocks them and its terms forbid it) | hetzner |
 | global news | GDELT (free, global), news RSS, ET (already collected) | hetzner |
 | page fetch | company sites, news articles (default gap per domain) | hetzner |
 | read / analyse | Claude | main |
 
-## 5. Before an open release
+### 4.1 Records: every filing stored as a summary, typed facts and searchable passages
 
-1. **Secrets.** `.env` is untracked, but the git history must be scanned for keys before the repo
-   goes public (e.g. gitleaks), and any key ever committed must be rotated.
+Decided 2026-11-10. Questions will be about orders, preferential shares, founder equity,
+investments, boards and more, often across many filings or companies. So each filing is
+read once and stored three ways (`infra/records.py`):
+
+- **Record** (`infra_record`): one per disclosure. The NSE and BSE copies of one document
+  merge, keyed on the document's text layer (a scan keys on its size and pages). Pilot:
+  842 filings -> 427 records. Each record keeps Claude's 2-4 sentence summary. A record whose
+  text changes (OCR arriving) goes back to pending and is read again.
+- **Facts** (`infra_fact`): one row per thing that happened, typed from a fixed list
+  (`records.FACT_TYPES`: order won, order book, L1 bid, results, guidance, preferential issue,
+  warrants, public issue, debt, ESOP, buyback, dividend, bonus/split, promoter stake, pledge,
+  insider trade, major holder, investment, acquisition, divestment, subsidiary/JV, capex,
+  partnership, approval, credit rating, director and KMP joined/left, auditor change,
+  litigation, regulatory action, related party, other). Common columns: date, period, amount
+  in Rs crore (foreign amounts at the RBI rate), percentage, shares, price, counterparty,
+  person, role, direction; anything else in `details`. Every fact carries a verbatim quote
+  and is **verified** only when the quote is in the text and its numbers are in the quote
+  (the order-win rule). Unverified facts are kept for inspection, never used in answers.
+  Each fact records the extraction version, so a new type re-reads only what it needs.
+- **Passages** (`infra_passage`): the full text cut into ~1,200-character pieces, each with a
+  384-number vector from a small open embedding model on the CPU (`infra/embed.py`,
+  bge-small-en-v1.5) in pgvector. The model only finds similar text; it writes and judges
+  nothing, so the "no local LLM" rule holds. This replaces cutting each filing at 6,000
+  characters, which lost the June 2026 KAYNES order book in the first test.
+- Routine notices (trading window, newspaper copies, depository certificates) get a summary
+  only. A long document is read as its first 12k characters plus up to 18k of the passages
+  most like a material fact.
+
+Answering (`infra/research.py`): Claude plans the fact types, text searches and dates; the
+code pulls the verified facts and the closest passages; Claude answers citing records [R#];
+citations of anything it was not given are removed. Cross-company questions ("preferential
+allotments to promoters above Rs 50 crore in 2025") are plain SQL over `infra_fact` -- not
+built yet.
+
+Extraction runs in the 22:00-08:00 IST window like the other Claude jobs.
+
+## 5. Before the public service
+
+1. **Secrets.** The repo stays private; workers still get no keys (2.5), and the site never
+   exposes the orchestrator or the DB.
 2. **Claude for the public.** The CLI runs on a personal subscription and cannot serve other
    people. The public service needs the Anthropic API with its own key, a budget per user and
    per day, and a queue.
@@ -175,9 +215,7 @@ every claim linked to its source.
 
 ## 7. Decisions for the operator
 
-- Daily spend caps for the Hetzner and RunPod pools.
-- Which search API (Google Programmable Search, Brave, Serper), and its budget.
-- Which history to fetch first: NSE or BSE announcements, attachments, annual reports.
+- Decided: under USD 100/month per pool; free search sources; start with two stocks.
 
 ## 8. Risks
 

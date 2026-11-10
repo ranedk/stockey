@@ -160,6 +160,22 @@ __STATIC_BLOCK__
         proxy_read_timeout    120s;
     }
 
+    # The scale-out orchestrator (stockey/infra/orchestrator.py). Workers on Hetzner and RunPod
+    # call it here, so it sits OUTSIDE the basic-auth gate on purpose: every call carries the
+    # worker's own bearer token, checked by the app; the app serves nothing else and has no docs.
+    location /orchestrator/ {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8100/;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_send_timeout    300s;
+        proxy_read_timeout    300s;
+        client_max_body_size  80m;
+    }
+
     location @app {
         proxy_pass http://__UPSTREAM__;
         proxy_http_version 1.1;

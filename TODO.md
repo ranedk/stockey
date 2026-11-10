@@ -615,6 +615,9 @@ Claude stays for all reading. Built for the open research interface.
 - [ ] RunPod: 100-page OCR trial, then the 2,385-filing backlog.
 - [ ] Hetzner: 2-server pilot (50 companies, block detector checked), then 8; history run.
 - [ ] Research task kinds: search API, GDELT/news, page fetch, board/founder; public-interface PRD.
+- [ ] Records (PRD 4.1, `infra/records.py`): summary + typed verified facts + searchable passages per
+  filing. Pilot SOLARINDS/KAYNES first; then cross-company questions as SQL over `infra_fact`, and
+  records/embedding steps wired into the crawl (today they are run by hand).
 - [ ] Before open release: gitleaks over history, Anthropic API for public use, data terms.
 
 ## F. Closed — do not re-open without new evidence
