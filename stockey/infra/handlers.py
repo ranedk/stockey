@@ -27,7 +27,7 @@ BSE_MAX_RANGE_DAYS = 360          # BSE refuses a range over 12 months
 BSE_MAX_PAGES = 40
 MIN_GAP_S = 10.0                  # per site, inside this worker -- a second check behind the orchestrator's
 MAX_FILE_BYTES = 60_000_000
-RETRIES = {"nse_announcements": 1, "bse_announcements": 2, "fetch_attachment": 2, "ocr_pdf": 1}
+RETRIES = {"nse_announcements": 1, "nse_results_listing": 1, "fetch_xbrl": 2, "bse_announcements": 2, "fetch_attachment": 2, "ocr_pdf": 1}
 OCR_MODEL = "zai-org/GLM-OCR"
 OCR_PROMPT = "Text Recognition:"  # the model card's exact prompt (utils/ocr/llm_ocr.py)
 OCR_MAX_IMAGE = 1280
@@ -93,11 +93,9 @@ _NSE_JS = """async (url) => {
 }"""
 
 
-def nse_announcements(p: dict, ctx: Context) -> tuple[dict, None]:
-    """Every announcement for a symbol in [from, to] (dd-mm-YYYY), as NSE serves it."""
+def _nse_json(ctx: Context, url: str):
+    """One NSE API call through the worker's browser session."""
     import json
-    url = (f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={p['symbol']}"
-           f"&from_date={p['from']}&to_date={p['to']}")
     page = ctx.nse_page()
     ctx.gap("nse")
     r = page.evaluate(_NSE_JS, url)
@@ -107,13 +105,52 @@ def nse_announcements(p: dict, ctx: Context) -> tuple[dict, None]:
     if r["status"] != 200:
         raise RuntimeError(f"NSE HTTP {r['status']}")
     try:
-        rows = json.loads(r["body"])
+        return json.loads(r["body"])
     except ValueError as exc:
         ctx.reset_nse()
         raise Blocked(f"NSE returned non-JSON ({r['body'][:80]!r})") from exc
+
+
+def nse_announcements(p: dict, ctx: Context) -> tuple[dict, None]:
+    """Every announcement for a symbol in [from, to] (dd-mm-YYYY), as NSE serves it."""
+    rows = _nse_json(ctx, f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={p['symbol']}"
+                          f"&from_date={p['from']}&to_date={p['to']}")
     if not isinstance(rows, list):
         raise RuntimeError(f"NSE unexpected payload {str(rows)[:120]}")
     return {"rows": rows}, None
+
+
+def nse_results_listing(p: dict, ctx: Context) -> tuple[dict, None]:
+    """Both lists of a company's result filings (docs/XBRL_FUNDAMENTALS.md): the old one (to Dec
+    2024) and the integrated filings (2025 on)."""
+    from urllib.parse import quote
+    sym = quote(p["symbol"])
+    old = _nse_json(ctx, f"https://www.nseindia.com/api/corporates-financial-results?index=equities&symbol={sym}"
+                         "&period=Quarterly")
+    new = _nse_json(ctx, "https://www.nseindia.com/api/integrated-filing-results?index=equities&symbol="
+                         f"{sym}&type={quote('Integrated Filing- Financials')}&page=1&size=100")
+    new = new.get("data", []) if isinstance(new, dict) else new
+    if not isinstance(old, list) or not isinstance(new, list):
+        raise RuntimeError(f"NSE unexpected payload {str(old)[:80]} / {str(new)[:80]}")
+    return {"old": old, "int": new}, None
+
+
+def fetch_xbrl(p: dict, ctx: Context) -> tuple[dict, bytes | None]:
+    """One XBRL result file from nsearchives."""
+    ctx.gap("nse")
+    r = requests.get(p["url"], headers={"User-Agent": BSE_UA}, timeout=90)
+    if r.status_code in (401, 403, 429):
+        raise Blocked(f"nse HTTP {r.status_code}")
+    if r.status_code == 404:
+        return {"status": "not_found"}, None
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    head = r.content[:600].lower()
+    if b"<html" in head and b"xbrl" not in head:
+        raise Blocked("nse returned an HTML page for an XBRL file")
+    if b"xbrl" not in head:
+        return {"status": "not_xbrl", "bytes": len(r.content)}, None
+    return {"status": "fetched", "bytes": len(r.content)}, r.content
 
 
 # --- BSE -------------------------------------------------------------------------------------
@@ -250,5 +287,6 @@ def echo(p: dict, ctx: Context) -> tuple[dict, bytes | None]:
 
 
 HANDLERS = {"echo": echo, "nse_announcements": nse_announcements, "bse_announcements": bse_announcements,
-            "fetch_attachment": fetch_attachment, "ocr_pdf": ocr_pdf}
+            "fetch_attachment": fetch_attachment, "ocr_pdf": ocr_pdf,
+            "nse_results_listing": nse_results_listing, "fetch_xbrl": fetch_xbrl}
 NEEDS_FILE = {"ocr_pdf"}          # the worker downloads the task's file from the orchestrator first

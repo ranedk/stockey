@@ -71,3 +71,27 @@ total income instead of interest earned.
    Failures are flagged, not dropped.
 6. **Store** point-in-time: every value keeps the filing it came from and when it became public;
    a revision adds a version, never overwrites.
+
+## Pilot: 50 companies, 2026-11-10
+
+Run through the crawl fleet (7 Hetzner workers): 50 listings, 1,919 filings since 2020, all
+parsed; 4 internal checks failed out of all identities tested. Compared with screener.in's
+standalone quarters (582 quarters, 46 companies):
+
+| | within 2% | within 5% |
+|---|---|---|
+| sales | 533 / 567 | 540 / 567 (95%) |
+| profit | 519 / 582 | 554 / 582 (95%); 568 (98%) counting gaps under Rs 0.5 cr (screener.in rounds to whole crores) |
+
+What the gaps were:
+- **Duty inside revenue** (SULA excise, PREMIERPOL GST, 7-14% every quarter). Filed inside
+  revenue from operations and itemised as an "other expenses" line. Mapping v2 adds
+  `excise_duty` (the itemised lines described as excise or GST) and `revenue_net`; the
+  screener.in comparison uses `revenue_net`. Fixed.
+- **screener.in shows restated history, we show figures as filed.** RAYMOND (demergers
+  2023-25), JKLAKSHMI, HONASA, JASH, RSYSTEMS, ADANIPORTS some quarters: our values equal the
+  filing; screener.in carries the restated comparatives printed in later results. The XBRL
+  files hold only the current period, so a restated series needs the next year's results
+  (PDF) -- later work if needed.
+- **One-off screener.in gaps**: AWHCL 2024-12 and 2025-09 (filing says Rs 8.5 cr, screener.in
+  Rs 156 cr), 63MOONS 2023-24 sales (we include all operating revenue).

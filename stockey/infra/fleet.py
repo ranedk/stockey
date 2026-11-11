@@ -73,7 +73,7 @@ def hetzner_user_data(token: str) -> str:
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y python3-venv poppler-utils xvfb curl
+apt-get install -y python3-venv poppler-utils xvfb curl libatomic1
 python3 -m venv /opt/w
 /opt/w/bin/pip install -q requests playwright
 /opt/w/bin/playwright install --with-deps chromium
@@ -120,11 +120,15 @@ class Hetzner:
         return max(float(p["price_hourly"]["gross"]) for p in prices) * EUR_USD
 
     def create(self, name: str, token: str) -> dict:
-        body = {"name": name, "server_type": HETZNER_TYPE, "image": "ubuntu-24.04",
-                "location": random.choice(HETZNER_LOCATIONS), "user_data": hetzner_user_data(token),
-                "labels": {"app": "stockey-infra", "pool": "hetzner"},
-                "public_net": {"enable_ipv4": True, "enable_ipv6": False}}
-        r = requests.post(f"{HETZNER_API}/servers", json=body, headers=self.h, timeout=60)
+        """A full location ("resource_unavailable", HTTP 412) is not a refusal: the next one is tried."""
+        for loc in random.sample(HETZNER_LOCATIONS, len(HETZNER_LOCATIONS)):
+            body = {"name": name, "server_type": HETZNER_TYPE, "image": "ubuntu-24.04",
+                    "location": loc, "user_data": hetzner_user_data(token),
+                    "labels": {"app": "stockey-infra", "pool": "hetzner"},
+                    "public_net": {"enable_ipv4": True, "enable_ipv6": False}}
+            r = requests.post(f"{HETZNER_API}/servers", json=body, headers=self.h, timeout=60)
+            if r.status_code != 412 or "resource_unavailable" not in r.text:
+                break
         if r.status_code >= 300:
             raise RuntimeError(f"hetzner create HTTP {r.status_code}: {r.text[:300]}")
         s = r.json()["server"]

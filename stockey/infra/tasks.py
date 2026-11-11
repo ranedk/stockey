@@ -171,6 +171,16 @@ def _ingest_ocr(task: dict, result: dict, _file: bytes | None) -> list[dict]:
     return []
 
 
+def _ingest_results_listing(task: dict, result: dict, file: bytes | None) -> list[dict]:
+    from fundamentals.xbrl import store
+    return store.ingest_listing(task, result, file)
+
+
+def _ingest_xbrl(task: dict, result: dict, file: bytes | None) -> list[dict]:
+    from fundamentals.xbrl import store
+    return store.ingest_xbrl(task, result, file)
+
+
 def _ingest_echo(task: dict, result: dict, _file: bytes | None) -> list[dict]:
     return []
 
@@ -181,4 +191,6 @@ SPECS: dict[str, Spec] = {
     "bse_announcements": Spec("hetzner", 900, 3, lambda p: "bse", _ingest_announcements),
     "fetch_attachment": Spec("hetzner", 300, 3, lambda p: _site(p.get("url")), _ingest_attachment),
     "ocr_pdf": Spec("runpod", 2400, 2, lambda p: None, _ingest_ocr),
+    "nse_results_listing": Spec("hetzner", 240, 3, lambda p: "nse", _ingest_results_listing),
+    "fetch_xbrl": Spec("hetzner", 180, 3, lambda p: "nse", _ingest_xbrl),
 }
