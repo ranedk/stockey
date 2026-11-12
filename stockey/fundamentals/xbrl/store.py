@@ -106,7 +106,10 @@ def listing_rows(symbol: str, result: dict) -> list[dict]:
         out.append({"filing_key": key(url), "symbol": symbol, "listing": "int", "period_end": end.date(),
                     "basis": "consolidated" if r.get("consolidated") == "Consolidated" else "standalone",
                     "revision": (r.get("type_Sub") or "original").lower(), "audited": r.get("audited"),
-                    "public_at": _ts(r.get("broadcast_Date"), "%d-%b-%Y %H:%M:%S"), "url": url})
+                    # a revision has no broadcast date; NSE gives when it was revised (or created)
+                    "public_at": _ts(r.get("broadcast_Date"), "%d-%b-%Y %H:%M:%S")
+                    or _ts(r.get("revised_Date"), "%d-%b-%Y %H:%M:%S")
+                    or _ts(r.get("creation_Date"), "%d-%b-%Y %H:%M:%S"), "url": url})
     return list({r["filing_key"]: r for r in out}.values())
 
 

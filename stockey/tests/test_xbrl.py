@@ -119,3 +119,12 @@ def test_comparison_with_screener_in_reports_the_gap_in_percent():
     scr = pd.DataFrame({"symbol": ["A"], "period_end": [date(2024, 3, 31)], "sales": [100.0], "net_profit": [10.0]})
     m = store.compare(ours, scr)
     assert round(m.loc[0, "sales_gap_pct"], 6) == 2.0 and round(m.loc[0, "profit_gap_pct"], 6) == -10.0
+
+
+def test_a_revised_filing_takes_its_publish_time_from_the_revision_date():
+    from datetime import datetime
+    from fundamentals.xbrl import store
+    rows = store.listing_rows("X", {"int": [{"xbrl": "https://x/a.xml", "qe_Date": "31-MAR-2026", "type_Sub": "Revision",
+                                            "broadcast_Date": None, "revised_Date": "24-JUL-2026 16:48:18",
+                                            "creation_Date": "24-Jul-2026 16:48:55", "consolidated": "Consolidated"}]})
+    assert rows[0]["public_at"] == datetime(2026, 7, 24, 16, 48, 18) and rows[0]["revision"] == "revision"
