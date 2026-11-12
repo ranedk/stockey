@@ -14,7 +14,7 @@ def test_history_pauses_in_the_main_servers_nse_bse_windows():
 def test_pools_never_exceed_their_caps():
     assert fleet.want("hetzner", 0) == 0
     assert fleet.want("hetzner", 3) == 3
-    assert fleet.want("hetzner", 500) == 8
+    assert fleet.want("hetzner", 500) == fleet.MAX_CAPS["hetzner"]
     assert fleet.want("runpod", 1) == 1
     assert fleet.want("runpod", 41) == 3
     assert fleet.want("runpod", 10_000) == 3

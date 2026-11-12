@@ -32,7 +32,7 @@ from utils.fallback_telemetry import record_local_fallback_event
 env = Env()
 env.read_env()
 
-MAX_CAPS = {"hetzner": 8, "runpod": 3}
+MAX_CAPS = {"hetzner": 20, "runpod": 3}
 # a run may lower a cap (INFRA_HETZNER_CAP=2 for a pilot), never raise it
 CAPS = {p: max(0, min(c, env.int(f"INFRA_{p.upper()}_CAP", c))) for p, c in MAX_CAPS.items()}
 MONTHLY_CAP_USD = 95.0                    # "below USD 100" per pool, with room for rounding

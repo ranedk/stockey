@@ -46,7 +46,7 @@ Status: proposal. Nothing here is built.
    | main pool  |          | hetzner pool   |     | runpod pool |
    | (Dhan,     |          | crawl, fetch,  |     | OCR         |
    | daily,     |          | web/news, text |     | max 3 GPUs  |
-   | Claude)    |          | max 8 servers  |     |             |
+   | Claude)    |          | max 20 servers |     |             |
    +------------+          +----------------+     +-------------+
 ```
 
