@@ -622,17 +622,36 @@ Claude stays for all reading. Built for the open research interface.
 
 ## J. Research platform (PLATFORM_PRD.md, 2026-11-13; was SAAS_PRD.md)
 
-- [ ] Stage 0 foundation -> 1 closed beta -> 2 research/testing -> 3 advisors -> 4 open beta/paid
-  (PLATFORM_PRD.md section 5). Partner details pending.
+Stages: 0 foundation -> 1a look up and screen -> 1b track and ask -> 2 research/testing ->
+3 advisors -> 4 open beta/paid. Task detail: PLATFORM_PRD.md section 10.
 
-- [ ] Phase 0 decisions: legal opinion (SEBI RA line, showing backtests), fundamentals source
-  (XBRL vs vendor), NSE data licence, Anthropic API account, brand/domain.
-- [x] XBRL sample (97 filings, 13 companies): findings and parser design in
-  `stockey/docs/XBRL_FUNDAMENTALS.md`; matches screener.in standalone within 3% almost everywhere.
-- [ ] Phase 1: XBRL fundamentals (2020 on) replacing screener.in; NSE industry classes; metric catalogue
-  with licence tags; serving schema on a separate box; 2-year filings for the whole universe.
-- [ ] Phases 2-5: private beta (screener, company pages, alerts) -> research questions -> screen
-  backtests with controls -> paid launch.
+- [x] XBRL sample, pilot and full run (2,344 companies, 87,700 filings; `stockey/docs/XBRL_FUNDAMENTALS.md`).
+- [x] Review proposals accepted (PRD section 0); the new app replaces `screener/` completely.
+- [ ] Operator: partner details; legal opinion; Anthropic API account; licences; hosting.
+
+Stage 0:
+- [ ] F1 coverage report (companies with no XBRL, and why)
+- [ ] F2 daily fetch of new result filings (cron; run by hand today)
+- [ ] F3 clean quarterly / annual / TTM series, point in time
+- [ ] F4 ratios and valuation (+ bank, NBFC, insurer lists)
+- [ ] F5 check against screener.in on the 50 pilot companies
+- [ ] F6 segments
+- [ ] F7 exchange industry labels cover the universe
+- [ ] S1 company identity table
+- [ ] S2 metric catalogue (first ~80 metrics, licence tags)
+- [ ] S3 serving tables + nightly build + freshness
+- [ ] S4 point-in-time tests on known cases
+- [ ] A1 design notes (screen tables, API, component/chart library)
+- [ ] A2 API skeleton: accounts, invites, sessions
+- [ ] A3 app shell (responsive)
+- [ ] A4 basic company page
+- [ ] A5 admin
+- [ ] A6 security, backup, alerts, usage log
+
+Later:
+- [ ] Stage 1a (B1-B6): 2-year filings records, full company page, screen language + UI, status page.
+- [ ] Stage 1b: portfolio model and engine, alerts, Ask on the API, market dashboard.
+- [ ] Before stage 4: rebuild served scores (story, confluence, themes, universe layers) on XBRL.
 
 ## F. Closed — do not re-open without new evidence
 

@@ -1,6 +1,7 @@
 # Research platform: fundamental + technical research, screens, paper portfolios
 
-Written 2026-11-13. Status: agreed scope, nothing built. Replaces `SAAS_PRD.md` as the plan
+Written 2026-11-13; reviewed the same day (gaps fixed, task list added: section 10).
+Status: agreed scope; only the XBRL quarterly store is built. Replaces `SAAS_PRD.md` as the plan
 (that file keeps the blocker notes: SEBI line, data licences). Builds on
 `stockey/docs/SCALE_OUT_PRD.md` (crawl/OCR fleet, records) and
 `stockey/docs/XBRL_FUNDAMENTALS.md` (our own financials).
@@ -23,6 +24,25 @@ macro, news) goes into it.
 | Login | Email + password to start (verified email, reset by email). Google sign-in and teams later. |
 | Databases | Postgres + TimescaleDB is the main store (local first, then a hosted box); BigQuery for heavy analysis of append-only data; SQLite only as a local batching buffer before loads. |
 | Brand | Separate brand later; build under the current name. |
+
+**Proposed in the review and accepted when work started (2026-11-13):**
+
+| Topic | Proposal |
+|---|---|
+| Timing of data | End-of-day product. No live or intraday prices in any stage before 5 (Dhan bars are a personal account: internal only). |
+| Financials shown | Figures **as filed**, with the time they became public; a revision is a new version. This is what makes "as of" screens honest. It will differ from screener.in where they show restated history. |
+| Consolidated or standalone | Consolidated where the company files it (1,895 of 2,344), else standalone; the page says which and lets the user switch. |
+| Where code lives | Serving-table builders in `stockey/serving/`; public API in a new `api/` folder at the workspace root with its own database schema (users, screens, portfolios, alerts); web app rebuilt inside `screener/`, **replacing the old site completely** (operator, 2026-11-13). The old pages that are still used (paper tracks, machine portfolio, data health, themes, stages) are rebuilt as sections of the new app; the old build stays deployed until the new one ships. |
+| Technical numbers | Computed only by systrader (stage, relative strength, averages), written to `systrader_*` tables; the serving build copies them. stockey grows no technical code (boundary unchanged). |
+
+## 0.1 Not doing
+
+- No order placing or broker link; paper only.
+- No live quotes, no intraday charts (until stage 5 at the earliest).
+- No mobile app.
+- No tips: outside the partner's published portfolios, the product states facts and test
+  results, never "buy".
+- No user-written SQL or code; screens go through the screen language only.
 
 ## 1. Who it is for
 
@@ -55,7 +75,7 @@ macro, news) goes into it.
 | Equities NSE/BSE incl. SME | daily OHLCV 2013+, adjusted, delivery, circuits; 1-min bars ~5y (Dhan, internal) | BSE-only names fully; corporate-action audit view |
 | Indices | NSE indices daily | sector/thematic index constituents over time |
 | F&O | daily bhavcopy 2016+, rolling options | open interest views, option chain history |
-| Financials | own XBRL results 2020+, 87,700 filings, 98% match vs screener.in | annual balance sheet/cash flow pages, segments, restated series, ratios, TTM |
+| Financials | own XBRL results 2020+ for 2,344 NSE companies (87,700 filings, 98% match vs screener.in): profit and loss every quarter, balance sheet and cash flow every half year. Fetched by hand, not on a schedule | daily fetch of new results; clean quarterly/annual/TTM series; ratios; segments (not mapped yet); companies with no XBRL (SME, BSE-only); history before 2020 is not planned |
 | Filings | records: summary, verified typed facts, searchable passages (pilot companies) | whole universe (2 years first, ~USD 1k), BSE-only filers |
 | Ownership and deals | bulk/block, insider/SAST, pledges, surveillance flags | shareholding pattern history, MF and FPI holdings per stock |
 | News | ET news tagged by company | more sources, de-duplication, event tagging into the same fact types |
@@ -183,6 +203,17 @@ status page.
 - **Services**: data pipelines stay Python; the backtest engine stays Go behind an HTTP API;
   a new public API (FastAPI) owns users, plans, quotas; the Nuxt app is rebuilt as a product
   with a component library and a chart library.
+- **How a screen runs.** Two kinds of serving table, joined by the screen compiler:
+  a wide daily table for price and technical metrics (one row per company per day), and
+  interval rows for slow data (financials, ownership, facts: value, known-from time,
+  known-until time). "As of date D" means the daily row for D and the interval rows known
+  on D. The screen language compiles to SQL over catalogue fields only. Targets: a screen on
+  today's data under 2 seconds, on a past date under 5.
+- **Company identity.** One stable company id (ISIN-based, from `dim_security`) with symbol
+  and name history, so renames, BSE-only names and relistings do not break pages or screens.
+- **Paper portfolio marking.** Orders fill at the next session's open with the cost model;
+  marks at the adjusted close; dividends credited; splits and bonuses through the adjustment
+  factors. One rule set for every portfolio, written down before the engine is built.
 - **Rewrites expected**: screener.in-sourced fields replaced by our XBRL financials; the
   screen engine (new); the portfolio engine unified (stockey's machine portfolio and
   systrader's paper tracks share one model); front end.
@@ -191,14 +222,16 @@ status page.
 
 | Stage | Scope | Done when |
 |---|---|---|
-| **0. Foundation** | metric catalogue; serving tables (point-in-time, licence tags); public API skeleton; email/password accounts; app shell (navigation, tables, charts, responsive); XBRL annual/TTM/ratios | an invited user can sign in and open any company page |
-| **1. Closed beta** (invite, free, everything shown) | company pages; mixed screener (builder + text, as-of dates); filings timeline and facts for the 2-year universe; Ask (one company); market dashboard; paper portfolios (rule-based and manual, frozen versions, daily marks); email alerts | 20-50 invited users weekly; screens and portfolios match the engine's numbers |
+| **0. Foundation** | clean quarterly/annual/TTM series and ratios from XBRL, fetched daily; company identity; metric catalogue; serving tables (point-in-time, licence tags); public API skeleton; email/password accounts and invites; app shell (navigation, tables, charts, responsive); a basic company page (price chart, financials, ratios, links to filings) | an invited user can sign in and open the basic page of any company; point-in-time tests pass |
+| **1a. Closed beta: look up and screen** (invite, free, everything shown) | full company page (filing timeline and facts, ownership, deals, themes, peers, news); mixed screener (builder + text, as-of dates, saved screens, export); filings records for the 2-year universe; status page | 10-20 invited users; a screen's result on a past date matches a hand check |
+| **1b. Closed beta: track and ask** | paper portfolios (rule-based and manual, frozen versions, daily marks); email alerts; Ask (one company, needs the Anthropic API account); market dashboard; usage tracking and a feedback button | 20-50 invited users weekly; portfolios match the engine's numbers |
 | **2. Research and testing** | screen backtests with controls, slicer, trial counter; cross-company questions; research library; themes, people, macro pages; MF data | backtests reproduce known ledger rows |
 | **3. Advisors** | model portfolios and client links, recommendation record, reports, team workspaces, our published portfolios under the partner | partner signs off on compliance |
 | **4. Open beta / paid** | licences settled (fields switched by tag), plans and billing (Razorpay), limits, terms and privacy, API keys, Telegram/WhatsApp/webhooks, commodities and currency | first paying users |
 | **5. Scale** | full filings history, more news sources, BigQuery-backed research views, options strategies in portfolios | -- |
 
-Stages 2 and 3 can overlap once stage 1 is stable.
+Stages 2 and 3 can overlap once stage 1b is stable. Stage 4 also needs every served score
+(story, confluence, themes, universe layers) rebuilt on XBRL numbers: today they read screener.in.
 
 ## 6. Hosting the main database (GCP options)
 
@@ -225,10 +258,98 @@ region.
 - Look-ahead: point-in-time enforced in the serving tables and tested on known cases.
 - LLM cost per user: plan budgets, cached answers per company per day.
 - One machine for pipelines and the public app: the hosted box separates them from stage 1.
+- Carried over from `SAAS_PRD.md` section 2, still open:
+  - screener.in data cannot be served; anything derived from it (story score, themes,
+    universe layers) is closed-beta only until rebuilt on XBRL.
+  - Sharpely sector labels cannot be served; the exchange's four-level industry labels
+    (`fundamentals_industry_classification`) replace them.
+  - The pipelines that read filings run on a personal Claude subscription (and one OpenAI
+    step). Output sold to the public must come from the Anthropic API under commercial terms;
+    this applies to the records build, not only to user questions.
+  - Privacy law (DPDP Act): consent, deletion on request, where user data is hosted. People
+    pages state public facts with sources only.
+- Coverage: 2,344 companies have XBRL financials; SME and BSE-only companies may have none.
+  The company page must say "no financials filed in XBRL" rather than show blanks.
+- Five years of financials only (2020 on): long-history ratios (10-year growth) are not
+  possible; say so in the catalogue.
 
-## 8. Open items
+## 8. Running it (applies from stage 0)
 
-1. Partner details (name, registration number, compliance rules, disclaimer text).
-2. Licences: NSE display/data, MCX, any news source.
-3. Anthropic API account and per-plan question budgets.
-4. Domain and brand (later).
+- **Security**: passwords hashed (argon2), login rate limit, sessions that can be revoked,
+  secrets out of the repo (gitleaks over history before any outside user), HTTPS only, API
+  rate limits per user.
+- **User data**: nightly backup of the app schema, restore tested once; account deletion works.
+- **Monitoring**: error log with alerts to the operator; data freshness on the status page
+  (reuses the completeness gate); a failed nightly serving build keeps yesterday's tables and
+  says so on the page.
+- **Usage**: page views, screens run, questions asked per user (needed for the "weekly users"
+  measure and for plan limits later).
+- **LLM spend**: budget per user per day, cached answers, a hard monthly cap.
+
+## 9. Open items (operator)
+
+1. Partner details (name, registration number, compliance rules, disclaimer text). Needed by stage 3.
+2. Legal opinion: the tool/advice line, and how a user's own backtest may be shown. Needed by stage 2.
+3. Anthropic API account and question budgets. Needed by stage 1b (Ask) and for the records build.
+4. Licences: NSE display/data, MCX, any news source. Needed by stage 4.
+5. Hosting choice (section 6) and where user data sits. Needed before the first outside user.
+6. Domain and brand (later).
+
+## 10. Tasks
+
+Stage 0 and 1a in detail; later stages get their list when the one before is close to done.
+`TODO.md` section J tracks status.
+
+### Stage 0: foundation
+
+Financials (stockey)
+- F1. Coverage report: universe companies with no XBRL financials, and why (SME, BSE-only,
+  new listing, fetch failed). Fix what can be fixed; list the rest.
+- F2. Daily fetch: new result filings picked up on a schedule (cron, through the fleet), so
+  numbers arrive the day they are filed. Today it is run by hand.
+- F3. Clean series per company and basis: quarters (Q4 = year - nine months; cash-flow
+  quarters from year-to-date), annual, TTM. Each value keeps known-from time; a revision
+  adds a version.
+- F4. Ratios: margins, growth (YoY, QoQ, 3-year), ROE, ROCE, debt/equity, interest cover,
+  working-capital days, cash conversion; valuation from market-cap history (PE, PB,
+  EV/EBITDA, price/sales). Separate short lists for banks, NBFCs and insurers.
+- F5. Check F3-F4 against screener.in on the 50 pilot companies (annual and ratios, 5%).
+- F6. Segments: map segment revenue and result.
+- F7. Industry labels: confirm the exchange four-level labels cover the whole universe.
+
+Serving (stockey/serving)
+- S1. Company identity table: stable id, ISIN, symbol and name history, exchange, industry.
+- S2. Metric catalogue: table + first ~80 metrics (name, group, unit, frequency, source,
+  licence tag, point-in-time rule, formula in words).
+- S3. Serving tables: daily prices (NSE end-of-day, adjusted), daily technicals (from
+  systrader tables), financial interval rows; nightly build after price adjustment; freshness table.
+- S4. Point-in-time tests on known cases: a revised result, a result filed after the close,
+  a split, a renamed company.
+
+App (api/, screener/)
+- A1. Design note first (one page each): screen-table layout, API layout, component and
+  chart library choice.
+- A2. API skeleton: accounts (email + password, verify, reset through SES), invites,
+  sessions, rate limits, app schema, tests.
+- A3. App shell: navigation, table, chart, empty states, settings, login pages; phone width works.
+- A4. Basic company page: price chart, quarterly/annual/TTM tables, ratios, filing links,
+  basis switch.
+- A5. Admin: invites, users, data freshness.
+- A6. Section 8 basics: gitleaks, app-schema backup, error alerts, usage log.
+
+### Stage 1a: look up and screen
+
+- B1. Filings records for the 2-year universe (about USD 1k), with records and embeddings
+  wired into the crawl (`TODO.md` section I).
+- B2. Interval serving tables for ownership, deals, filing facts, news, themes.
+- B3. Full company page: timeline, ownership, deals, themes, peers, news.
+- B4. Screen language (JSON) and compiler to SQL; all six condition kinds; as-of dates;
+  tests against hand-checked results.
+- B5. Screener UI: builder, text form, results table with columns/sort/export, saved screens.
+- B6. Status page; invite the first users.
+
+### Stage 1b: track and ask (outline)
+
+Portfolio model note (one model for stockey's machine portfolio and systrader's paper
+tracks) -> portfolio engine and daily marks -> portfolio pages -> email alerts -> Ask on the
+Anthropic API with budgets -> market dashboard.
