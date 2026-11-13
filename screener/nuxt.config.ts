@@ -23,6 +23,10 @@ export default defineNuxtConfig({
   // directly and CORS never matters (same reasoning as legacy/nuxt.config.ts).
   routeRules: {
     '/_api/**': { proxy: `${process.env.PLATFORM_API_ORIGIN || 'http://127.0.0.1:8110'}/api/v1/**` },
+    // The older backends the operator pages read (watchlist, themes, portfolio, data health from
+    // stockey's fundamentals API; stages and paper tracks from systrader's API).
+    '/_stockey/**': { proxy: `${process.env.STOCKEY_API_ORIGIN || 'http://127.0.0.1:8000'}/**` },
+    '/_systrader/**': { proxy: `${process.env.SYSTRADER_API_ORIGIN || 'http://127.0.0.1:8090'}/**` },
   },
 
   vite: {

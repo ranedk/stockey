@@ -31,7 +31,13 @@ From a laptop: `ssh -L 3100:127.0.0.1:3100 <host>` and open http://localhost:310
 - `/company/[symbol]`: header with tags and stage, key stats, price chart (line/candles,
   50/200-day averages, volume), scorecard against the industry median, financial charts,
   statements (P&L, balance sheet, cash flow), peers, about.
-- `/sectors`: median returns and uptrend share per sector.
+- `/sectors`: median returns and uptrend share per sector; second tab, capacity vs demand per
+  sector (stockey's sector cycle) with the watchlist companies in each.
+- Ported from the old site (2026-11-13), reading the older backends through `/_stockey/**`
+  (:8000, fundamentals API) and `/_systrader/**` (:8090) via `composables/useBackends.ts`:
+  `/themes`, `/stages` (industry trend stages), `/watchlist`, `/portfolio`, `/investors`,
+  `/paper` (frozen-rule paper tracks), `/strategies` (event triggers), `/paradigms`,
+  `/data-health`, `/todos`. The old Universe page is replaced by `/screener`.
 
 ## Design rules
 

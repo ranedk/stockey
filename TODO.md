@@ -641,14 +641,15 @@ Stage 0:
 - [ ] F7 exchange industry labels cover the universe
 - [ ] S1 company identity table
 - [~] S2 metric catalogue: first 55 fields with units and licence tags in `api/app/catalog.py` (move to a table)
-- [~] S3 `serving_company` (3,216 companies: identity, industry, returns, liquidity, size band, ratios, stage, tags)
-  built; NOT yet scheduled -- needs a cron job after price adjustment and the stage API
+- [x] S3 `serving_company` (3,216 companies: identity, industry, returns, liquidity, size band, ratios, stage, tags). Nightly via OS crontab `stockey/all_serving_build.sh` (16:00 UTC Mon-Fri + 03:30 UTC Tue-Sat rerun, log `logs/cron/serving_build.log`); fails rather than writing a table with no stages if the :8090 stage API is down (2026-11-13)
 - [ ] S4 point-in-time tests on known cases
 - [x] A1 choices: Nuxt UI 4 + ECharts, FastAPI on :8110 (`api/`), screens as whitelisted field:op:value until B4
 - [ ] A2 API skeleton: accounts, invites, sessions
 - [x] A3 app shell: sidebar, search (Ctrl K), dark mode, phone width checked
 - [x] A4 company page (beyond basic: scorecard vs industry, statements, peers); also Markets, Screener, Sectors pages
-- [ ] Switch-over: serve the new app + API publicly, port legacy pages (paper, portfolio, data health, themes, stages)
+- [x] Port legacy pages into the new app (watchlist, portfolio, investors, paper, strategies, paradigms, themes, stages, data health, todos, sector capacity cycle; /_stockey and /_systrader proxies) 2026-11-13
+- [ ] stockey `/api/platform-issues` takes 2-4 min (data-health's open-issues section waits on it); speed up or cache
+- [ ] Switch-over: serve the new app + API publicly (service ExecStart -> .output-next, nginx, API as a managed service)
 - [ ] A5 admin
 - [ ] A6 security, backup, alerts, usage log
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import time
 import logging
 import urllib.request
 from datetime import date, timedelta
@@ -99,12 +100,21 @@ def _financials() -> pd.DataFrame:
     return f.drop_duplicates("symbol").drop(columns="_rank")
 
 
+ALLOW_NO_STAGE = False      # --allow-no-stage; off by default so a down API never blanks every stage
+
+
 def _stages() -> pd.DataFrame:
-    try:
-        with urllib.request.urlopen(STAGE_URL, timeout=30) as r:
-            rows = json.load(r).get("rows", [])
-    except Exception as e:                          # visible, not fatal: the page shows "no stage"
-        log.warning("stage API unavailable: %s", e)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(STAGE_URL, timeout=30) as r:
+                rows = json.load(r).get("rows", [])
+            break
+        except Exception as e:
+            log.warning("stage API unavailable (try %d): %s", attempt + 1, e)
+            time.sleep(20)
+    else:
+        if not ALLOW_NO_STAGE:      # fail: yesterday's table keeps serving, with its stages
+            raise RuntimeError("stage API unavailable; not writing a table with no stages")
         return pd.DataFrame(columns=["symbol", "stage", "stage_label", "stage_as_of"])
     s = pd.DataFrame(rows).rename(columns={"ticker": "symbol", "as_of": "stage_as_of"})
     s["stage_as_of"] = pd.to_datetime(s["stage_as_of"])
@@ -205,7 +215,10 @@ def write(df: pd.DataFrame) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--allow-no-stage", action="store_true", help="write even if the stage API is down")
     a = ap.parse_args()
+    global ALLOW_NO_STAGE
+    ALLOW_NO_STAGE = a.allow_no_stage
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     df = build()
     log.info("companies: %d; with financials: %d; with stage: %d", len(df), df["sales"].notna().sum(),

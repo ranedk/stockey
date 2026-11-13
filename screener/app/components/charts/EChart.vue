@@ -3,12 +3,12 @@ import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { BarChart, CandlestickChart, LineChart, TreemapChart, HeatmapChart, ScatterChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, DataZoomComponent, MarkLineComponent, MarkPointComponent,
-  AxisPointerComponent, VisualMapComponent, TitleComponent } from 'echarts/components'
+  AxisPointerComponent, VisualMapComponent, TitleComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 
 use([CanvasRenderer, BarChart, CandlestickChart, LineChart, TreemapChart, HeatmapChart, ScatterChart,
   GridComponent, TooltipComponent, DataZoomComponent, MarkLineComponent, MarkPointComponent,
-  AxisPointerComponent, VisualMapComponent, TitleComponent])
+  AxisPointerComponent, VisualMapComponent, TitleComponent, LegendComponent])
 
 defineProps<{ option: Record<string, any>, height?: string }>()
 const emit = defineEmits<{ click: [params: any] }>()

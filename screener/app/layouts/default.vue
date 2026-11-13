@@ -7,11 +7,18 @@ const nav: NavigationMenuItem[][] = [[
   { label: 'Markets', icon: 'i-lucide-layout-dashboard', to: '/' },
   { label: 'Screener', icon: 'i-lucide-filter', to: '/screener' },
   { label: 'Sectors', icon: 'i-lucide-blocks', to: '/sectors' },
+  { label: 'Themes', icon: 'i-lucide-sparkles', to: '/themes' },
+  { label: 'Stages', icon: 'i-lucide-chart-no-axes-combined', to: '/stages' },
 ], [
-  { label: 'Themes', icon: 'i-lucide-sparkles', badge: 'Soon', disabled: true },
-  { label: 'Portfolios', icon: 'i-lucide-briefcase', badge: 'Soon', disabled: true },
-  { label: 'Alerts', icon: 'i-lucide-bell', badge: 'Soon', disabled: true },
-  { label: 'Research', icon: 'i-lucide-flask-conical', badge: 'Soon', disabled: true },
+  { label: 'Watchlist', icon: 'i-lucide-list-checks', to: '/watchlist' },
+  { label: 'Portfolio', icon: 'i-lucide-briefcase', to: '/portfolio' },
+  { label: 'Paper tracks', icon: 'i-lucide-notebook-pen', to: '/paper' },
+  { label: 'Strategies', icon: 'i-lucide-flask-conical', to: '/strategies' },
+  { label: 'Paradigms', icon: 'i-lucide-git-compare', to: '/paradigms' },
+  { label: 'Investors', icon: 'i-lucide-users', to: '/investors' },
+], [
+  { label: 'Data health', icon: 'i-lucide-activity', to: '/data-health' },
+  { label: 'To-dos', icon: 'i-lucide-square-check', to: '/todos' },
 ]]
 
 // company search: server-side, so the palette shows whatever the API returns
@@ -34,11 +41,7 @@ const groups = computed(() => [
   },
   {
     id: 'pages', label: 'Go to',
-    items: [
-      { label: 'Markets', icon: 'i-lucide-layout-dashboard', to: '/' },
-      { label: 'Screener', icon: 'i-lucide-filter', to: '/screener' },
-      { label: 'Sectors', icon: 'i-lucide-blocks', to: '/sectors' },
-    ],
+    items: nav.flat().map(n => ({ label: n.label, icon: n.icon, to: n.to })),
   },
 ])
 
@@ -62,8 +65,10 @@ const { data: fresh } = useApi<any>('meta/freshness', { lazy: true })
       <template #default="{ collapsed }">
         <UDashboardSearchButton :collapsed="collapsed" class="bg-transparent ring-default" label="Search companies" />
         <UNavigationMenu :collapsed="collapsed" :items="nav[0]" orientation="vertical" tooltip />
-        <div v-if="!collapsed" class="mt-4 px-2.5 text-[11px] font-medium uppercase tracking-wider text-dimmed">Coming next</div>
+        <div v-if="!collapsed" class="mt-4 px-2.5 text-[11px] font-medium uppercase tracking-wider text-dimmed">Research</div>
         <UNavigationMenu :collapsed="collapsed" :items="nav[1]" orientation="vertical" tooltip />
+        <div v-if="!collapsed" class="mt-4 px-2.5 text-[11px] font-medium uppercase tracking-wider text-dimmed">Operations</div>
+        <UNavigationMenu :collapsed="collapsed" :items="nav[2]" orientation="vertical" tooltip />
       </template>
 
       <template #footer="{ collapsed }">
