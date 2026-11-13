@@ -620,7 +620,10 @@ Claude stays for all reading. Built for the open research interface.
   records/embedding steps wired into the crawl (today they are run by hand).
 - [ ] Before open release: gitleaks over history, Anthropic API for public use, data terms.
 
-## J. SaaS: screener, research and alerts (SAAS_PRD.md, 2026-11-10)
+## J. Research platform (PLATFORM_PRD.md, 2026-11-13; was SAAS_PRD.md)
+
+- [ ] Stage 0 foundation -> 1 closed beta -> 2 research/testing -> 3 advisors -> 4 open beta/paid
+  (PLATFORM_PRD.md section 5). Partner details pending.
 
 - [ ] Phase 0 decisions: legal opinion (SEBI RA line, showing backtests), fundamentals source
   (XBRL vs vendor), NSE data licence, Anthropic API account, brand/domain.

@@ -1,6 +1,6 @@
 # SaaS plan: screener, research and alerts over our data
 
-Written 2026-11-10. Status: proposal, nothing built. Spans all three projects; the scale-out
+Written 2026-11-10. **Superseded as the plan by `PLATFORM_PRD.md` (2026-11-13)**; kept for the blocker notes (section 2). Spans all three projects; the scale-out
 work it builds on is `stockey/docs/SCALE_OUT_PRD.md`.
 
 **Goal.** A paid web service where people build complicated screens, research companies
