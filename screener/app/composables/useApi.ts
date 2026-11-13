@@ -1,17 +1,9 @@
-// Thin fetch wrapper over the stockey fundamentals API (fundamentals/api/app.py).
-// Base URL is a public runtime config value so it can be pointed at a different host
-// without a rebuild (see nuxt.config.ts's NUXT_PUBLIC_API_BASE).
-export function useApi() {
-  const config = useRuntimeConfig()
-  const base = config.public.apiBase as string
-
-  async function get<T>(path: string): Promise<T> {
-    return await $fetch<T>(`${base}${path}`)
-  }
-
-  async function post<T>(path: string, body: object): Promise<T> {
-    return await $fetch<T>(`${base}${path}`, { method: 'POST', body })
-  }
-
-  return { get, post }
+// All data comes from the platform API through the same-origin /_api proxy (nuxt.config.ts).
+export function useApi<T>(path: string | (() => string), opts: Record<string, any> = {}) {
+  return useFetch<T>(() => `/_api/${typeof path === 'function' ? path() : path}`, {
+    key: typeof path === 'string' ? path : undefined,
+    ...opts,
+  })
 }
+
+export const api = <T>(path: string, query?: Record<string, any>) => $fetch<T>(`/_api/${path}`, { query })

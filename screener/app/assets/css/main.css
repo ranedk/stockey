@@ -1,0 +1,69 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+@source "../../../app";
+
+@theme static {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* brand = the data-viz reference blue ramp (sequential steps 100..700) */
+  --color-brand-50: #eef5fe;
+  --color-brand-100: #cde2fb;
+  --color-brand-200: #9ec5f4;
+  --color-brand-300: #6da7ec;
+  --color-brand-400: #3987e5;
+  --color-brand-500: #2a78d6;
+  --color-brand-600: #256abf;
+  --color-brand-700: #1c5cab;
+  --color-brand-800: #184f95;
+  --color-brand-900: #104281;
+  --color-brand-950: #0d366b;
+}
+
+/* Chart and market tokens. Up/down follow the Indian convention (green up, red down); every
+   use also carries a sign or arrow, so direction never rests on colour alone. */
+:root {
+  --chart-surface: #ffffff;
+  --chart-grid: #ececea;
+  --chart-axis: #8a8985;
+  --chart-text: #52514e;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #6250d6;
+  --series-8: #e34948;
+  --up: #0f9d58;
+  --down: #d93b3b;
+  --up-soft: rgb(15 157 88 / 0.12);
+  --down-soft: rgb(217 59 59 / 0.12);
+  --ui-radius: 0.5rem;
+}
+.dark {
+  --chart-surface: #18181b;
+  --chart-grid: #2a2a2e;
+  --chart-axis: #7c7b77;
+  --chart-text: #c3c2b7;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+  --up: #22c55e;
+  --down: #f05252;
+  --up-soft: rgb(34 197 94 / 0.14);
+  --down-soft: rgb(240 82 82 / 0.14);
+}
+
+body { font-feature-settings: 'cv11', 'ss01'; }
+.num { font-variant-numeric: tabular-nums; }
+.text-up { color: var(--up); }
+.text-down { color: var(--down); }
+.bg-up-soft { background: var(--up-soft); }
+.bg-down-soft { background: var(--down-soft); }

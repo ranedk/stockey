@@ -22,7 +22,13 @@ warn() { printf '  \033[33mwarn\033[0m  %s\n' "$1"; }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; }
 
 echo "==> building"
-npx nuxt build
+# Until the new platform app is switched on (PLATFORM_PRD.md), the live site is still the old
+# app in legacy/. Build it there and copy its output to .output, which the service runs. The
+# new app builds to .output-next (nuxt.config.ts) so building it never touches the live site:
+# on 2026-11-13 a plain `nuxt build` of the new app overwrote .output and 4 live pages
+# returned 500 until the old build was restored.
+( cd legacy && npx nuxt build )
+rm -rf .output && cp -a legacy/.output .output
 [ -d .output/public/_nuxt ] || { bad ".output/public/_nuxt missing after build"; exit 1; }
 [ -f .output/server/index.mjs ] || { bad ".output/server/index.mjs missing after build"; exit 1; }
 

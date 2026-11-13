@@ -632,19 +632,23 @@ Stages: 0 foundation -> 1a look up and screen -> 1b track and ask -> 2 research/
 Stage 0:
 - [ ] F1 coverage report (companies with no XBRL, and why)
 - [ ] F2 daily fetch of new result filings (cron; run by hand today)
-- [ ] F3 clean quarterly / annual / TTM series, point in time
-- [ ] F4 ratios and valuation (+ bank, NBFC, insurer lists)
+- [x] F3 clean quarterly / annual / TTM series (`stockey/serving/financials.py` -> `serving_financials`, 2026-11-13);
+  mis-scaled balance sheets blanked (22); revisions still overwrite (versioning open, S4)
+- [~] F4 ratios and valuation: margins, growth, ROE/ROCE, D/E, cover, cash conversion, PE/PB/EV-EBITDA done;
+  bank equity not mapped (bank ROE blank); `pat_owners` often filed as 0 or mis-tagged -- used only within 0.5-1.5x of pat
 - [ ] F5 check against screener.in on the 50 pilot companies
 - [ ] F6 segments
 - [ ] F7 exchange industry labels cover the universe
 - [ ] S1 company identity table
-- [ ] S2 metric catalogue (first ~80 metrics, licence tags)
-- [ ] S3 serving tables + nightly build + freshness
+- [~] S2 metric catalogue: first 55 fields with units and licence tags in `api/app/catalog.py` (move to a table)
+- [~] S3 `serving_company` (3,216 companies: identity, industry, returns, liquidity, size band, ratios, stage, tags)
+  built; NOT yet scheduled -- needs a cron job after price adjustment and the stage API
 - [ ] S4 point-in-time tests on known cases
-- [ ] A1 design notes (screen tables, API, component/chart library)
+- [x] A1 choices: Nuxt UI 4 + ECharts, FastAPI on :8110 (`api/`), screens as whitelisted field:op:value until B4
 - [ ] A2 API skeleton: accounts, invites, sessions
-- [ ] A3 app shell (responsive)
-- [ ] A4 basic company page
+- [x] A3 app shell: sidebar, search (Ctrl K), dark mode, phone width checked
+- [x] A4 company page (beyond basic: scorecard vs industry, statements, peers); also Markets, Screener, Sectors pages
+- [ ] Switch-over: serve the new app + API publicly, port legacy pages (paper, portfolio, data health, themes, stages)
 - [ ] A5 admin
 - [ ] A6 security, backup, alerts, usage log
 
