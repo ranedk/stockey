@@ -128,3 +128,14 @@ def test_a_revised_filing_takes_its_publish_time_from_the_revision_date():
                                             "broadcast_Date": None, "revised_Date": "24-JUL-2026 16:48:18",
                                             "creation_Date": "24-Jul-2026 16:48:55", "consolidated": "Consolidated"}]})
     assert rows[0]["public_at"] == datetime(2026, 7, 24, 16, 48, 18) and rows[0]["revision"] == "revision"
+
+
+def test_a_power_companys_regulatory_deferral_after_tax_is_not_a_failed_check():
+    xml = doc(ctx("OneD", "2025-07-01", "2025-09-30") +
+              fact("ProfitBeforeTax", "OneD", "-600600000") + fact("TaxExpense", "OneD", "-167100000") +
+              fact("NetMovementInRegulatoryDeferralAccountBalancesRelatedToProfitOrLossAndTheRelatedDeferredTaxMovement",
+                   "OneD", "28700000") +
+              fact("ProfitLossForPeriodFromContinuingOperations", "OneD", "-404800000"))
+    fam, rows = mapping.extract(parse.parse(xml))
+    pat = [c for c in mapping.checks(fam, rows) if c["check"].startswith("pat_continuing")]
+    assert pat and all(c["ok"] for c in pat)

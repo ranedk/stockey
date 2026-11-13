@@ -95,3 +95,21 @@ What the gaps were:
   (PDF) -- later work if needed.
 - **One-off screener.in gaps**: AWHCL 2024-12 and 2025-09 (filing says Rs 8.5 cr, screener.in
   Rs 156 cr), 63MOONS 2023-24 sales (we include all operating revenue).
+
+## Full run: all companies, 2026-11-12
+
+3,546 listings, 86,003 fetches (12 Hetzner workers, about a day): 87,747 filings from 2,478
+companies parsed; 175 files gone from NSE, 34 unreadable. Mapping v3 adds `regulatory_deferral`:
+power companies add it after tax, and it was behind all 722 files failing `pat = pbt - tax`
+(54 of 60 sampled; the rest failed in another period). After v3, 1 file fails a check.
+
+Against screener.in (standalone quarters, 1,476 companies), counting a gap as fine when it is
+within 5% or under Rs 0.5 cr (screener.in rounds):
+
+| | quarters | fine |
+|---|---|---|
+| sales | 18,105 | 97.7% |
+| profit | 18,191 | 98.1% |
+
+Misses are spread over ~160 companies; the most frequent (HAPPSTMNDS, MASTEK, QUESS, SIEMENS,
+RAYMOND, ABREL) have had demergers or restatements, the same as-filed vs restated split as the pilot.

@@ -18,7 +18,8 @@ from datetime import date
 
 from fundamentals.xbrl.parse import Filing
 
-MAPPING_VERSION = 2       # 2: excise_duty and revenue_net (duty filed as an 'other expenses' line)
+MAPPING_VERSION = 3       # 2: excise_duty and revenue_net (duty filed as an 'other expenses' line)
+                          # 3: regulatory_deferral (power companies add it after tax)
 
 Spec = list  # list[str | tuple[str, ...]]
 
@@ -37,6 +38,7 @@ PL_COMPANY: dict[str, Spec] = {
     "exceptional": ["ExceptionalItemsBeforeTax"],
     "pbt": ["ProfitBeforeTax"],
     "tax": ["TaxExpense"],
+    "regulatory_deferral": ["NetMovementInRegulatoryDeferralAccountBalancesRelatedToProfitOrLossAndTheRelatedDeferredTaxMovement"],
     "pat_continuing": ["ProfitLossForPeriodFromContinuingOperations"],
     "pat": ["ProfitLossForPeriod"],
     "pat_owners": ["ProfitOrLossAttributableToOwnersOfParent"],
@@ -242,7 +244,7 @@ TOL_ABS = 2e5            # ... or Rs 2 lakh, whichever is larger (rounding in sm
 CHECKS = {
     "company": [("total_income = revenue + other_income", "total_income", ("revenue", "other_income"), ()),
                 ("pbt_before_exceptional = total_income - expenses", "pbt_before_exceptional", ("total_income",), ("expenses",)),
-                ("pat_continuing = pbt - tax", "pat_continuing", ("pbt",), ("tax",)),
+                ("pat_continuing = pbt - tax + regulatory_deferral", "pat_continuing", ("pbt", "regulatory_deferral"), ("tax",)),
                 ("total_assets = equity_and_liabilities", "total_assets", ("equity_and_liabilities",), ()),
                 ("total_assets = total_equity + liabilities", "total_assets", ("total_equity", "liabilities"), ()),
                 ("net_change_cash_before_fx = cfo + cfi + cff", "net_change_cash_before_fx", ("cfo", "cfi", "cff"), ())],
@@ -254,6 +256,7 @@ CHECKS = {
     "insurer": [],
 }
 CHECKS["nbfc"] = CHECKS["company"]
+OPTIONAL = {"regulatory_deferral"}       # counts as 0 when the filing has no such line
 
 
 def checks(fam: str, rows: list[Row]) -> list[dict]:
@@ -264,9 +267,9 @@ def checks(fam: str, rows: list[Row]) -> list[dict]:
     out = []
     for (k, end), v in sorted(by.items(), key=lambda x: (x[0][1], x[0][0])):
         for name, lhs, plus, minus in CHECKS[fam]:
-            if lhs not in v or not all(p in v for p in plus) or not all(m in v for m in minus):
+            if lhs not in v or not all(p in v or p in OPTIONAL for p in plus) or not all(m in v for m in minus):
                 continue
-            rhs = sum(v[p] for p in plus) - sum(v[m] for m in minus)
+            rhs = sum(v.get(p, 0.0) for p in plus) - sum(v[m] for m in minus)
             gap = v[lhs] - rhs
             ok = abs(gap) <= max(TOL_ABS, TOL_REL * max(abs(v[lhs]), abs(rhs)))
             out.append({"check": name, "kind": k, "end": end.isoformat(), "ok": ok, "gap": round(gap, 2)})
