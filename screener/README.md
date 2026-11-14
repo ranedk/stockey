@@ -17,11 +17,15 @@ From a laptop: `ssh -L 3100:127.0.0.1:3100 <host>` and open http://localhost:310
 
 ## Build and deploy: read before running anything
 
-- The live site (screener.service) runs `.output/` and that is still the OLD app. This app
-  builds to `.output-next/` so a build never touches production.
-- `deploy/deploy.sh` builds `legacy/` and publishes it. Switching the live site to this app is
-  a deliberate step (service ExecStart -> `.output-next`, nginx `/_nuxt/` root, API service),
-  not yet done.
+- LIVE since 2026-11-14: `./deploy/deploy.sh` builds this app to `.output-next/`, copies it to
+  `.output/` (what screener.service runs), publishes `/_nuxt` assets to /var/www/screener for
+  nginx, (re)installs and restarts `platform-api.service` (the API on :8110, unit in
+  `../api/deploy/`), restarts the app and checks the whole chain.
+- A plain `npx nuxt build` only writes `.output-next/`, never the live `.output/`.
+- Rollback: `./deploy/deploy.sh --legacy` ships the old app from `legacy/`.
+- Stop the dev server (:3100) before deploying: both use `.nuxt/`.
+- nginx gives the app 120 s per request; stockey's `/api/platform-issues` takes longer, so the
+  open-issues section of Data health fails publicly until that query is made faster.
 
 ## Pages
 

@@ -1,0 +1,29 @@
+# The research platform's read API (api/), behind the web app's /_api proxy.
+#
+#   sudo cp api/deploy/platform-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now platform-api
+#
+# Bound to 127.0.0.1: the only way in is through the web app (screener.service), which is
+# itself only reachable through nginx's auth gate. 8100 is the infra orchestrator.
+[Unit]
+Description=Research platform API (FastAPI, port 8110)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=dev
+Group=dev
+WorkingDirectory=/home/dev/code/trading/api
+# DB credentials come from stockey/.env (app/db.py) unless API_DATABASE_URL is set.
+ExecStart=/home/dev/code/trading/api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8110 --workers 2
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

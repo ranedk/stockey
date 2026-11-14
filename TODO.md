@@ -648,8 +648,8 @@ Stage 0:
 - [x] A3 app shell: sidebar, search (Ctrl K), dark mode, phone width checked
 - [x] A4 company page (beyond basic: scorecard vs industry, statements, peers); also Markets, Screener, Sectors pages
 - [x] Port legacy pages into the new app (watchlist, portfolio, investors, paper, strategies, paradigms, themes, stages, data health, todos, sector capacity cycle; /_stockey and /_systrader proxies) 2026-11-13
-- [ ] stockey `/api/platform-issues` takes 2-4 min (data-health's open-issues section waits on it); speed up or cache
-- [ ] Switch-over: serve the new app + API publicly (service ExecStart -> .output-next, nginx, API as a managed service)
+- [ ] stockey `/api/platform-issues` takes 2-4 min (data-health's open-issues section waits on it; nginx cuts it at 120 s, so it fails on the public site); speed up or cache
+- [x] Switch-over (2026-11-14): public site serves the new app; `platform-api.service` runs the API on :8110; `deploy.sh` ships the new app, `--legacy` rolls back
 - [ ] A5 admin
 - [ ] A6 security, backup, alerts, usage log
 

@@ -3,7 +3,8 @@
 # The one command. Builds the screener, publishes it, restarts what needs
 # restarting, then checks the whole chain and says which link is broken.
 #
-#   ./deploy/deploy.sh
+#   ./deploy/deploy.sh            # the platform app (this folder)
+#   ./deploy/deploy.sh --legacy   # rollback: the old app in legacy/
 #
 # Safe to re-run at any time. Nothing is published until the build succeeds and
 # nothing is restarted until the publish succeeds, so a failed run leaves the
@@ -22,13 +23,19 @@ warn() { printf '  \033[33mwarn\033[0m  %s\n' "$1"; }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; }
 
 echo "==> building"
-# Until the new platform app is switched on (PLATFORM_PRD.md), the live site is still the old
-# app in legacy/. Build it there and copy its output to .output, which the service runs. The
-# new app builds to .output-next (nuxt.config.ts) so building it never touches the live site:
-# on 2026-11-13 a plain `nuxt build` of the new app overwrote .output and 4 live pages
-# returned 500 until the old build was restored.
-( cd legacy && npx nuxt build )
-rm -rf .output && cp -a legacy/.output .output
+# The service always runs .output; each app BUILDS elsewhere and is copied in here, so a build
+# on its own never changes the live site (on 2026-11-13 a plain build wrote straight into
+# .output and 4 live pages returned 500). Switched from legacy/ to this app on 2026-11-14.
+if [ "${1:-}" = "--legacy" ]; then
+  ( cd legacy && npx nuxt build )
+  BUILT=legacy/.output
+else
+  npx nuxt build            # -> .output-next (nuxt.config.ts)
+  BUILT=.output-next
+fi
+[ -f "$BUILT/server/index.mjs" ] || { bad "$BUILT/server/index.mjs missing after build"; exit 1; }
+rm -rf .output.new && cp -a "$BUILT" .output.new
+rm -rf .output.old && { [ -d .output ] && mv .output .output.old || true; } && mv .output.new .output
 [ -d .output/public/_nuxt ] || { bad ".output/public/_nuxt missing after build"; exit 1; }
 [ -f .output/server/index.mjs ] || { bad ".output/server/index.mjs missing after build"; exit 1; }
 
@@ -41,6 +48,16 @@ sudo chown -R root:www-data "$STATIC_ROOT"
 sudo find "$STATIC_ROOT" -type d -exec chmod 755 {} +
 sudo find "$STATIC_ROOT" -type f -exec chmod 644 {} +
 ok "$(find "$STATIC_ROOT" -type f | wc -l) files, $(du -sh "$STATIC_ROOT" | cut -f1)"
+
+echo "==> platform API (api/, :8110)"
+API_UNIT=/etc/systemd/system/platform-api.service
+if ! cmp -s ../api/deploy/platform-api.service "$API_UNIT"; then
+  sudo cp ../api/deploy/platform-api.service "$API_UNIT"
+  sudo systemctl daemon-reload
+  sudo systemctl enable platform-api >/dev/null 2>&1
+  ok "installed/updated platform-api.service"
+fi
+sudo systemctl restart platform-api
 
 echo "==> restarting the app"
 if [ ! -f /etc/systemd/system/screener.service ]; then
@@ -72,6 +89,12 @@ echo "==> checking the chain"
 
 systemctl is-active --quiet screener \
   && ok "app service running" || bad "screener.service is not running (journalctl -u screener)"
+
+for i in $(seq 1 15); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8110/api/v1/health || true)" = "200" ] && break; sleep 1
+done
+api=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8110/api/v1/health || echo 000)
+[ "$api" = "200" ] && ok "platform API answers on :8110" || bad "platform API returned ${api} (journalctl -u platform-api)"
 
 app=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${UPSTREAM}/" || echo 000)
 [ "$app" = "200" ] && ok "app answers on ${UPSTREAM}" || bad "app returned ${app} on ${UPSTREAM}"
